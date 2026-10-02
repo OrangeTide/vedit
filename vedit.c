@@ -137,10 +137,10 @@ utf8_encode(unsigned char *buf, uint32_t rune)
  * common CJK and emoji ranges are two, everything else is one.
  ****************************************************************/
 
-struct wrange { uint32_t lo, hi; };
+typedef struct wrange { uint32_t lo, hi; } Wrange;
 
 static int
-in_ranges(uint32_t cp, const struct wrange *r, size_t n)
+in_ranges(uint32_t cp, const Wrange *r, size_t n)
 {
 	size_t lo = 0, hi = n;
 
@@ -158,7 +158,7 @@ in_ranges(uint32_t cp, const struct wrange *r, size_t n)
 }
 
 /* Zero-width combining marks (the ranges that matter in practice). */
-static const struct wrange zero_width[] = {
+static const Wrange zero_width[] = {
 	{ 0x0300, 0x036F }, { 0x0483, 0x0489 }, { 0x0591, 0x05BD },
 	{ 0x0610, 0x061A }, { 0x064B, 0x065F }, { 0x0670, 0x0670 },
 	{ 0x06D6, 0x06DC }, { 0x06DF, 0x06E4 }, { 0x0901, 0x0903 },
@@ -169,7 +169,7 @@ static const struct wrange zero_width[] = {
 };
 
 /* Two-cell wide ranges (CJK, Hangul, fullwidth forms, common emoji). */
-static const struct wrange wide[] = {
+static const Wrange wide[] = {
 	{ 0x1100, 0x115F }, { 0x2329, 0x232A }, { 0x2E80, 0x303E },
 	{ 0x3041, 0x33FF }, { 0x3400, 0x4DBF }, { 0x4E00, 0x9FFF },
 	{ 0xA000, 0xA4CF }, { 0xAC00, 0xD7A3 }, { 0xF900, 0xFAFF },
@@ -199,43 +199,43 @@ rune_width(uint32_t cp)
  * Terminal cell (inlined from lumi libvt)
  ****************************************************************/
 
-enum vt_attr {
-	VT_ATTR_BOLD      = 1 << 0,
-	VT_ATTR_UNDERLINE = 1 << 1,
-	VT_ATTR_REVERSE   = 1 << 2,
-	VT_ATTR_ITALIC    = 1 << 3,
-	VT_ATTR_BLINK     = 1 << 4,
-	VT_ATTR_UNDERCURL = 1 << 5,
-	VT_ATTR_DIM       = 1 << 6,
-	VT_ATTR_HIDDEN    = 1 << 7,
-	VT_ATTR_STRIKE    = 1 << 8,
-	VT_ATTR_PREDICTED = 1 << 9,
-};
+typedef enum vt_attr {
+	ATTR_BOLD      = 1 << 0,
+	ATTR_UNDERLINE = 1 << 1,
+	ATTR_REVERSE   = 1 << 2,
+	ATTR_ITALIC    = 1 << 3,
+	ATTR_BLINK     = 1 << 4,
+	ATTR_UNDERCURL = 1 << 5,
+	ATTR_DIM       = 1 << 6,
+	ATTR_HIDDEN    = 1 << 7,
+	ATTR_STRIKE    = 1 << 8,
+	ATTR_PREDICTED = 1 << 9,
+} Attr;
 
-enum vt_color_type {
-	VT_COLOR_DEFAULT,
-	VT_COLOR_INDEXED,
-	VT_COLOR_RGB,
-};
+typedef enum vt_color_type {
+	COLOR_DEFAULT,
+	COLOR_INDEXED,
+	COLOR_RGB,
+} ColorType;
 
-struct vt_color {
-	enum vt_color_type type;
+typedef struct vt_color {
+	ColorType type;
 	union {
 		uint8_t index;
 		struct { uint8_t r, g, b; } rgb;
 	};
-};
+} Color;
 
-struct vt_cell {
+typedef struct vt_cell {
 	uint32_t	codepoint;
-	struct vt_color	fg;
-	struct vt_color	bg;
+	Color	fg;
+	Color	bg;
 	uint16_t	attrs;
 	uint8_t		width;
-};
+} Cell;
 
 static void
-vt_cell_clear(struct vt_cell *c)
+vt_cell_clear(Cell *c)
 {
 	memset(c, 0, sizeof(*c));
 	c->codepoint = ' ';
@@ -249,27 +249,27 @@ vt_cell_clear(struct vt_cell *c)
  * render three ways depending on the client: UTF-8 box-drawing, DEC VT100
  * line-drawing (single bytes in the alternate charset, which many clients that
  * cannot do UTF-8 still support), or plain-ASCII substitutes. The editor stores
- * a glyph as a marker codepoint (BOX_CP) in a cell; draw_present turns it into
+ * a glyph as a marker codepoint (BOX_CP) in a cell; scr_present turns it into
  * the right bytes for the current mode. The mode is per editor instance (stored
- * on struct draw_term), so two players on one server can differ.
+ * on Scrbuf), so two players on one server can differ.
  ****************************************************************/
 
-enum box_glyph {
+typedef enum box_glyph {
 	BG_TL, BG_TR, BG_BL, BG_BR, BG_H, BG_V,
 	BG_UP, BG_DOWN, BG_LEFT, BG_RIGHT, BG_THUMB, BG_TRACK, BG_CHECK,
 	BG_COUNT
-};
+} BoxGlyph;
 
 /* For each glyph: its Unicode codepoint, its ASCII substitute, and the byte to
  * send in DEC line-drawing mode (0 means DEC has no equivalent, so the ASCII
  * substitute is used even in DEC mode). */
-struct box_def {
+typedef struct box_def {
 	uint32_t	uni;
 	unsigned char	ascii;
 	unsigned char	dec;
-};
+} BoxDef;
 
-static const struct box_def box_tab[BG_COUNT] = {
+static const BoxDef box_tab[BG_COUNT] = {
 	[BG_TL]    = { 0x250cu, '+', 'l' },	/* corners */
 	[BG_TR]    = { 0x2510u, '+', 'k' },
 	[BG_BL]    = { 0x2514u, '+', 'm' },
@@ -289,7 +289,7 @@ static const struct box_def box_tab[BG_COUNT] = {
 #define BOX_CP_BASE	0x0F0000u
 #define BOX_CP(id)	(BOX_CP_BASE + (uint32_t)(id))
 #define BOX_IS(cp)	((cp) >= BOX_CP_BASE && (cp) < BOX_CP_BASE + BG_COUNT)
-#define BOX_ID(cp)	((enum box_glyph)((cp) - BOX_CP_BASE))
+#define BOX_ID(cp)	((BoxGlyph)((cp) - BOX_CP_BASE))
 
 /* A forced mode set from the command line, or -1 for "decide from the
  * environment". box_default() resolves it. */
@@ -333,13 +333,13 @@ enum {
 	TUI_BORDER_R, TUI_BORDER_BL, TUI_BORDER_B, TUI_BORDER_BR,
 };
 
-enum tui_shadow_style {
+typedef enum tui_shadow_style {
 	TUI_SHADOW_NONE,
 	TUI_SHADOW_HALF,
 	TUI_SHADOW_SHADE,
-};
+} ShadowStyle;
 
-struct tui_theme {
+typedef struct tui_theme {
 	const char	*name;
 	const char	*border[8];
 	const char	*title_l;
@@ -354,23 +354,23 @@ struct tui_theme {
 	const char	*sep_l;
 	const char	*sep_fill;
 	const char	*sep_r;
-	struct vt_color	border_fg, border_bg, title_fg;
-	struct vt_color	content_fg, content_bg;
-	struct vt_color	sel_fg, sel_bg;
-	struct vt_color	key_fg, sel_key_fg;
-	struct vt_color	focus_fg, focus_bg, unfocus_fg, unfocus_bg;
-	struct vt_color	title_focus_fg, title_idle_fg;
-	struct vt_color	close_fg, tool_fg;
-	struct vt_color	status_focus_fg, status_idle_fg;
-	struct vt_color	indicator_fg, drag_fg;
-	enum tui_shadow_style shadow;
-	struct vt_color	shadow_fg, shadow_bg;
-};
+	Color	border_fg, border_bg, title_fg;
+	Color	content_fg, content_bg;
+	Color	sel_fg, sel_bg;
+	Color	key_fg, sel_key_fg;
+	Color	focus_fg, focus_bg, unfocus_fg, unfocus_bg;
+	Color	title_focus_fg, title_idle_fg;
+	Color	close_fg, tool_fg;
+	Color	status_focus_fg, status_idle_fg;
+	Color	indicator_fg, drag_fg;
+	ShadowStyle shadow;
+	Color	shadow_fg, shadow_bg;
+} Theme;
 
-#define CI(n)  { .type = VT_COLOR_INDEXED, { .index = (n) } }
-#define CD     { .type = VT_COLOR_DEFAULT }
+#define CI(n)  { .type = COLOR_INDEXED, { .index = (n) } }
+#define CD     { .type = COLOR_DEFAULT }
 
-static const struct tui_theme themes[] = {
+static const Theme themes[] = {
 	{
 		.name = "ascii",
 		.border = { "+", "-", "+", "|", "|", "+", "-", "+" },
@@ -430,8 +430,8 @@ static const struct tui_theme themes[] = {
 #define THEME_COUNT ((int)(sizeof(themes) / sizeof(themes[0])))
 
 
-static const struct tui_theme *
-tui_theme_by_name(const char *name)
+static const Theme *
+ui_theme_by_name(const char *name)
 {
 	int i;
 
@@ -443,19 +443,19 @@ tui_theme_by_name(const char *name)
 
 /* The theme supplies dialog colors only; the frame glyphs come from the
  * box-drawing layer. */
-static const struct tui_theme *
-tui_theme_default(void)
+static const Theme *
+ui_theme_default(void)
 {
 	const char *lang = getenv("LANG");
 
 	if (lang && (strstr(lang, "UTF-8") || strstr(lang, "utf-8") ||
 	    strstr(lang, "utf8")))
-		return tui_theme_by_name("thin");
+		return ui_theme_by_name("thin");
 	lang = getenv("LC_ALL");
 	if (lang && (strstr(lang, "UTF-8") || strstr(lang, "utf-8") ||
 	    strstr(lang, "utf8")))
-		return tui_theme_by_name("thin");
-	return tui_theme_by_name("ascii");
+		return ui_theme_by_name("thin");
+	return ui_theme_by_name("ascii");
 }
 
 /****************************************************************
@@ -465,19 +465,19 @@ tui_theme_default(void)
  * compiles against them.
  ****************************************************************/
 
-enum syn_style {
+typedef enum syn_style {
 	SYN_TEXT, SYN_COMMENT, SYN_KEYWORD, SYN_TYPE, SYN_CONSTANT,
 	SYN_STRING, SYN_OPERATOR, SYN_FUNCTION, SYN_PREPROC,
 	SYN_STYLE_COUNT,
-};
+} SynStyle;
 
-struct syntax {
+typedef struct syntax {
 	const char	*name;
 	uint16_t	start;
-};
+} Syntax;
 
 static uint16_t
-syn_line(const struct syntax *sy, uint16_t state_in, const char *bytes,
+syn_line(const Syntax *sy, uint16_t state_in, const char *bytes,
     size_t n, uint8_t *out)
 {
 	(void)sy; (void)bytes; (void)out;
@@ -485,32 +485,13 @@ syn_line(const struct syntax *sy, uint16_t state_in, const char *bytes,
 	return state_in;
 }
 
-static const struct syntax *
+static const Syntax *
 syn_for_ext(const char *ext)
 {
 	(void)ext;
 	return NULL;
 }
 
-/* vedit has no config file; the struct editor keeps an unused cfg pointer. */
-struct cfg;
-
-/* Sending text to another pane needs a lumi session; a standalone or embedded
- * vedit has none, so this always reports "no session". */
-enum lu_send_result {
-	LU_SEND_OK = 0,
-	LU_SEND_NO_SESSION,
-	LU_SEND_NO_TARGET,
-	LU_SEND_READONLY,
-	LU_SEND_ERROR,
-};
-
-static enum lu_send_result
-lu_send_input(const char *session, pid_t target, const char *data, size_t len)
-{
-	(void)session; (void)target; (void)data; (void)len;
-	return LU_SEND_NO_SESSION;
-}
 
 #define VEDIT_VERSION "vedit 0.1"
 #define LUMI_VERSION VEDIT_VERSION
@@ -638,40 +619,39 @@ struct tkbd_seq {
  * The draw surface and its ANSI terminal backend. draw is the
  * cell grid the editor paints into; draw_term holds the grid, the
  * shadow copy for dirty-line diffing, the input decoder, and the
- * bound io vtable. draw_new wraps a draw_term, matching the two
+ * bound io vtable. scr_new wraps a draw_term, matching the two
  * objects the editor expects (e->d and e->term).
  ****************************************************************/
 
-#define DRAW_CELL_CONT 0xFFFEu
+#define CELL_CONT 0xFFFEu
 
-enum draw_event_type {
-	DRAW_EVENT_NONE,
-	DRAW_EVENT_KEY,
-	DRAW_EVENT_RESIZE,
-	DRAW_EVENT_RESUME,
-	DRAW_EVENT_EOF,
-};
+typedef enum draw_event_type {
+	EVENT_NONE,
+	EVENT_KEY,
+	EVENT_RESIZE,
+	EVENT_RESUME,
+	EVENT_EOF,
+} EventType;
 
-struct draw_event {
-	enum draw_event_type	type;
+typedef struct draw_event {
+	EventType	type;
 	struct tkbd_seq		key;
-};
+} Event;
 
-enum draw_cursor_shape {
-	DRAW_CURSOR_DEFAULT,
-	DRAW_CURSOR_BLOCK,
-	DRAW_CURSOR_BAR,
-	DRAW_CURSOR_UNDERLINE,
-};
+typedef enum cursor_shape {
+	CURSOR_DEFAULT,
+	CURSOR_BLOCK,
+	CURSOR_BAR,
+	CURSOR_UNDERLINE,
+} CursorShape;
 
-struct draw_driver;	/* unused; draw_new ignores it */
 
-struct draw_term {
+typedef struct draw_term {
 	struct vedit_io	io;
 
 	int		rows, cols;
-	struct vt_cell	*cur;		/* grid being painted */
-	struct vt_cell	*shadow;	/* last grid presented */
+	Cell	*cur;		/* grid being painted */
+	Cell	*shadow;	/* last grid presented */
 	int		*rowdirty;	/* per-row dirty flag for the diff */
 
 	int		cursor_r, cursor_c;
@@ -679,7 +659,7 @@ struct draw_term {
 
 	int		begun;
 	int		mouse_on;	/* accepted but unused (no mouse) */
-	int		want_resize;	/* a resize is pending for draw_wait */
+	int		want_resize;	/* a resize is pending for scr_wait */
 	int		box_mode;	/* enum vedit_box_mode for the glyphs */
 
 	/* raw input bytes awaiting decode */
@@ -689,9 +669,9 @@ struct draw_term {
 	/* pending output bytes awaiting flush */
 	char		*out;
 	size_t		outlen, outcap;
-};
+} Scrbuf;
 
-struct draw { struct draw_term *t; };
+typedef struct draw { Scrbuf *t; } Screen;
 
 /* The one process-wide window-change flag, set by the SIGWINCH handler the
  * command-line binding installs. An embedded host uses vedit_set_size()
@@ -699,7 +679,7 @@ struct draw { struct draw_term *t; };
 static volatile sig_atomic_t g_winch;
 
 static void
-out_reserve(struct draw_term *t, size_t need)
+scr_reserve(Scrbuf *t, size_t need)
 {
 	if (t->outlen + need > t->outcap) {
 		size_t cap = t->outcap ? t->outcap : 4096;
@@ -716,9 +696,9 @@ out_reserve(struct draw_term *t, size_t need)
 }
 
 static void
-out_bytes(struct draw_term *t, const char *s, size_t n)
+scr_bytes(Scrbuf *t, const char *s, size_t n)
 {
-	out_reserve(t, n);
+	scr_reserve(t, n);
 	if (t->outlen + n <= t->outcap) {
 		memcpy(t->out + t->outlen, s, n);
 		t->outlen += n;
@@ -726,13 +706,13 @@ out_bytes(struct draw_term *t, const char *s, size_t n)
 }
 
 static void
-out_str(struct draw_term *t, const char *s)
+scr_str(Scrbuf *t, const char *s)
 {
-	out_bytes(t, s, strlen(s));
+	scr_bytes(t, s, strlen(s));
 }
 
 static void
-out_flush(struct draw_term *t)
+scr_flush(Scrbuf *t)
 {
 	size_t off = 0;
 
@@ -748,11 +728,11 @@ out_flush(struct draw_term *t)
 }
 
 static int
-grid_alloc(struct draw_term *t, int rows, int cols)
+grid_alloc(Scrbuf *t, int rows, int cols)
 {
 	size_t n = (size_t)rows * (size_t)cols;
-	struct vt_cell *cur = calloc(n ? n : 1, sizeof(*cur));
-	struct vt_cell *shadow = calloc(n ? n : 1, sizeof(*shadow));
+	Cell *cur = calloc(n ? n : 1, sizeof(*cur));
+	Cell *shadow = calloc(n ? n : 1, sizeof(*shadow));
 	int *rd = calloc(rows ? (size_t)rows : 1, sizeof(*rd));
 	size_t i;
 
@@ -777,10 +757,10 @@ grid_alloc(struct draw_term *t, int rows, int cols)
 	return 0;
 }
 
-static struct draw_term *
-draw_term_new_io(const struct vedit_io *io)
+static Scrbuf *
+scr_new_io(const struct vedit_io *io)
 {
-	struct draw_term *t = calloc(1, sizeof(*t));
+	Scrbuf *t = calloc(1, sizeof(*t));
 	int rows = 24, cols = 80;
 
 	if (!t)
@@ -801,10 +781,9 @@ draw_term_new_io(const struct vedit_io *io)
 	return t;
 }
 
-static const struct draw_driver *draw_term_driver(void) { return NULL; }
 
 static void
-draw_term_mouse(struct draw_term *t, int on)
+scr_mouse(Scrbuf *t, int on)
 {
 	t->mouse_on = on;	/* no mouse decoding; kept for API parity */
 }
@@ -812,66 +791,66 @@ draw_term_mouse(struct draw_term *t, int on)
 /* ---- SGR emission ------------------------------------------------------- */
 
 static int
-color_eq(struct vt_color a, struct vt_color b)
+color_eq(Color a, Color b)
 {
 	if (a.type != b.type)
 		return 0;
-	if (a.type == VT_COLOR_INDEXED)
+	if (a.type == COLOR_INDEXED)
 		return a.index == b.index;
-	if (a.type == VT_COLOR_RGB)
+	if (a.type == COLOR_RGB)
 		return a.rgb.r == b.rgb.r && a.rgb.g == b.rgb.g &&
 		    a.rgb.b == b.rgb.b;
 	return 1;
 }
 
 static void
-sgr_color(struct draw_term *t, struct vt_color c, int is_bg)
+scr_sgr_color(Scrbuf *t, Color c, int is_bg)
 {
 	char buf[32];
 
-	if (c.type == VT_COLOR_DEFAULT) {
+	if (c.type == COLOR_DEFAULT) {
 		snprintf(buf, sizeof(buf), "\033[%dm", is_bg ? 49 : 39);
-	} else if (c.type == VT_COLOR_INDEXED) {
+	} else if (c.type == COLOR_INDEXED) {
 		snprintf(buf, sizeof(buf), "\033[%d;5;%dm", is_bg ? 48 : 38,
 		    c.index);
 	} else {
 		snprintf(buf, sizeof(buf), "\033[%d;2;%d;%d;%dm",
 		    is_bg ? 48 : 38, c.rgb.r, c.rgb.g, c.rgb.b);
 	}
-	out_str(t, buf);
+	scr_str(t, buf);
 }
 
 static void
-sgr_attrs(struct draw_term *t, uint16_t attrs)
+scr_sgr_attrs(Scrbuf *t, uint16_t attrs)
 {
-	if (attrs & VT_ATTR_BOLD)
-		out_str(t, "\033[1m");
-	if (attrs & VT_ATTR_DIM)
-		out_str(t, "\033[2m");
-	if (attrs & VT_ATTR_ITALIC)
-		out_str(t, "\033[3m");
-	if (attrs & VT_ATTR_UNDERLINE)
-		out_str(t, "\033[4m");
-	if (attrs & VT_ATTR_BLINK)
-		out_str(t, "\033[5m");
-	if (attrs & VT_ATTR_REVERSE)
-		out_str(t, "\033[7m");
-	if (attrs & VT_ATTR_STRIKE)
-		out_str(t, "\033[9m");
+	if (attrs & ATTR_BOLD)
+		scr_str(t, "\033[1m");
+	if (attrs & ATTR_DIM)
+		scr_str(t, "\033[2m");
+	if (attrs & ATTR_ITALIC)
+		scr_str(t, "\033[3m");
+	if (attrs & ATTR_UNDERLINE)
+		scr_str(t, "\033[4m");
+	if (attrs & ATTR_BLINK)
+		scr_str(t, "\033[5m");
+	if (attrs & ATTR_REVERSE)
+		scr_str(t, "\033[7m");
+	if (attrs & ATTR_STRIKE)
+		scr_str(t, "\033[9m");
 }
 
 /* The pen tracks the SGR state already emitted, so a row paints only the
  * changes between adjacent cells instead of a full reset per cell. This matters
  * on a slow link: a uniformly colored line costs one escape, not one per
  * column. */
-struct pen {
+typedef struct pen {
 	int		valid;
-	struct vt_color	fg, bg;
+	Color	fg, bg;
 	uint16_t	attrs;
-};
+} Pen;
 
 static void
-pen_reset(struct pen *p)
+pen_reset(Pen *p)
 {
 	p->valid = 0;
 }
@@ -880,8 +859,8 @@ pen_reset(struct pen *p)
  * attribute turning off needs a full reset (SGR has no per-attribute off here),
  * so an attrs change re-emits the colors too. */
 static void
-emit_pen(struct draw_term *t, struct pen *p, struct vt_color fg,
-    struct vt_color bg, uint16_t attrs)
+scr_pen(Scrbuf *t, Pen *p, Color fg,
+    Color bg, uint16_t attrs)
 {
 	int need_color;
 
@@ -890,19 +869,19 @@ emit_pen(struct draw_term *t, struct pen *p, struct vt_color fg,
 		return;
 
 	if (!p->valid || p->attrs != attrs) {
-		out_str(t, "\033[0m");
-		sgr_attrs(t, attrs);
+		scr_str(t, "\033[0m");
+		scr_sgr_attrs(t, attrs);
 		need_color = 1;		/* reset cleared the colors */
 	} else {
 		need_color = 0;
 	}
 	if (need_color || !color_eq(p->fg, fg)) {
-		if (fg.type != VT_COLOR_DEFAULT || !need_color)
-			sgr_color(t, fg, 0);
+		if (fg.type != COLOR_DEFAULT || !need_color)
+			scr_sgr_color(t, fg, 0);
 	}
 	if (need_color || !color_eq(p->bg, bg)) {
-		if (bg.type != VT_COLOR_DEFAULT || !need_color)
-			sgr_color(t, bg, 1);
+		if (bg.type != COLOR_DEFAULT || !need_color)
+			scr_sgr_color(t, bg, 1);
 	}
 	p->fg = fg;
 	p->bg = bg;
@@ -911,7 +890,7 @@ emit_pen(struct draw_term *t, struct pen *p, struct vt_color fg,
 }
 
 static int
-cell_eq(const struct vt_cell *a, const struct vt_cell *b)
+cell_eq(const Cell *a, const Cell *b)
 {
 	return a->codepoint == b->codepoint && a->attrs == b->attrs &&
 	    a->width == b->width && color_eq(a->fg, b->fg) &&
@@ -920,12 +899,11 @@ cell_eq(const struct vt_cell *a, const struct vt_cell *b)
 
 /* ---- the draw surface API the editor calls ------------------------------ */
 
-static struct draw *
-draw_new(const struct draw_driver *drv, void *ctx)
+static Screen *
+scr_new(void *ctx)
 {
-	struct draw *d;
+	Screen *d;
 
-	(void)drv;
 	d = calloc(1, sizeof(*d));
 	if (!d)
 		return NULL;
@@ -934,7 +912,7 @@ draw_new(const struct draw_driver *drv, void *ctx)
 }
 
 static void
-draw_size(struct draw *d, int *rows, int *cols)
+scr_size(Screen *d, int *rows, int *cols)
 {
 	if (rows)
 		*rows = d->t->rows;
@@ -943,9 +921,9 @@ draw_size(struct draw *d, int *rows, int *cols)
 }
 
 static void
-draw_resize(struct draw *d, int rows, int cols)
+scr_resize(Screen *d, int rows, int cols)
 {
-	struct draw_term *t = d->t;
+	Scrbuf *t = d->t;
 	int i;
 
 	if (rows < 1)
@@ -959,9 +937,9 @@ draw_resize(struct draw *d, int rows, int cols)
 }
 
 static void
-draw_clear(struct draw *d)
+scr_clear(Screen *d)
 {
-	struct draw_term *t = d->t;
+	Scrbuf *t = d->t;
 	size_t n = (size_t)t->rows * (size_t)t->cols;
 	size_t i;
 
@@ -970,11 +948,11 @@ draw_clear(struct draw *d)
 }
 
 static void
-draw_cell(struct draw *d, int r, int c, uint32_t cp, struct vt_color fg,
-    struct vt_color bg, uint16_t attrs)
+scr_cell(Screen *d, int r, int c, uint32_t cp, Color fg,
+    Color bg, uint16_t attrs)
 {
-	struct draw_term *t = d->t;
-	struct vt_cell *cell;
+	Scrbuf *t = d->t;
+	Cell *cell;
 	int w;
 
 	if (r < 0 || r >= t->rows || c < 0 || c >= t->cols)
@@ -989,9 +967,9 @@ draw_cell(struct draw *d, int r, int c, uint32_t cp, struct vt_color fg,
 	cell->attrs = attrs;
 	cell->width = (uint8_t)w;
 	if (w == 2 && c + 1 < t->cols) {
-		struct vt_cell *cont = &t->cur[(size_t)r * t->cols + c + 1];
+		Cell *cont = &t->cur[(size_t)r * t->cols + c + 1];
 
-		cont->codepoint = DRAW_CELL_CONT;
+		cont->codepoint = CELL_CONT;
 		cont->fg = fg;
 		cont->bg = bg;
 		cont->attrs = attrs;
@@ -1000,10 +978,10 @@ draw_cell(struct draw *d, int r, int c, uint32_t cp, struct vt_color fg,
 }
 
 static int
-draw_text(struct draw *d, int r, int c, const char *utf8, struct vt_color fg,
-    struct vt_color bg, uint16_t attrs)
+scr_text(Screen *d, int r, int c, const char *utf8, Color fg,
+    Color bg, uint16_t attrs)
 {
-	struct draw_term *t = d->t;
+	Scrbuf *t = d->t;
 	const unsigned char *p = (const unsigned char *)utf8;
 	size_t len = strlen(utf8), i = 0;
 
@@ -1021,7 +999,7 @@ draw_text(struct draw *d, int r, int c, const char *utf8, struct vt_color fg,
 			w = 1;
 		if (w == 2 && c + 1 >= t->cols)
 			break;			/* a wide glyph would overflow */
-		draw_cell(d, r, c, cp, fg, bg, attrs);
+		scr_cell(d, r, c, cp, fg, bg, attrs);
 		c += w;
 		i += (size_t)n;
 	}
@@ -1029,30 +1007,30 @@ draw_text(struct draw *d, int r, int c, const char *utf8, struct vt_color fg,
 }
 
 static void
-draw_fill(struct draw *d, int r, int c, int n, uint32_t cp, struct vt_color fg,
-    struct vt_color bg, uint16_t attrs)
+scr_fill(Screen *d, int r, int c, int n, uint32_t cp, Color fg,
+    Color bg, uint16_t attrs)
 {
 	int i;
 
 	for (i = 0; i < n; i++)
-		draw_cell(d, r, c + i, cp, fg, bg, attrs);
+		scr_cell(d, r, c + i, cp, fg, bg, attrs);
 }
 
 static void
-draw_cursor(struct draw *d, int r, int c)
+scr_cursor(Screen *d, int r, int c)
 {
 	d->t->cursor_r = r;
 	d->t->cursor_c = c;
 }
 
 static void
-draw_cursor_vis(struct draw *d, int on)
+scr_cursor_vis(Screen *d, int on)
 {
 	d->t->cursor_vis = on;
 }
 
 static void
-draw_cursor_shape(struct draw *d, enum draw_cursor_shape shape)
+scr_cursor_shape(Screen *d, CursorShape shape)
 {
 	(void)d; (void)shape;	/* primitive terminals ignore cursor shape */
 }
@@ -1061,18 +1039,18 @@ draw_cursor_shape(struct draw *d, enum draw_cursor_shape shape)
  * to its start and repaint the whole row, then sync the shadow. Only changed
  * rows reach the wire, which keeps a redraw cheap over a slow link. */
 static void
-draw_present(struct draw *d)
+scr_present(Screen *d)
 {
-	struct draw_term *t = d->t;
+	Scrbuf *t = d->t;
 	int r, c;
 	char mv[32];
-	struct pen pen;
+	Pen pen;
 	int acs = 0;			/* DEC line-drawing charset is active */
 
-	out_str(t, "\033[?25l");		/* hide cursor during the paint */
+	scr_str(t, "\033[?25l");		/* hide cursor during the paint */
 	for (r = 0; r < t->rows; r++) {
-		struct vt_cell *row = &t->cur[(size_t)r * t->cols];
-		struct vt_cell *srow = &t->shadow[(size_t)r * t->cols];
+		Cell *row = &t->cur[(size_t)r * t->cols];
+		Cell *srow = &t->shadow[(size_t)r * t->cols];
 		int dirty = t->rowdirty[r];
 
 		if (!dirty) {
@@ -1086,43 +1064,43 @@ draw_present(struct draw *d)
 			continue;
 
 		snprintf(mv, sizeof(mv), "\033[%d;1H", r + 1);
-		out_str(t, mv);
+		scr_str(t, mv);
 		pen_reset(&pen);
 		for (c = 0; c < t->cols; c++) {
-			struct vt_cell *cell = &row[c];
+			Cell *cell = &row[c];
 			uint32_t cp = cell->codepoint;
 			unsigned char ub[4];
 			int n;
 
-			if (cp == DRAW_CELL_CONT)
+			if (cp == CELL_CONT)
 				continue;	/* trailing half of a wide cell */
-			emit_pen(t, &pen, cell->fg, cell->bg, cell->attrs);
+			scr_pen(t, &pen, cell->fg, cell->bg, cell->attrs);
 
 			if (BOX_IS(cp)) {
-				const struct box_def *b = &box_tab[BOX_ID(cp)];
+				const BoxDef *b = &box_tab[BOX_ID(cp)];
 
 				if (t->box_mode == VEDIT_BOX_DEC && b->dec) {
 					if (!acs) {
-						out_str(t, "\033(0");
+						scr_str(t, "\033(0");
 						acs = 1;
 					}
 					ub[0] = b->dec;
-					out_bytes(t, (const char *)ub, 1);
+					scr_bytes(t, (const char *)ub, 1);
 					continue;
 				}
 				if (acs) {
-					out_str(t, "\033(B");
+					scr_str(t, "\033(B");
 					acs = 0;
 				}
 				cp = (t->box_mode == VEDIT_BOX_UTF8) ? b->uni
 				    : (uint32_t)b->ascii;
 				n = utf8_encode(ub, cp);
-				out_bytes(t, (const char *)ub, (size_t)n);
+				scr_bytes(t, (const char *)ub, (size_t)n);
 				continue;
 			}
 
 			if (acs) {		/* back to ASCII for ordinary text */
-				out_str(t, "\033(B");
+				scr_str(t, "\033(B");
 				acs = 0;
 			}
 			if (cp < 0x20 || cp == 0x7f)
@@ -1133,61 +1111,61 @@ draw_present(struct draw *d)
 				ub[0] = ' ';
 				n = 1;
 			}
-			out_bytes(t, (const char *)ub, (size_t)n);
+			scr_bytes(t, (const char *)ub, (size_t)n);
 		}
 		if (acs) {		/* never leave a row in line-drawing mode */
-			out_str(t, "\033(B");
+			scr_str(t, "\033(B");
 			acs = 0;
 		}
-		out_str(t, "\033[0m");
+		scr_str(t, "\033[0m");
 		t->rowdirty[r] = 0;
 		memcpy(srow, row, (size_t)t->cols * sizeof(*row));
 	}
 
 	snprintf(mv, sizeof(mv), "\033[%d;%dH", t->cursor_r + 1,
 	    t->cursor_c + 1);
-	out_str(t, mv);
-	out_str(t, t->cursor_vis ? "\033[?25h" : "\033[?25l");
-	out_flush(t);
+	scr_str(t, mv);
+	scr_str(t, t->cursor_vis ? "\033[?25h" : "\033[?25l");
+	scr_flush(t);
 }
 
 static void
-draw_begin(struct draw *d)
+scr_begin(Screen *d)
 {
-	struct draw_term *t = d->t;
+	Scrbuf *t = d->t;
 	int i;
 
 	if (t->io.begin)
 		t->io.begin(t->io.ctx);
 	t->begun = 1;
-	out_str(t, "\033[?1049h");	/* alt screen, if supported */
-	out_str(t, "\033[?2004h");	/* bracketed paste */
-	out_str(t, "\033[2J");		/* clear */
-	out_str(t, "\033[H");
+	scr_str(t, "\033[?1049h");	/* alt screen, if supported */
+	scr_str(t, "\033[?2004h");	/* bracketed paste */
+	scr_str(t, "\033[2J");		/* clear */
+	scr_str(t, "\033[H");
 	for (i = 0; i < t->rows; i++)
 		t->rowdirty[i] = 1;
-	out_flush(t);
+	scr_flush(t);
 }
 
 static void
-draw_end(struct draw *d)
+scr_end(Screen *d)
 {
-	struct draw_term *t = d->t;
+	Scrbuf *t = d->t;
 
-	out_str(t, "\033[0m");
-	out_str(t, "\033[?2004l");
-	out_str(t, "\033[?25h");
-	out_str(t, "\033[?1049l");	/* leave alt screen */
-	out_flush(t);
+	scr_str(t, "\033[0m");
+	scr_str(t, "\033[?2004l");
+	scr_str(t, "\033[?25h");
+	scr_str(t, "\033[?1049l");	/* leave alt screen */
+	scr_flush(t);
 	t->begun = 0;
 	if (t->io.end)
 		t->io.end(t->io.ctx);
 }
 
 static void
-draw_free(struct draw *d)
+scr_free(Screen *d)
 {
-	struct draw_term *t;
+	Scrbuf *t;
 
 	if (!d)
 		return;
@@ -1203,7 +1181,7 @@ draw_free(struct draw *d)
 }
 
 static void
-draw_set_clipboard(struct draw *d, const char *utf8, size_t n)
+scr_set_clipboard(Screen *d, const char *utf8, size_t n)
 {
 	(void)d; (void)utf8; (void)n;	/* no OSC 52 on primitive clients */
 }
@@ -1412,7 +1390,7 @@ tkbd_decode(struct tkbd_seq *seq, const unsigned char *buf, int len)
 /* Pull more raw bytes into the decode buffer. Returns 1 when bytes arrived,
  * 0 on timeout, -1 on EOF or error. */
 static int
-in_refill(struct draw_term *t, int timeout_ms)
+in_refill(Scrbuf *t, int timeout_ms)
 {
 	long r;
 
@@ -1440,9 +1418,9 @@ in_refill(struct draw_term *t, int timeout_ms)
 /* Remove and return the next decoded event. Returns 1 when out is filled,
  * 0 on timeout with no event, or -1 on EOF or error. */
 static int
-draw_next_event(struct draw *d, int timeout_ms, struct tkbd_seq *out)
+scr_next_event(Screen *d, int timeout_ms, struct tkbd_seq *out)
 {
-	struct draw_term *t = d->t;
+	Scrbuf *t = d->t;
 
 	for (;;) {
 		if (t->inlen > 0) {
@@ -1491,9 +1469,9 @@ draw_next_event(struct draw *d, int timeout_ms, struct tkbd_seq *out)
 
 /* Wait for the next event, folding in resize handling. */
 static int
-draw_wait(struct draw *d, struct draw_event *ev)
+scr_wait(Screen *d, Event *ev)
 {
-	struct draw_term *t = d->t;
+	Scrbuf *t = d->t;
 
 	for (;;) {
 		int rc;
@@ -1507,19 +1485,19 @@ draw_wait(struct draw *d, struct draw_event *ev)
 			    t->io.getsize(t->io.ctx, &rows, &cols) == 0) {
 				if (rows >= 1 && cols >= 1 &&
 				    (rows != t->rows || cols != t->cols))
-					draw_resize(d, rows, cols);
+					scr_resize(d, rows, cols);
 			}
-			ev->type = DRAW_EVENT_RESIZE;
-			return DRAW_EVENT_RESIZE;
+			ev->type = EVENT_RESIZE;
+			return EVENT_RESIZE;
 		}
-		rc = draw_next_event(d, 200, &ev->key);
+		rc = scr_next_event(d, 200, &ev->key);
 		if (rc == 1) {
-			ev->type = DRAW_EVENT_KEY;
-			return DRAW_EVENT_KEY;
+			ev->type = EVENT_KEY;
+			return EVENT_KEY;
 		}
 		if (rc < 0) {
-			ev->type = DRAW_EVENT_EOF;
-			return DRAW_EVENT_EOF;
+			ev->type = EVENT_EOF;
+			return EVENT_EOF;
 		}
 		/* rc == 0: timeout; loop to re-check resize */
 	}
@@ -1532,39 +1510,40 @@ draw_wait(struct draw *d, struct draw_event *ev)
  *
  * edit.c holds the buffer, rendering, chrome, menus, dialogs, and the
  * modeless personality; vi.c holds the vi personality layered on top. This
- * header carries the state both share (struct editor and its enums), the core
+ * header carries the state both share (Editor and its enums), the core
  * helpers vi.c calls, and the vi entry points edit.c calls. */
 
 
 
 /* A yank/delete register: owned bytes, their length, and whether the content
  * is whole lines (put restores it as new lines). */
-struct vi_reg {
+typedef struct vi_reg {
 	char	*bytes;
 	size_t	len;
 	int	linewise;
-};
+} Reg;
 
 /* A recorded key sequence, used by the '.' repeat to replay the last change. */
-struct vi_keylog {
+typedef struct vi_keylog {
 	struct tkbd_seq	*ev;
 	int		len;
 	int		cap;
-};
+} Keylog;
 
 /* One open file. The editor keeps a list of these; the active buffer's fields
- * are mirrored into the flat struct editor for editing and copied back here on
+ * are mirrored into the flat Editor for editing and copied back here on
  * a switch. Only genuinely per-file state lives here -- the draw surface,
  * chrome, and global vi state (registers, the dot register, the clipboard, the
- * last search) stay in struct editor and are shared across all buffers. */
-struct ebuf {
-	struct text	*t;
+ * last search) stay in Editor and are shared across all buffers. */
+typedef struct text Text;
+typedef struct ebuf {
+	Text	*t;
 	char		path[PATH_MAX];
 	int		has_name;
 	size_t		cy, cx, top, left;
 	int		sel_active;
 	size_t		ay, ax;
-	const struct syntax *syn;
+	const Syntax *syn;
 	uint16_t	*line_state;
 	size_t		line_state_cap;
 	size_t		hl_valid;
@@ -1573,30 +1552,24 @@ struct ebuf {
 	size_t		vi_mark_y[26];
 	size_t		vi_mark_x[26];
 	uint32_t	vi_marks_set;
-};
+} Buf;
 
 /* Referenced only by pointer here; the users include the real headers. */
-struct text;
-struct draw;
-struct draw_term;
-struct cfg;
-struct syntax;
-struct build_err;
 struct tkbd_seq;
 
 #define TAB_WIDTH 8
 
 /* Editing personality. The default is a modeless (nano-style) editor;
  * MODE_NORMAL/MODE_INSERT are the vi personality, toggled with F2. */
-enum edit_mode {
+typedef enum edit_mode {
 	MODE_MODELESS,		/* value 0, so a zeroed editor starts modeless */
 	MODE_NORMAL,		/* vi command mode */
 	MODE_INSERT,		/* vi insert mode */
-};
+} Mode;
 
 /* What the main loop must do after a command; save and quit may prompt, so
  * they are carried out there where the input stream is available. */
-enum req {
+typedef enum req {
 	REQ_CONTINUE,
 	REQ_FIND,
 	REQ_GOTO,
@@ -1607,14 +1580,14 @@ enum req {
 	REQ_VI_SEARCH,		/* vi '/' search prompt */
 	REQ_FORCE_QUIT,		/* vi decided quitting is allowed: leave now */
 	REQ_QUIT_ERR,		/* vi ':cq' -- leave with a nonzero exit code */
-};
+} Req;
 
-struct editor {
-	struct ebuf	*bufs;		/* open buffers; active mirrors into flat */
+typedef struct editor {
+	Buf	*bufs;		/* open buffers; active mirrors into flat */
 	int		nbuf;		/* number of open buffers */
 	int		bufs_cap;	/* allocated slots in bufs */
 	int		cur;		/* index of the active buffer */
-	struct text	*t;
+	Text	*t;
 	char		path[PATH_MAX];
 	int		has_name;
 	size_t		cy;		/* cursor line */
@@ -1624,8 +1597,8 @@ struct editor {
 	int		rows;
 	int		cols;
 	int		in_session;
-	struct draw	*d;		/* drawing surface and input source */
-	struct draw_term *term;		/* terminal driver, for mouse control */
+	Screen	*d;		/* drawing surface and input source */
+	Scrbuf *term;		/* terminal driver, for mouse control */
 	int		mouse_on;	/* editor mouse reporting is enabled */
 	int		sel_active;	/* a selection is being extended */
 	int		sel_block;	/* the selection is a rectangle (draw mode) */
@@ -1655,20 +1628,8 @@ struct editor {
 	int		hex_inspect;	/* show the data-inspector footer line */
 	int		hex_sel;	/* a byte selection is being extended */
 	size_t		hex_anchor;	/* byte offset the selection anchors at */
-	struct cfg	*cfg;		/* lumi.conf, for [build] commands */
-
-	/* Build diagnostics from the last compile/make. This is one global
-	 * quickfix list shared by every buffer, not per-file state, so
-	 * navigation can cross files. */
-	struct build_err *errs;		/* parsed file:line[:col] diagnostics */
-	int		n_errs;
-	int		errs_cap;
-	int		err_cur;	/* current diagnostic, or -1 */
-	char		build_dir[PATH_MAX];	/* cwd of the last build, for
-						 * resolving relative paths */
-
 	/* syntax highlighting */
-	const struct syntax *syn;	/* language, or NULL when none */
+	const Syntax *syn;	/* language, or NULL when none */
 	int		hl_on;		/* highlighting enabled */
 	uint16_t	*line_state;	/* tokenizer state at each line's start */
 	size_t		line_state_cap;
@@ -1677,7 +1638,7 @@ struct editor {
 	size_t		hl_buf_cap;
 
 	/* vi personality state */
-	enum edit_mode	mode;
+	Mode	mode;
 	char		vi_visual;	/* 0, 'v' charwise, or 'V' linewise */
 	int		vi_count;	/* pending motion count, 0 = none */
 	char		vi_op;		/* pending operator: 0, 'd', 'c', 'y' */
@@ -1691,12 +1652,12 @@ struct editor {
 	size_t		vi_mark_y[26];	/* line of mark 'a'..'z' */
 	size_t		vi_mark_x[26];	/* byte column of the mark */
 	uint32_t	vi_marks_set;	/* bit i set: mark 'a'+i is defined */
-	struct vi_reg	vi_regs[26];	/* named registers "a..z */
+	Reg	vi_regs[26];	/* named registers "a..z */
 	char		vi_reg;		/* selected register a-z/A-Z, 0 = none */
 	char		vi_reg_fresh;	/* vi_reg was just armed by " */
 	char		vi_regpending;	/* " typed, awaiting the register name */
-	struct vi_keylog vi_dot;	/* keys of the last change, for '.' */
-	struct vi_keylog vi_rec;	/* the command being recorded now */
+	Keylog vi_dot;	/* keys of the last change, for '.' */
+	Keylog vi_rec;	/* the command being recorded now */
 	int		vi_replaying;	/* replaying '.': do not record */
 	int		vi_cmd_open;	/* a command is mid-record */
 	int		vi_suppress_dot;/* this command must not become '.' */
@@ -1704,48 +1665,48 @@ struct editor {
 	char		vi_last_fT;	/* last f/F/t/T, for ; and , */
 	uint32_t	vi_last_fT_ch;	/* the target char it searched for */
 	int		vi_zpending;	/* a leading 'Z' is awaiting its pair */
-};
+} Editor;
 
 /* Core helpers the vi personality relies on, defined in edit.c. */
-int text_height(const struct editor *e);
+int text_height(const Editor *e);
 int disp_cols(const char *s, size_t nbytes);
 size_t rune_len_at(const char *s, size_t len, size_t cx);
 size_t prev_rune_len(const char *s, size_t cx);
-void clamp_col(struct editor *e);
-void move_left(struct editor *e);
-void move_right(struct editor *e);
-void hl_touch(struct editor *e, size_t line);
-void do_insert(struct editor *e, const char *bytes, size_t n);
-void do_newline(struct editor *e);
-void do_delete(struct editor *e);
-void do_backspace(struct editor *e);
-void do_find(struct editor *e, const char *q);
-void do_find_dir(struct editor *e, const char *q, int dir);
+void clamp_col(Editor *e);
+void move_left(Editor *e);
+void move_right(Editor *e);
+void hl_touch(Editor *e, size_t line);
+void ed_insert(Editor *e, const char *bytes, size_t n);
+void ed_newline(Editor *e);
+void ed_delete(Editor *e);
+void ed_backspace(Editor *e);
+void ed_find(Editor *e, const char *q);
+void ed_find_dir(Editor *e, const char *q, int dir);
 
 /* Multi-buffer management (edit.c). The active buffer's per-file state lives
  * in the flat struct editor; these swap it with the saved buffers. */
-int buf_open(struct editor *e, const char *path);	/* open/switch; index or -1 */
-void buf_switch(struct editor *e, int i);
-int buf_cycle(struct editor *e, int dir);		/* next/prev; new index */
-int buf_close(struct editor *e, int i);			/* 0 ok, -1 refused */
-void buf_list(struct editor *e);			/* summarize into status */
-void insert_clip(struct editor *e);
-void insert_bytes(struct editor *e, const char *bytes, size_t len);
-char *region_text(struct editor *e, size_t y1, size_t x1, size_t y2, size_t x2,
+int buf_open(Editor *e, const char *path);	/* open/switch; index or -1 */
+void buf_switch(Editor *e, int i);
+int buf_cycle(Editor *e, int dir);		/* next/prev; new index */
+int buf_close(Editor *e, int i);			/* 0 ok, -1 refused */
+void buf_list(Editor *e);			/* summarize into status */
+void insert_clip(Editor *e);
+void insert_bytes(Editor *e, const char *bytes, size_t len);
+char *region_text(Editor *e, size_t y1, size_t x1, size_t y2, size_t x2,
     size_t *outlen);
-void delete_region(struct editor *e, size_t y1, size_t x1, size_t y2,
+void delete_region(Editor *e, size_t y1, size_t x1, size_t y2,
     size_t x2);
-void clip_set(struct editor *e, char *bytes, size_t len);
-int prompt_line(struct editor *e, const char *q, char *buf, size_t bufsz);
+void clip_set(Editor *e, char *bytes, size_t len);
+int dlg_prompt_line(Editor *e, const char *q, char *buf, size_t bufsz);
 
 /* Hex view helpers, defined in hex.c. The byte stream is the buffer's line
  * bytes joined by an implied newline (a trailing one only when the content
- * ends with a newline), so these operate over the same struct text as the
+ * ends with a newline), so these operate over the same Text as the
  * text view. */
-size_t hex_total(const struct text *t);
-size_t hex_offset_of(const struct text *t, size_t cy, size_t cx);
-void hex_pos_at(const struct text *t, size_t off, size_t *cy, size_t *cx);
-size_t hex_gather(const struct text *t, size_t start, unsigned char *buf,
+size_t hex_total(const Text *t);
+size_t hex_offset_of(const Text *t, size_t cy, size_t cx);
+void hex_pos_at(const Text *t, size_t off, size_t *cy, size_t *cx);
+size_t hex_gather(const Text *t, size_t start, unsigned char *buf,
     size_t count);
 void hex_format_row(char *out, size_t out_sz, size_t offset,
     const unsigned char *buf, size_t n, int cols);
@@ -1755,18 +1716,18 @@ int hex_asciicol(int j, int cols);	/* row column of byte j's ascii cell */
 int hex_row_width(int cols);	/* display width of a cols-wide dump row */
 int hex_parse_bytes(const char *s, unsigned char *out, size_t max,
     size_t *outlen);		/* parse "de ad be ef" hex pairs; 0 ok, -1 bad */
-int hex_find(const struct text *t, const unsigned char *pat, size_t plen,
+int hex_find(const Text *t, const unsigned char *pat, size_t plen,
     size_t from, int dir, size_t *found);	/* wrapping byte search; 1 = hit */
 void hex_inspect_line(char *out, size_t out_sz, const unsigned char *b,
     size_t n);				/* decode up to 4 bytes at the cursor */
 
 /* The vi personality, defined in vi.c. */
-enum req vi_dispatch(struct editor *e, const struct tkbd_seq *seq);
-enum req vi_colon(struct editor *e);
-void vi_search(struct editor *e);
-void vi_clamp(struct editor *e);
-void vi_reset_pending(struct editor *e);
-size_t vi_col_to_byte(struct editor *e, size_t y, int target_col);
+Req vi_dispatch(Editor *e, const struct tkbd_seq *seq);
+Req vi_colon(Editor *e);
+void vi_search(Editor *e);
+void vi_clamp(Editor *e);
+void vi_reset_pending(Editor *e);
+size_t vi_col_to_byte(Editor *e, size_t y, int target_col);
 
 
 /****************************************************************
@@ -1779,50 +1740,50 @@ size_t vi_col_to_byte(struct editor *e, size_t y, int target_col);
 #define OK	0
 #define ERR	(-1)
 
-struct estack;
-static void estack_clear(struct estack *s);
-static void estack_free(struct estack *s);
+typedef struct estack Estack;
+static void estack_clear(Estack *s);
+static void estack_free(Estack *s);
 
-struct line {
+typedef struct line {
 	char	*buf;		/* NUL-terminated line bytes, no newline */
 	size_t	len;		/* bytes excluding the NUL */
 	size_t	cap;		/* allocated bytes including room for NUL */
-};
+} Line;
 
 /* A reversible primitive. Applying one mutates the buffer and yields the
  * primitive that reverses it, which is how undo and redo stay symmetric. */
-enum eop {
+typedef enum eop {
 	OP_INSERT,		/* insert bytes at (line, col) */
 	OP_DELETE,		/* delete n bytes at (line, col) */
 	OP_SPLIT,		/* split line at col */
 	OP_JOIN,		/* join line with the one after it */
-};
+} Eop;
 
-struct erec {
-	enum eop	op;
+typedef struct erec {
+	Eop	op;
 	size_t		line;
 	size_t		col;
 	char		*bytes;		/* owned; the payload for OP_INSERT */
 	size_t		n;		/* byte count for INSERT and DELETE */
 	unsigned	group;		/* group id; 0 = a standalone step */
-};
+} Erec;
 
 struct estack {
-	struct erec	*v;
+	Erec	*v;
 	size_t		n;
 	size_t		cap;
 };
 
 struct text {
-	struct line	*lines;
+	Line	*lines;
 	size_t		nlines;
 	size_t		cap;
 	int		final_newline;	/* source ended with a newline */
 	int		dirty;
 	size_t		rev;		/* bumped on every primitive mutation */
 
-	struct estack	undo;
-	struct estack	redo;
+	Estack	undo;
+	Estack	redo;
 	int		can_coalesce;	/* a typing run may extend the top */
 
 	/* Undo grouping: while a group is open every recorded primitive is
@@ -1839,7 +1800,7 @@ struct text {
  ****************************************************************/
 
 static int
-line_reserve(struct line *l, size_t need)
+line_reserve(Line *l, size_t need)
 {
 	/* need is bytes excluding the NUL */
 	if (need + 1 > l->cap) {
@@ -1858,7 +1819,7 @@ line_reserve(struct line *l, size_t need)
 }
 
 static int
-line_init(struct line *l, const char *s, size_t n)
+line_init(Line *l, const char *s, size_t n)
 {
 	l->buf = NULL;
 	l->len = 0;
@@ -1873,11 +1834,11 @@ line_init(struct line *l, const char *s, size_t n)
 }
 
 static int
-lines_reserve(struct text *t, size_t need)
+lines_reserve(Text *t, size_t need)
 {
 	if (need > t->cap) {
 		size_t cap = t->cap ? t->cap : 32;
-		struct line *p;
+		Line *p;
 
 		while (cap < need)
 			cap *= 2;
@@ -1892,7 +1853,7 @@ lines_reserve(struct text *t, size_t need)
 
 /* Insert a fresh line initialized from s[0..n) at index idx. */
 static int
-lines_insert_at(struct text *t, size_t idx, const char *s, size_t n)
+lines_insert_at(Text *t, size_t idx, const char *s, size_t n)
 {
 	if (idx > t->nlines)
 		return ERR;
@@ -1902,10 +1863,10 @@ lines_insert_at(struct text *t, size_t idx, const char *s, size_t n)
 		return ERR;
 	/* the new line was built at the end; rotate it into place */
 	if (idx < t->nlines) {
-		struct line tmp = t->lines[t->nlines];
+		Line tmp = t->lines[t->nlines];
 
 		memmove(&t->lines[idx + 1], &t->lines[idx],
-		    (t->nlines - idx) * sizeof(struct line));
+		    (t->nlines - idx) * sizeof(Line));
 		t->lines[idx] = tmp;
 	}
 	t->nlines++;
@@ -1913,18 +1874,18 @@ lines_insert_at(struct text *t, size_t idx, const char *s, size_t n)
 }
 
 static void
-lines_remove_at(struct text *t, size_t idx)
+lines_remove_at(Text *t, size_t idx)
 {
 	if (idx >= t->nlines)
 		return;
 	free(t->lines[idx].buf);
 	memmove(&t->lines[idx], &t->lines[idx + 1],
-	    (t->nlines - idx - 1) * sizeof(struct line));
+	    (t->nlines - idx - 1) * sizeof(Line));
 	t->nlines--;
 }
 
 static void
-text_clear(struct text *t)
+text_clear(Text *t)
 {
 	size_t i;
 
@@ -1937,10 +1898,10 @@ text_clear(struct text *t)
  * Lifecycle
  ****************************************************************/
 
-struct text *
+Text *
 text_new(void)
 {
-	struct text *t = calloc(1, sizeof(*t));
+	Text *t = calloc(1, sizeof(*t));
 
 	if (!t)
 		return NULL;
@@ -1955,7 +1916,7 @@ text_new(void)
 }
 
 void
-text_free(struct text *t)
+text_free(Text *t)
 {
 	if (!t)
 		return;
@@ -1971,7 +1932,7 @@ text_free(struct text *t)
  ****************************************************************/
 
 int
-text_load(struct text *t, const char *path)
+text_load(Text *t, const char *path)
 {
 	FILE *fp;
 	char *data = NULL;
@@ -2048,7 +2009,7 @@ text_load(struct text *t, const char *path)
 }
 
 int
-text_save(struct text *t, const char *path)
+text_save(Text *t, const char *path)
 {
 	FILE *fp;
 	size_t i;
@@ -2087,13 +2048,13 @@ werr:
  ****************************************************************/
 
 size_t
-text_lines(const struct text *t)
+text_lines(const Text *t)
 {
 	return t->nlines;
 }
 
 const char *
-text_line(const struct text *t, size_t line, size_t *len)
+text_line(const Text *t, size_t line, size_t *len)
 {
 	if (line >= t->nlines)
 		return NULL;
@@ -2103,7 +2064,7 @@ text_line(const struct text *t, size_t line, size_t *len)
 }
 
 size_t
-text_line_len(const struct text *t, size_t line)
+text_line_len(const Text *t, size_t line)
 {
 	if (line >= t->nlines)
 		return 0;
@@ -2111,19 +2072,19 @@ text_line_len(const struct text *t, size_t line)
 }
 
 int
-text_dirty(const struct text *t)
+text_dirty(const Text *t)
 {
 	return t->dirty;
 }
 
 int
-text_final_newline(const struct text *t)
+text_final_newline(const Text *t)
 {
 	return t->final_newline;
 }
 
 size_t
-text_revision(const struct text *t)
+text_revision(const Text *t)
 {
 	return t->rev;
 }
@@ -2133,7 +2094,7 @@ text_revision(const struct text *t)
  ****************************************************************/
 
 static void
-estack_clear(struct estack *s)
+estack_clear(Estack *s)
 {
 	size_t i;
 
@@ -2143,7 +2104,7 @@ estack_clear(struct estack *s)
 }
 
 static void
-estack_free(struct estack *s)
+estack_free(Estack *s)
 {
 	estack_clear(s);
 	free(s->v);
@@ -2152,11 +2113,11 @@ estack_free(struct estack *s)
 }
 
 static int
-estack_push(struct estack *s, const struct erec *rec)
+estack_push(Estack *s, const Erec *rec)
 {
 	if (s->n >= s->cap) {
 		size_t cap = s->cap ? s->cap * 2 : 32;
-		struct erec *p = realloc(s->v, cap * sizeof(*p));
+		Erec *p = realloc(s->v, cap * sizeof(*p));
 
 		if (!p)
 			return ERR;
@@ -2170,7 +2131,7 @@ estack_push(struct estack *s, const struct erec *rec)
 /* Apply one primitive to the buffer and fill inv with the primitive that
  * reverses it. inv->bytes, when set, is owned by the caller. */
 static int
-apply_op(struct text *t, const struct erec *in, struct erec *inv)
+apply_op(Text *t, const Erec *in, Erec *inv)
 {
 	inv->bytes = NULL;
 	inv->n = 0;
@@ -2179,7 +2140,7 @@ apply_op(struct text *t, const struct erec *in, struct erec *inv)
 
 	switch (in->op) {
 	case OP_INSERT: {
-		struct line *l;
+		Line *l;
 
 		if (in->line >= t->nlines)
 			return ERR;
@@ -2200,7 +2161,7 @@ apply_op(struct text *t, const struct erec *in, struct erec *inv)
 		break;
 	}
 	case OP_DELETE: {
-		struct line *l;
+		Line *l;
 		size_t nn;
 		char *cap;
 
@@ -2228,7 +2189,7 @@ apply_op(struct text *t, const struct erec *in, struct erec *inv)
 		break;
 	}
 	case OP_SPLIT: {
-		struct line *l;
+		Line *l;
 
 		if (in->line >= t->nlines)
 			return ERR;
@@ -2246,7 +2207,7 @@ apply_op(struct text *t, const struct erec *in, struct erec *inv)
 		break;
 	}
 	case OP_JOIN: {
-		struct line *l, *next;
+		Line *l, *next;
 		size_t boundary;
 
 		if (in->line + 1 >= t->nlines)
@@ -2278,13 +2239,13 @@ apply_op(struct text *t, const struct erec *in, struct erec *inv)
 /* Record an inverse on the undo stack, extending the top record when a
  * typing run continues, and drop the now-stale redo stack. */
 static void
-record_undo(struct text *t, struct erec *inv)
+record_undo(Text *t, Erec *inv)
 {
 	estack_clear(&t->redo);
 	inv->group = t->cur_group;
 
 	if (t->can_coalesce && inv->op == OP_DELETE && t->undo.n > 0) {
-		struct erec *top = &t->undo.v[t->undo.n - 1];
+		Erec *top = &t->undo.v[t->undo.n - 1];
 
 		if (top->op == OP_DELETE && top->group == inv->group &&
 		    top->line == inv->line && top->col + top->n == inv->col) {
@@ -2299,7 +2260,7 @@ record_undo(struct text *t, struct erec *inv)
 /* Fill the cursor location a change should move to, given the primitive
  * that was applied and the inverse it produced. */
 static void
-cursor_after(const struct erec *applied, const struct erec *inv,
+cursor_after(const Erec *applied, const Erec *inv,
     size_t *line, size_t *col)
 {
 	size_t cl = applied->line, cc = applied->col;
@@ -2330,10 +2291,10 @@ cursor_after(const struct erec *applied, const struct erec *inv,
  ****************************************************************/
 
 int
-text_insert(struct text *t, size_t line, size_t col,
+text_insert(Text *t, size_t line, size_t col,
     const char *s, size_t n)
 {
-	struct erec in, inv;
+	Erec in, inv;
 
 	if (line >= t->nlines || col > t->lines[line].len)
 		return ERR;
@@ -2353,9 +2314,9 @@ text_insert(struct text *t, size_t line, size_t col,
 }
 
 int
-text_delete(struct text *t, size_t line, size_t col, size_t n)
+text_delete(Text *t, size_t line, size_t col, size_t n)
 {
-	struct erec in, inv;
+	Erec in, inv;
 
 	if (line >= t->nlines || col > t->lines[line].len)
 		return ERR;
@@ -2375,9 +2336,9 @@ text_delete(struct text *t, size_t line, size_t col, size_t n)
 }
 
 int
-text_split(struct text *t, size_t line, size_t col)
+text_split(Text *t, size_t line, size_t col)
 {
-	struct erec in, inv;
+	Erec in, inv;
 
 	if (line >= t->nlines || col > t->lines[line].len)
 		return ERR;
@@ -2395,9 +2356,9 @@ text_split(struct text *t, size_t line, size_t col)
 }
 
 int
-text_join(struct text *t, size_t line)
+text_join(Text *t, size_t line)
 {
-	struct erec in, inv;
+	Erec in, inv;
 
 	if (line + 1 >= t->nlines)
 		return ERR;
@@ -2419,25 +2380,25 @@ text_join(struct text *t, size_t line)
  ****************************************************************/
 
 int
-text_can_undo(const struct text *t)
+text_can_undo(const Text *t)
 {
 	return t->undo.n > 0;
 }
 
 int
-text_can_redo(const struct text *t)
+text_can_redo(const Text *t)
 {
 	return t->redo.n > 0;
 }
 
 void
-text_undo_boundary(struct text *t)
+text_undo_boundary(Text *t)
 {
 	t->can_coalesce = 0;
 }
 
 void
-text_undo_group_begin(struct text *t)
+text_undo_group_begin(Text *t)
 {
 	if (t->group_depth == 0)
 		t->cur_group = ++t->group_seq;
@@ -2446,7 +2407,7 @@ text_undo_group_begin(struct text *t)
 }
 
 void
-text_undo_group_end(struct text *t)
+text_undo_group_end(Text *t)
 {
 	if (t->group_depth > 0)
 		t->group_depth--;
@@ -2459,10 +2420,10 @@ text_undo_group_end(struct text *t)
  * inverse onto `to` (preserving its group so the reverse direction regroups),
  * and update the cursor location. */
 static int
-undo_apply_one(struct text *t, struct estack *from, struct estack *to,
+undo_apply_one(Text *t, Estack *from, Estack *to,
     size_t *line, size_t *col)
 {
-	struct erec rec, inv;
+	Erec rec, inv;
 
 	rec = from->v[--from->n];
 	if (apply_op(t, &rec, &inv) != OK) {
@@ -2481,7 +2442,7 @@ undo_apply_one(struct text *t, struct estack *from, struct estack *to,
  * every record at the top of `from` sharing the same non-zero group id, so a
  * multi-primitive edit undoes and redoes as a unit. */
 static int
-undo_step(struct text *t, struct estack *from, struct estack *to,
+undo_step(Text *t, Estack *from, Estack *to,
     size_t *line, size_t *col)
 {
 	unsigned group;
@@ -2501,13 +2462,13 @@ undo_step(struct text *t, struct estack *from, struct estack *to,
 }
 
 int
-text_undo(struct text *t, size_t *line, size_t *col)
+text_undo(Text *t, size_t *line, size_t *col)
 {
 	return undo_step(t, &t->undo, &t->redo, line, col);
 }
 
 int
-text_redo(struct text *t, size_t *line, size_t *col)
+text_redo(Text *t, size_t *line, size_t *col)
 {
 	return undo_step(t, &t->redo, &t->undo, line, col);
 }
@@ -2518,7 +2479,7 @@ text_redo(struct text *t, size_t *line, size_t *col)
 /* hex.c : hex-dump view helpers for lumi edit.
  *
  * The editor can render the current buffer as a hex dump instead of as text.
- * Both views share one struct text, so these helpers reconstruct the byte
+ * Both views share one Text, so these helpers reconstruct the byte
  * stream that view walks: each line's bytes in order, joined by an implied
  * newline, with a trailing newline only when the content ends with one. The
  * functions are pure over struct text; the rendering and key handling that use
@@ -2530,7 +2491,7 @@ text_redo(struct text *t, size_t *line, size_t *col)
 /* Whether an implied newline follows line i (a separator before the next line,
  * or the trailing newline after the last line when the file carried one). */
 static int
-line_has_newline(const struct text *t, size_t i, size_t nlines)
+line_has_newline(const Text *t, size_t i, size_t nlines)
 {
 	return (i + 1 < nlines) || text_final_newline(t);
 }
@@ -2538,7 +2499,7 @@ line_has_newline(const struct text *t, size_t i, size_t nlines)
 /* Total bytes the hex view shows: every line's bytes plus one for each implied
  * newline. */
 size_t
-hex_total(const struct text *t)
+hex_total(const Text *t)
 {
 	size_t n = text_lines(t), i, tot = 0;
 
@@ -2553,7 +2514,7 @@ hex_total(const struct text *t)
 /* Byte offset of the text position (cy, cx). cx is a byte column within its
  * line and may equal the line length (the cursor sitting on the newline). */
 size_t
-hex_offset_of(const struct text *t, size_t cy, size_t cx)
+hex_offset_of(const Text *t, size_t cy, size_t cx)
 {
 	size_t n = text_lines(t), i, off = 0;
 
@@ -2571,7 +2532,7 @@ hex_offset_of(const struct text *t, size_t cy, size_t cx)
  * an implied newline maps to (line, line_len); at or past the end it clamps to
  * the last position. */
 void
-hex_pos_at(const struct text *t, size_t off, size_t *cy, size_t *cx)
+hex_pos_at(const Text *t, size_t off, size_t *cy, size_t *cx)
 {
 	size_t n = text_lines(t), i, base = 0;
 
@@ -2593,7 +2554,7 @@ hex_pos_at(const struct text *t, size_t off, size_t *cy, size_t *cx)
  * "start" into buf. Returns how many were copied (fewer than count only near
  * the end of the buffer). */
 size_t
-hex_gather(const struct text *t, size_t start, unsigned char *buf,
+hex_gather(const Text *t, size_t start, unsigned char *buf,
     size_t count)
 {
 	size_t n = text_lines(t), cy, cx, got = 0;
@@ -2693,7 +2654,7 @@ hex_format_row(char *out, size_t out_sz, size_t offset,
 
 /* The value 0-15 of a hex digit, or -1 if c is not one. */
 static int
-hexval(char c)
+hex_val(char c)
 {
 	if (c >= '0' && c <= '9')
 		return c - '0';
@@ -2718,7 +2679,7 @@ hex_parse_bytes(const char *s, unsigned char *out, size_t max, size_t *outlen)
 
 		if (*s == ' ' || *s == '\t')
 			continue;
-		d = hexval(*s);
+		d = hex_val(*s);
 		if (d < 0)
 			return -1;
 		if (hi < 0) {
@@ -2787,7 +2748,7 @@ hex_inspect_line(char *out, size_t out_sz, const unsigned char *b, size_t n)
  * is skipped but every other position is tried. Returns 1 and the match offset
  * in *found, or 0 when the pattern does not occur (or on allocation failure). */
 int
-hex_find(const struct text *t, const unsigned char *pat, size_t plen,
+hex_find(const Text *t, const unsigned char *pat, size_t plen,
     size_t from, int dir, size_t *found)
 {
 	size_t total = hex_total(t), maxstart, i;
@@ -2840,18 +2801,11 @@ static const char *progname = "lumi-edit";
 
 
 /* One parsed compiler/make diagnostic (see the build section). */
-struct build_err {
-	char	path[512];	/* file the diagnostic names */
-	long	line;		/* 1-based line, 0 if none */
-	long	col;		/* 1-based column, 0 if none */
-	char	msg[200];	/* the message text */
-};
-
 /****************************************************************
  * Keymap -- the table a modal (vi) personality would swap out
  ****************************************************************/
 
-enum cmd {
+typedef enum cmd {
 	CMD_NONE,
 	CMD_INSERT,		/* self-insert the typed character */
 	CMD_TAB,
@@ -2877,15 +2831,15 @@ enum cmd {
 	CMD_HELP,		/* show the key bindings */
 	CMD_SAVE,
 	CMD_QUIT,
-};
+} Cmd;
 
-struct keybind {
+typedef struct keybind {
 	uint16_t	key;		/* TKBD_KEY_* to match */
 	uint8_t		ctrl;		/* require the Ctrl modifier */
-	enum cmd	cmd;
-};
+	Cmd	cmd;
+} Keybind;
 
-static const struct keybind keymap[] = {
+static const Keybind keymap[] = {
 	{ TKBD_KEY_Q,		1, CMD_QUIT },
 	{ TKBD_KEY_S,		1, CMD_SAVE },
 	{ TKBD_KEY_Z,		1, CMD_UNDO },
@@ -2914,7 +2868,7 @@ static const struct keybind keymap[] = {
 
 #define KEYMAP_COUNT ((int)(sizeof(keymap) / sizeof(keymap[0])))
 
-static enum cmd
+static Cmd
 key_to_cmd(const struct tkbd_seq *seq)
 {
 	int i;
@@ -3005,15 +2959,15 @@ rune_len_at(const char *s, size_t len, size_t cx)
  * back to the terminal default foreground so ordinary code is left alone. An
  * [edit.syntax] section in lumi.conf overrides any of these at startup (see
  * load_syntax_colors). */
-#define SYN_IDX(n) { .type = VT_COLOR_INDEXED, { .index = (n) } }
-static struct vt_color syn_color[SYN_STYLE_COUNT] = {
-	[SYN_TEXT] = { .type = VT_COLOR_DEFAULT },
+#define SYN_IDX(n) { .type = COLOR_INDEXED, { .index = (n) } }
+static Color syn_color[SYN_STYLE_COUNT] = {
+	[SYN_TEXT] = { .type = COLOR_DEFAULT },
 	[SYN_COMMENT] = SYN_IDX(244),
 	[SYN_KEYWORD] = SYN_IDX(3),
 	[SYN_TYPE] = SYN_IDX(6),
 	[SYN_CONSTANT] = SYN_IDX(5),
 	[SYN_STRING] = SYN_IDX(2),
-	[SYN_OPERATOR] = { .type = VT_COLOR_DEFAULT },
+	[SYN_OPERATOR] = { .type = COLOR_DEFAULT },
 	[SYN_FUNCTION] = SYN_IDX(4),
 	[SYN_PREPROC] = SYN_IDX(1),
 };
@@ -3036,7 +2990,7 @@ file_ext(const char *path)
 /* Mark the highlighter's cached start-states stale from `line` onward: the
  * state entering `line` is unchanged, but everything after it may differ. */
 void
-hl_touch(struct editor *e, size_t line)
+hl_touch(Editor *e, size_t line)
 {
 	if (e->hl_valid > line + 1)
 		e->hl_valid = line + 1;
@@ -3046,7 +3000,7 @@ hl_touch(struct editor *e, size_t line)
  * from the last valid line. Cheap once warm; after an edit it recomputes only
  * from the change down to the bottom of the view. */
 static void
-hl_ensure(struct editor *e, size_t upto)
+hl_ensure(Editor *e, size_t upto)
 {
 	size_t nl = text_lines(e->t);
 
@@ -3086,7 +3040,7 @@ hl_ensure(struct editor *e, size_t upto)
 /* Compute the per-byte styles for line idx into e->hl_buf, or return NULL when
  * highlighting is off or the line has no cached start-state. */
 static const uint8_t *
-hl_line(struct editor *e, size_t idx, const char *s, size_t llen)
+hl_line(Editor *e, size_t idx, const char *s, size_t llen)
 {
 	if (!e->syn || !e->hl_on || idx >= e->hl_valid)
 		return NULL;
@@ -3121,11 +3075,11 @@ hl_line(struct editor *e, size_t idx, const char *s, size_t llen)
 #define CHROME_BOTTOM	2	/* rows below the text (bottom border + status) */
 #define CHROME_RIGHT	1	/* columns right of the text (border/scrollbar) */
 
-static void draw_field(struct draw *d, int row, int col, int width,
-    const char *s, struct vt_color fg, struct vt_color bg, uint16_t attrs);
+static void ui_field(Screen *d, int row, int col, int width,
+    const char *s, Color fg, Color bg, uint16_t attrs);
 
 /* Frame and scrollbar glyphs. GL_* are logical markers (see the box-drawing
- * section near the top of the file); draw_present renders each one per the
+ * section near the top of the file); scr_present renders each one per the
  * editor's box mode as UTF-8 box-drawing, DEC line-drawing, or an ASCII
  * substitute. Keeping them as markers means the many call sites below are
  * unchanged. */
@@ -3145,26 +3099,25 @@ static void draw_field(struct draw *d, int row, int col, int width,
 
 /* Editor chrome palette. The two presets are the DOS look (blue text area,
  * gray bars) and a monochrome fallback that leans on reverse video. */
-struct chrome_pal {
-	struct vt_color	content_fg, content_bg;	/* the text area */
-	struct vt_color	frame_fg, frame_bg;	/* window border + scrollbars */
-	struct vt_color	title_fg;		/* filename in the top border */
-	struct vt_color	bar_fg, bar_bg;		/* menu bar + status bar */
+typedef struct chrome_pal {
+	Color	content_fg, content_bg;	/* the text area */
+	Color	frame_fg, frame_bg;	/* window border + scrollbars */
+	Color	title_fg;		/* filename in the top border */
+	Color	bar_fg, bar_bg;		/* menu bar + status bar */
 	int		reverse_bars;		/* draw the bars in reverse video */
-};
+} Pal;
 
-#define CIDX(n) { .type = VT_COLOR_INDEXED, { .index = (n) } }
-#define CDEF	{ .type = VT_COLOR_DEFAULT }
-/* The default DOS look. edit.theme in lumi.conf replaces it at startup with a
- * palette derived from a named tui_theme (see chrome_from_theme). */
-static struct chrome_pal chrome_dos = {
+#define CIDX(n) { .type = COLOR_INDEXED, { .index = (n) } }
+#define CDEF	{ .type = COLOR_DEFAULT }
+/* The default DOS look (the chrome palette the editor paints with). */
+static Pal chrome_dos = {
 	.content_fg = CIDX(15), .content_bg = CIDX(4),
 	.frame_fg = CIDX(15), .frame_bg = CIDX(4),
 	.title_fg = CIDX(15),
 	.bar_fg = CIDX(0), .bar_bg = CIDX(7),
 	.reverse_bars = 0,
 };
-static const struct chrome_pal chrome_plain = {
+static const Pal chrome_plain = {
 	.content_fg = CDEF, .content_bg = CDEF,
 	.frame_fg = CDEF, .frame_bg = CDEF,
 	.title_fg = CDEF,
@@ -3175,15 +3128,15 @@ static const struct chrome_pal chrome_plain = {
 #undef CDEF
 
 
-static const struct chrome_pal *
-chrome(const struct editor *e)
+static const Pal *
+ed_chrome(const Editor *e)
 {
 	return e->dos_chrome ? &chrome_dos : &chrome_plain;
 }
 
 /* Height of the framed text area (rows minus menu, two borders, status). */
 int
-text_height(const struct editor *e)
+text_height(const Editor *e)
 {
 	int h = e->rows - CHROME_TOP - CHROME_BOTTOM;
 
@@ -3192,7 +3145,7 @@ text_height(const struct editor *e)
 
 /* Width of the framed text area (cols minus the two border columns). */
 static int
-text_width(const struct editor *e)
+text_width(const Editor *e)
 {
 	int w = e->cols - CHROME_LEFT - CHROME_RIGHT;
 
@@ -3201,9 +3154,9 @@ text_width(const struct editor *e)
 
 /* Paint one scrollbar cell, choosing the thumb where pos falls in [0,span). */
 static void
-scrollbar_cell(struct draw *d, int row, int col, int idx, int span,
+scrollbar_cell(Screen *d, int row, int col, int idx, int span,
     int thumb, uint32_t arrow_a, uint32_t arrow_b,
-    struct vt_color fg, struct vt_color bg)
+    Color fg, Color bg)
 {
 	uint32_t cp;
 
@@ -3213,7 +3166,7 @@ scrollbar_cell(struct draw *d, int row, int col, int idx, int span,
 		cp = arrow_b;
 	else
 		cp = (idx == thumb) ? GL_THUMB : GL_TRACK;
-	draw_cell(d, row, col, cp, fg, bg, 0);
+	scr_cell(d, row, col, cp, fg, bg, 0);
 }
 
 /* Thumb index within a track of tspan interior cells for a scroll offset. */
@@ -3235,7 +3188,7 @@ thumb_index(size_t off, size_t max_off, int span)
 
 /* Menu bar model: a fixed set of pull-down menus. Each item names an action
  * the main loop carries out; a separator (MA_SEP) is a non-selectable rule. */
-enum menu_act {
+typedef enum menu_act {
 	MA_NONE, MA_SEP,
 	MA_NEW, MA_OPEN, MA_SAVE, MA_SAVE_AS,
 	MA_BUF_NEXT, MA_BUF_PREV, MA_BUF_LIST, MA_EXIT,
@@ -3244,26 +3197,26 @@ enum menu_act {
 	MA_RUN, MA_COMPILE, MA_MAKE, MA_NEXT_ERR, MA_PREV_ERR,
 	MA_SYNTAX, MA_SCHEME, MA_HEX, MA_DRAW, MA_VI_MODE, MA_MOUSE,
 	MA_HELP, MA_ABOUT,
-};
+} Menuact;
 
 /* draw mode toggle, defined with the draw-mode module further down */
-static void draw_toggle(struct editor *e);
+static void draw_toggle(Editor *e);
 
-struct menu_item {
+typedef struct menu_item {
 	const char	*label;
 	const char	*accel;		/* modeless shortcut, right-aligned, or "" */
 	const char	*vaccel;	/* vi-personality shortcut, or "" to reuse accel */
-	enum menu_act	act;
-};
+	Menuact	act;
+} Menuitem;
 
-struct menu_def {
+typedef struct menu_def {
 	const char	*title;
 	int		col;		/* start column on the bar (Help: dynamic) */
-	const struct menu_item *items;
+	const Menuitem *items;
 	int		n;
-};
+} Menu;
 
-static const struct menu_item mi_file[] = {
+static const Menuitem mi_file[] = {
 	{ "&New",	"",		"",	MA_NEW },
 	{ "&Open...",	"",		"",	MA_OPEN },
 	{ "&Save",	"Ctrl+S",	":w",	MA_SAVE },
@@ -3275,7 +3228,7 @@ static const struct menu_item mi_file[] = {
 	{ "",		"",		"",	MA_SEP },
 	{ "E&xit",	"Ctrl+Q",	":q",	MA_EXIT },
 };
-static const struct menu_item mi_edit[] = {
+static const Menuitem mi_edit[] = {
 	{ "&Undo",	"Ctrl+Z",	"u",		MA_UNDO },
 	{ "&Redo",	"Ctrl+Y",	"Ctrl+R",	MA_REDO },
 	{ "",		"",		"",		MA_SEP },
@@ -3283,12 +3236,12 @@ static const struct menu_item mi_edit[] = {
 	{ "&Copy",	"Ctrl+C",	"yy",		MA_COPY },
 	{ "&Paste",	"Ctrl+V",	"p",		MA_PASTE },
 };
-static const struct menu_item mi_search[] = {
+static const Menuitem mi_search[] = {
 	{ "&Find...",		"Ctrl+F",	"/",	MA_FIND },
 	{ "&Repeat Find",	"",		"n",	MA_FIND_NEXT },
 	{ "&Go to Line...",	"Ctrl+L",	"G",	MA_GOTO },
 };
-static const struct menu_item mi_build[] = {
+static const Menuitem mi_build[] = {
 	{ "&Run",	"F5",	"",	MA_RUN },
 	{ "&Compile",	"F6",	"",	MA_COMPILE },
 	{ "&Make",	"F7",	"",	MA_MAKE },
@@ -3296,23 +3249,23 @@ static const struct menu_item mi_build[] = {
 	{ "&Next Error","F4",	"",	MA_NEXT_ERR },
 	{ "&Prev Error","Shift+F4", "",	MA_PREV_ERR },
 };
-static const struct menu_item mi_view[] = {
+static const Menuitem mi_view[] = {
 	{ "&Syntax Highlight",	"",	"",	MA_SYNTAX },
 	{ "&Color Scheme",	"",	"",	MA_SCHEME },
 	{ "&Hex Dump",		"",	"",	MA_HEX },
 };
-static const struct menu_item mi_options[] = {
+static const Menuitem mi_options[] = {
 	{ "&Draw Mode",	"Ins",	"",	MA_DRAW },
 	{ "&Vi Keys",	"F2",	"",	MA_VI_MODE },
 	{ "&Mouse",	"",	"",	MA_MOUSE },
 };
-static const struct menu_item mi_help[] = {
+static const Menuitem mi_help[] = {
 	{ "&Key Bindings",	"F1",	"",	MA_HELP },
 	{ "&About",		"",	"",	MA_ABOUT },
 };
 
 #define MENU_ITEMS(a) (a), (int)(sizeof(a) / sizeof((a)[0]))
-static const struct menu_def MENUS[] = {
+static const Menu MENUS[] = {
 	{ "&File",	1,	MENU_ITEMS(mi_file) },
 	{ "&Edit",	7,	MENU_ITEMS(mi_edit) },
 	{ "&Search",	13,	MENU_ITEMS(mi_search) },
@@ -3365,8 +3318,8 @@ menu_mnemonic(const char *s)
 /* Draw a label, dropping the '&' markers and underlining the mnemonic letter.
  * Returns the column after the last cell written. */
 static int
-draw_menu_label(struct draw *d, int r, int c, const char *s,
-    struct vt_color fg, struct vt_color bg, uint16_t at)
+ui_menu_label(Screen *d, int r, int c, const char *s,
+    Color fg, Color bg, uint16_t at)
 {
 	char buf[2] = { 0, 0 };
 
@@ -3376,11 +3329,11 @@ draw_menu_label(struct draw *d, int r, int c, const char *s,
 		if (*s == '&' && s[1] == '&')
 			s++;			/* "&&" -> literal '&' */
 		else if (*s == '&' && s[1]) {
-			a |= VT_ATTR_UNDERLINE;
+			a |= ATTR_UNDERLINE;
 			s++;
 		}
 		buf[0] = *s;
-		c = draw_text(d, r, c, buf, fg, bg, a);
+		c = scr_text(d, r, c, buf, fg, bg, a);
 	}
 	return c;
 }
@@ -3413,7 +3366,7 @@ menu_item_by_mnemonic(int m, int lc)
 
 /* Bar column of menu i; Help is right-aligned. */
 static int
-menu_col(const struct editor *e, int i)
+menu_col(const Editor *e, int i)
 {
 	if (i == MENU_HELP)
 		return e->cols - 5;
@@ -3422,7 +3375,7 @@ menu_col(const struct editor *e, int i)
 
 /* Which top-level menu title column x falls on, or -1. */
 static int
-menu_hit(const struct editor *e, int x)
+menu_hit(const Editor *e, int x)
 {
 	int i;
 
@@ -3436,26 +3389,26 @@ menu_hit(const struct editor *e, int x)
 }
 
 static void
-draw_menubar(struct editor *e, const struct chrome_pal *p, int active)
+ui_menubar(Editor *e, const Pal *p, int active)
 {
-	uint16_t at = p->reverse_bars ? VT_ATTR_REVERSE : 0;
+	uint16_t at = p->reverse_bars ? ATTR_REVERSE : 0;
 	int i;
 
-	draw_fill(e->d, 0, 0, e->cols, ' ', p->bar_fg, p->bar_bg, at);
+	scr_fill(e->d, 0, 0, e->cols, ' ', p->bar_fg, p->bar_bg, at);
 	for (i = 0; i < MENU_COUNT; i++) {
-		uint16_t a = (i == active) ? (at ^ VT_ATTR_REVERSE) : at;
+		uint16_t a = (i == active) ? (at ^ ATTR_REVERSE) : at;
 		int col = menu_col(e, i);
 
 		if (col < 0 || col >= e->cols)
 			continue;
-		draw_menu_label(e->d, 0, col, MENUS[i].title, p->bar_fg,
+		ui_menu_label(e->d, 0, col, MENUS[i].title, p->bar_fg,
 		    p->bar_bg, a);
 	}
 }
 
 /* Clamped left column of menu i's drop-down box (kept on screen). */
 static int
-dropdown_x(const struct editor *e, int mi, int boxw)
+dropdown_x(const Editor *e, int mi, int boxw)
 {
 	int x = menu_col(e, mi);
 
@@ -3471,7 +3424,7 @@ dropdown_x(const struct editor *e, int mi, int boxw)
  * show the vi keys that carry out the same action instead. An empty vaccel
  * means the modeless accel applies in both (e.g. the F1/F2 function keys). */
 static const char *
-item_accel(const struct editor *e, const struct menu_item *it)
+item_accel(const Editor *e, const Menuitem *it)
 {
 	if (e->mode != MODE_MODELESS && it->vaccel[0])
 		return it->vaccel;
@@ -3480,13 +3433,13 @@ item_accel(const struct editor *e, const struct menu_item *it)
 
 /* Inner width of menu i's drop-down (widest "label  accel"). */
 static int
-dropdown_width(const struct editor *e, int mi)
+dropdown_width(const Editor *e, int mi)
 {
-	const struct menu_def *m = &MENUS[mi];
+	const Menu *m = &MENUS[mi];
 	int i, w = 0;
 
 	for (i = 0; i < m->n; i++) {
-		const struct menu_item *it = &m->items[i];
+		const Menuitem *it = &m->items[i];
 		const char *accel = item_accel(e, it);
 		int lw = menu_disp_w(it->label);
 
@@ -3500,7 +3453,7 @@ dropdown_width(const struct editor *e, int mi)
 
 /* Toggle state of a menu action: 1 on, 0 off, -1 when it is not a toggle. */
 static int
-menu_checked(const struct editor *e, enum menu_act act)
+menu_checked(const Editor *e, Menuact act)
 {
 	switch (act) {
 	case MA_SYNTAX:
@@ -3519,13 +3472,13 @@ menu_checked(const struct editor *e, enum menu_act act)
 }
 
 static void
-draw_dropdown(struct editor *e, int mi, int sel)
+ui_dropdown(Editor *e, int mi, int sel)
 {
-	const struct chrome_pal *p = chrome(e);
-	const struct menu_def *m = &MENUS[mi];
-	struct draw *d = e->d;
-	struct vt_color fg = p->bar_fg, bg = p->bar_bg;
-	uint16_t base = p->reverse_bars ? VT_ATTR_REVERSE : 0;
+	const Pal *p = ed_chrome(e);
+	const Menu *m = &MENUS[mi];
+	Screen *d = e->d;
+	Color fg = p->bar_fg, bg = p->bar_bg;
+	uint16_t base = p->reverse_bars ? ATTR_REVERSE : 0;
 	int w = dropdown_width(e, mi);
 	int boxw = w + 2;
 	int x = dropdown_x(e, mi, boxw);
@@ -3533,40 +3486,40 @@ draw_dropdown(struct editor *e, int mi, int sel)
 	int i;
 
 	/* top and bottom border */
-	draw_cell(d, y, x, GL_TL, fg, bg, base);
-	draw_cell(d, y, x + boxw - 1, GL_TR, fg, bg, base);
-	draw_cell(d, y + m->n + 1, x, GL_BL, fg, bg, base);
-	draw_cell(d, y + m->n + 1, x + boxw - 1, GL_BR, fg, bg, base);
+	scr_cell(d, y, x, GL_TL, fg, bg, base);
+	scr_cell(d, y, x + boxw - 1, GL_TR, fg, bg, base);
+	scr_cell(d, y + m->n + 1, x, GL_BL, fg, bg, base);
+	scr_cell(d, y + m->n + 1, x + boxw - 1, GL_BR, fg, bg, base);
 	for (i = 0; i < w; i++) {
-		draw_cell(d, y, x + 1 + i, GL_H, fg, bg, base);
-		draw_cell(d, y + m->n + 1, x + 1 + i, GL_H, fg, bg, base);
+		scr_cell(d, y, x + 1 + i, GL_H, fg, bg, base);
+		scr_cell(d, y + m->n + 1, x + 1 + i, GL_H, fg, bg, base);
 	}
 
 	for (i = 0; i < m->n; i++) {
-		const struct menu_item *it = &m->items[i];
+		const Menuitem *it = &m->items[i];
 		const char *accel;
 		int row = y + 1 + i;
 		uint16_t at = base;
 
-		draw_cell(d, row, x, GL_V, fg, bg, base);
-		draw_cell(d, row, x + boxw - 1, GL_V, fg, bg, base);
+		scr_cell(d, row, x, GL_V, fg, bg, base);
+		scr_cell(d, row, x + boxw - 1, GL_V, fg, bg, base);
 		if (it->act == MA_SEP) {
 			int c;
 
 			for (c = 0; c < w; c++)
-				draw_cell(d, row, x + 1 + c, GL_H, fg, bg,
+				scr_cell(d, row, x + 1 + c, GL_H, fg, bg,
 				    base);
 			continue;
 		}
 		if (i == sel)
-			at = base ^ VT_ATTR_REVERSE;	/* highlight bar */
-		draw_fill(d, row, x + 1, w, ' ', fg, bg, at);
+			at = base ^ ATTR_REVERSE;	/* highlight bar */
+		scr_fill(d, row, x + 1, w, ' ', fg, bg, at);
 		if (menu_checked(e, it->act) == 1)
-			draw_cell(d, row, x + 1, GL_CHECK, fg, bg, at);
-		draw_menu_label(d, row, x + 2, it->label, fg, bg, at);
+			scr_cell(d, row, x + 1, GL_CHECK, fg, bg, at);
+		ui_menu_label(d, row, x + 2, it->label, fg, bg, at);
 		accel = item_accel(e, it);
 		if (accel[0])
-			draw_text(d, row, x + 1 + w - 1 - (int)strlen(accel),
+			scr_text(d, row, x + 1 + w - 1 - (int)strlen(accel),
 			    accel, fg, bg, at);
 	}
 }
@@ -3574,8 +3527,8 @@ draw_dropdown(struct editor *e, int mi, int sel)
 /* Draw a bordered, filled box of w by h cells at (x, y). Used by the modal
  * dialogs. */
 static void
-draw_box(struct draw *d, int x, int y, int w, int h,
-    struct vt_color fg, struct vt_color bg, uint16_t at)
+scr_box(Screen *d, int x, int y, int w, int h,
+    Color fg, Color bg, uint16_t at)
 {
 	int r, c;
 
@@ -3591,14 +3544,14 @@ draw_box(struct draw *d, int x, int y, int w, int h,
 				    c == w - 1 ? GL_BR : GL_H;
 			else if (c == 0 || c == w - 1)
 				cp = GL_V;
-			draw_cell(d, y + r, x + c, cp, fg, bg, at);
+			scr_cell(d, y + r, x + c, cp, fg, bg, at);
 		}
 }
 
 /* Top-left corner that centers a boxw by boxh overlay in the screen, clamped
  * to stay on screen. Used by the modal dialogs at open and on resize. */
 static void
-center_box(const struct editor *e, int boxw, int boxh, int *x, int *y)
+dlg_center(const Editor *e, int boxw, int boxh, int *x, int *y)
 {
 	*x = (e->cols - boxw) / 2;
 	*y = (e->rows - boxh) / 2;
@@ -3611,21 +3564,21 @@ center_box(const struct editor *e, int boxw, int boxh, int *x, int *y)
 /* The bar palette the modal overlays draw with (menu bar colors, reverse
  * video in the plain scheme). */
 static void
-dialog_palette(const struct editor *e, struct vt_color *fg, struct vt_color *bg,
+dlg_palette(const Editor *e, Color *fg, Color *bg,
     uint16_t *base)
 {
-	const struct chrome_pal *p = chrome(e);
+	const Pal *p = ed_chrome(e);
 
 	*fg = p->bar_fg;
 	*bg = p->bar_bg;
-	*base = p->reverse_bars ? VT_ATTR_REVERSE : 0;
+	*base = p->reverse_bars ? ATTR_REVERSE : 0;
 }
 
 static void
-draw_frame(struct editor *e, const struct chrome_pal *p)
+ui_frame(Editor *e, const Pal *p)
 {
-	struct draw *d = e->d;
-	struct vt_color fg = p->frame_fg, bg = p->frame_bg;
+	Screen *d = e->d;
+	Color fg = p->frame_fg, bg = p->frame_bg;
 	int top = CHROME_TOP - 1;	/* top border row, under the menu bar */
 	int bot = e->rows - CHROME_BOTTOM;	/* bottom border row */
 	int sb = e->cols - CHROME_RIGHT;	/* right border / vertical bar */
@@ -3648,12 +3601,12 @@ draw_frame(struct editor *e, const struct chrome_pal *p)
 		bot = top;
 
 	/* top and bottom borders */
-	draw_fill(d, top, 0, e->cols, GL_H, fg, bg, 0);
-	draw_fill(d, bot, 0, e->cols, GL_H, fg, bg, 0);
-	draw_cell(d, top, 0, GL_TL, fg, bg, 0);
-	draw_cell(d, top, sb, GL_TR, fg, bg, 0);
-	draw_cell(d, bot, 0, GL_BL, fg, bg, 0);
-	draw_cell(d, bot, sb, GL_BR, fg, bg, 0);
+	scr_fill(d, top, 0, e->cols, GL_H, fg, bg, 0);
+	scr_fill(d, bot, 0, e->cols, GL_H, fg, bg, 0);
+	scr_cell(d, top, 0, GL_TL, fg, bg, 0);
+	scr_cell(d, top, sb, GL_TR, fg, bg, 0);
+	scr_cell(d, bot, 0, GL_BL, fg, bg, 0);
+	scr_cell(d, bot, sb, GL_BR, fg, bg, 0);
 
 	/* centered filename on the top border, bracketed by spaces; a buffer
 	 * index is prefixed when more than one file is open */
@@ -3668,20 +3621,20 @@ draw_frame(struct editor *e, const struct chrome_pal *p)
 		tstart = (e->cols - tlen) / 2;
 		if (tstart < 1)
 			tstart = 1;
-		draw_field(d, top, tstart, tlen, title, p->title_fg, bg,
-		    VT_ATTR_BOLD);
+		ui_field(d, top, tstart, tlen, title, p->title_fg, bg,
+		    ATTR_BOLD);
 	}
 
 	/* left border column and the vertical scrollbar column */
 	for (i = 0; i < th; i++) {
 		int r = CHROME_TOP + i;
 
-		draw_cell(d, r, 0, GL_V, fg, bg, 0);
+		scr_cell(d, r, 0, GL_V, fg, bg, 0);
 		if (th >= 3)
 			scrollbar_cell(d, r, sb, i, th, vthumb,
 			    GL_UP, GL_DOWN, fg, bg);
 		else
-			draw_cell(d, r, sb, GL_V, fg, bg, 0);
+			scr_cell(d, r, sb, GL_V, fg, bg, 0);
 	}
 
 	/* horizontal scrollbar embedded in the bottom border */
@@ -3696,17 +3649,17 @@ draw_frame(struct editor *e, const struct chrome_pal *p)
 }
 
 static void
-draw_statusbar(struct editor *e, const struct chrome_pal *p, int cur_col)
+ui_statusbar(Editor *e, const Pal *p, int cur_col)
 {
 	int row = e->rows - 1;
-	uint16_t at = p->reverse_bars ? VT_ATTR_REVERSE : 0;
+	uint16_t at = p->reverse_bars ? ATTR_REVERSE : 0;
 	char right[64];
 	int rlen;
 
-	draw_fill(e->d, row, 0, e->cols, ' ', p->bar_fg, p->bar_bg, at);
+	scr_fill(e->d, row, 0, e->cols, ' ', p->bar_fg, p->bar_bg, at);
 
 	if (e->status[0]) {
-		draw_text(e->d, row, 1, e->status, p->bar_fg, p->bar_bg, at);
+		scr_text(e->d, row, 1, e->status, p->bar_fg, p->bar_bg, at);
 	} else {
 		const char *mode = "";
 
@@ -3720,8 +3673,8 @@ draw_statusbar(struct editor *e, const struct chrome_pal *p, int cur_col)
 			mode = "-- NORMAL --  ";
 		else if (e->mode == MODE_INSERT)
 			mode = "-- INSERT --  ";
-		draw_text(e->d, row, 1, mode, p->bar_fg, p->bar_bg, at);
-		draw_text(e->d, row, 1 + (int)strlen(mode), "F1=Help",
+		scr_text(e->d, row, 1, mode, p->bar_fg, p->bar_bg, at);
+		scr_text(e->d, row, 1 + (int)strlen(mode), "F1=Help",
 		    p->bar_fg, p->bar_bg, at);
 	}
 
@@ -3730,7 +3683,7 @@ draw_statusbar(struct editor *e, const struct chrome_pal *p, int cur_col)
 	    text_dirty(e->t) ? "  *" : "",
 	    e->in_session ? "  [session]" : "");
 	if (rlen > 0 && rlen < e->cols - 1)
-		draw_text(e->d, row, e->cols - rlen - 1, right,
+		scr_text(e->d, row, e->cols - rlen - 1, right,
 		    p->bar_fg, p->bar_bg, at);
 }
 
@@ -3743,9 +3696,9 @@ draw_statusbar(struct editor *e, const struct chrome_pal *p, int cur_col)
  * [hl_start, hl_end) are shown in reverse video for the selection; pass
  * hl_start >= hl_end for no highlight. */
 static void
-draw_line(struct draw *d, int row, int col0, const char *s, size_t len,
+scr_line(Screen *d, int row, int col0, const char *s, size_t len,
     int left, int width, int hl_start, int hl_end, const uint8_t *sty,
-    struct vt_color base_fg, struct vt_color base_bg)
+    Color base_fg, Color base_bg)
 {
 	const unsigned char *p = (const unsigned char *)s;
 	size_t i = 0;
@@ -3758,7 +3711,7 @@ draw_line(struct draw *d, int row, int col0, const char *s, size_t len,
 		int w;
 		int rev;
 		uint16_t attrs;
-		struct vt_color fg;
+		Color fg;
 
 		if (n <= 0)
 			n = 1;
@@ -3782,7 +3735,7 @@ draw_line(struct draw *d, int row, int col0, const char *s, size_t len,
 		/* reverse video marks the selection (its bounds fall on rune
 		 * edges, so a whole rune is in or out); syntax colors the fg */
 		rev = (hl_start < hl_end && col >= hl_start && col < hl_end);
-		attrs = rev ? VT_ATTR_REVERSE : 0;
+		attrs = rev ? ATTR_REVERSE : 0;
 		fg = sty ? syn_color[sty[i]] : base_fg;
 
 		if (r == '\t' || r < 0x20 || r == 0x7f) {
@@ -3794,7 +3747,7 @@ draw_line(struct draw *d, int row, int col0, const char *s, size_t len,
 					continue;
 				if (drawn >= width)
 					break;
-				draw_cell(d, row, col0 + drawn, ' ', fg, base_bg,
+				scr_cell(d, row, col0 + drawn, ' ', fg, base_bg,
 				    attrs);
 				drawn++;
 			}
@@ -3803,14 +3756,14 @@ draw_line(struct draw *d, int row, int col0, const char *s, size_t len,
 			int c;
 
 			for (c = 0; c < w && drawn < width; c++) {
-				draw_cell(d, row, col0 + drawn, ' ', fg, base_bg,
+				scr_cell(d, row, col0 + drawn, ' ', fg, base_bg,
 				    attrs);
 				drawn++;
 			}
 		} else if (drawn + w > width) {
 			break;			/* would overflow right edge */
 		} else if (w > 0) {
-			draw_cell(d, row, col0 + drawn, r, fg, base_bg, attrs);
+			scr_cell(d, row, col0 + drawn, r, fg, base_bg, attrs);
 			drawn += w;
 		}
 		col += w;
@@ -3822,8 +3775,8 @@ draw_line(struct draw *d, int row, int col0, const char *s, size_t len,
 		int dcol = left + drawn;
 		int rev = (hl_start < hl_end && dcol >= hl_start && dcol < hl_end);
 
-		draw_cell(d, row, col0 + drawn, ' ', base_fg, base_bg,
-		    rev ? VT_ATTR_REVERSE : 0);
+		scr_cell(d, row, col0 + drawn, ' ', base_fg, base_bg,
+		    rev ? ATTR_REVERSE : 0);
 		drawn++;
 	}
 }
@@ -3832,7 +3785,7 @@ draw_line(struct draw *d, int row, int col0, const char *s, size_t len,
  * the end of a line (or on a virtual row below the buffer) sits that many blank
  * columns further right. */
 static int
-cursor_dispcol(const struct editor *e)
+cursor_dispcol(const Editor *e)
 {
 	size_t len = 0;
 	const char *line;
@@ -3849,7 +3802,7 @@ cursor_dispcol(const struct editor *e)
 
 /* Adjust top/left so the cursor stays on screen. */
 static void
-scroll_to_cursor(struct editor *e, int text_h, int text_w)
+scroll_to_cursor(Editor *e, int text_h, int text_w)
 {
 	int cur_col = cursor_dispcol(e);
 
@@ -3867,7 +3820,7 @@ scroll_to_cursor(struct editor *e, int text_h, int text_w)
 /* Order the anchor and cursor so (*y1,*x1) is the start of the selection and
  * (*y2,*x2) the end. */
 static void
-sel_bounds(const struct editor *e, size_t *y1, size_t *x1,
+sel_bounds(const Editor *e, size_t *y1, size_t *x1,
     size_t *y2, size_t *x2)
 {
 	if (e->ay < e->cy || (e->ay == e->cy && e->ax <= e->cx)) {
@@ -3884,25 +3837,25 @@ sel_bounds(const struct editor *e, size_t *y1, size_t *x1,
 }
 
 /* Fill row [col, col+width) with a color, then write s over the start of it,
- * so the text sits in a uniformly colored field. Mirrors tui_out_field. */
+ * so the text sits in a uniformly colored field. */
 static void
-draw_field(struct draw *d, int row, int col, int width, const char *s,
-    struct vt_color fg, struct vt_color bg, uint16_t attrs)
+ui_field(Screen *d, int row, int col, int width, const char *s,
+    Color fg, Color bg, uint16_t attrs)
 {
-	draw_fill(d, row, col, width, ' ', fg, bg, attrs);
-	draw_text(d, row, col, s, fg, bg, attrs);
+	scr_fill(d, row, col, width, ' ', fg, bg, attrs);
+	scr_text(d, row, col, s, fg, bg, attrs);
 }
 
 /* Prompt for a byte offset (hex, an optional 0x accepted) and move the cursor
  * there. */
 static void
-hex_goto(struct editor *e)
+hex_goto(Editor *e)
 {
 	char buf[32];
 	size_t total = hex_total(e->t), off;
 
 	buf[0] = '\0';
-	if (!prompt_line(e, "Go to offset: ", buf, sizeof(buf)))
+	if (!dlg_prompt_line(e, "Go to offset: ", buf, sizeof(buf)))
 		return;
 	off = (size_t)strtoull(buf, NULL, 16);
 	if (total == 0)
@@ -3929,7 +3882,7 @@ hex_digit(uint32_t c)
  * the cursor is on an implied newline or v would introduce one, since changing
  * the line structure is deferred. Returns 1 when a byte was written. */
 static int
-hex_overwrite(struct editor *e, unsigned char v)
+hex_overwrite(Editor *e, unsigned char v)
 {
 	size_t off = hex_offset_of(e->t, e->cy, e->cx);
 	size_t total = hex_total(e->t);
@@ -3959,7 +3912,7 @@ hex_overwrite(struct editor *e, unsigned char v)
 
 /* Move the cursor to the next byte after an overwrite, clamped to the end. */
 static void
-hex_advance(struct editor *e)
+hex_advance(Editor *e)
 {
 	size_t total = hex_total(e->t);
 	size_t off = hex_offset_of(e->t, e->cy, e->cx) + 1;
@@ -3977,7 +3930,7 @@ hex_advance(struct editor *e)
  * newline (cx == line length) appends to the end of the line, which is what
  * the offset there means. */
 static void
-hex_insert_byte(struct editor *e, unsigned char v)
+hex_insert_byte(Editor *e, unsigned char v)
 {
 	size_t off = hex_offset_of(e->t, e->cy, e->cx);
 	size_t cy, cx;
@@ -4000,7 +3953,7 @@ hex_insert_byte(struct editor *e, unsigned char v)
  * is the final_newline flag, which the structural keys do not touch. Returns
  * 1 when a byte was removed. */
 static int
-hex_delete_at(struct editor *e)
+hex_delete_at(Editor *e)
 {
 	size_t off = hex_offset_of(e->t, e->cy, e->cx);
 	size_t total = hex_total(e->t);
@@ -4041,7 +3994,7 @@ hex_delete_at(struct editor *e)
 /* Delete the byte before the cursor (Backspace): step back one offset and
  * delete there, which leaves the cursor on the byte that shifted into place. */
 static void
-hex_delete_prev(struct editor *e)
+hex_delete_prev(Editor *e)
 {
 	size_t off = hex_offset_of(e->t, e->cy, e->cx);
 
@@ -4055,7 +4008,7 @@ hex_delete_prev(struct editor *e)
  * and advance past it. Overwrite refuses structural positions; insert accepts
  * them (a newline byte splits the line). */
 static void
-hex_put(struct editor *e, unsigned char v)
+hex_put(Editor *e, unsigned char v)
 {
 	if (e->hex_insert)
 		hex_insert_byte(e, v);
@@ -4065,7 +4018,7 @@ hex_put(struct editor *e, unsigned char v)
 
 /* Repeat the stored search in direction dir, moving the cursor to the match. */
 static void
-hex_do_search(struct editor *e, int dir)
+hex_do_search(Editor *e, int dir)
 {
 	size_t from = hex_offset_of(e->t, e->cy, e->cx);
 	size_t found;
@@ -4086,7 +4039,7 @@ hex_do_search(struct editor *e, int dir)
  * the query's bytes are searched literally; otherwise it is parsed as hex byte
  * pairs (for example "0a 0d"). The pattern is remembered for n and N. */
 static void
-hex_search_prompt(struct editor *e, int ascii)
+hex_search_prompt(Editor *e, int ascii)
 {
 	char buf[160];
 
@@ -4095,7 +4048,7 @@ hex_search_prompt(struct editor *e, int ascii)
 	if (ascii) {
 		size_t len;
 
-		if (!prompt_line(e, "Find text: ", buf, sizeof(buf)))
+		if (!dlg_prompt_line(e, "Find text: ", buf, sizeof(buf)))
 			return;
 		len = strlen(buf);
 		if (len == 0)
@@ -4108,7 +4061,7 @@ hex_search_prompt(struct editor *e, int ascii)
 		unsigned char pat[sizeof(e->hex_pat)];
 		size_t plen;
 
-		if (!prompt_line(e, "Find hex bytes: ", buf, sizeof(buf)))
+		if (!dlg_prompt_line(e, "Find hex bytes: ", buf, sizeof(buf)))
 			return;
 		if (hex_parse_bytes(buf, pat, sizeof(pat), &plen) != 0 ||
 		    plen == 0) {
@@ -4126,7 +4079,7 @@ hex_search_prompt(struct editor *e, int ascii)
 /* The inclusive byte range the selection covers, low to high. With no active
  * selection this is just the byte under the cursor. */
 static void
-hex_sel_range(struct editor *e, size_t *lo, size_t *hi)
+hex_sel_range(Editor *e, size_t *lo, size_t *hi)
 {
 	size_t cur = hex_offset_of(e->t, e->cy, e->cx);
 
@@ -4145,7 +4098,7 @@ hex_sel_range(struct editor *e, size_t *lo, size_t *hi)
  * clipboard, which also mirrors to the system clipboard, then clear the
  * selection. */
 static void
-hex_yank(struct editor *e)
+hex_yank(Editor *e)
 {
 	size_t total = hex_total(e->t), lo, hi, n;
 	unsigned char *buf;
@@ -4177,7 +4130,7 @@ hex_yank(struct editor *e)
 /* Insert the clipboard bytes at the cursor as one undo step. Newlines in the
  * clipboard split lines, matching how the hex view treats a 0a byte. */
 static void
-hex_paste(struct editor *e)
+hex_paste(Editor *e)
 {
 	size_t off = hex_offset_of(e->t, e->cy, e->cx);
 
@@ -4208,8 +4161,8 @@ hex_paste(struct editor *e)
  * which the main loop carries out through the same handling as the text view.
  * The command letters act in the hex column, where they are not byte data.
  * Returns the request for the caller to act on, usually REQ_CONTINUE. */
-static enum req
-hex_key(struct editor *e, const struct tkbd_seq *seq)
+static Req
+hex_key(Editor *e, const struct tkbd_seq *seq)
 {
 	size_t total = hex_total(e->t);
 	size_t off = hex_offset_of(e->t, e->cy, e->cx);
@@ -4373,10 +4326,10 @@ hex_key(struct editor *e, const struct tkbd_seq *seq)
 /* Draw the buffer as a hex dump: a menu bar, offset/hex/ascii rows following
  * the cursor byte, and a status line with the offset and total size. */
 static void
-hex_render(struct editor *e, struct draw *d)
+hex_render(Editor *e, Screen *d)
 {
-	const struct chrome_pal *p = chrome(e);
-	uint16_t barat = p->reverse_bars ? VT_ATTR_REVERSE : 0;
+	const Pal *p = ed_chrome(e);
+	uint16_t barat = p->reverse_bars ? ATTR_REVERSE : 0;
 	int content_h = e->rows - 2 - (e->hex_inspect ? 1 : 0);
 	size_t cols = e->hex_cols ? (size_t)e->hex_cols : 16;
 	size_t total = hex_total(e->t);
@@ -4396,7 +4349,7 @@ hex_render(struct editor *e, struct draw *d)
 	if (e->hex_sel)
 		hex_sel_range(e, &sello, &selhi);
 
-	draw_clear(d);
+	scr_clear(d);
 	for (i = 0; i < content_h; i++) {
 		size_t rowoff = (e->hex_top + (size_t)i) * cols;
 		unsigned char bytes[32];
@@ -4404,13 +4357,13 @@ hex_render(struct editor *e, struct draw *d)
 		size_t got, j;
 
 		if (rowoff >= total && !(rowoff == 0 && total == 0)) {
-			draw_field(d, 1 + i, 0, e->cols, "", p->content_fg,
+			ui_field(d, 1 + i, 0, e->cols, "", p->content_fg,
 			    p->content_bg, 0);
 			continue;
 		}
 		got = hex_gather(e->t, rowoff, bytes, cols);
 		hex_format_row(line, sizeof(line), rowoff, bytes, got, (int)cols);
-		draw_field(d, 1 + i, 0, e->cols, line, p->content_fg,
+		ui_field(d, 1 + i, 0, e->cols, line, p->content_fg,
 		    p->content_bg, 0);
 		for (j = 0; e->hex_sel && j < got; j++) {	/* selected bytes */
 			size_t boff = rowoff + j;
@@ -4425,10 +4378,10 @@ hex_render(struct editor *e, struct draw *d)
 			hp[2] = '\0';
 			ac[0] = line[hex_asciicol((int)j, (int)cols)];
 			ac[1] = '\0';
-			draw_field(d, 1 + i, hc, 2, hp, p->content_fg,
-			    p->content_bg, VT_ATTR_REVERSE);
-			draw_field(d, 1 + i, hex_asciicol((int)j, (int)cols), 1,
-			    ac, p->content_fg, p->content_bg, VT_ATTR_REVERSE);
+			ui_field(d, 1 + i, hc, 2, hp, p->content_fg,
+			    p->content_bg, ATTR_REVERSE);
+			ui_field(d, 1 + i, hex_asciicol((int)j, (int)cols), 1,
+			    ac, p->content_fg, p->content_bg, ATTR_REVERSE);
 		}
 		if (e->hex_top + (size_t)i == currow && (size_t)curj < got) {
 			char hp[3], ac[2];
@@ -4440,10 +4393,10 @@ hex_render(struct editor *e, struct draw *d)
 			hp[2] = '\0';
 			ac[0] = line[hex_asciicol(curj, (int)cols)];
 			ac[1] = '\0';
-			draw_field(d, 1 + i, hc, 2, hp, p->content_fg,
-			    p->content_bg, VT_ATTR_REVERSE);
-			draw_field(d, 1 + i, hex_asciicol(curj, (int)cols), 1, ac,
-			    p->content_fg, p->content_bg, VT_ATTR_REVERSE);
+			ui_field(d, 1 + i, hc, 2, hp, p->content_fg,
+			    p->content_bg, ATTR_REVERSE);
+			ui_field(d, 1 + i, hex_asciicol(curj, (int)cols), 1, ac,
+			    p->content_fg, p->content_bg, ATTR_REVERSE);
 		}
 	}
 
@@ -4453,12 +4406,12 @@ hex_render(struct editor *e, struct draw *d)
 		char line[160];
 
 		hex_inspect_line(line, sizeof(line), ins, got);
-		draw_fill(d, e->rows - 2, 0, e->cols, ' ', p->bar_fg, p->bar_bg,
+		scr_fill(d, e->rows - 2, 0, e->cols, ' ', p->bar_fg, p->bar_bg,
 		    barat);
-		draw_text(d, e->rows - 2, 1, line, p->bar_fg, p->bar_bg, barat);
+		scr_text(d, e->rows - 2, 1, line, p->bar_fg, p->bar_bg, barat);
 	}
 
-	draw_menubar(e, p, -1);
+	ui_menubar(e, p, -1);
 	if (e->status[0])		/* a transient message (search, errors) */
 		snprintf(st, sizeof(st),
 		    " HEX%s  %08zx / %08zx  [%s %s]  %.60s",
@@ -4479,20 +4432,20 @@ hex_render(struct editor *e, struct draw *d)
 		    e->hex_ascii ? "ascii" : "hex",
 		    e->hex_insert ? "INS" : "OVR",
 		    e->has_name ? e->path : "[No Name]");
-	draw_fill(d, e->rows - 1, 0, e->cols, ' ', p->bar_fg, p->bar_bg, barat);
-	draw_text(d, e->rows - 1, 1, st, p->bar_fg, p->bar_bg, barat);
+	scr_fill(d, e->rows - 1, 0, e->cols, ' ', p->bar_fg, p->bar_bg, barat);
+	scr_text(d, e->rows - 1, 1, st, p->bar_fg, p->bar_bg, barat);
 
-	draw_cursor_shape(d, DRAW_CURSOR_DEFAULT);
-	draw_cursor_vis(d, 1);
+	scr_cursor_shape(d, CURSOR_DEFAULT);
+	scr_cursor_vis(d, 1);
 	if (currow >= e->hex_top && currow < e->hex_top + (size_t)content_h)
-		draw_cursor(d, 1 + (int)(currow - e->hex_top),
+		scr_cursor(d, 1 + (int)(currow - e->hex_top),
 		    e->hex_ascii ? hex_asciicol(curj, (int)cols) : hex_hexcol(curj));
 }
 
 static void
-render_body(struct editor *e, struct draw *d)
+render_body(Editor *e, Screen *d)
 {
-	const struct chrome_pal *p = chrome(e);
+	const Pal *p = ed_chrome(e);
 	int text_h = text_height(e);
 	int text_w = text_width(e);
 	int i;
@@ -4511,7 +4464,7 @@ render_body(struct editor *e, struct draw *d)
 
 	hl_ensure(e, e->top + (size_t)text_h);
 
-	draw_clear(d);
+	scr_clear(d);
 
 	for (i = 0; i < text_h; i++) {
 		size_t idx = e->top + (size_t)i;
@@ -4559,46 +4512,46 @@ render_body(struct editor *e, struct draw *d)
 
 		if (s) {
 			sty = hl_line(e, idx, s, llen);
-			draw_line(d, row, CHROME_LEFT, s, llen, (int)e->left,
+			scr_line(d, row, CHROME_LEFT, s, llen, (int)e->left,
 			    text_w, hs, he, sty, p->content_fg, p->content_bg);
 		} else {
-			draw_line(d, row, CHROME_LEFT, "", 0, (int)e->left,
+			scr_line(d, row, CHROME_LEFT, "", 0, (int)e->left,
 			    text_w, hs, he, NULL, p->content_fg, p->content_bg);
 		}
 	}
 
-	draw_menubar(e, p, -1);
-	draw_frame(e, p);
-	draw_statusbar(e, p, cur_col);
+	ui_menubar(e, p, -1);
+	ui_frame(e, p);
+	ui_statusbar(e, p, cur_col);
 
 	/* cursor shape follows the mode: a block in normal mode, a bar while
 	 * inserting; leave the modeless editor's cursor at its default */
 	if (e->mode == MODE_NORMAL)
-		draw_cursor_shape(d, DRAW_CURSOR_BLOCK);
+		scr_cursor_shape(d, CURSOR_BLOCK);
 	else if (e->mode == MODE_INSERT)
-		draw_cursor_shape(d, DRAW_CURSOR_BAR);
+		scr_cursor_shape(d, CURSOR_BAR);
 	else
-		draw_cursor_shape(d, DRAW_CURSOR_DEFAULT);
+		scr_cursor_shape(d, CURSOR_DEFAULT);
 
-	draw_cursor_vis(d, 1);		/* a menu overlay may have hidden it */
-	draw_cursor(d, CHROME_TOP + (int)(e->cy - e->top),
+	scr_cursor_vis(d, 1);		/* a menu overlay may have hidden it */
+	scr_cursor(d, CHROME_TOP + (int)(e->cy - e->top),
 	    CHROME_LEFT + cur_col - (int)e->left);
 }
 
 static void
-render(struct editor *e, struct draw *d)
+ed_render(Editor *e, Screen *d)
 {
 	render_body(e, d);
-	draw_present(d);
+	scr_present(d);
 }
 
 /* Geometry and palette of a centered modal overlay, handed to its draw and
  * key callbacks each frame. */
-struct modal {
+typedef struct modal {
 	int		x, y, w, h;
-	struct vt_color	fg, bg;
+	Color	fg, bg;
 	uint16_t	base;
-};
+} Modal;
 
 /* Run a centered modal box of w by h until its key handler closes it. draw
  * paints the box interior each frame; on_key handles one input event and
@@ -4606,38 +4559,38 @@ struct modal {
  * the caller's ctx. EOF and the editor frame behind the box are handled here.
  */
 static void
-modal_run(struct editor *e, int w, int h, void *ctx,
-    void (*draw)(struct editor *, const struct modal *, void *),
-    int (*on_key)(struct editor *, const struct modal *,
-        const struct draw_event *, void *))
+dlg_run(Editor *e, int w, int h, void *ctx,
+    void (*draw)(Editor *, const Modal *, void *),
+    int (*on_key)(Editor *, const Modal *,
+        const Event *, void *))
 {
-	struct modal m;
+	Modal m;
 
-	dialog_palette(e, &m.fg, &m.bg, &m.base);
+	dlg_palette(e, &m.fg, &m.bg, &m.base);
 	m.w = w > e->cols ? e->cols : w;
 	m.h = h > e->rows ? e->rows : h;
-	center_box(e, m.w, m.h, &m.x, &m.y);
+	dlg_center(e, m.w, m.h, &m.x, &m.y);
 
 	for (;;) {
-		struct draw_event ev;
+		Event ev;
 
 		render_body(e, e->d);
-		draw_box(e->d, m.x, m.y, m.w, m.h, m.fg, m.bg, m.base);
+		scr_box(e->d, m.x, m.y, m.w, m.h, m.fg, m.bg, m.base);
 		draw(e, &m, ctx);
-		draw_cursor_vis(e->d, 0);
-		draw_present(e->d);
+		scr_cursor_vis(e->d, 0);
+		scr_present(e->d);
 
-		switch (draw_wait(e->d, &ev)) {
-		case DRAW_EVENT_EOF:
+		switch (scr_wait(e->d, &ev)) {
+		case EVENT_EOF:
 			return;
-		case DRAW_EVENT_KEY:
+		case EVENT_KEY:
 			if (on_key(e, &m, &ev, ctx))
 				return;
 			break;
-		case DRAW_EVENT_RESIZE:
-		case DRAW_EVENT_RESUME:
-			draw_size(e->d, &e->rows, &e->cols);
-			center_box(e, m.w, m.h, &m.x, &m.y);
+		case EVENT_RESIZE:
+		case EVENT_RESUME:
+			scr_size(e->d, &e->rows, &e->cols);
+			dlg_center(e, m.w, m.h, &m.x, &m.y);
 			break;
 		default:
 			break;
@@ -4650,7 +4603,7 @@ modal_run(struct editor *e, int w, int h, void *ctx,
  ****************************************************************/
 
 void
-move_left(struct editor *e)
+move_left(Editor *e)
 {
 	size_t len = 0;
 	const char *line = text_line(e->t, e->cy, &len);
@@ -4664,7 +4617,7 @@ move_left(struct editor *e)
 }
 
 void
-move_right(struct editor *e)
+move_right(Editor *e)
 {
 	size_t len = 0;
 	const char *line = text_line(e->t, e->cy, &len);
@@ -4679,7 +4632,7 @@ move_right(struct editor *e)
 
 /* Clamp the cursor to a valid line and column. */
 void
-clamp_col(struct editor *e)
+clamp_col(Editor *e)
 {
 	size_t len;
 
@@ -4691,7 +4644,7 @@ clamp_col(struct editor *e)
 }
 
 void
-do_insert(struct editor *e, const char *bytes, size_t n)
+ed_insert(Editor *e, const char *bytes, size_t n)
 {
 	hl_touch(e, e->cy);
 	if (text_insert(e->t, e->cy, e->cx, bytes, n) == 0)
@@ -4699,7 +4652,7 @@ do_insert(struct editor *e, const char *bytes, size_t n)
 }
 
 void
-do_backspace(struct editor *e)
+ed_backspace(Editor *e)
 {
 	size_t len = 0;
 	const char *line = text_line(e->t, e->cy, &len);
@@ -4720,7 +4673,7 @@ do_backspace(struct editor *e)
 }
 
 void
-do_delete(struct editor *e)
+ed_delete(Editor *e)
 {
 	size_t len = 0;
 	const char *line = text_line(e->t, e->cy, &len);
@@ -4733,7 +4686,7 @@ do_delete(struct editor *e)
 }
 
 void
-do_newline(struct editor *e)
+ed_newline(Editor *e)
 {
 	hl_touch(e, e->cy);
 	if (text_split(e->t, e->cy, e->cx) == 0) {
@@ -4748,7 +4701,7 @@ do_newline(struct editor *e)
  * CR, LF, and CRLF all become one newline. Undo boundaries fence the paste
  * off from the surrounding edits. */
 static void
-paste_input(struct editor *e)
+paste_input(Editor *e)
 {
 	int saw_cr = 0;
 
@@ -4761,15 +4714,15 @@ paste_input(struct editor *e)
 	}
 	text_undo_boundary(e->t);	/* separate the paste from prior typing */
 	for (;;) {
-		struct draw_event ev;
+		Event ev;
 		struct tkbd_seq seq;
 		unsigned char buf[8];
 		int n;
 
-		if (draw_wait(e->d, &ev) == DRAW_EVENT_EOF)
+		if (scr_wait(e->d, &ev) == EVENT_EOF)
 			break;			/* input closed ends the paste */
-		if (ev.type != DRAW_EVENT_KEY) {
-			draw_size(e->d, &e->rows, &e->cols);	/* resize/resume */
+		if (ev.type != EVENT_KEY) {
+			scr_size(e->d, &e->rows, &e->cols);	/* resize/resume */
 			continue;
 		}
 		seq = ev.key;
@@ -4784,20 +4737,20 @@ paste_input(struct editor *e)
 				saw_cr = 0;
 				continue;
 			}
-			do_newline(e);
+			ed_newline(e);
 			saw_cr = (seq.ch == 0x0d);
 			continue;
 		}
 		saw_cr = 0;
 		if (seq.key == TKBD_KEY_TAB) {
-			do_insert(e, "\t", 1);
+			ed_insert(e, "\t", 1);
 			continue;
 		}
 		if (seq.ch != TKBD_CH_NONE && seq.ch >= 0x20 &&
 		    seq.ch != 0x7f) {
 			n = utf8_encode(buf, seq.ch);
 			if (n > 0)
-				do_insert(e, (char *)buf, (size_t)n);
+				ed_insert(e, (char *)buf, (size_t)n);
 		}
 		/* other control and function keys are dropped inside a paste */
 	}
@@ -4807,16 +4760,16 @@ paste_input(struct editor *e)
 /* Consume and discard a bracketed-paste payload without inserting it. Used in
  * vi normal mode, where a paste is not text input. */
 static void
-paste_discard(struct editor *e)
+paste_discard(Editor *e)
 {
 	for (;;) {
-		struct draw_event ev;
+		Event ev;
 		struct tkbd_seq seq;
 
-		if (draw_wait(e->d, &ev) == DRAW_EVENT_EOF)
+		if (scr_wait(e->d, &ev) == EVENT_EOF)
 			break;
-		if (ev.type != DRAW_EVENT_KEY) {
-			draw_size(e->d, &e->rows, &e->cols);	/* resize/resume */
+		if (ev.type != EVENT_KEY) {
+			scr_size(e->d, &e->rows, &e->cols);	/* resize/resume */
 			continue;
 		}
 		seq = ev.key;
@@ -4826,7 +4779,7 @@ paste_discard(struct editor *e)
 }
 
 static int
-is_movement(enum cmd cmd)
+is_movement(Cmd cmd)
 {
 	switch (cmd) {
 	case CMD_LEFT:
@@ -4846,7 +4799,7 @@ is_movement(enum cmd cmd)
 /* Copy the selection [y1,x1)-(y2,x2) into a fresh buffer, joining lines with
  * '\n'. Returns NULL on allocation failure. Sets *outlen to the byte count. */
 char *
-region_text(struct editor *e, size_t y1, size_t x1, size_t y2, size_t x2,
+region_text(Editor *e, size_t y1, size_t x1, size_t y2, size_t x2,
     size_t *outlen)
 {
 	size_t cap = 0, len = 0, y;
@@ -4889,7 +4842,7 @@ region_text(struct editor *e, size_t y1, size_t x1, size_t y2, size_t x2,
 
 /* Delete the selection [y1,x1)-(y2,x2) and leave the cursor at its start. */
 void
-delete_region(struct editor *e, size_t y1, size_t x1, size_t y2, size_t x2)
+delete_region(Editor *e, size_t y1, size_t x1, size_t y2, size_t x2)
 {
 	hl_touch(e, y1);
 	if (y1 == y2) {
@@ -4916,7 +4869,7 @@ delete_region(struct editor *e, size_t y1, size_t x1, size_t y2, size_t x2)
 
 /* Insert bytes at the cursor, breaking lines on embedded newlines. */
 void
-insert_bytes(struct editor *e, const char *bytes, size_t len)
+insert_bytes(Editor *e, const char *bytes, size_t len)
 {
 	size_t i = 0;
 
@@ -4926,16 +4879,16 @@ insert_bytes(struct editor *e, const char *bytes, size_t len)
 		while (j < len && bytes[j] != '\n')
 			j++;
 		if (j > i)
-			do_insert(e, bytes + i, j - i);
+			ed_insert(e, bytes + i, j - i);
 		if (j < len)
-			do_newline(e);		/* the newline itself */
+			ed_newline(e);		/* the newline itself */
 		i = (j < len) ? j + 1 : j;
 	}
 }
 
 /* Insert the clipboard (the unnamed register) at the cursor. */
 void
-insert_clip(struct editor *e)
+insert_clip(Editor *e)
 {
 	insert_bytes(e, e->clip, e->clip_len);
 }
@@ -4947,21 +4900,21 @@ insert_clip(struct editor *e)
 #define OSC52_MAX 100000
 
 void
-clip_set(struct editor *e, char *bytes, size_t len)
+clip_set(Editor *e, char *bytes, size_t len)
 {
 	free(e->clip);
 	e->clip = bytes;
 	e->clip_len = len;
 	/* mirror to the system clipboard; the driver emits OSC 52 */
 	if (len > 0 && len <= OSC52_MAX)
-		draw_set_clipboard(e->d, bytes, len);
+		scr_set_clipboard(e->d, bytes, len);
 }
 
 /* Allocated text of the active selection, with its byte length in *len. The
  * caller owns the buffer. Returns NULL when nothing is selected or on an
  * allocation failure. */
 static char *
-current_selection_text(struct editor *e, size_t *len)
+current_selection_text(Editor *e, size_t *len)
 {
 	size_t y1, x1, y2, x2;
 
@@ -4976,7 +4929,7 @@ current_selection_text(struct editor *e, size_t *len)
  * another window of the session as typed input. A carriage return is
  * appended so the line runs in the target shell or REPL. */
 static void
-do_send(struct editor *e)
+ed_send(Editor *e)
 {
 	const char *session = getenv("LUMI_SESSION");
 	char *text = NULL, *payload;
@@ -5012,33 +4965,15 @@ do_send(struct editor *e)
 	payload[tlen] = '\r';		/* submit the line in the target */
 	free(text);
 
-	switch (lu_send_input(session, -1, payload, tlen + 1)) {
-	case LU_SEND_OK:
-		snprintf(e->status, sizeof(e->status),
-		    "sent %zu bytes to another pane", tlen);
-		break;
-	case LU_SEND_NO_TARGET:
-		snprintf(e->status, sizeof(e->status),
-		    "no other window to send to");
-		break;
-	case LU_SEND_READONLY:
-		snprintf(e->status, sizeof(e->status),
-		    "target pane is read-only");
-		break;
-	case LU_SEND_NO_SESSION:
-		snprintf(e->status, sizeof(e->status), "session not found");
-		break;
-	case LU_SEND_ERROR:
-		snprintf(e->status, sizeof(e->status), "send failed");
-		break;
-	}
+	/* A standalone or embedded vedit has no lumi session to send to. */
+	snprintf(e->status, sizeof(e->status), "session not found");
 	free(payload);
 	e->sel_active = 0;		/* consume the selection */
 }
 
 /* Carry out one command, returning what the main loop must do next. */
-static enum req
-dispatch(struct editor *e, enum cmd cmd, const struct tkbd_seq *seq)
+static Req
+ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 {
 	int page = text_height(e) - 1;
 	unsigned char buf[8];
@@ -5175,7 +5110,7 @@ dispatch(struct editor *e, enum cmd cmd, const struct tkbd_seq *seq)
 		insert_clip(e);
 		break;
 	case CMD_SEND:
-		do_send(e);
+		ed_send(e);
 		break;
 	case CMD_FIND:
 		return REQ_FIND;
@@ -5186,19 +5121,19 @@ dispatch(struct editor *e, enum cmd cmd, const struct tkbd_seq *seq)
 	case CMD_INSERT:
 		n = utf8_encode(buf, seq->ch);
 		if (n > 0)
-			do_insert(e, (char *)buf, (size_t)n);
+			ed_insert(e, (char *)buf, (size_t)n);
 		break;
 	case CMD_TAB:
-		do_insert(e, "\t", 1);
+		ed_insert(e, "\t", 1);
 		break;
 	case CMD_NEWLINE:
-		do_newline(e);
+		ed_newline(e);
 		break;
 	case CMD_BACKSPACE:
-		do_backspace(e);
+		ed_backspace(e);
 		break;
 	case CMD_DELETE:
-		do_delete(e);
+		ed_delete(e);
 		break;
 	case CMD_LEFT:
 		move_left(e);
@@ -5249,40 +5184,40 @@ dispatch(struct editor *e, enum cmd cmd, const struct tkbd_seq *seq)
 /* Draw the editor frame, then overlay a prompt on the status row and leave
  * the cursor at the end of the typed text. */
 static void
-draw_prompt(struct editor *e, const char *q, const char *buf)
+ui_prompt(Editor *e, const char *q, const char *buf)
 {
-	const struct tui_theme *t = tui_theme_default();
+	const Theme *t = ui_theme_default();
 	char line[512];
 	int col;
 	int status_row = (e->rows > 0 ? e->rows : 24) - 1;
 
-	render(e, e->d);		/* paint the frame under the prompt */
+	ed_render(e, e->d);		/* paint the frame under the prompt */
 	col = snprintf(line, sizeof(line), "%s%s", q, buf ? buf : "");
-	draw_field(e->d, status_row, 0, e->cols, line, t->sel_fg, t->sel_bg,
-	    VT_ATTR_BOLD);
+	ui_field(e->d, status_row, 0, e->cols, line, t->sel_fg, t->sel_bg,
+	    ATTR_BOLD);
 	if (col >= e->cols)
 		col = e->cols - 1;
-	draw_cursor(e->d, status_row, col);
-	draw_present(e->d);
+	scr_cursor(e->d, status_row, col);
+	scr_present(e->d);
 }
 
 /* Read a line of text. buf is edited in place, so a caller may pre-fill it
  * with a default (for example the last search). Returns 1 with buf filled, or
  * 0 if cancelled or left empty. */
 int
-prompt_line(struct editor *e, const char *q, char *buf, size_t bufsz)
+dlg_prompt_line(Editor *e, const char *q, char *buf, size_t bufsz)
 {
 	size_t len = strlen(buf);
 
 	for (;;) {
-		struct draw_event ev;
+		Event ev;
 		struct tkbd_seq seq;
 
-		draw_prompt(e, q, buf);
-		if (draw_wait(e->d, &ev) == DRAW_EVENT_EOF)
+		ui_prompt(e, q, buf);
+		if (scr_wait(e->d, &ev) == EVENT_EOF)
 			return 0;
-		if (ev.type != DRAW_EVENT_KEY) {
-			draw_size(e->d, &e->rows, &e->cols);	/* resize/resume */
+		if (ev.type != EVENT_KEY) {
+			scr_size(e->d, &e->rows, &e->cols);	/* resize/resume */
 			continue;			/* loop redraws the prompt */
 		}
 		seq = ev.key;
@@ -5320,13 +5255,13 @@ prompt_line(struct editor *e, const char *q, char *buf, size_t bufsz)
 /* Save the buffer, prompting for a name if it has none. Returns 0 on a
  * successful save, -1 on failure or when the save was cancelled. */
 static int
-save_editor(struct editor *e)
+save_editor(Editor *e)
 {
 	if (!e->has_name) {
 		char name[PATH_MAX];
 
 		name[0] = '\0';
-		if (!prompt_line(e, "Save as: ", name, sizeof(name))) {
+		if (!dlg_prompt_line(e, "Save as: ", name, sizeof(name))) {
 			snprintf(e->status, sizeof(e->status), "save cancelled");
 			return -1;
 		}
@@ -5365,7 +5300,7 @@ last_match(const char *s, size_t slen, size_t lo, size_t hi, const char *q)
 /* Search for q from the cursor in direction dir (1 forward, -1 backward),
  * wrapping around the buffer, and move the cursor to the match. */
 void
-do_find_dir(struct editor *e, const char *q, int dir)
+ed_find_dir(Editor *e, const char *q, int dir)
 {
 	size_t nlines = text_lines(e->t);
 	size_t i;
@@ -5430,37 +5365,37 @@ do_find_dir(struct editor *e, const char *q, int dir)
 }
 
 void
-do_find(struct editor *e, const char *q)
+ed_find(Editor *e, const char *q)
 {
-	do_find_dir(e, q, 1);
+	ed_find_dir(e, q, 1);
 }
 
 /* Prompt for a search string (defaulting to the last one, so Enter repeats)
  * and jump to the next match. */
 static void
-find_prompt(struct editor *e)
+find_prompt(Editor *e)
 {
 	char q[256];
 
 	snprintf(q, sizeof(q), "%s", e->last_find);
-	if (!prompt_line(e, "Search: ", q, sizeof(q))) {
+	if (!dlg_prompt_line(e, "Search: ", q, sizeof(q))) {
 		snprintf(e->status, sizeof(e->status), "search cancelled");
 		return;
 	}
 	snprintf(e->last_find, sizeof(e->last_find), "%s", q);
-	do_find(e, q);
+	ed_find(e, q);
 }
 
 /* Prompt for a 1-based line number and move the cursor to that line. A number
  * past the end clamps to the last line. */
 static void
-goto_prompt(struct editor *e)
+goto_prompt(Editor *e)
 {
 	char buf[32], *end;
 	long ln;
 
 	buf[0] = '\0';
-	if (!prompt_line(e, "Go to line: ", buf, sizeof(buf))) {
+	if (!dlg_prompt_line(e, "Go to line: ", buf, sizeof(buf))) {
 		snprintf(e->status, sizeof(e->status), "goto cancelled");
 		return;
 	}
@@ -5542,32 +5477,32 @@ static const struct {
  * the end), and a bold footer row. Used by the help and build-output screens.
  */
 static void
-draw_scroll_view(struct editor *e, const char *header, const char *footer,
-    int top, const char *(*get_line)(struct editor *, void *, int), void *ctx)
+ui_scroll_view(Editor *e, const char *header, const char *footer,
+    int top, const char *(*get_line)(Editor *, void *, int), void *ctx)
 {
-	const struct tui_theme *t = tui_theme_default();
-	struct draw *d = e->d;
+	const Theme *t = ui_theme_default();
+	Screen *d = e->d;
 	int rows = e->rows > 0 ? e->rows : 24;
 	int row;
 
-	draw_clear(d);
-	draw_field(d, 0, 0, e->cols, header, t->title_fg, t->border_bg,
-	    VT_ATTR_BOLD);
+	scr_clear(d);
+	ui_field(d, 0, 0, e->cols, header, t->title_fg, t->border_bg,
+	    ATTR_BOLD);
 	for (row = 1; row < rows - 1; row++) {
 		const char *s = get_line(e, ctx, top + row - 1);
 
-		draw_field(d, row, 0, e->cols, s ? s : "", t->content_fg,
+		ui_field(d, row, 0, e->cols, s ? s : "", t->content_fg,
 		    t->content_bg, 0);
 	}
-	draw_field(d, rows - 1, 0, e->cols, footer, t->title_fg, t->border_bg,
-	    VT_ATTR_BOLD);
-	draw_present(d);
+	ui_field(d, rows - 1, 0, e->cols, footer, t->title_fg, t->border_bg,
+	    ATTR_BOLD);
+	scr_present(d);
 }
 
 /* Line provider for the help view: one formatted "keys  description" row from
  * the active personality's table. */
 static const char *
-help_line(struct editor *e, void *ctx, int idx)
+help_line(Editor *e, void *ctx, int idx)
 {
 	static char line[128];
 	int vi = e->mode != MODE_MODELESS;
@@ -5584,26 +5519,26 @@ help_line(struct editor *e, void *ctx, int idx)
 
 /* Show the help screen and wait for one key press to dismiss it. */
 static void
-show_help(struct editor *e)
+dlg_help(Editor *e)
 {
 	const char *hdr = e->mode != MODE_MODELESS ?
 	    " lumi edit -- vi key bindings" : " lumi edit -- key bindings";
 
 	for (;;) {
-		struct draw_event ev;
+		Event ev;
 
-		draw_scroll_view(e, hdr, " Press any key to return", 0,
+		ui_scroll_view(e, hdr, " Press any key to return", 0,
 		    help_line, NULL);
-		switch (draw_wait(e->d, &ev)) {
-		case DRAW_EVENT_KEY:
+		switch (scr_wait(e->d, &ev)) {
+		case EVENT_KEY:
 			if (ev.key.type == TKBD_KEY)
 				return;		/* any key returns to editing */
 			break;
-		case DRAW_EVENT_RESIZE:
-		case DRAW_EVENT_RESUME:
-			draw_size(e->d, &e->rows, &e->cols);
+		case EVENT_RESIZE:
+		case EVENT_RESUME:
+			scr_size(e->d, &e->rows, &e->cols);
 			break;
-		case DRAW_EVENT_EOF:
+		case EVENT_EOF:
 			return;
 		default:
 			break;
@@ -5615,59 +5550,59 @@ show_help(struct editor *e)
  * Menu bar actions and the pull-down modal loop
  ****************************************************************/
 
-enum dlg_result { DLG_CANCEL = -1, DLG_NO = 0, DLG_YES = 1 };
+typedef enum dlg_result { DLG_CANCEL = -1, DLG_NO = 0, DLG_YES = 1 } Dlgresult;
 
 /* Result chosen by button index 0/1/2. */
-static enum dlg_result
+static Dlgresult
 dlg_btn_result(int i)
 {
 	return i == 0 ? DLG_YES : i == 1 ? DLG_NO : DLG_CANCEL;
 }
 
-static const char *const confirm_btn[3] = {
+static const char *const dlg_confirm_btn[3] = {
 	"[ &Yes ]", "[ &No ]", "[ &Cancel ]"
 };
 
 /* State of the save-confirm dialog across its modal frames. */
-struct confirm_ctx {
+typedef struct confirm_ctx {
 	const char	*msg;
 	int		focus;		/* 0 Yes, 1 No, 2 Cancel */
-	enum dlg_result	result;		/* what to return; Cancel by default */
+	Dlgresult	result;		/* what to return; Cancel by default */
 	int		bx[3];		/* button columns, set by the draw pass */
 	int		brow;		/* button row, set by the draw pass */
-};
+} Confirmctx;
 
 static void
-confirm_draw(struct editor *e, const struct modal *m, void *ctx)
+dlg_confirm_draw(Editor *e, const Modal *m, void *ctx)
 {
-	struct confirm_ctx *c = ctx;
-	struct draw *d = e->d;
+	Confirmctx *c = ctx;
+	Screen *d = e->d;
 	int msglen = (int)strlen(c->msg);
 	int brow_w = 4;			/* two 2-space gaps between 3 buttons */
 	int i, cx;
 
 	for (i = 0; i < 3; i++)
-		brow_w += menu_disp_w(confirm_btn[i]);
+		brow_w += menu_disp_w(dlg_confirm_btn[i]);
 	c->brow = m->y + m->h - 2;
 	cx = m->x + (m->w - brow_w) / 2;
-	draw_text(d, m->y + 1, m->x + (m->w - msglen) / 2, c->msg,
+	scr_text(d, m->y + 1, m->x + (m->w - msglen) / 2, c->msg,
 	    m->fg, m->bg, m->base);
 	for (i = 0; i < 3; i++) {
 		uint16_t at = (i == c->focus) ?
-		    m->base ^ VT_ATTR_REVERSE : m->base;
+		    m->base ^ ATTR_REVERSE : m->base;
 
 		c->bx[i] = cx;
-		draw_menu_label(d, c->brow, cx, confirm_btn[i], m->fg, m->bg,
+		ui_menu_label(d, c->brow, cx, dlg_confirm_btn[i], m->fg, m->bg,
 		    at);
-		cx += menu_disp_w(confirm_btn[i]) + 2;
+		cx += menu_disp_w(dlg_confirm_btn[i]) + 2;
 	}
 }
 
 static int
-confirm_key(struct editor *e, const struct modal *m,
-    const struct draw_event *ev, void *ctx)
+dlg_confirm_key(Editor *e, const Modal *m,
+    const Event *ev, void *ctx)
 {
-	struct confirm_ctx *c = ctx;
+	Confirmctx *c = ctx;
 	int i;
 
 	(void)e;
@@ -5677,7 +5612,7 @@ confirm_key(struct editor *e, const struct modal *m,
 		    !(ev->key.mod & TKBD_MOD_MOTION) && ev->key.y == c->brow)
 			for (i = 0; i < 3; i++)
 				if (ev->key.x >= c->bx[i] && ev->key.x <
-				    c->bx[i] + menu_disp_w(confirm_btn[i])) {
+				    c->bx[i] + menu_disp_w(dlg_confirm_btn[i])) {
 					c->result = dlg_btn_result(i);
 					return 1;
 				}
@@ -5689,7 +5624,7 @@ confirm_key(struct editor *e, const struct modal *m,
 		int lc = tolower((int)ev->key.ch);
 
 		for (i = 0; i < 3; i++)
-			if (menu_mnemonic(confirm_btn[i]) == lc) {
+			if (menu_mnemonic(dlg_confirm_btn[i]) == lc) {
 				c->result = dlg_btn_result(i);
 				return 1;
 			}
@@ -5717,29 +5652,29 @@ confirm_key(struct editor *e, const struct modal *m,
  * arrow keys or Tab move focus, Enter picks the focused button, an underlined
  * mnemonic letter (Y/N/C) chooses directly, Esc cancels, and a click selects a
  * button. */
-static enum dlg_result
-confirm_save_dialog(struct editor *e, const char *msg)
+static Dlgresult
+dlg_confirm_save_dialog(Editor *e, const char *msg)
 {
-	struct confirm_ctx c = { msg, 0, DLG_CANCEL, { 0, 0, 0 }, 0 };
+	Confirmctx c = { msg, 0, DLG_CANCEL, { 0, 0, 0 }, 0 };
 	int msglen = (int)strlen(msg);
 	int brow_w = 4;			/* two 2-space gaps between 3 buttons */
 	int i, boxw;
 
 	for (i = 0; i < 3; i++)
-		brow_w += menu_disp_w(confirm_btn[i]);
+		brow_w += menu_disp_w(dlg_confirm_btn[i]);
 	boxw = (msglen > brow_w ? msglen : brow_w) + 4 + 2;
-	modal_run(e, boxw, 5, &c, confirm_draw, confirm_key);
+	dlg_run(e, boxw, 5, &c, dlg_confirm_draw, dlg_confirm_key);
 	return c.result;
 }
 
 /* Offer to save a dirty buffer before it is replaced or the editor exits.
  * Returns 1 to proceed (saved or discarded), 0 to abort the operation. */
 static int
-confirm_save(struct editor *e, const char *msg)
+dlg_confirm_save(Editor *e, const char *msg)
 {
 	if (!text_dirty(e->t))
 		return 1;
-	switch (confirm_save_dialog(e, msg)) {
+	switch (dlg_confirm_save_dialog(e, msg)) {
 	case DLG_CANCEL:
 		return 0;
 	case DLG_YES:
@@ -5752,14 +5687,14 @@ confirm_save(struct editor *e, const char *msg)
 
 /* Confirm before replacing the current buffer (New/Open). */
 static int
-confirm_discard(struct editor *e)
+dlg_confirm_discard(Editor *e)
 {
-	return confirm_save(e, "Save changes to the current file?");
+	return dlg_confirm_save(e, "Save changes to the current file?");
 }
 
 /* Reset syntax and cursor state after the buffer is swapped. */
 static void
-buffer_reset(struct editor *e)
+buffer_reset(Editor *e)
 {
 	e->cy = e->cx = e->top = e->left = 0;
 	e->sel_active = 0;
@@ -5767,7 +5702,7 @@ buffer_reset(struct editor *e)
 }
 
 /* ---- multi-buffer management ------------------------------------------- *
- * The active buffer's per-file state lives in the flat struct editor, which
+ * The active buffer's per-file state lives in the flat Editor, which
  * is authoritative for it; the parked buffers live in e->bufs. buf_save mirrors
  * the flat state into a slot, buf_load mirrors a slot back. Only the active
  * buffer is ever read from the flat fields, so a parked slot may lag until the
@@ -5775,7 +5710,7 @@ buffer_reset(struct editor *e)
 
 /* Copy the active buffer's per-file fields into a slot. */
 static void
-buf_save(struct editor *e, struct ebuf *b)
+buf_save(Editor *e, Buf *b)
 {
 	b->t = e->t;
 	memcpy(b->path, e->path, sizeof(b->path));
@@ -5800,7 +5735,7 @@ buf_save(struct editor *e, struct ebuf *b)
 
 /* Mirror a slot into the flat editor and drop any in-flight vi command. */
 static void
-buf_load(struct editor *e, const struct ebuf *b)
+buf_load(Editor *e, const Buf *b)
 {
 	e->t = b->t;
 	memcpy(e->path, b->path, sizeof(e->path));
@@ -5835,7 +5770,7 @@ buf_load(struct editor *e, const struct ebuf *b)
  * active buffer. The diagnostics list is global, not per-buffer, and is
  * freed once at teardown. */
 static void
-buf_free_fields(struct text *t, uint16_t *line_state)
+buf_free_fields(Text *t, uint16_t *line_state)
 {
 	text_free(t);
 	free(line_state);
@@ -5843,11 +5778,11 @@ buf_free_fields(struct text *t, uint16_t *line_state)
 
 /* Ensure room for one more buffer and return its index (nbuf grows). */
 static int
-buf_slot(struct editor *e)
+buf_slot(Editor *e)
 {
 	if (e->nbuf >= e->bufs_cap) {
 		int nc = e->bufs_cap ? e->bufs_cap * 2 : 4;
-		struct ebuf *nb = realloc(e->bufs, (size_t)nc * sizeof(*nb));
+		Buf *nb = realloc(e->bufs, (size_t)nc * sizeof(*nb));
 
 		if (!nb)
 			return -1;
@@ -5858,7 +5793,7 @@ buf_slot(struct editor *e)
 }
 
 void
-buf_switch(struct editor *e, int i)
+buf_switch(Editor *e, int i)
 {
 	if (i < 0 || i >= e->nbuf || i == e->cur)
 		return;
@@ -5868,7 +5803,7 @@ buf_switch(struct editor *e, int i)
 }
 
 int
-buf_cycle(struct editor *e, int dir)
+buf_cycle(Editor *e, int dir)
 {
 	int i;
 
@@ -5880,9 +5815,9 @@ buf_cycle(struct editor *e, int dir)
 }
 
 int
-buf_open(struct editor *e, const char *path)
+buf_open(Editor *e, const char *path)
 {
-	struct text *nt;
+	Text *nt;
 	int i;
 
 	if (path && path[0]) {			/* already open? just switch */
@@ -5944,7 +5879,7 @@ buf_open(struct editor *e, const char *path)
 }
 
 int
-buf_close(struct editor *e, int i)
+buf_close(Editor *e, int i)
 {
 	if (e->nbuf <= 1 || i < 0 || i >= e->nbuf)
 		return -1;
@@ -5971,7 +5906,7 @@ buf_close(struct editor *e, int i)
 }
 
 void
-buf_list(struct editor *e)
+buf_list(Editor *e)
 {
 	char *p = e->status;
 	size_t rem = sizeof(e->status);
@@ -5997,11 +5932,11 @@ buf_list(struct editor *e)
 }
 
 static void
-do_new(struct editor *e)
+ed_new(Editor *e)
 {
-	struct text *nt;
+	Text *nt;
 
-	if (!confirm_discard(e))
+	if (!dlg_confirm_discard(e))
 		return;
 	nt = text_new();
 	if (!nt) {
@@ -6019,15 +5954,15 @@ do_new(struct editor *e)
 }
 
 static void
-do_open(struct editor *e)
+ed_open(Editor *e)
 {
 	char path[PATH_MAX];
-	struct text *nt;
+	Text *nt;
 
-	if (!confirm_discard(e))
+	if (!dlg_confirm_discard(e))
 		return;
 	path[0] = '\0';
-	if (!prompt_line(e, "Open file: ", path, sizeof(path)))
+	if (!dlg_prompt_line(e, "Open file: ", path, sizeof(path)))
 		return;
 	nt = text_new();
 	if (!nt) {
@@ -6051,14 +5986,14 @@ do_open(struct editor *e)
 }
 
 static void
-do_save_as(struct editor *e)
+ed_save_as(Editor *e)
 {
 	char path[PATH_MAX];
 
 	path[0] = '\0';
 	if (e->has_name)
 		snprintf(path, sizeof(path), "%s", e->path);
-	if (!prompt_line(e, "Save as: ", path, sizeof(path)))
+	if (!dlg_prompt_line(e, "Save as: ", path, sizeof(path)))
 		return;
 	snprintf(e->path, sizeof(e->path), "%s", path);
 	e->has_name = 1;
@@ -6069,7 +6004,7 @@ do_save_as(struct editor *e)
 
 /* Switch between the modeless and vi personalities (also on F2). */
 static void
-toggle_vi(struct editor *e)
+toggle_vi(Editor *e)
 {
 	e->vi_visual = 0;
 	if (e->mode == MODE_MODELESS) {
@@ -6089,33 +6024,33 @@ toggle_vi(struct editor *e)
 }
 
 /* The About box content, one centered line per row plus a button. */
-struct about_ctx {
+typedef struct about_ctx {
 	const char *const	*lines;
 	int			nlines;
 	const char		*btn;
-};
+} Aboutctx;
 
 static void
-about_draw(struct editor *e, const struct modal *m, void *ctx)
+dlg_about_draw(Editor *e, const Modal *m, void *ctx)
 {
-	struct about_ctx *a = ctx;
-	struct draw *d = e->d;
+	Aboutctx *a = ctx;
+	Screen *d = e->d;
 	int i, brow;
 
 	for (i = 0; i < a->nlines; i++) {
 		int lw = (int)strlen(a->lines[i]);
 
-		draw_text(d, m->y + 1 + i, m->x + (m->w - lw) / 2, a->lines[i],
+		scr_text(d, m->y + 1 + i, m->x + (m->w - lw) / 2, a->lines[i],
 		    m->fg, m->bg, m->base);
 	}
 	brow = m->y + m->h - 2;
-	draw_text(d, brow, m->x + (m->w - (int)strlen(a->btn)) / 2, a->btn,
-	    m->fg, m->bg, m->base ^ VT_ATTR_REVERSE);
+	scr_text(d, brow, m->x + (m->w - (int)strlen(a->btn)) / 2, a->btn,
+	    m->fg, m->bg, m->base ^ ATTR_REVERSE);
 }
 
 static int
-about_key(struct editor *e, const struct modal *m,
-    const struct draw_event *ev, void *ctx)
+dlg_about_key(Editor *e, const Modal *m,
+    const Event *ev, void *ctx)
 {
 	(void)e;
 	(void)m;
@@ -6132,14 +6067,14 @@ about_key(struct editor *e, const struct modal *m,
 
 /* A centered modal About box, dismissed by any key or a click. */
 static void
-show_about(struct editor *e)
+dlg_about(Editor *e)
 {
 	static const char *const lines[] = {
 		"lumi edit",
 		"a lumimux full-screen editor",
 		"version " LUMI_VERSION,
 	};
-	struct about_ctx a = {
+	Aboutctx a = {
 		lines, (int)(sizeof(lines) / sizeof(lines[0])), "[ OK ]"
 	};
 	int inner, boxw, i;
@@ -6153,7 +6088,7 @@ show_about(struct editor *e)
 	}
 	inner += 4;			/* two spaces of padding each side */
 	boxw = inner + 2;		/* left and right border */
-	modal_run(e, boxw, a.nlines + 4, &a, about_draw, about_key);
+	dlg_run(e, boxw, a.nlines + 4, &a, dlg_about_draw, dlg_about_key);
 }
 
 /* The lumi build commands (compile / make / run and the quickfix error list)
@@ -6163,20 +6098,20 @@ show_about(struct editor *e)
 
 /* Carry out a chosen menu action. Returns 1 when the editor should quit. */
 static int
-run_menu_act(struct editor *e, enum menu_act act)
+run_menu_act(Editor *e, Menuact act)
 {
 	switch (act) {
 	case MA_NEW:
-		do_new(e);
+		ed_new(e);
 		break;
 	case MA_OPEN:
-		do_open(e);
+		ed_open(e);
 		break;
 	case MA_SAVE:
 		(void)save_editor(e);
 		break;
 	case MA_SAVE_AS:
-		do_save_as(e);
+		ed_save_as(e);
 		break;
 	case MA_BUF_NEXT:
 		buf_cycle(e, 1);
@@ -6188,30 +6123,30 @@ run_menu_act(struct editor *e, enum menu_act act)
 		buf_list(e);
 		break;
 	case MA_EXIT:
-		if (confirm_save(e, "Save changes before exiting?"))
+		if (dlg_confirm_save(e, "Save changes before exiting?"))
 			return 1;
 		break;
 	case MA_UNDO:
-		(void)dispatch(e, CMD_UNDO, NULL);
+		(void)ed_dispatch(e, CMD_UNDO, NULL);
 		break;
 	case MA_REDO:
-		(void)dispatch(e, CMD_REDO, NULL);
+		(void)ed_dispatch(e, CMD_REDO, NULL);
 		break;
 	case MA_CUT:
-		(void)dispatch(e, CMD_CUT, NULL);
+		(void)ed_dispatch(e, CMD_CUT, NULL);
 		break;
 	case MA_COPY:
-		(void)dispatch(e, CMD_COPY, NULL);
+		(void)ed_dispatch(e, CMD_COPY, NULL);
 		break;
 	case MA_PASTE:
-		(void)dispatch(e, CMD_PASTE, NULL);
+		(void)ed_dispatch(e, CMD_PASTE, NULL);
 		break;
 	case MA_FIND:
 		find_prompt(e);
 		break;
 	case MA_FIND_NEXT:
 		if (e->last_find[0])
-			do_find(e, e->last_find);
+			ed_find(e, e->last_find);
 		else
 			snprintf(e->status, sizeof(e->status),
 			    "no previous search");
@@ -6258,16 +6193,16 @@ run_menu_act(struct editor *e, enum menu_act act)
 	case MA_MOUSE:
 		e->mouse_on = !e->mouse_on;
 		if (e->term)
-			draw_term_mouse(e->term, e->mouse_on);
+			scr_mouse(e->term, e->mouse_on);
 		snprintf(e->status, sizeof(e->status), "mouse %s%s",
 		    e->mouse_on ? "on" : "off",
 		    e->mouse_on ? "" : " (terminal selection restored)");
 		break;
 	case MA_HELP:
-		show_help(e);
+		dlg_help(e);
 		break;
 	case MA_ABOUT:
-		show_about(e);
+		dlg_about(e);
 		break;
 	case MA_NONE:
 	case MA_SEP:
@@ -6306,8 +6241,8 @@ menu_step(int m, int sel, int dir)
 
 /* Run the menu bar with menu `start` open. Returns the chosen action, or
  * MA_NONE when the user backs out with Esc. */
-static enum menu_act
-menu_bar_run(struct editor *e, int start, int open)
+static Menuact
+menu_bar_run(Editor *e, int start, int open)
 {
 	int cur = start;
 	int sel;
@@ -6321,24 +6256,24 @@ menu_bar_run(struct editor *e, int start, int open)
 	sel = menu_first(cur);
 
 	for (;;) {
-		struct draw_event ev;
+		Event ev;
 		uint32_t ch;
 
 		render_body(e, e->d);
-		draw_menubar(e, chrome(e), cur);
+		ui_menubar(e, ed_chrome(e), cur);
 		if (menu_open)
-			draw_dropdown(e, cur, sel);
-		draw_cursor_vis(e->d, 0);
-		draw_present(e->d);
+			ui_dropdown(e, cur, sel);
+		scr_cursor_vis(e->d, 0);
+		scr_present(e->d);
 
-		switch (draw_wait(e->d, &ev)) {
-		case DRAW_EVENT_EOF:
+		switch (scr_wait(e->d, &ev)) {
+		case EVENT_EOF:
 			return MA_EXIT;
-		case DRAW_EVENT_RESIZE:
-		case DRAW_EVENT_RESUME:
-			draw_size(e->d, &e->rows, &e->cols);
+		case EVENT_RESIZE:
+		case EVENT_RESUME:
+			scr_size(e->d, &e->rows, &e->cols);
 			continue;
-		case DRAW_EVENT_KEY:
+		case EVENT_KEY:
 			break;
 		default:
 			continue;
@@ -6523,7 +6458,7 @@ usage(void)
  * on the one backing buffer, so save, quit, find, and goto behave identically
  * whichever view raised them. Returns 1 when the editor should exit. */
 static int
-run_req(struct editor *e, enum req req)
+run_req(Editor *e, Req req)
 {
 	switch (req) {
 	case REQ_FIND:
@@ -6533,13 +6468,13 @@ run_req(struct editor *e, enum req req)
 		goto_prompt(e);
 		break;
 	case REQ_HELP:
-		show_help(e);
+		dlg_help(e);
 		break;
 	case REQ_SAVE:
 		(void)save_editor(e);
 		break;
 	case REQ_QUIT:
-		if (confirm_save(e, "Save changes before exiting?"))
+		if (dlg_confirm_save(e, "Save changes before exiting?"))
 			return 1;
 		break;
 	default:
@@ -6562,7 +6497,7 @@ run_req(struct editor *e, enum req req)
 
 /* Append blank lines until row y exists. */
 static void
-draw_ensure_row(struct editor *e, size_t y)
+draw_ensure_row(Editor *e, size_t y)
 {
 	while (text_lines(e->t) <= y) {
 		size_t last = text_lines(e->t) - 1;
@@ -6573,7 +6508,7 @@ draw_ensure_row(struct editor *e, size_t y)
 
 /* Pad row y with spaces so it is at least col bytes long. */
 static void
-draw_pad_col(struct editor *e, size_t y, size_t col)
+draw_pad_col(Editor *e, size_t y, size_t col)
 {
 	size_t len = text_line_len(e->t, y);
 	char sp[128];
@@ -6595,7 +6530,7 @@ draw_pad_col(struct editor *e, size_t y, size_t col)
 /* Overwrite the cell at the cursor with one glyph, extending virtual space as
  * needed, then advance the cursor past it. */
 static void
-draw_overtype(struct editor *e, const char *bytes, size_t n)
+draw_overtype(Editor *e, const char *bytes, size_t n)
 {
 	size_t len = 0;
 
@@ -6616,7 +6551,7 @@ draw_overtype(struct editor *e, const char *bytes, size_t n)
 
 /* Erase the cell under the cursor to a space, without moving. */
 static void
-draw_erase(struct editor *e)
+draw_erase(Editor *e)
 {
 	size_t len;
 	const char *s;
@@ -6636,7 +6571,7 @@ draw_erase(struct editor *e)
 
 /* Move the free cursor by (dy, dx) cells, never wrapping at an edge. */
 static void
-draw_move(struct editor *e, int dy, int dx)
+draw_move(Editor *e, int dy, int dx)
 {
 	if (dy < 0)
 		e->cy = e->cy >= (size_t)(-dy) ? e->cy + dy : 0;
@@ -6668,7 +6603,7 @@ draw_move(struct editor *e, int dy, int dx)
 
 /* Rectangle bounds (inclusive) of the current block selection. */
 static void
-draw_block_bounds(struct editor *e, size_t *y1, size_t *y2, size_t *x1,
+draw_block_bounds(Editor *e, size_t *y1, size_t *y2, size_t *x1,
     size_t *x2)
 {
 	*y1 = e->ay < e->cy ? e->ay : e->cy;
@@ -6679,7 +6614,7 @@ draw_block_bounds(struct editor *e, size_t *y1, size_t *y2, size_t *x1,
 
 /* Copy the selected rectangle into the clipboard as blank-padded rows. */
 static void
-draw_block_copy(struct editor *e)
+draw_block_copy(Editor *e)
 {
 	size_t y1, y2, x1, x2, w, y, cap, off = 0;
 	char *buf;
@@ -6716,7 +6651,7 @@ draw_block_copy(struct editor *e)
 
 /* Blank the selected rectangle in place (overlay model). */
 static void
-draw_block_erase(struct editor *e, size_t y1, size_t y2, size_t x1, size_t x2)
+draw_block_erase(Editor *e, size_t y1, size_t y2, size_t x1, size_t x2)
 {
 	size_t y;
 
@@ -6751,7 +6686,7 @@ draw_block_erase(struct editor *e, size_t y1, size_t y2, size_t x1, size_t x2)
 
 /* Cut = copy then blank the rectangle. */
 static void
-draw_block_cut(struct editor *e)
+draw_block_cut(Editor *e)
 {
 	size_t y1, y2, x1, x2;
 
@@ -6765,7 +6700,7 @@ draw_block_cut(struct editor *e)
 
 /* Overlay the clipboard rows at the cursor, extending virtual space. */
 static void
-draw_block_paste(struct editor *e)
+draw_block_paste(Editor *e)
 {
 	size_t y, i;
 
@@ -6799,7 +6734,7 @@ draw_block_paste(struct editor *e)
 /* Overwrite the single cell at (y, x) with one ASCII byte, extending virtual
  * space as needed. The caller owns the undo group. */
 static void
-draw_put_cell(struct editor *e, size_t y, size_t x, char c)
+draw_put_cell(Editor *e, size_t y, size_t x, char c)
 {
 	size_t len;
 
@@ -6819,7 +6754,7 @@ draw_put_cell(struct editor *e, size_t y, size_t x, char c)
  * current block selection. A one-cell-wide or one-cell-tall rectangle reduces
  * to a straight line. The whole box is one undo step. */
 static void
-draw_block_box(struct editor *e)
+draw_block_box(Editor *e)
 {
 	size_t y1, y2, x1, x2, x, y;
 
@@ -6856,7 +6791,7 @@ draw_block_box(struct editor *e)
 /* Toggle draw mode. Entering from vi insert drops back to normal so leaving
  * draw mode lands somewhere sane. */
 static void
-draw_toggle(struct editor *e)
+draw_toggle(Editor *e)
 {
 	e->draw_mode = !e->draw_mode;
 	e->sel_active = 0;
@@ -6871,8 +6806,8 @@ draw_toggle(struct editor *e)
 }
 
 /* Handle one key in draw mode. Returns a request for the main loop. */
-static enum req
-draw_key(struct editor *e, const struct tkbd_seq *seq)
+static Req
+draw_key(Editor *e, const struct tkbd_seq *seq)
 {
 	int shift = seq->mod & TKBD_MOD_SHIFT;
 	int ctrl = seq->mod & TKBD_MOD_CTRL;
@@ -7013,7 +6948,7 @@ draw_key(struct editor *e, const struct tkbd_seq *seq)
 
 /* Set an editor's defaults on a zeroed struct. */
 static void
-editor_init(struct editor *e)
+editor_init(Editor *e)
 {
 	memset(e, 0, sizeof(*e));
 	e->hl_on = 0;		/* no syntax engine in vedit */
@@ -7021,27 +6956,26 @@ editor_init(struct editor *e)
 	e->hex_cols = 16;
 	e->dos_chrome = 1;	/* MS-EDIT look by default; toggleable */
 	e->mouse_on = 0;	/* no mouse decoding */
-	e->err_cur = -1;
 }
 
 /* Run the event loop until the editor exits. Returns a process-style code:
  * 0 on a normal quit, 1 on end-of-input or vi ':cq'. */
 static int
-editor_loop(struct editor *e)
+editor_loop(Editor *e)
 {
 	for (;;) {
-		struct draw_event ev;
+		Event ev;
 		struct tkbd_seq seq;
 
-		switch (draw_wait(e->d, &ev)) {
-		case DRAW_EVENT_EOF:
+		switch (scr_wait(e->d, &ev)) {
+		case EVENT_EOF:
 			return 1;
-		case DRAW_EVENT_RESIZE:
-		case DRAW_EVENT_RESUME:
-			draw_size(e->d, &e->rows, &e->cols);
-			render(e, e->d);
+		case EVENT_RESIZE:
+		case EVENT_RESUME:
+			scr_size(e->d, &e->rows, &e->cols);
+			ed_render(e, e->d);
 			continue;
-		case DRAW_EVENT_KEY:
+		case EVENT_KEY:
 			seq = ev.key;
 			break;
 		default:
@@ -7059,11 +6993,11 @@ editor_loop(struct editor *e)
 				/* F10 arms the bar (a letter then opens a menu);
 				 * Alt+letter opens that menu straight away. */
 				int open = (seq.key != TKBD_KEY_F10);
-				enum menu_act act = menu_bar_run(e, mi, open);
+				Menuact act = menu_bar_run(e, mi, open);
 
 				if (run_menu_act(e, act))
 					return 0;
-				render(e, e->d);
+				ed_render(e, e->d);
 				continue;
 			}
 		}
@@ -7073,7 +7007,7 @@ editor_loop(struct editor *e)
 		if (e->hex_view) {
 			if (run_req(e, hex_key(e, &seq)))
 				return 0;
-			render(e, e->d);
+			ed_render(e, e->d);
 			continue;
 		}
 
@@ -7082,7 +7016,7 @@ editor_loop(struct editor *e)
 		if (seq.type == TKBD_KEY && seq.key == TKBD_KEY_INS &&
 		    !(seq.mod & TKBD_MOD_CTRL)) {
 			draw_toggle(e);
-			render(e, e->d);
+			ed_render(e, e->d);
 			continue;
 		}
 
@@ -7090,7 +7024,7 @@ editor_loop(struct editor *e)
 		if (e->draw_mode) {
 			if (run_req(e, draw_key(e, &seq)))
 				return 0;
-			render(e, e->d);
+			ed_render(e, e->d);
 			continue;
 		}
 
@@ -7111,7 +7045,7 @@ editor_loop(struct editor *e)
 				snprintf(e->status, sizeof(e->status),
 				    "modeless mode (F2 for vi keys)");
 			}
-			render(e, e->d);
+			ed_render(e, e->d);
 			continue;
 		}
 
@@ -7120,7 +7054,7 @@ editor_loop(struct editor *e)
 		if (seq.type == TKBD_KEY && seq.key == TKBD_KEY_F8 &&
 		    !(seq.mod & TKBD_MOD_CTRL)) {
 			buf_cycle(e, (seq.mod & TKBD_MOD_SHIFT) ? -1 : 1);
-			render(e, e->d);
+			ed_render(e, e->d);
 			continue;
 		}
 
@@ -7129,7 +7063,7 @@ editor_loop(struct editor *e)
 				paste_discard(e);
 			else
 				paste_input(e);
-			render(e, e->d);
+			ed_render(e, e->d);
 			continue;
 		}
 
@@ -7149,33 +7083,33 @@ editor_loop(struct editor *e)
 				vi_search(e);
 				break;
 			case REQ_HELP:
-				show_help(e);
+				dlg_help(e);
 				break;
 			case REQ_FORCE_QUIT:
 				return 0;
 			default:
 				break;
 			}
-			render(e, e->d);
+			ed_render(e, e->d);
 			continue;
 		}
 
-		if (run_req(e, dispatch(e, key_to_cmd(&seq), &seq)))
+		if (run_req(e, ed_dispatch(e, key_to_cmd(&seq), &seq)))
 			return 0;
-		render(e, e->d);
+		ed_render(e, e->d);
 	}
 }
 
 /* Release everything an editor owns, including the draw surface (which frees
  * the terminal backend through it). */
 static void
-editor_teardown(struct editor *e)
+editor_teardown(Editor *e)
 {
 	int i;
 
 	if (e->d) {
-		draw_end(e->d);
-		draw_free(e->d);
+		scr_end(e->d);
+		scr_free(e->d);
 		e->d = NULL;
 		e->term = NULL;
 	}
@@ -7187,7 +7121,6 @@ editor_teardown(struct editor *e)
 		buf_free_fields(e->t, e->line_state);
 	}
 	free(e->bufs);
-	free(e->errs);
 	free(e->clip);
 	for (i = 0; i < 26; i++)
 		free(e->vi_regs[i].bytes);
@@ -7206,7 +7139,7 @@ editor_teardown(struct editor *e)
  ****************************************************************/
 
 struct vedit {
-	struct editor	e;
+	Editor	e;
 	int		registered;	/* buffer 0 registered yet */
 };
 
@@ -7215,7 +7148,7 @@ struct vedit *
 vedit_new(const struct vedit_io *io)
 {
 	struct vedit *v = calloc(1, sizeof(*v));
-	struct draw_term *term;
+	Scrbuf *term;
 
 	if (!v)
 		return NULL;
@@ -7226,14 +7159,14 @@ vedit_new(const struct vedit_io *io)
 		free(v);
 		return NULL;
 	}
-	term = draw_term_new_io(io);
+	term = scr_new_io(io);
 	if (!term) {
 		text_free(v->e.t);
 		free(v);
 		return NULL;
 	}
 	v->e.term = term;
-	v->e.d = draw_new(draw_term_driver(), term);
+	v->e.d = scr_new(term);
 	if (!v->e.d) {
 		free(term->out);
 		free(term->cur);
@@ -7244,7 +7177,7 @@ vedit_new(const struct vedit_io *io)
 		free(v);
 		return NULL;
 	}
-	draw_size(v->e.d, &v->e.rows, &v->e.cols);
+	scr_size(v->e.d, &v->e.rows, &v->e.cols);
 	return v;
 }
 
@@ -7279,7 +7212,7 @@ vedit_set_size(struct vedit *v, int rows, int cols)
 		return;
 	if (rows == v->e.rows && cols == v->e.cols)
 		return;
-	draw_resize(v->e.d, rows, cols);
+	scr_resize(v->e.d, rows, cols);
 	v->e.rows = rows;
 	v->e.cols = cols;
 	v->e.term->want_resize = 1;
@@ -7290,7 +7223,7 @@ vedit_set_size(struct vedit *v, int rows, int cols)
 int
 vedit_run(struct vedit *v)
 {
-	struct editor *e = &v->e;
+	Editor *e = &v->e;
 	int rc;
 
 	if (!v->registered) {
@@ -7299,9 +7232,9 @@ vedit_run(struct vedit *v)
 		buf_save(e, &e->bufs[0]);
 		v->registered = 1;
 	}
-	draw_begin(e->d);
+	scr_begin(e->d);
 	snprintf(e->status, sizeof(e->status), "Press F1 for help");
-	render(e, e->d);
+	ed_render(e, e->d);
 	rc = editor_loop(e);
 	return rc;
 }
@@ -7322,13 +7255,13 @@ vedit_free(struct vedit *v)
  * signals; an embedded host supplies its own io instead.
  ****************************************************************/
 
-struct tty_io {
+typedef struct tty_io {
 	int		in_fd, out_fd;
 	struct termios	saved;
 	int		raw;
-};
+} Ttyio;
 
-static struct tty_io g_tty;	/* the CLI runs a single editor */
+static Ttyio g_tty;	/* the CLI runs a single editor */
 
 static void
 tty_on_winch(int sig)
@@ -7340,7 +7273,7 @@ tty_on_winch(int sig)
 static long
 tty_read(void *ctx, void *buf, long n)
 {
-	struct tty_io *t = ctx;
+	Ttyio *t = ctx;
 	ssize_t r = read(t->in_fd, buf, (size_t)n);
 
 	if (r < 0) {
@@ -7354,7 +7287,7 @@ tty_read(void *ctx, void *buf, long n)
 static long
 tty_write(void *ctx, const void *buf, long n)
 {
-	struct tty_io *t = ctx;
+	Ttyio *t = ctx;
 	const char *p = buf;
 	long off = 0;
 
@@ -7374,7 +7307,7 @@ tty_write(void *ctx, const void *buf, long n)
 static int
 tty_poll(void *ctx, int timeout_ms)
 {
-	struct tty_io *t = ctx;
+	Ttyio *t = ctx;
 	fd_set rfds;
 	struct timeval tv, *ptv = NULL;
 	int r;
@@ -7395,7 +7328,7 @@ tty_poll(void *ctx, int timeout_ms)
 static void
 tty_begin(void *ctx)
 {
-	struct tty_io *t = ctx;
+	Ttyio *t = ctx;
 	struct termios raw;
 	struct sigaction sa;
 
@@ -7419,7 +7352,7 @@ tty_begin(void *ctx)
 static void
 tty_end(void *ctx)
 {
-	struct tty_io *t = ctx;
+	Ttyio *t = ctx;
 	struct sigaction sa;
 
 	memset(&sa, 0, sizeof(sa));
@@ -7434,7 +7367,7 @@ tty_end(void *ctx)
 static int
 tty_getsize(void *ctx, int *rows, int *cols)
 {
-	struct tty_io *t = ctx;
+	Ttyio *t = ctx;
 	struct winsize ws;
 
 	if (ioctl(t->out_fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) {
@@ -7520,7 +7453,7 @@ main(int argc, char **argv)
 /* vi.c : the vi personality for lumi edit.
  *
  * A self-contained modal layer over the modeless editor's buffer operations
- * in edit.c. It keeps its state on struct editor (mode, a pending count, a
+ * in edit.c. It keeps its state on Editor (mode, a pending count, a
  * pending operator) so one key press advances a small state machine: digits
  * build a count, d/c/y arm an operator, and a motion either moves the cursor
  * or, when an operator is armed, defines the span it acts on. It reaches the
@@ -7533,7 +7466,7 @@ main(int argc, char **argv)
  * vi personality -- modal editing (toggle with F2)
  *
  * This is a self-contained block layered on top of the modeless editor's
- * buffer operations. It keeps its state on struct editor (mode, a pending
+ * buffer operations. It keeps its state on Editor (mode, a pending
  * count, and a pending operator) so a single key press advances a small
  * state machine: digits build a count, d/c/y arm an operator, and a motion
  * either moves the cursor or, when an operator is armed, defines the span it
@@ -7543,7 +7476,7 @@ main(int argc, char **argv)
 
 /* Byte offset of the first non-blank on a line, or 0 if the line is blank. */
 static size_t
-first_nonblank(struct editor *e, size_t y)
+first_nonblank(Editor *e, size_t y)
 {
 	size_t len = 0, x = 0;
 	const char *s = text_line(e->t, y, &len);
@@ -7560,7 +7493,7 @@ first_nonblank(struct editor *e, size_t y)
 /* Keep the cursor on a valid line and rune boundary. In normal mode the
  * cursor rests on a character, so it may not sit past the last rune. */
 void
-vi_clamp(struct editor *e)
+vi_clamp(Editor *e)
 {
 	size_t len = 0;
 	const char *s;
@@ -7581,7 +7514,7 @@ vi_clamp(struct editor *e)
 
 /* Clear any pending count, operator, and 'g' prefix. */
 void
-vi_reset_pending(struct editor *e)
+vi_reset_pending(Editor *e)
 {
 	e->vi_count = 0;
 	e->vi_op = 0;
@@ -7613,7 +7546,7 @@ vi_class(uint32_t r, int big)
 /* Decode the rune at (y,x); returns its byte length and fills *r, or 0 when
  * the position is at or past the end of the line. */
 static int
-vi_rune(struct editor *e, size_t y, size_t x, uint32_t *r)
+vi_rune(Editor *e, size_t y, size_t x, uint32_t *r)
 {
 	size_t len = 0;
 	const char *s = text_line(e->t, y, &len);
@@ -7628,7 +7561,7 @@ vi_rune(struct editor *e, size_t y, size_t x, uint32_t *r)
 /* Step one rune left, crossing to the end of the previous line. Returns 0
  * when already at the start of the buffer. */
 static int
-vi_step_back(struct editor *e, size_t *y, size_t *x)
+vi_step_back(Editor *e, size_t *y, size_t *x)
 {
 	if (*x > 0) {
 		size_t len = 0;
@@ -7646,7 +7579,7 @@ vi_step_back(struct editor *e, size_t *y, size_t *x)
 
 /* Advance (*py,*px) to the start of the next word. */
 static void
-vi_pos_word_fwd(struct editor *e, size_t *py, size_t *px, int big)
+vi_pos_word_fwd(Editor *e, size_t *py, size_t *px, int big)
 {
 	size_t y = *py, x = *px, len;
 	uint32_t r;
@@ -7686,7 +7619,7 @@ vi_pos_word_fwd(struct editor *e, size_t *py, size_t *px, int big)
 
 /* Move (*py,*px) back to the start of the previous word. */
 static void
-vi_pos_word_back(struct editor *e, size_t *py, size_t *px, int big)
+vi_pos_word_back(Editor *e, size_t *py, size_t *px, int big)
 {
 	size_t y = *py, x = *px;
 	uint32_t r;
@@ -7733,7 +7666,7 @@ done:
 
 /* Advance (*py,*px) to the last rune of the next word (inclusive target). */
 static void
-vi_pos_word_end(struct editor *e, size_t *py, size_t *px, int big)
+vi_pos_word_end(Editor *e, size_t *py, size_t *px, int big)
 {
 	size_t y = *py, x = *px;
 	uint32_t r;
@@ -7780,7 +7713,7 @@ done:
 /* Move one rune forward, crossing to the start of the next line. Returns 0
  * at the end of the buffer. */
 static int
-vi_step_fwd(struct editor *e, size_t *y, size_t *x)
+vi_step_fwd(Editor *e, size_t *y, size_t *x)
 {
 	size_t len = 0;
 	const char *s = text_line(e->t, *y, &len);
@@ -7799,7 +7732,7 @@ vi_step_fwd(struct editor *e, size_t *y, size_t *x)
 /* Paragraphs are separated by empty lines. '}' moves to the next empty line
  * below (or the end of the buffer); '{' to the previous one (or the top). */
 static void
-vi_para_fwd(struct editor *e, size_t *py, size_t *px, int count)
+vi_para_fwd(Editor *e, size_t *py, size_t *px, int count)
 {
 	size_t y = *py, nlines = text_lines(e->t);
 	int i;
@@ -7821,7 +7754,7 @@ vi_para_fwd(struct editor *e, size_t *py, size_t *px, int count)
 }
 
 static void
-vi_para_back(struct editor *e, size_t *py, size_t *px, int count)
+vi_para_back(Editor *e, size_t *py, size_t *px, int count)
 {
 	size_t y = *py;
 	int i;
@@ -7854,7 +7787,7 @@ vi_pos_lt(size_t ay, size_t ax, size_t by, size_t bx)
  * '.', '!' or '?' followed by optional closers and then whitespace or the end
  * of a line; an empty line is also a boundary. */
 static void
-vi_sentence_step_fwd(struct editor *e, size_t *py, size_t *px)
+vi_sentence_step_fwd(Editor *e, size_t *py, size_t *px)
 {
 	size_t y = *py, x = *px, nlines = text_lines(e->t);
 	uint32_t r;
@@ -7928,7 +7861,7 @@ done:
 /* First content line of the paragraph containing y, at its first non-blank.
  * A blank line is its own paragraph start. */
 static void
-vi_para_content_start(struct editor *e, size_t y, size_t *sy, size_t *sx)
+vi_para_content_start(Editor *e, size_t y, size_t *sy, size_t *sx)
 {
 	if (text_line_len(e->t, y) == 0) {
 		*sy = y;
@@ -7945,7 +7878,7 @@ vi_para_content_start(struct editor *e, size_t y, size_t *sy, size_t *sx)
  * walks forward from a point at most a paragraph earlier and keeps the last
  * sentence start before the cursor, which handles crossing a blank line. */
 static void
-vi_sentence_step_back(struct editor *e, size_t *py, size_t *px)
+vi_sentence_step_back(Editor *e, size_t *py, size_t *px)
 {
 	size_t cy = *py, cx = *px, scan_y, scan_x, best_y, best_x, cur_y, cur_x;
 
@@ -7991,12 +7924,12 @@ vi_sentence_step_back(struct editor *e, size_t *py, size_t *px)
 }
 
 /* A resolved motion: a target position plus how an operator treats it. */
-struct vi_mot {
+typedef struct vi_mot {
 	size_t	y, x;
 	int	line;		/* operate on whole lines */
 	int	incl;		/* charwise: include the target rune */
 	int	valid;
-};
+} Motion;
 
 /* Classify a bracket rune: fill *match with its partner and *forward with the
  * direction to search for it. Returns 0 for a non-bracket. */
@@ -8018,10 +7951,10 @@ vi_bracket_info(uint32_t r, uint32_t *match, int *forward)
  * current line, jump to its match, counting nesting across lines. The result
  * is inclusive so d% covers through the match. Invalid when the line holds no
  * bracket at or after the cursor, or the match is unbalanced. */
-static struct vi_mot
-vi_match_pair(struct editor *e)
+static Motion
+vi_match_pair(Editor *e)
 {
-	struct vi_mot r = { e->cy, e->cx, 0, 0, 0 };
+	Motion r = { e->cy, e->cx, 0, 0, 0 };
 	size_t len = 0, bx = e->cx;
 	const char *s = text_line(e->t, e->cy, &len);
 	uint32_t open = 0, want = 0;
@@ -8077,7 +8010,7 @@ vi_match_pair(struct editor *e)
  * on line y, expanding tabs and honoring rune widths. Returns the line length
  * when the column is past the end. This is the inverse of disp_cols(). */
 size_t
-vi_col_to_byte(struct editor *e, size_t y, int target_col)
+vi_col_to_byte(Editor *e, size_t y, int target_col)
 {
 	size_t len = 0;
 	const char *s = text_line(e->t, y, &len);
@@ -8113,10 +8046,10 @@ vi_col_to_byte(struct editor *e, size_t y, int target_col)
 
 /* Resolve a motion character to a target. have_count says whether the caller
  * actually typed a count (matters for G/gg, whose count is a line number). */
-static struct vi_mot
-vi_motion(struct editor *e, uint32_t m, int count, int have_count)
+static Motion
+vi_motion(Editor *e, uint32_t m, int count, int have_count)
 {
-	struct vi_mot r = { e->cy, e->cx, 0, 0, 1 };
+	Motion r = { e->cy, e->cx, 0, 0, 1 };
 	size_t len = text_line_len(e->t, e->cy);
 	const char *line = text_line(e->t, e->cy, NULL);
 	int i;
@@ -8346,11 +8279,11 @@ find_char_back(const char *s, size_t from, uint32_t target, int count,
 
 /* Resolve an f/F/t/T search for target on the current line. repeat is set for
  * ; and , so a t/T advances past an adjacent match instead of sticking. */
-static struct vi_mot
-vi_charsearch_motion(struct editor *e, char cmd, uint32_t target, int count,
+static Motion
+vi_charsearch_motion(Editor *e, char cmd, uint32_t target, int count,
     int repeat)
 {
-	struct vi_mot r = { e->cy, e->cx, 0, 0, 0 };
+	Motion r = { e->cy, e->cx, 0, 0, 0 };
 	size_t len = 0;
 	const char *s = text_line(e->t, e->cy, &len);
 	int forward = (cmd == 'f' || cmd == 't');
@@ -8388,7 +8321,7 @@ vi_charsearch_motion(struct editor *e, char cmd, uint32_t target, int count,
 
 /* Remove whole lines [y1,y2], keeping the buffer's one-line invariant. */
 static void
-vi_delete_lines(struct editor *e, size_t y1, size_t y2)
+vi_delete_lines(Editor *e, size_t y1, size_t y2)
 {
 	size_t nlines = text_lines(e->t);
 	size_t count, i;
@@ -8431,12 +8364,12 @@ vi_delete_lines(struct editor *e, size_t y1, size_t y2)
  * uppercase name appending rather than replacing. The unnamed register always
  * mirrors the stored text, and the one-shot register selection is released. */
 static void
-vi_reg_store(struct editor *e, char *bytes, size_t len, int linewise)
+vi_reg_store(Editor *e, char *bytes, size_t len, int linewise)
 {
 	char reg = e->vi_reg;
 
 	if (reg >= 'a' && reg <= 'z') {
-		struct vi_reg *r = &e->vi_regs[reg - 'a'];
+		Reg *r = &e->vi_regs[reg - 'a'];
 		char *dup = malloc(len ? len : 1);
 
 		if (dup) {
@@ -8447,7 +8380,7 @@ vi_reg_store(struct editor *e, char *bytes, size_t len, int linewise)
 			r->linewise = linewise;
 		}
 	} else if (reg >= 'A' && reg <= 'Z') {
-		struct vi_reg *r = &e->vi_regs[reg - 'A'];
+		Reg *r = &e->vi_regs[reg - 'A'];
 		size_t nl = r->len + len;
 		char *cat = malloc(nl ? nl : 1);
 
@@ -8476,14 +8409,14 @@ vi_reg_store(struct editor *e, char *bytes, size_t len, int linewise)
  * e->vi_reg, or the unnamed clip. The returned bytes are owned by the editor
  * and must not be freed by the caller. */
 static void
-vi_reg_get(struct editor *e, const char **bytes, size_t *len, int *linewise)
+vi_reg_get(Editor *e, const char **bytes, size_t *len, int *linewise)
 {
 	char reg = e->vi_reg;
 
 	if (reg >= 'A' && reg <= 'Z')
 		reg += 'a' - 'A';
 	if (reg >= 'a' && reg <= 'z') {
-		struct vi_reg *r = &e->vi_regs[reg - 'a'];
+		Reg *r = &e->vi_regs[reg - 'a'];
 
 		*bytes = r->bytes;
 		*len = r->len;
@@ -8497,7 +8430,7 @@ vi_reg_get(struct editor *e, const char **bytes, size_t *len, int *linewise)
 
 /* Yank a charwise span into the register. */
 static void
-vi_yank_region(struct editor *e, size_t sy, size_t sx, size_t ey, size_t ex)
+vi_yank_region(Editor *e, size_t sy, size_t sx, size_t ey, size_t ex)
 {
 	size_t rl = 0;
 	char *r = region_text(e, sy, sx, ey, ex, &rl);
@@ -8509,7 +8442,7 @@ vi_yank_region(struct editor *e, size_t sy, size_t sx, size_t ey, size_t ex)
 /* Yank whole lines [y1,y2] into the register, with a trailing newline so a
  * later put reproduces them as lines. */
 static void
-vi_yank_lines(struct editor *e, size_t y1, size_t y2)
+vi_yank_lines(Editor *e, size_t y1, size_t y2)
 {
 	size_t rl = 0, lastlen = text_line_len(e->t, y2);
 	char *r = region_text(e, y1, 0, y2, lastlen, &rl);
@@ -8527,18 +8460,18 @@ vi_yank_lines(struct editor *e, size_t y1, size_t y2)
 }
 
 static void
-enter_insert(struct editor *e)
+enter_insert(Editor *e)
 {
 	e->mode = MODE_INSERT;
 }
 
-static void vi_shift_lines(struct editor *e, size_t y1, size_t y2, int dir);
+static void vi_shift_lines(Editor *e, size_t y1, size_t y2, int dir);
 
 /* Apply operator op linewise over lines [lo,hi]. The caller has already opened
  * the undo group; this closes it (except for a change, which stays open until
  * the insert Esc). */
-static enum req
-vi_op_lines(struct editor *e, char op, size_t lo, size_t hi)
+static Req
+vi_op_lines(Editor *e, char op, size_t lo, size_t hi)
 {
 	vi_yank_lines(e, lo, hi);
 	if (op == 'y') {
@@ -8555,7 +8488,7 @@ vi_op_lines(struct editor *e, char op, size_t lo, size_t hi)
 
 			e->cy = last;
 			e->cx = text_line_len(e->t, last);
-			do_newline(e);
+			ed_newline(e);
 		} else {
 			text_split(e->t, lo, 0);
 			e->cy = lo;
@@ -8573,8 +8506,8 @@ vi_op_lines(struct editor *e, char op, size_t lo, size_t hi)
 
 /* Apply an armed operator (d/c/y, or the > / < shifts) over a resolved
  * motion. */
-static enum req
-vi_apply_operator(struct editor *e, char op, struct vi_mot m)
+static Req
+vi_apply_operator(Editor *e, char op, Motion m)
 {
 	size_t sy, sx, ey, ex;
 
@@ -8651,7 +8584,7 @@ vi_apply_operator(struct editor *e, char op, struct vi_mot m)
 /* Put the register after (or before) the cursor: linewise as new lines,
  * charwise inline. */
 static void
-vi_put(struct editor *e, int after)
+vi_put(Editor *e, int after)
 {
 	const char *clip;
 	size_t clip_len;
@@ -8690,12 +8623,12 @@ vi_put(struct editor *e, int after)
 				j++;
 			if (top_before) {
 				if (j > i)
-					do_insert(e, clip + i, j - i);
-				do_newline(e);
+					ed_insert(e, clip + i, j - i);
+				ed_newline(e);
 			} else {
-				do_newline(e);
+				ed_newline(e);
 				if (j > i)
-					do_insert(e, clip + i, j - i);
+					ed_insert(e, clip + i, j - i);
 			}
 			if (j >= l)
 				break;
@@ -8727,7 +8660,7 @@ vi_put(struct editor *e, int after)
 
 /* Delete count runes at the cursor (the vi 'x' command). */
 static void
-vi_delete_char(struct editor *e, int count)
+vi_delete_char(Editor *e, int count)
 {
 	size_t len = 0, start = e->cx, x = e->cx, rl = 0;
 	const char *s = text_line(e->t, e->cy, &len);
@@ -8752,7 +8685,7 @@ vi_delete_char(struct editor *e, int count)
 
 /* Enter insert mode at the point implied by an insert-entry command. */
 static void
-vi_enter_insert_cmd(struct editor *e, uint32_t c)
+vi_enter_insert_cmd(Editor *e, uint32_t c)
 {
 	size_t len = 0;
 	const char *s;
@@ -8775,7 +8708,7 @@ vi_enter_insert_cmd(struct editor *e, uint32_t c)
 		break;
 	case 'o':
 		e->cx = text_line_len(e->t, e->cy);
-		do_newline(e);
+		ed_newline(e);
 		break;
 	case 'O':
 		e->cx = 0;
@@ -8788,7 +8721,7 @@ vi_enter_insert_cmd(struct editor *e, uint32_t c)
 
 /* Move the cursor by a signed number of lines, for the scroll keys. */
 static void
-vi_move_lines(struct editor *e, int delta)
+vi_move_lines(Editor *e, int delta)
 {
 	if (delta < 0) {
 		size_t d = (size_t)(-delta);
@@ -8806,7 +8739,7 @@ vi_move_lines(struct editor *e, int delta)
  * a leading tab or up to TAB_WIDTH leading spaces. Blank lines are left alone.
  * The cursor rests on the first non-blank of the first shifted line. */
 static void
-vi_shift_lines(struct editor *e, size_t y1, size_t y2, int dir)
+vi_shift_lines(Editor *e, size_t y1, size_t y2, int dir)
 {
 	size_t y;
 
@@ -8848,13 +8781,13 @@ vi_shift_lines(struct editor *e, size_t y1, size_t y2, int dir)
 
 /* Carry out a motion character: move the cursor, or, when an operator is
  * armed, apply it over the motion's span. */
-static enum req
-vi_do_motion(struct editor *e, uint32_t motchar)
+static Req
+vi_do_motion(Editor *e, uint32_t motchar)
 {
 	int mot_have = e->vi_count > 0;
 	int mot_count = mot_have ? e->vi_count : 1;
 	int have, count;
-	struct vi_mot m;
+	Motion m;
 
 	if (e->vi_op) {
 		int oc = e->vi_op_count > 0 ? e->vi_op_count : 1;
@@ -8923,12 +8856,12 @@ vi_do_motion(struct editor *e, uint32_t motchar)
 /* Carry out an f/F/t/T (or a ; / , repeat) search, moving the cursor or, when
  * an operator is armed, applying it over the span. repeat is set for ; and ,
  * so the remembered search is not overwritten. */
-static enum req
-vi_do_charsearch(struct editor *e, char cmd, uint32_t target, int repeat)
+static Req
+vi_do_charsearch(Editor *e, char cmd, uint32_t target, int repeat)
 {
 	int mot_count = e->vi_count > 0 ? e->vi_count : 1;
 	int count;
-	struct vi_mot m;
+	Motion m;
 
 	if (!repeat) {
 		e->vi_last_fT = cmd;
@@ -8969,7 +8902,7 @@ vi_do_charsearch(struct editor *e, char cmd, uint32_t target, int repeat)
  * when there is none, or (on whitespace) the following word. big picks WORD
  * class (whitespace-delimited) over word class. */
 static int
-vi_word_object(struct editor *e, char kind, int big, size_t *sx, size_t *ex)
+vi_word_object(Editor *e, char kind, int big, size_t *sx, size_t *ex)
 {
 	size_t len = 0;
 	const char *s = text_line(e->t, e->cy, &len);
@@ -9048,7 +8981,7 @@ vi_word_object(struct editor *e, char kind, int big, size_t *sx, size_t *ex)
 /* Bracket object: find the pair of open/close brackets enclosing the cursor,
  * counting nesting across lines. 'i' spans inside them, 'a' includes them. */
 static int
-vi_bracket_object(struct editor *e, char kind, uint32_t open, uint32_t close,
+vi_bracket_object(Editor *e, char kind, uint32_t open, uint32_t close,
     size_t *sy, size_t *sx, size_t *ey, size_t *ex)
 {
 	size_t oy = e->cy, ox = e->cx, ny, nx;
@@ -9107,7 +9040,7 @@ vi_bracket_object(struct editor *e, char kind, uint32_t open, uint32_t close,
  * is the first whose closing quote is at or after the cursor. 'i' spans
  * between the quotes, 'a' includes them. */
 static int
-vi_quote_object(struct editor *e, char kind, uint32_t q, size_t *sx,
+vi_quote_object(Editor *e, char kind, uint32_t q, size_t *sx,
     size_t *ex)
 {
 	size_t len = 0;
@@ -9150,7 +9083,7 @@ vi_quote_object(struct editor *e, char kind, uint32_t q, size_t *sx,
  * Returns 1 on success. Word and quote objects are line-local; bracket objects
  * may span lines. */
 static int
-vi_text_object(struct editor *e, char kind, uint32_t obj, size_t *sy,
+vi_text_object(Editor *e, char kind, uint32_t obj, size_t *sy,
     size_t *sx, size_t *ey, size_t *ex)
 {
 	*sy = *ey = e->cy;
@@ -9187,8 +9120,8 @@ vi_text_object(struct editor *e, char kind, uint32_t obj, size_t *sy,
 /* Apply an armed operator (d/c/y) over a resolved text-object span. Mirrors
  * the charwise branch of vi_apply_operator, but the span is explicit rather
  * than cursor-to-motion. */
-static enum req
-vi_apply_textobject_op(struct editor *e, char op, size_t sy, size_t sx,
+static Req
+vi_apply_textobject_op(Editor *e, char op, size_t sy, size_t sx,
     size_t ey, size_t ex)
 {
 	if (op == '>' || op == '<') {		/* shift the object's lines */
@@ -9223,8 +9156,8 @@ vi_apply_textobject_op(struct editor *e, char op, size_t sy, size_t sx,
  * 'a'..'z'. A jump with an operator armed applies it over the span: charwise
  * and exclusive for '`', linewise for '\''. Marks hold absolute positions and
  * do not shift as the buffer is edited. */
-static enum req
-vi_do_mark(struct editor *e, char cmd, int idx)
+static Req
+vi_do_mark(Editor *e, char cmd, int idx)
 {
 	size_t y, x;
 	char op;
@@ -9248,7 +9181,7 @@ vi_do_mark(struct editor *e, char cmd, int idx)
 
 	op = e->vi_op;
 	if (op) {
-		struct vi_mot m = { y, x, 0, 0, 1 };
+		Motion m = { y, x, 0, 0, 1 };
 
 		if (cmd == '\'')
 			m.line = 1;		/* '<mark> is linewise */
@@ -9265,7 +9198,7 @@ vi_do_mark(struct editor *e, char cmd, int idx)
 /* Toggle the case of count runes from the cursor, advancing past each. Only
  * ASCII letters flip; other runes are stepped over unchanged (the vi '~'). */
 static void
-vi_toggle_case(struct editor *e, int count)
+vi_toggle_case(Editor *e, int count)
 {
 	int i;
 
@@ -9301,7 +9234,7 @@ vi_toggle_case(struct editor *e, int count)
  * blanks, unless the current line is empty or already ends in whitespace. The
  * cursor rests at the join. */
 static void
-vi_join_lines(struct editor *e, int count)
+vi_join_lines(Editor *e, int count)
 {
 	int joins = count > 1 ? count - 1 : 1;
 	int i;
@@ -9338,10 +9271,10 @@ vi_join_lines(struct editor *e, int count)
 /* Change ('c') or delete ('d') the charwise span from the cursor to (ey,ex),
  * end exclusive. A change enters insert even when the span is empty, so C and
  * s at the end of a line still open for typing. */
-static enum req
-vi_edit_span(struct editor *e, char op, size_t ey, size_t ex)
+static Req
+vi_edit_span(Editor *e, char op, size_t ey, size_t ex)
 {
-	struct vi_mot m = { ey, ex, 0, 0, 1 };
+	Motion m = { ey, ex, 0, 0, 1 };
 
 	if (op == 'c' && e->cy == ey && e->cx == ex) {
 		text_undo_group_begin(e->t);	/* closed by the insert Esc */
@@ -9355,8 +9288,8 @@ vi_edit_span(struct editor *e, char op, size_t ey, size_t ex)
  * newline replaces them with a line break. Nothing happens when the line does
  * not hold count runes from the cursor, matching vi. The cursor rests on the
  * last replaced rune. */
-static enum req
-vi_do_replace(struct editor *e, uint32_t ch)
+static Req
+vi_do_replace(Editor *e, uint32_t ch)
 {
 	int cnt = e->vi_count > 0 ? e->vi_count : 1;
 	size_t len = 0;
@@ -9414,7 +9347,7 @@ vi_do_replace(struct editor *e, uint32_t ch)
  * substring; there are no word boundaries, so it also matches inside longer
  * words. */
 static void
-vi_search_word(struct editor *e, int dir)
+vi_search_word(Editor *e, int dir)
 {
 	size_t len = 0;
 	const char *s = text_line(e->t, e->cy, &len);
@@ -9464,14 +9397,14 @@ vi_search_word(struct editor *e, int dir)
 	snprintf(e->last_find, sizeof(e->last_find), "%s", word);
 	e->vi_search_dir = dir;
 	e->cx = start;				/* search from the word start */
-	do_find_dir(e, word, dir);
+	ed_find_dir(e, word, dir);
 }
 
-static void vi_dot_replay(struct editor *e);
+static void vi_dot_replay(Editor *e);
 
 /* Handle one key in vi normal mode. */
-static enum req
-vi_normal_key(struct editor *e, const struct tkbd_seq *seq)
+static Req
+vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 {
 	uint32_t c = seq->ch;
 	int ctrl = (seq->mod & TKBD_MOD_CTRL) != 0;
@@ -9765,7 +9698,7 @@ vi_normal_key(struct editor *e, const struct tkbd_seq *seq)
 			int oc = e->vi_op_count > 0 ? e->vi_op_count : 1;
 			int mc = e->vi_count > 0 ? e->vi_count : 1;
 			char op = e->vi_op;
-			struct vi_mot m = { 0, 0, 1, 0, 1 };
+			Motion m = { 0, 0, 1, 0, 1 };
 
 			m.y = e->cy + (size_t)(oc * mc - 1);
 			if (m.y >= text_lines(e->t))
@@ -9880,7 +9813,7 @@ vi_normal_key(struct editor *e, const struct tkbd_seq *seq)
 	}
 	case 'S': {
 		int cnt = e->vi_count > 0 ? e->vi_count : 1;
-		struct vi_mot m = { 0, 0, 1, 0, 1 };
+		Motion m = { 0, 0, 1, 0, 1 };
 
 		m.y = e->cy + (size_t)(cnt - 1);
 		if (m.y >= text_lines(e->t))
@@ -9908,7 +9841,7 @@ vi_normal_key(struct editor *e, const struct tkbd_seq *seq)
 			dir = -dir;
 		vi_reset_pending(e);
 		if (e->last_find[0])
-			do_find_dir(e, e->last_find, dir);
+			ed_find_dir(e, e->last_find, dir);
 		else
 			snprintf(e->status, sizeof(e->status),
 			    "no previous search");
@@ -9941,8 +9874,8 @@ vi_normal_key(struct editor *e, const struct tkbd_seq *seq)
 
 /* Handle one key in vi insert mode. Esc returns to normal mode, backing the
  * cursor up one rune the way vi does. */
-static enum req
-vi_insert_key(struct editor *e, const struct tkbd_seq *seq)
+static Req
+vi_insert_key(Editor *e, const struct tkbd_seq *seq)
 {
 	unsigned char buf[8];
 	int ctrl = (seq->mod & TKBD_MOD_CTRL) != 0;
@@ -9965,17 +9898,17 @@ vi_insert_key(struct editor *e, const struct tkbd_seq *seq)
 		vi_clamp(e);
 		return REQ_CONTINUE;
 	case TKBD_KEY_ENTER:
-		do_newline(e);
+		ed_newline(e);
 		return REQ_CONTINUE;
 	case TKBD_KEY_TAB:
-		do_insert(e, "\t", 1);
+		ed_insert(e, "\t", 1);
 		return REQ_CONTINUE;
 	case TKBD_KEY_BACKSPACE:
 	case TKBD_KEY_BACKSPACE2:
-		do_backspace(e);
+		ed_backspace(e);
 		return REQ_CONTINUE;
 	case TKBD_KEY_DEL:
-		do_delete(e);
+		ed_delete(e);
 		return REQ_CONTINUE;
 	case TKBD_KEY_LEFT:
 		move_left(e);
@@ -10017,7 +9950,7 @@ vi_insert_key(struct editor *e, const struct tkbd_seq *seq)
 					text_delete(e->t, e->cy, e->cx,
 					    rune_len_at(s, len, e->cx));
 			}
-			do_insert(e, (char *)buf, (size_t)n);
+			ed_insert(e, (char *)buf, (size_t)n);
 		}
 	}
 	return REQ_CONTINUE;
@@ -10025,7 +9958,7 @@ vi_insert_key(struct editor *e, const struct tkbd_seq *seq)
 
 /* Leave visual mode, dropping the selection. */
 static void
-vi_leave_visual(struct editor *e)
+vi_leave_visual(Editor *e)
 {
 	e->vi_visual = 0;
 	e->sel_active = 0;
@@ -10035,10 +9968,10 @@ vi_leave_visual(struct editor *e)
 /* The motion an operator sees for the current visual selection: the anchor is
  * the far end, the cursor the near end. Charwise is inclusive of both cells;
  * linewise spans whole lines. vi_apply_operator orders the two ends. */
-static struct vi_mot
-vi_visual_span(struct editor *e)
+static Motion
+vi_visual_span(Editor *e)
 {
-	struct vi_mot m = { e->ay, e->ax, 0, 0, 1 };
+	Motion m = { e->ay, e->ax, 0, 0, 1 };
 
 	if (e->vi_visual == 'V')
 		m.line = 1;
@@ -10051,8 +9984,8 @@ vi_visual_span(struct editor *e)
  * normal mode; the visual keys and Esc leave it; everything else (motions,
  * counts, searches) runs through the normal handler and, with no operator
  * pending, just moves the cursor, so the selection tracks it. */
-static enum req
-vi_visual_key(struct editor *e, const struct tkbd_seq *seq)
+static Req
+vi_visual_key(Editor *e, const struct tkbd_seq *seq)
 {
 	uint32_t c = seq->ch;
 	int ctrl = (seq->mod & TKBD_MOD_CTRL) != 0;
@@ -10121,7 +10054,7 @@ vi_visual_key(struct editor *e, const struct tkbd_seq *seq)
 	case 'd':
 	case 'x':
 	case 'y': {
-		struct vi_mot m = vi_visual_span(e);
+		Motion m = vi_visual_span(e);
 		char op = (c == 'y') ? 'y' : 'd';
 
 		vi_reset_pending(e);
@@ -10131,7 +10064,7 @@ vi_visual_key(struct editor *e, const struct tkbd_seq *seq)
 	}
 	case 'c':
 	case 's': {
-		struct vi_mot m = vi_visual_span(e);
+		Motion m = vi_visual_span(e);
 
 		vi_reset_pending(e);
 		vi_apply_operator(e, 'c', m);	/* deletes, then enters INSERT */
@@ -10141,7 +10074,7 @@ vi_visual_key(struct editor *e, const struct tkbd_seq *seq)
 	}
 	case 'p':
 	case 'P': {			/* replace the selection with the register */
-		struct vi_mot m = vi_visual_span(e);
+		Motion m = vi_visual_span(e);
 		char *reg = NULL;
 		size_t reglen = e->clip_len;
 		int reglw = e->clip_linewise;
@@ -10203,8 +10136,8 @@ vi_visual_key(struct editor *e, const struct tkbd_seq *seq)
 }
 
 /* Route a key to the handler for the current mode. */
-static enum req
-vi_dispatch_key(struct editor *e, const struct tkbd_seq *seq)
+static Req
+vi_dispatch_key(Editor *e, const struct tkbd_seq *seq)
 {
 	if (e->mode == MODE_INSERT)
 		return vi_insert_key(e, seq);
@@ -10217,7 +10150,7 @@ vi_dispatch_key(struct editor *e, const struct tkbd_seq *seq)
  * register armed. A command begins and ends at these rest points, which is
  * where the '.' recorder starts a recording and commits it. */
 static int
-vi_at_rest(const struct editor *e)
+vi_at_rest(const Editor *e)
 {
 	return e->mode == MODE_NORMAL && !e->vi_visual && !e->vi_op &&
 	    e->vi_count == 0 && !e->vi_gpending && !e->vi_charsearch &&
@@ -10227,7 +10160,7 @@ vi_at_rest(const struct editor *e)
 
 /* Append one key to a recording log, growing it as needed. */
 static void
-vi_keylog_push(struct vi_keylog *log, const struct tkbd_seq *seq)
+vi_keylog_push(Keylog *log, const struct tkbd_seq *seq)
 {
 	if (log->len >= log->cap) {
 		int ncap = log->cap ? log->cap * 2 : 16;
@@ -10244,9 +10177,9 @@ vi_keylog_push(struct vi_keylog *log, const struct tkbd_seq *seq)
 
 /* Copy the just-recorded command into the '.' log. */
 static void
-vi_dot_commit(struct editor *e)
+vi_dot_commit(Editor *e)
 {
-	struct vi_keylog *d = &e->vi_dot, *s = &e->vi_rec;
+	Keylog *d = &e->vi_dot, *s = &e->vi_rec;
 
 	if (s->len == 0)
 		return;
@@ -10265,7 +10198,7 @@ vi_dot_commit(struct editor *e)
 
 /* Replay the last change recorded for '.'. */
 static void
-vi_dot_replay(struct editor *e)
+vi_dot_replay(Editor *e)
 {
 	int i, n = e->vi_dot.len;
 
@@ -10283,11 +10216,11 @@ vi_dot_replay(struct editor *e)
 	e->vi_replaying = 0;
 }
 
-enum req
-vi_dispatch(struct editor *e, const struct tkbd_seq *seq)
+Req
+vi_dispatch(Editor *e, const struct tkbd_seq *seq)
 {
 	int at_rest_before;
-	enum req r;
+	Req r;
 
 	if (e->vi_replaying)		/* a '.' replay records nothing */
 		return vi_dispatch_key(e, seq);
@@ -10317,7 +10250,7 @@ vi_dispatch(struct editor *e, const struct tkbd_seq *seq)
 
 /* True when p equals any of the NULL-terminated list of names. */
 static int
-ex_match(const char *p, const char *const *names)
+vi_ex_match(const char *p, const char *const *names)
 {
 	for (; *names; names++)
 		if (strcmp(p, *names) == 0)
@@ -10338,14 +10271,14 @@ is_ex_delim(char d)
 
 /* A ':s' is a substitute only when the character after the s is a delimiter. */
 static int
-ex_is_subst(const char *cmd)
+vi_ex_is_subst(const char *cmd)
 {
 	return is_ex_delim(cmd[1]);
 }
 
 /* A ':g' or ':v' (or ':g!') is global only when a delimiter follows. */
 static int
-ex_is_global(const char *cmd)
+vi_ex_is_global(const char *cmd)
 {
 	const char *p = cmd + 1;
 
@@ -10358,7 +10291,7 @@ ex_is_global(const char *cmd)
  * when global. Returns the number of substitutions made. The search is a plain
  * byte substring, with no regex or backreferences. */
 static int
-ex_subst_line(struct editor *e, size_t y, const char *pat, const char *rep,
+vi_ex_subst_line(Editor *e, size_t y, const char *pat, const char *rep,
     int global)
 {
 	size_t plen = strlen(pat), rlen = strlen(rep), len = 0;
@@ -10405,8 +10338,8 @@ ex_subst_line(struct editor *e, size_t y, const char *pat, const char *rep,
 
 /* Run a :[range]s/pat/rep/[g] over lines [lo,hi]. The delimiter is the char
  * after the s; an empty pattern reuses the last search string. */
-static enum req
-ex_substitute(struct editor *e, size_t lo, size_t hi, const char *cmd)
+static Req
+vi_ex_substitute(Editor *e, size_t lo, size_t hi, const char *cmd)
 {
 	char delim = cmd[1];
 	char pat[256], rep[256];
@@ -10448,7 +10381,7 @@ ex_substitute(struct editor *e, size_t lo, size_t hi, const char *cmd)
 		hi = text_lines(e->t) - 1;
 	text_undo_group_begin(e->t);
 	for (y = lo; y <= hi; y++) {
-		int k = ex_subst_line(e, y, use, rep, global);
+		int k = vi_ex_subst_line(e, y, use, rep, global);
 
 		if (k > 0) {
 			subs += k;
@@ -10475,8 +10408,8 @@ ex_substitute(struct editor *e, size_t lo, size_t hi, const char *cmd)
  * :g!, each line not matching). The range defaults to the whole file. The
  * supported commands are d (delete) and s (substitute). Matching lines are
  * collected first so the command can shift line numbers safely. */
-static enum req
-ex_global(struct editor *e, size_t lo, size_t hi, int had_range,
+static Req
+vi_ex_global(Editor *e, size_t lo, size_t hi, int had_range,
     const char *cmd, int invert)
 {
 	const char *p = cmd + 1, *sub, *use;
@@ -10537,9 +10470,9 @@ ex_global(struct editor *e, size_t lo, size_t hi, int had_range,
 	if (sub[0] == 'd' && (sub[1] == '\0' || sub[1] == ' ')) {
 		for (i = nrows; i > 0; i--)	/* delete bottom-up */
 			vi_delete_lines(e, rows[i - 1], rows[i - 1]);
-	} else if (sub[0] == 's' && ex_is_subst(sub)) {
+	} else if (sub[0] == 's' && vi_ex_is_subst(sub)) {
 		for (i = 0; i < nrows; i++)	/* substitute keeps line count */
-			ex_substitute(e, rows[i], rows[i], sub);
+			vi_ex_substitute(e, rows[i], rows[i], sub);
 	} else {
 		text_undo_group_end(e->t);
 		free(rows);
@@ -10562,7 +10495,7 @@ ex_global(struct editor *e, size_t lo, size_t hi, int had_range,
  * run of +N/-N offsets. Returns 1 when an address was read, 0 when there was
  * none, or -1 on an error (an undefined mark). *pp is advanced past it. */
 static int
-ex_addr(struct editor *e, char **pp, long cur, long *out)
+vi_ex_addr(Editor *e, char **pp, long cur, long *out)
 {
 	char *p = *pp;
 	long base = cur;
@@ -10610,7 +10543,7 @@ ex_addr(struct editor *e, char **pp, long cur, long *out)
  * clamped to the buffer and ordered. Returns 1 when a range (or '%') was
  * present, 0 when none was, or -1 on an error. *pp is advanced past it. */
 static int
-ex_parse_range(struct editor *e, char **pp, size_t *lo, size_t *hi)
+vi_ex_parse_range(Editor *e, char **pp, size_t *lo, size_t *hi)
 {
 	char *p = *pp;
 	long cur = (long)e->cy + 1;
@@ -10627,7 +10560,7 @@ ex_parse_range(struct editor *e, char **pp, size_t *lo, size_t *hi)
 		*pp = p;
 		return 1;
 	}
-	r = ex_addr(e, &p, cur, &a1);
+	r = vi_ex_addr(e, &p, cur, &a1);
 	if (r < 0)
 		return -1;
 	if (r == 0) {
@@ -10642,7 +10575,7 @@ ex_parse_range(struct editor *e, char **pp, size_t *lo, size_t *hi)
 		p++;
 		if (semi)				/* ; moves . to the first */
 			cur = a1;
-		r = ex_addr(e, &p, cur, &c);
+		r = vi_ex_addr(e, &p, cur, &c);
 		if (r < 0)
 			return -1;
 		if (r > 0)
@@ -10673,11 +10606,11 @@ ex_parse_range(struct editor *e, char **pp, size_t *lo, size_t *hi)
 /* Read the file named in cmd (":r path" or ":read path") into the buffer,
  * inserting its contents on the line below line "at". The cursor lands on
  * the first inserted line, matching vi's :r. */
-static enum req
-ex_read_file(struct editor *e, size_t at, const char *cmd)
+static Req
+vi_ex_read_file(Editor *e, size_t at, const char *cmd)
 {
 	const char *fn = cmd;
-	struct text *nt;
+	Text *nt;
 	char *bytes;
 	size_t nlines, i, total, off;
 
@@ -10752,8 +10685,8 @@ ex_read_file(struct editor *e, size_t at, const char *cmd)
  * command asks to leave, otherwise REQ_CONTINUE. lumi edit holds a single
  * buffer, so the "all" variants (:qa, :wqa, :xa) behave like their single
  * forms. Split from vi_colon so it can run without the interactive prompt. */
-static enum req
-vi_ex_exec(struct editor *e, char *buf)
+static Req
+vi_ex_exec(Editor *e, char *buf)
 {
 	char *p;
 
@@ -10765,7 +10698,7 @@ vi_ex_exec(struct editor *e, char *buf)
 	{
 		char *after = p;
 		size_t lo = 0, hi = 0;
-		int rr = ex_parse_range(e, &after, &lo, &hi);
+		int rr = vi_ex_parse_range(e, &after, &lo, &hi);
 
 		if (rr < 0) {
 			snprintf(e->status, sizeof(e->status),
@@ -10785,13 +10718,13 @@ vi_ex_exec(struct editor *e, char *buf)
 
 		switch (*after) {
 		case 's':				/* :s -- substitute */
-			if (ex_is_subst(after))
-				return ex_substitute(e, lo, hi, after);
+			if (vi_ex_is_subst(after))
+				return vi_ex_substitute(e, lo, hi, after);
 			break;			/* :syntax etc.: fall through */
 		case 'g':				/* :g / :g! -- global */
 		case 'v':				/* :v -- inverse global */
-			if (ex_is_global(after))
-				return ex_global(e, lo, hi, rr > 0, after,
+			if (vi_ex_is_global(after))
+				return vi_ex_global(e, lo, hi, rr > 0, after,
 				    *after == 'v');
 			break;
 		case 'd':				/* :d -- delete lines */
@@ -10820,7 +10753,7 @@ vi_ex_exec(struct editor *e, char *buf)
 		case 'r':				/* :[N]r file -- read below */
 			if (after[1] == ' ' || after[1] == '\0' ||
 			    strncmp(after, "read", 4) == 0)
-				return ex_read_file(e, hi, after);
+				return vi_ex_read_file(e, hi, after);
 			break;
 		default:
 			break;
@@ -10845,7 +10778,7 @@ vi_ex_exec(struct editor *e, char *buf)
 			e->hl_on = 1;
 			e->hl_valid = 0;	/* recolor from the top */
 		} else {
-			const struct syntax *sy = syn_for_ext(arg);
+			const Syntax *sy = syn_for_ext(arg);
 
 			if (!sy) {
 				snprintf(e->status, sizeof(e->status),
@@ -10871,7 +10804,7 @@ vi_ex_exec(struct editor *e, char *buf)
 	}
 	if (strcmp(p, "e") == 0 || strcmp(p, "e!") == 0 ||
 	    strcmp(p, "edit") == 0 || strcmp(p, "edit!") == 0) {
-		struct text *nt;
+		Text *nt;
 
 		if (!e->has_name) {
 			snprintf(e->status, sizeof(e->status),
@@ -11024,9 +10957,9 @@ vi_ex_exec(struct editor *e, char *buf)
 			memcpy(base, p, bl);
 			base[bl] = '\0';
 
-			if (ex_match(base, cquit))
+			if (vi_ex_match(base, cquit))
 				return REQ_QUIT_ERR;	/* exit nonzero */
-			if (ex_match(base, qall)) {
+			if (vi_ex_match(base, qall)) {
 				if (!force && text_dirty(e->t)) {
 					snprintf(e->status, sizeof(e->status),
 					    "E37: no write since last change"
@@ -11035,7 +10968,7 @@ vi_ex_exec(struct editor *e, char *buf)
 				}
 				return REQ_FORCE_QUIT;
 			}
-			if (ex_match(base, wqall)) {
+			if (vi_ex_match(base, wqall)) {
 				if (!e->has_name) {
 					snprintf(e->status, sizeof(e->status),
 					    "E32: no file name");
@@ -11057,30 +10990,30 @@ vi_ex_exec(struct editor *e, char *buf)
 }
 
 /* Prompt for a ':' ex command and run it. */
-enum req
-vi_colon(struct editor *e)
+Req
+vi_colon(Editor *e)
 {
 	char buf[PATH_MAX];
 
 	buf[0] = '\0';
-	if (!prompt_line(e, ":", buf, sizeof(buf)))
+	if (!dlg_prompt_line(e, ":", buf, sizeof(buf)))
 		return REQ_CONTINUE;
 	return vi_ex_exec(e, buf);
 }
 
 /* Read a vi '/' search pattern and jump to the next match. */
 void
-vi_search(struct editor *e)
+vi_search(Editor *e)
 {
 	int dir = e->vi_search_dir < 0 ? -1 : 1;
 	char q[256];
 
 	q[0] = '\0';
-	if (!prompt_line(e, dir < 0 ? "?" : "/", q, sizeof(q))) {
+	if (!dlg_prompt_line(e, dir < 0 ? "?" : "/", q, sizeof(q))) {
 		snprintf(e->status, sizeof(e->status), "search cancelled");
 		return;
 	}
 	snprintf(e->last_find, sizeof(e->last_find), "%s", q);
-	do_find_dir(e, q, dir);
+	ed_find_dir(e, q, dir);
 }
 
