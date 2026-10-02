@@ -62,6 +62,7 @@ support the VT100 alternate charset.
 | Ctrl-Z / Ctrl-Y | undo / redo |
 | Ctrl-S | save (prompts for a name if the buffer has none) |
 | Ctrl-Q | quit (prompts if the buffer was modified) |
+| Insert | toggle draw mode (2D / block editing, see below) |
 | F8 / Shift-F8 | next / previous open buffer |
 | F10 | activate the menu bar (then a letter opens that menu) |
 | Alt+letter | open a menu directly (File, Edit, ...) |
@@ -83,6 +84,35 @@ $`, `w b e`, `gg G`, `f F t T`, `; ,`, `{ } ( )`, `% H M L |`, counts such as
 `p`, `u`, and `i a A I o O` to insert. `ZZ` writes and quits, `ZQ` quits without
 writing. The `:` line runs `w q wq q! qa wqa cq` and `:N`. `/` searches and `n`
 repeats.
+
+## Draw mode (ASCII art and maps)
+
+Draw mode turns vedit into a 2D canvas for maps, box diagrams, and block art,
+in the spirit of tools like DuhDraw. Toggle it with the **Insert** key (in either
+personality), the Options menu, or the vi `:draw` command. The status line shows
+`-- DRAW --` while it is on, and leaving it restores normal insert editing.
+
+In draw mode:
+
+- The cursor moves freely over a virtual grid. Arrows (or vi `h j k l`) go one
+  cell in any direction, past the end of a line and below the last line, and do
+  not wrap at the edges.
+- Typing overwrites the cell under the cursor (insert is off). Writing in
+  virtual space pads the line with spaces and adds blank lines as needed, so you
+  can draw anywhere.
+- Enter is a carriage return: down one row, back to column 0.
+- Backspace and Delete erase a cell to a space instead of joining lines.
+- Shift+arrows mark a rectangle. Ctrl-C copies it, Ctrl-X cuts it (blanking the
+  rectangle in place), and Ctrl-V overlays the copied block at the cursor.
+- Ctrl-B draws an ASCII border around the marked rectangle (`+` corners, `-` and
+  `|` edges). A one-cell-wide or one-cell-tall selection reduces to a straight
+  line, so the same key draws lines. The glyphs are plain ASCII, so they render
+  on any client.
+- Ctrl-S, Ctrl-Q, Ctrl-Z/Y, Ctrl-F, and Ctrl-L work as usual.
+
+Because the blanks you draw are real spaces, draw mode does not trim trailing
+whitespace on save. That is what you want for art; keep it in mind when drawing
+a diagram into a source file.
 
 ## Embedding in a host (for example a MUD)
 
@@ -126,7 +156,8 @@ push-style state machine is not provided.
 The lumi editor sits on about ten libraries. vedit keeps the text buffer with
 undo and redo, the modeless and vi personalities, the MS-EDIT chrome (menu bar,
 frame, scrollbars, dialogs), find, selection and an internal clipboard,
-goto-line, multiple buffers, and a hex view. It replaces the drawing stack with
+goto-line, multiple buffers, a hex view, and a 2D/block draw mode. It replaces
+the drawing stack with
 a self-contained ANSI renderer over the io vtable, and the keyboard decoder with
 a compact one that covers UTF-8 text, control keys, arrows, navigation keys,
 function keys, CSI modifiers, Alt+letter, and bracketed paste.

@@ -1628,11 +1628,14 @@ struct editor {
 	struct draw_term *term;		/* terminal driver, for mouse control */
 	int		mouse_on;	/* editor mouse reporting is enabled */
 	int		sel_active;	/* a selection is being extended */
+	int		sel_block;	/* the selection is a rectangle (draw mode) */
 	size_t		ay;		/* selection anchor line */
 	size_t		ax;		/* selection anchor byte column */
 	char		*clip;		/* internal clipboard bytes */
 	size_t		clip_len;	/* length of clip in bytes */
 	int		clip_linewise;	/* clip holds whole lines (vi p/P) */
+	int		clip_block;	/* clip holds a rectangle (draw mode) */
+	int		draw_mode;	/* 2D/block draw mode: free cursor + overtype */
 	char		last_find[256];	/* last search string, for repeat */
 	int		vi_search_dir;	/* last search direction: 1 fwd, -1 back */
 	int		vi_want_col;	/* display column j/k aim for (INT_MAX=EOL) */
@@ -3239,9 +3242,12 @@ enum menu_act {
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE,
 	MA_FIND, MA_FIND_NEXT, MA_GOTO,
 	MA_RUN, MA_COMPILE, MA_MAKE, MA_NEXT_ERR, MA_PREV_ERR,
-	MA_SYNTAX, MA_SCHEME, MA_HEX, MA_VI_MODE, MA_MOUSE,
+	MA_SYNTAX, MA_SCHEME, MA_HEX, MA_DRAW, MA_VI_MODE, MA_MOUSE,
 	MA_HELP, MA_ABOUT,
 };
+
+/* draw mode toggle, defined with the draw-mode module further down */
+static void draw_toggle(struct editor *e);
 
 struct menu_item {
 	const char	*label;
@@ -3296,6 +3302,7 @@ static const struct menu_item mi_view[] = {
 	{ "&Hex Dump",		"",	"",	MA_HEX },
 };
 static const struct menu_item mi_options[] = {
+	{ "&Draw Mode",	"Ins",	"",	MA_DRAW },
 	{ "&Vi Keys",	"F2",	"",	MA_VI_MODE },
 	{ "&Mouse",	"",	"",	MA_MOUSE },
 };
@@ -3500,6 +3507,8 @@ menu_checked(const struct editor *e, enum menu_act act)
 		return e->hl_on ? 1 : 0;
 	case MA_SCHEME:
 		return e->dos_chrome ? 1 : 0;
+	case MA_DRAW:
+		return e->draw_mode ? 1 : 0;
 	case MA_VI_MODE:
 		return e->mode != MODE_MODELESS ? 1 : 0;
 	case MA_MOUSE:
@@ -3701,7 +3710,9 @@ draw_statusbar(struct editor *e, const struct chrome_pal *p, int cur_col)
 	} else {
 		const char *mode = "";
 
-		if (e->vi_visual == 'v')
+		if (e->draw_mode)
+			mode = "-- DRAW --  ";
+		else if (e->vi_visual == 'v')
 			mode = "-- VISUAL --  ";
 		else if (e->vi_visual == 'V')
 			mode = "-- VISUAL LINE --  ";
@@ -3806,18 +3817,41 @@ draw_line(struct draw *d, int row, int col0, const char *s, size_t len,
 		i += (size_t)n;
 	}
 	while (drawn < width) {
-		draw_cell(d, row, col0 + drawn, ' ', base_fg, base_bg, 0);
+		/* highlight blank cells too, so a block selection or a selection
+		 * that runs past a short line still shows as a solid rectangle */
+		int dcol = left + drawn;
+		int rev = (hl_start < hl_end && dcol >= hl_start && dcol < hl_end);
+
+		draw_cell(d, row, col0 + drawn, ' ', base_fg, base_bg,
+		    rev ? VT_ATTR_REVERSE : 0);
 		drawn++;
 	}
+}
+
+/* Display column of the cursor, honoring draw-mode virtual space: a cursor past
+ * the end of a line (or on a virtual row below the buffer) sits that many blank
+ * columns further right. */
+static int
+cursor_dispcol(const struct editor *e)
+{
+	size_t len = 0;
+	const char *line;
+
+	if (e->cy >= text_lines(e->t))
+		return (int)e->cx;		/* virtual row: all blanks */
+	line = text_line(e->t, e->cy, &len);
+	if (!line)
+		return (int)e->cx;
+	if (e->cx <= len)
+		return disp_cols(line, e->cx);
+	return disp_cols(line, len) + (int)(e->cx - len);
 }
 
 /* Adjust top/left so the cursor stays on screen. */
 static void
 scroll_to_cursor(struct editor *e, int text_h, int text_w)
 {
-	size_t len = 0;
-	const char *line = text_line(e->t, e->cy, &len);
-	int cur_col = line ? disp_cols(line, e->cx) : 0;
+	int cur_col = cursor_dispcol(e);
 
 	if (e->cy < e->top)
 		e->top = e->cy;
@@ -4472,7 +4506,8 @@ render_body(struct editor *e, struct draw *d)
 	}
 
 	scroll_to_cursor(e, text_h, text_w);
-	cur_col = cur ? disp_cols(cur, e->cx) : 0;
+	cur_col = cursor_dispcol(e);
+	(void)cur;
 
 	hl_ensure(e, e->top + (size_t)text_h);
 
@@ -4486,7 +4521,19 @@ render_body(struct editor *e, struct draw *d)
 		const uint8_t *sty = NULL;
 		int row = CHROME_TOP + i;
 
-		if (e->sel_active && s) {
+		if (e->sel_active && e->sel_block) {
+			/* a rectangle: the same columns highlight on every row
+			 * in range, including blank and virtual rows */
+			size_t ry1 = e->ay < e->cy ? e->ay : e->cy;
+			size_t ry2 = e->ay > e->cy ? e->ay : e->cy;
+			size_t rx1 = e->ax < e->cx ? e->ax : e->cx;
+			size_t rx2 = e->ax > e->cx ? e->ax : e->cx;
+
+			if (idx >= ry1 && idx <= ry2) {
+				hs = (int)rx1;
+				he = (int)rx2 + 1;
+			}
+		} else if (e->sel_active && s) {
 			size_t y1, x1, y2, x2;
 
 			sel_bounds(e, &y1, &x1, &y2, &x2);
@@ -4515,8 +4562,8 @@ render_body(struct editor *e, struct draw *d)
 			draw_line(d, row, CHROME_LEFT, s, llen, (int)e->left,
 			    text_w, hs, he, sty, p->content_fg, p->content_bg);
 		} else {
-			draw_line(d, row, CHROME_LEFT, "", 0, 0, text_w, -1, -1,
-			    NULL, p->content_fg, p->content_bg);
+			draw_line(d, row, CHROME_LEFT, "", 0, (int)e->left,
+			    text_w, hs, he, NULL, p->content_fg, p->content_bg);
 		}
 	}
 
@@ -6202,6 +6249,9 @@ run_menu_act(struct editor *e, enum menu_act act)
 		snprintf(e->status, sizeof(e->status), "%s view",
 		    e->hex_view ? "hex" : "text");
 		break;
+	case MA_DRAW:
+		draw_toggle(e);
+		break;
 	case MA_VI_MODE:
 		toggle_vi(e);
 		break;
@@ -6499,6 +6549,463 @@ run_req(struct editor *e, enum req req)
 }
 
 /****************************************************************
+ * Draw mode: a 2D / block editor for ASCII art and maps
+ *
+ * Toggled with the Insert key (or Options > Draw mode, or vi ':draw'), draw
+ * mode layers over either personality. The cursor moves freely over a virtual
+ * grid -- past the end of a line and below the last line -- typing overwrites
+ * the cell under it (insert off), and writing into virtual space pads the line
+ * with blanks and adds blank lines as needed. Backspace and Delete erase a cell
+ * to a space instead of joining lines. Shift+arrows mark a rectangle that copy,
+ * cut (erase to spaces), paste (overlay), and box (ASCII border) act on.
+ ****************************************************************/
+
+/* Append blank lines until row y exists. */
+static void
+draw_ensure_row(struct editor *e, size_t y)
+{
+	while (text_lines(e->t) <= y) {
+		size_t last = text_lines(e->t) - 1;
+
+		text_split(e->t, last, text_line_len(e->t, last));
+	}
+}
+
+/* Pad row y with spaces so it is at least col bytes long. */
+static void
+draw_pad_col(struct editor *e, size_t y, size_t col)
+{
+	size_t len = text_line_len(e->t, y);
+	char sp[128];
+	size_t off = len, need;
+
+	if (col <= len)
+		return;
+	need = col - len;
+	memset(sp, ' ', sizeof(sp));
+	while (need) {
+		size_t chunk = need < sizeof(sp) ? need : sizeof(sp);
+
+		text_insert(e->t, y, off, sp, chunk);
+		off += chunk;
+		need -= chunk;
+	}
+}
+
+/* Overwrite the cell at the cursor with one glyph, extending virtual space as
+ * needed, then advance the cursor past it. */
+static void
+draw_overtype(struct editor *e, const char *bytes, size_t n)
+{
+	size_t len = 0;
+
+	text_undo_group_begin(e->t);
+	draw_ensure_row(e, e->cy);
+	draw_pad_col(e, e->cy, e->cx);
+	len = text_line_len(e->t, e->cy);
+	if (e->cx < len) {
+		const char *s = text_line(e->t, e->cy, &len);
+
+		text_delete(e->t, e->cy, e->cx, rune_len_at(s, len, e->cx));
+	}
+	text_insert(e->t, e->cy, e->cx, bytes, n);
+	e->cx += n;
+	hl_touch(e, e->cy);
+	text_undo_group_end(e->t);
+}
+
+/* Erase the cell under the cursor to a space, without moving. */
+static void
+draw_erase(struct editor *e)
+{
+	size_t len;
+	const char *s;
+
+	if (e->cy >= text_lines(e->t))
+		return;
+	len = text_line_len(e->t, e->cy);
+	if (e->cx >= len)
+		return;			/* virtual column: nothing to erase */
+	s = text_line(e->t, e->cy, &len);
+	text_undo_group_begin(e->t);
+	text_delete(e->t, e->cy, e->cx, rune_len_at(s, len, e->cx));
+	text_insert(e->t, e->cy, e->cx, " ", 1);
+	hl_touch(e, e->cy);
+	text_undo_group_end(e->t);
+}
+
+/* Move the free cursor by (dy, dx) cells, never wrapping at an edge. */
+static void
+draw_move(struct editor *e, int dy, int dx)
+{
+	if (dy < 0)
+		e->cy = e->cy >= (size_t)(-dy) ? e->cy + dy : 0;
+	else
+		e->cy += dy;
+
+	if (dx < 0 && e->cx > 0) {
+		if (e->cy < text_lines(e->t) &&
+		    e->cx <= text_line_len(e->t, e->cy)) {
+			size_t len = 0;
+			const char *s = text_line(e->t, e->cy, &len);
+
+			e->cx -= prev_rune_len(s, e->cx);
+		} else {
+			e->cx--;
+		}
+	} else if (dx > 0) {
+		if (e->cy < text_lines(e->t) &&
+		    e->cx < text_line_len(e->t, e->cy)) {
+			size_t len = 0;
+			const char *s = text_line(e->t, e->cy, &len);
+
+			e->cx += rune_len_at(s, len, e->cx);
+		} else {
+			e->cx++;
+		}
+	}
+}
+
+/* Rectangle bounds (inclusive) of the current block selection. */
+static void
+draw_block_bounds(struct editor *e, size_t *y1, size_t *y2, size_t *x1,
+    size_t *x2)
+{
+	*y1 = e->ay < e->cy ? e->ay : e->cy;
+	*y2 = e->ay > e->cy ? e->ay : e->cy;
+	*x1 = e->ax < e->cx ? e->ax : e->cx;
+	*x2 = e->ax > e->cx ? e->ax : e->cx;
+}
+
+/* Copy the selected rectangle into the clipboard as blank-padded rows. */
+static void
+draw_block_copy(struct editor *e)
+{
+	size_t y1, y2, x1, x2, w, y, cap, off = 0;
+	char *buf;
+
+	if (!e->sel_active || !e->sel_block)
+		return;
+	draw_block_bounds(e, &y1, &y2, &x1, &x2);
+	w = x2 - x1 + 1;
+	cap = (y2 - y1 + 1) * (w + 1) + 1;
+	buf = malloc(cap);
+	if (!buf)
+		return;
+	for (y = y1; y <= y2; y++) {
+		size_t len = 0, c;
+		const char *s = y < text_lines(e->t) ?
+		    text_line(e->t, y, &len) : NULL;
+
+		for (c = 0; c < w; c++) {
+			size_t col = x1 + c;
+
+			buf[off++] = (s && col < len) ? s[col] : ' ';
+		}
+		if (y < y2)
+			buf[off++] = '\n';
+	}
+	free(e->clip);
+	e->clip = buf;
+	e->clip_len = off;
+	e->clip_block = 1;
+	e->clip_linewise = 0;
+	snprintf(e->status, sizeof(e->status), "copied %zux%zu block",
+	    w, y2 - y1 + 1);
+}
+
+/* Blank the selected rectangle in place (overlay model). */
+static void
+draw_block_erase(struct editor *e, size_t y1, size_t y2, size_t x1, size_t x2)
+{
+	size_t y;
+
+	text_undo_group_begin(e->t);
+	for (y = y1; y <= y2 && y < text_lines(e->t); y++) {
+		size_t len = text_line_len(e->t, y);
+		size_t a = x1, b = x2 + 1;
+		char sp[128];
+		size_t off, need;
+
+		if (a >= len)
+			continue;
+		if (b > len)
+			b = len;
+		if (b <= a)
+			continue;
+		text_delete(e->t, y, a, b - a);
+		memset(sp, ' ', sizeof(sp));
+		off = a;
+		need = b - a;
+		while (need) {
+			size_t chunk = need < sizeof(sp) ? need : sizeof(sp);
+
+			text_insert(e->t, y, off, sp, chunk);
+			off += chunk;
+			need -= chunk;
+		}
+		hl_touch(e, y);
+	}
+	text_undo_group_end(e->t);
+}
+
+/* Cut = copy then blank the rectangle. */
+static void
+draw_block_cut(struct editor *e)
+{
+	size_t y1, y2, x1, x2;
+
+	if (!e->sel_active || !e->sel_block)
+		return;
+	draw_block_bounds(e, &y1, &y2, &x1, &x2);
+	draw_block_copy(e);
+	draw_block_erase(e, y1, y2, x1, x2);
+	e->sel_active = 0;
+}
+
+/* Overlay the clipboard rows at the cursor, extending virtual space. */
+static void
+draw_block_paste(struct editor *e)
+{
+	size_t y, i;
+
+	if (!e->clip || e->clip_len == 0)
+		return;
+	text_undo_group_begin(e->t);
+	y = e->cy;
+	i = 0;
+	for (;;) {
+		size_t j = i, rlen;
+
+		while (j < e->clip_len && e->clip[j] != '\n')
+			j++;
+		rlen = j - i;
+		draw_ensure_row(e, y);
+		draw_pad_col(e, y, e->cx + rlen);
+		if (rlen) {
+			text_delete(e->t, y, e->cx, rlen);
+			text_insert(e->t, y, e->cx, e->clip + i, rlen);
+		}
+		hl_touch(e, y);
+		y++;
+		if (j >= e->clip_len)
+			break;
+		i = j + 1;
+	}
+	text_undo_group_end(e->t);
+	e->sel_active = 0;
+}
+
+/* Overwrite the single cell at (y, x) with one ASCII byte, extending virtual
+ * space as needed. The caller owns the undo group. */
+static void
+draw_put_cell(struct editor *e, size_t y, size_t x, char c)
+{
+	size_t len;
+
+	draw_ensure_row(e, y);
+	draw_pad_col(e, y, x);
+	len = text_line_len(e->t, y);
+	if (x < len) {
+		const char *s = text_line(e->t, y, &len);
+
+		text_delete(e->t, y, x, rune_len_at(s, len, x));
+	}
+	text_insert(e->t, y, x, &c, 1);
+	hl_touch(e, y);
+}
+
+/* Draw an ASCII border ('+' corners, '-' top/bottom, '|' sides) around the
+ * current block selection. A one-cell-wide or one-cell-tall rectangle reduces
+ * to a straight line. The whole box is one undo step. */
+static void
+draw_block_box(struct editor *e)
+{
+	size_t y1, y2, x1, x2, x, y;
+
+	if (!e->sel_active || !e->sel_block)
+		return;
+	draw_block_bounds(e, &y1, &y2, &x1, &x2);
+	text_undo_group_begin(e->t);
+	if (y1 == y2 && x1 == x2) {		/* single cell */
+		draw_put_cell(e, y1, x1, '+');
+	} else if (y1 == y2) {			/* horizontal line */
+		for (x = x1; x <= x2; x++)
+			draw_put_cell(e, y1, x, (x == x1 || x == x2) ? '+' : '-');
+	} else if (x1 == x2) {			/* vertical line */
+		for (y = y1; y <= y2; y++)
+			draw_put_cell(e, y, x1, (y == y1 || y == y2) ? '+' : '|');
+	} else {
+		for (x = x1; x <= x2; x++) {	/* top and bottom edges */
+			char c = (x == x1 || x == x2) ? '+' : '-';
+
+			draw_put_cell(e, y1, x, c);
+			draw_put_cell(e, y2, x, c);
+		}
+		for (y = y1 + 1; y < y2; y++) {	/* left and right sides */
+			draw_put_cell(e, y, x1, '|');
+			draw_put_cell(e, y, x2, '|');
+		}
+	}
+	text_undo_group_end(e->t);
+	e->sel_active = 0;
+	snprintf(e->status, sizeof(e->status), "boxed %zux%zu",
+	    x2 - x1 + 1, y2 - y1 + 1);
+}
+
+/* Toggle draw mode. Entering from vi insert drops back to normal so leaving
+ * draw mode lands somewhere sane. */
+static void
+draw_toggle(struct editor *e)
+{
+	e->draw_mode = !e->draw_mode;
+	e->sel_active = 0;
+	if (e->draw_mode) {
+		if (e->mode == MODE_INSERT)
+			e->mode = MODE_NORMAL;
+		snprintf(e->status, sizeof(e->status),
+		    "-- DRAW -- Insert exits; type overwrites, arrows roam free");
+	} else {
+		snprintf(e->status, sizeof(e->status), "draw mode off");
+	}
+}
+
+/* Handle one key in draw mode. Returns a request for the main loop. */
+static enum req
+draw_key(struct editor *e, const struct tkbd_seq *seq)
+{
+	int shift = seq->mod & TKBD_MOD_SHIFT;
+	int ctrl = seq->mod & TKBD_MOD_CTRL;
+	uint16_t k = seq->key;
+
+	if (seq->type != TKBD_KEY)
+		return REQ_CONTINUE;
+
+	if (ctrl) {
+		switch (k) {
+		case TKBD_KEY_S:
+			return REQ_SAVE;
+		case TKBD_KEY_Q:
+			return REQ_QUIT;
+		case TKBD_KEY_F:
+			return REQ_FIND;
+		case TKBD_KEY_L:
+			return REQ_GOTO;
+		case TKBD_KEY_Z:
+			e->sel_active = 0;
+			if (text_undo(e->t, &e->cy, &e->cx) == 0)
+				hl_touch(e, 0);
+			return REQ_CONTINUE;
+		case TKBD_KEY_Y:
+			e->sel_active = 0;
+			if (text_redo(e->t, &e->cy, &e->cx) == 0)
+				hl_touch(e, 0);
+			return REQ_CONTINUE;
+		case TKBD_KEY_C:
+			draw_block_copy(e);
+			return REQ_CONTINUE;
+		case TKBD_KEY_X:
+			draw_block_cut(e);
+			return REQ_CONTINUE;
+		case TKBD_KEY_V:
+			draw_block_paste(e);
+			return REQ_CONTINUE;
+		case TKBD_KEY_B:
+			draw_block_box(e);
+			return REQ_CONTINUE;
+		default:
+			return REQ_CONTINUE;
+		}
+	}
+
+	/* Shift+arrow extends a rectangle; an unshifted move drops it. */
+	if (k == TKBD_KEY_LEFT || k == TKBD_KEY_RIGHT || k == TKBD_KEY_UP ||
+	    k == TKBD_KEY_DOWN || k == TKBD_KEY_HOME || k == TKBD_KEY_END) {
+		if (shift) {
+			if (!e->sel_active) {
+				e->sel_active = 1;
+				e->sel_block = 1;
+				e->ay = e->cy;
+				e->ax = e->cx;
+			}
+		} else {
+			e->sel_active = 0;
+		}
+	}
+
+	switch (k) {
+	case TKBD_KEY_LEFT:
+		draw_move(e, 0, -1);
+		return REQ_CONTINUE;
+	case TKBD_KEY_RIGHT:
+		draw_move(e, 0, 1);
+		return REQ_CONTINUE;
+	case TKBD_KEY_UP:
+		draw_move(e, -1, 0);
+		return REQ_CONTINUE;
+	case TKBD_KEY_DOWN:
+		draw_move(e, 1, 0);
+		return REQ_CONTINUE;
+	case TKBD_KEY_HOME:
+		e->cx = 0;
+		return REQ_CONTINUE;
+	case TKBD_KEY_END:
+		e->cx = e->cy < text_lines(e->t) ?
+		    text_line_len(e->t, e->cy) : e->cx;
+		return REQ_CONTINUE;
+	case TKBD_KEY_PGUP: {
+		int h = text_height(e) - 1;
+
+		if (h < 1)
+			h = 1;
+		e->sel_active = 0;
+		e->cy = e->cy > (size_t)h ? e->cy - (size_t)h : 0;
+		return REQ_CONTINUE;
+	}
+	case TKBD_KEY_PGDN: {
+		int h = text_height(e) - 1;
+
+		if (h < 1)
+			h = 1;
+		e->sel_active = 0;
+		e->cy += (size_t)h;
+		return REQ_CONTINUE;
+	}
+	case TKBD_KEY_ENTER:			/* carriage return */
+		e->sel_active = 0;
+		e->cy++;
+		e->cx = 0;
+		return REQ_CONTINUE;
+	case TKBD_KEY_BACKSPACE:
+	case TKBD_KEY_BACKSPACE2:
+		e->sel_active = 0;
+		draw_move(e, 0, -1);
+		draw_erase(e);
+		return REQ_CONTINUE;
+	case TKBD_KEY_DEL:
+		e->sel_active = 0;
+		draw_erase(e);
+		return REQ_CONTINUE;
+	case TKBD_KEY_ESC:
+		e->sel_active = 0;
+		return REQ_CONTINUE;
+	default:
+		break;
+	}
+
+	if (seq->ch != TKBD_CH_NONE && seq->ch >= 0x20 && seq->ch != 0x7f) {
+		unsigned char buf[8];
+		int n = utf8_encode(buf, seq->ch);
+
+		if (n > 0) {
+			e->sel_active = 0;
+			draw_overtype(e, (char *)buf, (size_t)n);
+		}
+	}
+	return REQ_CONTINUE;
+}
+
+/****************************************************************
  * The editor loop, shared by the command-line binding and an
  * embedding host. Mouse handling and the build keys are gone; a
  * MUD client sends neither.
@@ -6565,6 +7072,23 @@ editor_loop(struct editor *e)
 		 * request handling, so Ctrl-S and Ctrl-Q behave as usual. */
 		if (e->hex_view) {
 			if (run_req(e, hex_key(e, &seq)))
+				return 0;
+			render(e, e->d);
+			continue;
+		}
+
+		/* The Insert key toggles the 2D/block draw mode in either
+		 * personality. */
+		if (seq.type == TKBD_KEY && seq.key == TKBD_KEY_INS &&
+		    !(seq.mod & TKBD_MOD_CTRL)) {
+			draw_toggle(e);
+			render(e, e->d);
+			continue;
+		}
+
+		/* Draw mode takes over input while it is on. */
+		if (e->draw_mode) {
+			if (run_req(e, draw_key(e, &seq)))
 				return 0;
 			render(e, e->d);
 			continue;
@@ -10434,6 +10958,10 @@ vi_ex_exec(struct editor *e, char *buf)
 	}
 	if (strcmp(p, "q!") == 0)
 		return REQ_FORCE_QUIT;
+	if (strcmp(p, "draw") == 0) {		/* toggle 2D/block draw mode */
+		draw_toggle(e);
+		return REQ_CONTINUE;
+	}
 	if (strcmp(p, "w") == 0 || strcmp(p, "w!") == 0 ||
 	    strncmp(p, "w ", 2) == 0) {
 		const char *fn = p + 1;
