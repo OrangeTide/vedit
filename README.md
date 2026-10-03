@@ -100,6 +100,45 @@ sent, and within a row only the columns between the first and last change are
 repainted. On the black color scheme (below), a long run of trailing blanks in a
 changed row is cleared with one erase-to-EOL instead of a column of spaces.
 
+### Configuration file
+
+A gitconfig-style file sets the startup defaults. It is read from the first of
+`$VEDIT_CONFIG`, `$XDG_CONFIG_HOME/vedit/config`, and `~/.veditrc` that exists;
+`--config FILE` points at a specific file and `--no-config` skips it.
+
+```ini
+# ~/.veditrc
+[ui]
+    scheme = black      # dos | black | plain
+    number = on         # line-number gutter
+    wrap   = on         # word wrap
+    box    = dec         # utf8 | dec | ascii
+    colors = 256         # 256 | 16
+    scroll = on          # VT100 scroll-region fast path
+
+[edit]
+    mode = vi            # vi | modeless
+
+[syntax]
+    enable = on          # highlight recognized file types
+```
+
+Keys are dotted, so `ui.scheme = black` without a section header works too.
+Booleans accept `on`/`off`, `yes`/`no`, `true`/`false`, or `1`/`0`. A missing or
+unreadable file is ignored (an explicit `--config` path that cannot be read
+prints a warning and the editor still starts).
+
+Settings rank from weakest to strongest: built-in default, then the config file,
+then the `VEDIT_*` environment variables, then the command-line flags, then an
+embedding host's `vedit_set_*()` calls. So a `--dec` flag or `VEDIT_BOX` beats
+`ui.box` in the file, and the host always wins. The core never opens the file
+itself; the command-line front end reads it and hands it in through
+`vedit_set_config()`, which an embedding host can also call with a config it
+builds from `vedit_cfg_new()` / `vedit_cfg_load()`.
+
+The color schemes, themes, and the joe-style syntax rules are not yet
+configurable here; that is the planned next step.
+
 ### Color schemes
 
 ### Line numbers

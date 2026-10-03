@@ -42,6 +42,259 @@
 #include "vedit.h"
 
 /****************************************************************
+ * Configuration file (gitconfig-style key/value).
+ *
+ * The core never opens a file. The CLI front end, or an embedding host, parses
+ * one with vedit_cfg_load() and hands it in with vedit_set_config(); the
+ * startup resolvers consult it, ranked below the environment and flags. Keys
+ * are dotted: a "[section]" header prefixes the names under it, "[section
+ * \"sub\"]" adds a middle component, and "section.key = value" works without a
+ * header. '#' and ';' start comments. A later value for a key wins.
+ ****************************************************************/
+
+typedef struct cfg Cfg;
+
+typedef struct cfg_entry {
+	char	*key;
+	char	*value;
+} Cfgent;
+
+struct cfg {
+	Cfgent	*entries;
+	int	 count;
+	int	 alloc;
+};
+
+static char *
+cfg_dup(const char *s)
+{
+	size_t n = strlen(s) + 1;
+	char *p = malloc(n);
+
+	if (p)
+		memcpy(p, s, n);
+	return p;
+}
+
+Cfg *
+vedit_cfg_new(void)
+{
+	return calloc(1, sizeof(Cfg));
+}
+
+void
+vedit_cfg_free(Cfg *c)
+{
+	int i;
+
+	if (!c)
+		return;
+	for (i = 0; i < c->count; i++) {
+		free(c->entries[i].key);
+		free(c->entries[i].value);
+	}
+	free(c->entries);
+	free(c);
+}
+
+/* Store or overwrite a normalized key. Silently drops the pair on an
+ * allocation failure, which leaves the earlier config intact. */
+static void
+cfg_set(Cfg *c, const char *key, const char *value)
+{
+	char *k, *v;
+	int i;
+
+	for (i = 0; i < c->count; i++) {
+		if (strcmp(c->entries[i].key, key) == 0) {
+			v = cfg_dup(value);
+			if (!v)
+				return;
+			free(c->entries[i].value);
+			c->entries[i].value = v;
+			return;
+		}
+	}
+	if (c->count >= c->alloc) {
+		int na = c->alloc ? c->alloc * 2 : 16;
+		Cfgent *ne = realloc(c->entries, (size_t)na * sizeof(*ne));
+
+		if (!ne)
+			return;
+		c->entries = ne;
+		c->alloc = na;
+	}
+	k = cfg_dup(key);
+	v = cfg_dup(value);
+	if (!k || !v) {
+		free(k);
+		free(v);
+		return;
+	}
+	c->entries[c->count].key = k;
+	c->entries[c->count].value = v;
+	c->count++;
+}
+
+static const char *
+cfg_get(const Cfg *c, const char *key)
+{
+	int i;
+
+	if (!c)
+		return NULL;
+	for (i = 0; i < c->count; i++)
+		if (strcmp(c->entries[i].key, key) == 0)
+			return c->entries[i].value;
+	return NULL;
+}
+
+/* Interpret a config value as a boolean. Returns def when c has no such key or
+ * the value is not recognized. */
+static int
+cfg_bool(const Cfg *c, const char *key, int def)
+{
+	const char *v = cfg_get(c, key);
+
+	if (!v)
+		return def;
+	if (strcmp(v, "on") == 0 || strcmp(v, "yes") == 0 ||
+	    strcmp(v, "true") == 0 || strcmp(v, "1") == 0)
+		return 1;
+	if (strcmp(v, "off") == 0 || strcmp(v, "no") == 0 ||
+	    strcmp(v, "false") == 0 || strcmp(v, "0") == 0)
+		return 0;
+	return def;
+}
+
+static char *
+cfg_skip_ws(char *s)
+{
+	while (*s == ' ' || *s == '\t')
+		s++;
+	return s;
+}
+
+static void
+cfg_trim_end(char *s)
+{
+	char *end = s + strlen(s);
+
+	while (end > s && (end[-1] == ' ' || end[-1] == '\t' ||
+	    end[-1] == '\r' || end[-1] == '\n'))
+		end--;
+	*end = '\0';
+}
+
+/* Join section + subsection + name into a dotted key written to out. */
+static void
+cfg_make_key(char *out, size_t outsz, const char *section,
+    const char *subsect, const char *name)
+{
+	if (section[0] == '\0')
+		snprintf(out, outsz, "%s", name);
+	else if (subsect)
+		snprintf(out, outsz, "%s.%s.%s", section, subsect, name);
+	else
+		snprintf(out, outsz, "%s.%s", section, name);
+}
+
+/* Parse a config file into c, merging over anything already there. Returns 0
+ * on success (a missing file is a failure, so the caller can ignore it), -1 on
+ * a read or syntax error. */
+int
+vedit_cfg_load(Cfg *c, const char *path)
+{
+	char buf[512], section[256], key[2048];
+	FILE *f;
+	char *subsect = NULL;
+	int line = 0, rc = 0;
+
+	if (!c)
+		return -1;
+	f = fopen(path, "r");
+	if (!f)
+		return -1;
+	section[0] = '\0';
+	while (fgets(buf, (int)sizeof(buf), f)) {
+		char *base, *tmp;
+
+		line++;
+		/* strip a comment, honoring quoted regions */
+		for (tmp = buf; *tmp; tmp++) {
+			if (*tmp == '#' || *tmp == ';') {
+				*tmp = '\0';
+				break;
+			}
+			if (*tmp == '"') {
+				tmp++;
+				while (*tmp && *tmp != '"')
+					tmp++;
+				if (!*tmp)
+					break;
+			}
+		}
+		base = cfg_skip_ws(buf);
+		if (*base == '\0')
+			continue;
+		if (*base == '[') {		/* [section] or [section "sub"] */
+			char *end, *q;
+
+			base++;
+			end = strchr(base, ']');
+			if (!end) {
+				rc = -1;
+				break;
+			}
+			*end = '\0';
+			q = strchr(base, '"');
+			free(subsect);
+			subsect = NULL;
+			if (q) {
+				char *q2;
+
+				*q = '\0';
+				q2 = strchr(q + 1, '"');
+				if (!q2) {
+					rc = -1;
+					break;
+				}
+				*q2 = '\0';
+				subsect = cfg_dup(q + 1);
+			}
+			base = cfg_skip_ws(base);
+			cfg_trim_end(base);
+			snprintf(section, sizeof(section), "%s", base);
+			continue;
+		}
+		tmp = strchr(base, '=');
+		if (!tmp) {
+			rc = -1;
+			break;
+		}
+		*tmp = '\0';
+		{
+			char *name = base, *value = cfg_skip_ws(tmp + 1);
+
+			cfg_trim_end(name);
+			cfg_trim_end(value);
+			if (section[0] == '\0' && strchr(name, '.') != NULL) {
+				/* shorthand: a trimmed name with a dot is already
+				 * a full dotted key */
+				cfg_set(c, name, value);
+			} else {
+				cfg_make_key(key, sizeof(key), section, subsect,
+				    name);
+				cfg_set(c, key, value);
+			}
+		}
+	}
+	free(subsect);
+	fclose(f);
+	return rc;
+}
+
+/****************************************************************
  * UTF-8 (inlined from lumi libutf8)
  ****************************************************************/
 
@@ -293,6 +546,10 @@ static const BoxDef box_tab[BG_COUNT] = {
 #define BOX_IS(cp)	((cp) >= BOX_CP_BASE && (cp) < BOX_CP_BASE + BG_COUNT)
 #define BOX_ID(cp)	((BoxGlyph)((cp) - BOX_CP_BASE))
 
+/* The configuration handed in by vedit_set_config(), or NULL. The startup
+ * resolvers consult it below the environment and above auto-detection. */
+static const Cfg *g_cfg;
+
 /* A forced mode set from the command line, or -1 for "decide from the
  * environment". box_default() resolves it. */
 static int g_box_force = -1;
@@ -307,6 +564,15 @@ box_default(void)
 	if (getenv("VEDIT_ASCII"))
 		return VEDIT_BOX_ASCII;
 	l = getenv("VEDIT_BOX");
+	if (l) {
+		if (strcmp(l, "utf8") == 0 || strcmp(l, "utf-8") == 0)
+			return VEDIT_BOX_UTF8;
+		if (strcmp(l, "dec") == 0)
+			return VEDIT_BOX_DEC;
+		if (strcmp(l, "ascii") == 0)
+			return VEDIT_BOX_ASCII;
+	}
+	l = cfg_get(g_cfg, "ui.box");
 	if (l) {
 		if (strcmp(l, "utf8") == 0 || strcmp(l, "utf-8") == 0)
 			return VEDIT_BOX_UTF8;
@@ -339,6 +605,13 @@ color_default(void)
 	if (g_colors_force > 0)
 		return g_colors_force;
 	s = getenv("VEDIT_COLORS");
+	if (s) {
+		if (strcmp(s, "256") == 0)
+			return 256;
+		if (strcmp(s, "16") == 0 || strcmp(s, "8") == 0)
+			return 16;
+	}
+	s = cfg_get(g_cfg, "ui.colors");
 	if (s) {
 		if (strcmp(s, "256") == 0)
 			return 256;
@@ -379,6 +652,8 @@ scroll_default(void)
 		    strcmp(s, "no") == 0)
 			return 0;
 	}
+	if (cfg_get(g_cfg, "ui.scroll"))
+		return cfg_bool(g_cfg, "ui.scroll", 0);
 	return 0;	/* conservative: dumb full-row repaint */
 }
 
@@ -7757,7 +8032,7 @@ usage(void)
 {
 	fprintf(stderr,
 	    "usage: %s [--utf8|--dec|-a|--ascii] [--16color|--256color]"
-	    " [--scroll] [file]\n"
+	    " [--scroll] [--config FILE|--no-config] [file]\n"
 	    "\n"
 	    "A single-file visual text editor for primitive terminals.\n"
 	    "\n"
@@ -7773,6 +8048,10 @@ usage(void)
 	    "  --scroll      use the VT100 scroll region when scrolling (faster\n"
 	    "                on a slow link; needs a client that supports it)\n"
 	    "  --no-scroll   repaint instead (the default; also VEDIT_SCROLL=0|1)\n"
+	    "  --config FILE read settings from FILE (gitconfig style)\n"
+	    "  --no-config   skip the config file\n"
+	    "                Default: $VEDIT_CONFIG, else $XDG_CONFIG_HOME/vedit/\n"
+	    "                config, else ~/.veditrc.\n"
 	    "\n"
 	    "Modeless (MS-EDIT) keys:\n"
 	    "  arrows        move the cursor\n"
@@ -8579,6 +8858,54 @@ vedit_set_scroll(struct vedit *v, int on)
 		v->e.term->scroll = on ? 1 : 0;
 }
 
+/* Apply the editor-level defaults from g_cfg: color scheme, word wrap, line
+ * numbers, startup personality, and syntax highlighting. Each unset key keeps
+ * the value editor_init() already set. */
+static void
+ed_apply_config(Editor *e)
+{
+	const char *s;
+
+	if (!g_cfg)
+		return;
+	s = cfg_get(g_cfg, "ui.scheme");
+	if (s) {
+		if (strcmp(s, "dos") == 0)
+			e->scheme = SCHEME_DOS;
+		else if (strcmp(s, "black") == 0)
+			e->scheme = SCHEME_BLACK;
+		else if (strcmp(s, "plain") == 0)
+			e->scheme = SCHEME_PLAIN;
+	}
+	e->wrap = cfg_bool(g_cfg, "ui.wrap", e->wrap);
+	e->show_lineno = cfg_bool(g_cfg, "ui.number", e->show_lineno);
+	e->hl_on = cfg_bool(g_cfg, "syntax.enable", e->hl_on);
+	s = cfg_get(g_cfg, "edit.mode");
+	if (s) {
+		if (strcmp(s, "vi") == 0)
+			e->mode = MODE_NORMAL;
+		else if (strcmp(s, "modeless") == 0)
+			e->mode = MODE_MODELESS;
+	}
+}
+
+/* Hand the editor a parsed configuration (see vedit_cfg_load). It is borrowed,
+ * not copied, so it must outlive the editor; pass NULL to clear it. Call before
+ * vedit_run(). The startup knobs (box mode, colors, scroll) are re-resolved so
+ * the config takes effect even after vedit_new(), still ranked below any
+ * environment variable or explicit setter. */
+void
+vedit_set_config(struct vedit *v, const struct cfg *c)
+{
+	g_cfg = c;
+	if (v->e.term) {
+		v->e.term->box_mode = box_default();
+		v->e.term->colors = color_default();
+		v->e.term->scroll = scroll_default();
+	}
+	ed_apply_config(&v->e);
+}
+
 /* Deliver a new terminal size. The host calls this from wherever it learns the
  * size (telnet NAWS, a SIGWINCH it caught, a resize message). The change is
  * picked up by the run loop, which repaints. */
@@ -8782,13 +9109,48 @@ tty_getsize(void *ctx, int *rows, int *cols)
 	return -1;
 }
 
+/* Pick the config file path. An explicit --config (opt) or $VEDIT_CONFIG is
+ * used as given; otherwise the first of $XDG_CONFIG_HOME/vedit/config and
+ * ~/.veditrc that exists. Writes buf and returns 1, or returns 0 for none. */
+static int
+cli_config_path(const char *opt, char *buf, size_t bufsz)
+{
+	const char *env;
+
+	if (opt) {
+		snprintf(buf, bufsz, "%s", opt);
+		return 1;
+	}
+	env = getenv("VEDIT_CONFIG");
+	if (env && env[0]) {
+		snprintf(buf, bufsz, "%s", env);
+		return 1;
+	}
+	env = getenv("XDG_CONFIG_HOME");
+	if (env && env[0]) {
+		snprintf(buf, bufsz, "%s/vedit/config", env);
+		if (access(buf, R_OK) == 0)
+			return 1;
+	}
+	env = getenv("HOME");
+	if (env && env[0]) {
+		snprintf(buf, bufsz, "%s/.veditrc", env);
+		if (access(buf, R_OK) == 0)
+			return 1;
+	}
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
 	struct vedit_io io;
 	struct vedit *v;
+	struct cfg *cfg = NULL;
 	const char *file = NULL;
-	int rc, i;
+	const char *cfg_opt = NULL;
+	char cfg_path[PATH_MAX];
+	int rc, i, no_config = 0;
 
 	if (argv[0])
 		progname = argv[0];
@@ -8827,6 +9189,19 @@ main(int argc, char **argv)
 			g_scroll_force = 0;
 			continue;
 		}
+		if (strcmp(argv[i], "--no-config") == 0) {
+			no_config = 1;
+			continue;
+		}
+		if (strcmp(argv[i], "--config") == 0) {
+			if (i + 1 >= argc) {
+				fprintf(stderr, "%s: --config needs a path\n",
+				    progname);
+				return 1;
+			}
+			cfg_opt = argv[++i];
+			continue;
+		}
 		if (!file) {
 			file = argv[i];
 			continue;
@@ -8856,14 +9231,28 @@ main(int argc, char **argv)
 		fprintf(stderr, "%s: out of memory\n", progname);
 		return 1;
 	}
+	if (!no_config && cli_config_path(cfg_opt, cfg_path, sizeof(cfg_path))) {
+		cfg = vedit_cfg_new();
+		if (cfg && vedit_cfg_load(cfg, cfg_path) == 0) {
+			vedit_set_config(v, cfg);
+		} else {
+			if (cfg_opt)		/* an explicit path should exist */
+				fprintf(stderr, "%s: %s: cannot read config\n",
+				    progname, cfg_path);
+			vedit_cfg_free(cfg);
+			cfg = NULL;
+		}
+	}
 	if (file && vedit_open(v, file) < 0) {
 		fprintf(stderr, "%s: %s: %s\n", progname, file,
 		    strerror(errno));
 		vedit_free(v);
+		vedit_cfg_free(cfg);
 		return 1;
 	}
 	rc = vedit_run(v);
 	vedit_free(v);
+	vedit_cfg_free(cfg);
 	return rc;
 }
 

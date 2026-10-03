@@ -235,8 +235,7 @@ t_jump_label(void *ctx, int i)
 static void
 t_pick_jump(Test *t)
 {
-	Picksrc src = { NULL, NULL, t_jump_count, t_jump_label, NULL, NULL,
-	    NULL };
+	Picksrc src = { .count = t_jump_count, .label = t_jump_label };
 	Picker pk;
 
 	memset(&pk, 0, sizeof(pk));
@@ -327,6 +326,122 @@ t_filepick_start_dir(Test *t)
 	rmdir(dir);
 }
 
+/* Write text to a temp file and parse it; caller frees *out and unlinks path. */
+static Cfg *
+load_cfg_text(const char *text, char *path, size_t pathsz)
+{
+	int fd;
+	FILE *f;
+	Cfg *c;
+
+	snprintf(path, pathsz, "/tmp/vedit_cfgXXXXXX");
+	fd = mkstemp(path);
+	if (fd < 0)
+		return NULL;
+	f = fdopen(fd, "w");
+	if (!f) {
+		close(fd);
+		return NULL;
+	}
+	fputs(text, f);
+	fclose(f);
+	c = vedit_cfg_new();
+	if (c && vedit_cfg_load(c, path) != 0) {
+		vedit_cfg_free(c);
+		c = NULL;
+	}
+	return c;
+}
+
+static void
+t_cfg_parse(Test *t)
+{
+	static const char *text =
+	    "# a comment\n"
+	    "ui.scheme = dos\n"		/* shorthand, overwritten below */
+	    "edit.mode = vi\n"
+	    "[ui]\n"
+	    "  scheme = black ; trailing comment\n"
+	    "  wrap = on\n"
+	    "[theme \"midnight\"]\n"
+	    "  content.fg = 250\n";
+	char path[256];
+	Cfg *c = load_cfg_text(text, path, sizeof(path));
+	const char *v;
+
+	TAP_ASSERT(t, c != NULL);
+	v = cfg_get(c, "edit.mode");
+	TAP_CHECKF(t, v && strcmp(v, "vi") == 0, "edit.mode=%s", v ? v : "(nil)");
+	v = cfg_get(c, "ui.scheme");			/* section wins, overwrite */
+	TAP_CHECKF(t, v && strcmp(v, "black") == 0, "ui.scheme=%s",
+	    v ? v : "(nil)");
+	v = cfg_get(c, "ui.wrap");
+	TAP_CHECKF(t, v && strcmp(v, "on") == 0, "ui.wrap=%s", v ? v : "(nil)");
+	v = cfg_get(c, "theme.midnight.content.fg");
+	TAP_CHECKF(t, v && strcmp(v, "250") == 0, "theme fg=%s",
+	    v ? v : "(nil)");
+	TAP_CHECK(t, cfg_get(c, "comment") == NULL);	/* comment not a key */
+	TAP_CHECK(t, cfg_bool(c, "ui.wrap", 0) == 1);
+	TAP_CHECK(t, cfg_bool(c, "missing", 1) == 1);	/* default when unset */
+
+	vedit_cfg_free(c);
+	unlink(path);
+}
+
+static void
+t_cfg_resolve(Test *t)
+{
+	static const char *text =
+	    "[ui]\n"
+	    "box = dec\n"
+	    "colors = 256\n"
+	    "scroll = on\n"
+	    "scheme = black\n"
+	    "wrap = on\n"
+	    "number = on\n"
+	    "[edit]\n"
+	    "mode = vi\n"
+	    "[syntax]\n"
+	    "enable = off\n";
+	char path[256];
+	Cfg *c = load_cfg_text(text, path, sizeof(path));
+	const Cfg *old = g_cfg;
+	int sb = g_box_force, sc = g_colors_force, ss = g_scroll_force;
+	Editor e;
+
+	TAP_ASSERT(t, c != NULL);
+	unsetenv("VEDIT_BOX");
+	unsetenv("VEDIT_ASCII");
+	unsetenv("VEDIT_COLORS");
+	unsetenv("VEDIT_SCROLL");
+	g_box_force = g_colors_force = g_scroll_force = -1;
+	g_cfg = c;
+
+	/* config beats auto-detect for the startup knobs */
+	TAP_CHECK(t, box_default() == VEDIT_BOX_DEC);
+	TAP_CHECK(t, color_default() == 256);
+	TAP_CHECK(t, scroll_default() == 1);
+	/* a flag still beats config */
+	g_box_force = VEDIT_BOX_ASCII;
+	TAP_CHECK(t, box_default() == VEDIT_BOX_ASCII);
+
+	/* editor-level toggles */
+	editor_init(&e);
+	ed_apply_config(&e);
+	TAP_CHECK(t, e.scheme == SCHEME_BLACK);
+	TAP_CHECK(t, e.wrap == 1);
+	TAP_CHECK(t, e.show_lineno == 1);
+	TAP_CHECK(t, e.mode == MODE_NORMAL);
+	TAP_CHECK(t, e.hl_on == 0);
+
+	g_cfg = old;
+	g_box_force = sb;
+	g_colors_force = sc;
+	g_scroll_force = ss;
+	vedit_cfg_free(c);
+	unlink(path);
+}
+
 const Case tap_cases[] = {
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },
@@ -345,5 +460,7 @@ const Case tap_cases[] = {
 	{ "pick_jump", t_pick_jump },
 	{ "filepick_load", t_filepick_load },
 	{ "filepick_start_dir", t_filepick_start_dir },
+	{ "cfg_parse", t_cfg_parse },
+	{ "cfg_resolve", t_cfg_resolve },
 	{ NULL, NULL },
 };

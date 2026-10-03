@@ -100,6 +100,19 @@ void vedit_set_colors(struct vedit *v, int colors);
  * Call before vedit_run(). When never called, it is taken from VEDIT_SCROLL. */
 void vedit_set_scroll(struct vedit *v, int on);
 
+/* Optional configuration file (gitconfig-style key/value). The editor core
+ * never opens a file itself: build a config with vedit_cfg_new(), fill it from
+ * one or more files with vedit_cfg_load(), hand it to vedit_set_config() before
+ * vedit_run(), and free it with vedit_cfg_free() after vedit_run(). Recognized
+ * keys include ui.box, ui.colors, ui.scroll, ui.scheme, ui.wrap, ui.number,
+ * edit.mode, and syntax.enable (see README). Config values rank below the
+ * VEDIT_* environment variables and the explicit setters above. */
+struct cfg;
+struct cfg *vedit_cfg_new(void);
+int vedit_cfg_load(struct cfg *c, const char *path);
+void vedit_cfg_free(struct cfg *c);
+void vedit_set_config(struct vedit *v, const struct cfg *c);
+
 /* Run the editor to completion. Returns 0 on a normal quit, 1 on end of input
  * or vi ':cq'. */
 int vedit_run(struct vedit *v);
