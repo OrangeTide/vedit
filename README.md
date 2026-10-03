@@ -90,6 +90,17 @@ buffer's digit count, and the current line's number is drawn brighter than the
 rest. In vi keys it toggles with `:set number` / `:set nonumber` (`:set nu` /
 `:set nonu`, or `:set number!` to flip it).
 
+### Word wrap
+
+**View > Word Wrap** soft-wraps long lines to the window width instead of
+scrolling horizontally. Lines break at word boundaries (a word wider than the
+window is broken mid-word), the wrap is display-only so the file is unchanged,
+and a wrapped line's continuation rows have a blank gutter. In vi keys it toggles
+with `:set wrap` / `:set nowrap` (`:set wrap!` to flip). Up and down move by
+whole lines; Home, End, and left/right move within the wrapped line as usual.
+Wrap does not apply in draw mode, and the scroll-region fast path is skipped
+while it is on.
+
 ### Color schemes
 
 The **View > Color Scheme** menu cycles three looks: the DOS blue text area
@@ -142,7 +153,8 @@ $`, `w b e`, `gg G`, `f F t T`, `; ,`, `{ } ( )`, `% H M L |`, counts such as
 `p`, `u`, and `i a A I o O` to insert. `Ctrl-Home` and `Ctrl-End` jump to the
 first and last line, the same as `gg` and `G`, and work in insert mode too. `ZZ`
 writes and quits, `ZQ` quits without writing. The `:` line runs
-`w q wq q! qa wqa cq`, `:N`, and `:set number` / `:set nonumber`. `/` searches
+`w q wq q! qa wqa cq`, `:N`, `:set number` / `:set nonumber`, and `:set wrap` /
+`:set nowrap`. `/` searches
 and `n` repeats.
 
 ## Draw mode (ASCII art and maps)

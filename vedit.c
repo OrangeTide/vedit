@@ -2134,6 +2134,7 @@ typedef struct editor {
 	char		status[160];
 	int		scheme;		/* chrome color scheme (SCHEME_*) */
 	int		show_lineno;	/* draw the line-number gutter */
+	int		wrap;		/* soft-wrap long lines to the window width */
 	int		hex_view;	/* render the buffer as a hex dump */
 	size_t		hex_top;	/* first visible hex row (byte offset >> 4) */
 	int		hex_ascii;	/* editing the ascii column, not the hex */
@@ -3743,19 +3744,20 @@ gutter_width(const Editor *e)
 }
 
 /* Paint the gutter cells for one screen row: the 1-based number of line `idx`
- * right-aligned, or blanks for a virtual row past the end of the buffer. The
- * cursor's own line is drawn bright, the rest dim. */
+ * right-aligned, or blanks for a virtual row past the end of the buffer or a
+ * soft-wrap continuation row (number == 0). The cursor's own line is drawn
+ * bright, the rest dim. */
 static void
 render_gutter(Screen *d, const Editor *e, int row, int gutter, size_t idx,
-    Color fg, Color bg)
+    int number, Color fg, Color bg)
 {
 	char num[24];
-	uint16_t at = (idx == e->cy) ? 0 : ATTR_DIM;
+	uint16_t at = (number && idx == e->cy) ? 0 : ATTR_DIM;
 	int i, n = 0;
 
 	if (gutter <= 0)
 		return;
-	if (idx < text_lines(e->t))
+	if (number && idx < text_lines(e->t))
 		n = snprintf(num, sizeof(num), "%*zu ", gutter - 1, idx + 1);
 	for (i = 0; i < gutter; i++)
 		scr_cell(d, row, CHROME_LEFT + i,
@@ -3804,7 +3806,7 @@ typedef enum menu_act {
 	MA_BUF_NEXT, MA_BUF_PREV, MA_BUF_LIST, MA_EXIT,
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE,
 	MA_FIND, MA_FIND_NEXT, MA_GOTO,
-	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_HEX, MA_DRAW, MA_VI_MODE,
+	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_HEX, MA_DRAW, MA_VI_MODE,
 	MA_HELP, MA_ABOUT,
 } Menuact;
 
@@ -3854,6 +3856,7 @@ static const Menuitem mi_view[] = {
 	{ "&Syntax Highlight",	"",	"",	MA_SYNTAX },
 	{ "&Color Scheme",	"",	"",	MA_SCHEME },
 	{ "&Line Numbers",	"",	":set nu",	MA_LINENO },
+	{ "&Word Wrap",		"",	":set wrap",	MA_WRAP },
 	{ "&Hex Dump",		"",	"",	MA_HEX },
 };
 static const Menuitem mi_options[] = {
@@ -4062,6 +4065,8 @@ menu_checked(const Editor *e, Menuact act)
 		return -1;		/* a three-way cycle, not a checkbox */
 	case MA_LINENO:
 		return e->show_lineno ? 1 : 0;
+	case MA_WRAP:
+		return e->wrap ? 1 : 0;
 	case MA_DRAW:
 		return e->draw_mode ? 1 : 0;
 	case MA_VI_MODE:
@@ -5044,6 +5049,255 @@ hex_render(Editor *e, Screen *d)
 		    e->hex_ascii ? hex_asciicol(curj, (int)cols) : hex_hexcol(curj));
 }
 
+/* Selection highlight bounds for one buffer line, as display columns [*hs,*he)
+ * within the line, or -1/-1 when nothing on the line is selected. Shared by the
+ * plain and soft-wrap renderers. */
+static void
+sel_cols(const Editor *e, size_t idx, const char *s, size_t llen,
+    int *hs, int *he)
+{
+	*hs = -1;
+	*he = -1;
+	if (e->sel_active && e->sel_block) {
+		size_t ry1 = e->ay < e->cy ? e->ay : e->cy;
+		size_t ry2 = e->ay > e->cy ? e->ay : e->cy;
+		size_t rx1 = e->ax < e->cx ? e->ax : e->cx;
+		size_t rx2 = e->ax > e->cx ? e->ax : e->cx;
+
+		if (idx >= ry1 && idx <= ry2) {
+			*hs = (int)rx1;
+			*he = (int)rx2 + 1;
+		}
+	} else if (e->sel_active && s) {
+		size_t y1, x1, y2, x2;
+
+		sel_bounds(e, &y1, &x1, &y2, &x2);
+		if (idx >= y1 && idx <= y2) {
+			size_t a = (idx == y1) ? x1 : 0;
+			size_t b = (idx == y2) ? x2 : llen;
+
+			if (e->vi_visual == 'V') {
+				a = 0;
+				b = llen;
+			} else if (e->vi_visual == 'v' && idx == y2 && b < llen) {
+				b += rune_len_at(s, llen, b);
+			}
+			*hs = disp_cols(s, a);
+			*he = disp_cols(s, b);
+		}
+	}
+}
+
+/* One soft-wrap step. For the segment of line s (llen bytes) that starts at byte
+ * `a`, whose first column is `acol`, and a wrap width of W display columns:
+ * return the byte at which to stop drawing (a trailing break space is left out),
+ * set *next to the first byte of the following segment (past the break spaces),
+ * and *nextcol to its first display column. Breaks at the last space that fits,
+ * or mid-rune when a single word is wider than W. */
+static size_t
+wrap_next(const char *s, size_t llen, size_t a, int acol, int W,
+    size_t *next, int *nextcol)
+{
+	size_t i = a, sp = (size_t)-1;
+	int col = acol, spcol = 0;
+
+	while (i < llen) {
+		uint32_t r;
+		int n = utf8_decode(&r, (const unsigned char *)s + i, llen - i);
+		int w;
+
+		if (n <= 0)
+			n = 1;
+		if (r == '\t')
+			w = TAB_WIDTH - (col % TAB_WIDTH);
+		else if ((w = rune_width(r)) < 1)
+			w = 1;
+		if (col - acol + w > W && i > a) {
+			if (sp != (size_t)-1) {	/* break at the last space */
+				size_t ns = sp;
+
+				while (ns < llen && s[ns] == ' ')
+					ns++;
+				*next = ns;
+				*nextcol = spcol + (int)(ns - sp);
+				return sp;
+			}
+			*next = i;		/* a word wider than the window */
+			*nextcol = col;
+			return i;
+		}
+		if (r == ' ') {
+			sp = i;
+			spcol = col;
+		}
+		col += w;
+		i += (size_t)n;
+	}
+	*next = llen;
+	*nextcol = col;
+	return llen;
+}
+
+/* Number of screen rows a buffer line occupies at wrap width W (at least one). */
+static int
+line_rows(const char *s, size_t llen, int W)
+{
+	size_t a = 0;
+	int acol = 0, rows = 0;
+
+	if (llen == 0)
+		return 1;
+	while (a < llen) {
+		size_t next;
+		int nextcol;
+
+		wrap_next(s, llen, a, acol, W, &next, &nextcol);
+		rows++;
+		if (next <= a)
+			break;
+		a = next;
+		acol = nextcol;
+	}
+	return rows ? rows : 1;
+}
+
+/* Which wrap segment (0-based) of line s holds byte offset cx. */
+static int
+seg_index_of(const char *s, size_t llen, size_t cx, int W)
+{
+	size_t a = 0;
+	int acol = 0, seg = 0;
+
+	while (a < llen) {
+		size_t next;
+		int nextcol;
+
+		wrap_next(s, llen, a, acol, W, &next, &nextcol);
+		if (cx < next || next >= llen || next <= a)
+			break;
+		a = next;
+		acol = nextcol;
+		seg++;
+	}
+	return seg;
+}
+
+/* scroll_to_cursor for soft-wrap mode: keep the cursor's wrapped row on screen
+ * by dropping whole buffer lines from the top. The view always starts at a
+ * buffer-line boundary, and horizontal scrolling is off. */
+static void
+scroll_to_cursor_wrap(Editor *e, int text_h, int W)
+{
+	e->left = 0;
+	if (e->cy < e->top)
+		e->top = e->cy;
+	for (;;) {
+		int rows = 0;
+		size_t idx;
+
+		for (idx = e->top; idx < e->cy; idx++) {
+			size_t l = 0;
+			const char *s = text_line(e->t, idx, &l);
+
+			rows += s ? line_rows(s, l, W) : 1;
+		}
+		{
+			size_t l = 0;
+			const char *s = text_line(e->t, e->cy, &l);
+
+			rows += s ? seg_index_of(s, l, e->cx, W) : 0;
+		}
+		if (rows < text_h || e->top >= e->cy)
+			break;
+		e->top++;		/* drop a whole line from the top */
+	}
+}
+
+/* Paint the text area with soft wrap: each buffer line flows across as many
+ * screen rows as it needs. Returns the cursor's screen row/col through the out
+ * params (col0-based column). */
+static void
+render_body_wrapped(Editor *e, Screen *d, const Pal *p, int text_h,
+    int text_w, int gutter, int col0, int *cur_row, int *cur_col)
+{
+	int i = 0;
+	size_t idx = e->top;
+
+	*cur_row = 0;
+	*cur_col = col0;
+	while (i < text_h) {
+		size_t llen = 0;
+		const char *s = text_line(e->t, idx, &llen);
+		const uint8_t *sty;
+		int hs, he, row = CHROME_TOP + i;
+		size_t a;
+		int acol, seg;
+
+		if (!s) {			/* a virtual row past the last line */
+			render_gutter(d, e, row, gutter, idx, 0, p->content_fg,
+			    p->content_bg);
+			scr_line(d, row, col0, "", 0, 0, text_w, -1, -1, NULL,
+			    p->content_fg, p->content_bg);
+			if (idx == e->cy) {
+				*cur_row = i;
+				*cur_col = col0;
+			}
+			idx++;
+			i++;
+			continue;
+		}
+
+		sel_cols(e, idx, s, llen, &hs, &he);
+		sty = hl_line(e, idx, s, llen);
+
+		if (llen == 0) {		/* an empty line is one blank row */
+			render_gutter(d, e, row, gutter, idx, 1, p->content_fg,
+			    p->content_bg);
+			scr_line(d, row, col0, "", 0, 0, text_w, hs, he, NULL,
+			    p->content_fg, p->content_bg);
+			if (idx == e->cy) {
+				*cur_row = i;
+				*cur_col = col0;
+			}
+			idx++;
+			i++;
+			continue;
+		}
+
+		a = 0;
+		acol = 0;
+		seg = 0;
+		while (a < llen && i < text_h) {
+			size_t next, end;
+			int nextcol;
+
+			end = wrap_next(s, llen, a, acol, text_w, &next, &nextcol);
+			if (end <= a)
+				end = a + 1;		/* guarantee progress */
+			row = CHROME_TOP + i;
+			render_gutter(d, e, row, gutter, idx, seg == 0,
+			    p->content_fg, p->content_bg);
+			scr_line(d, row, col0, s, end, acol, text_w, hs, he,
+			    sty, p->content_fg, p->content_bg);
+			if (idx == e->cy && (e->cx < next || next >= llen)) {
+				int cc = disp_cols(s, e->cx) - acol;
+
+				if (cc < 0)
+					cc = 0;
+				if (cc > text_w)
+					cc = text_w;
+				*cur_row = i;
+				*cur_col = col0 + cc;
+			}
+			seg++;
+			a = next;
+			acol = nextcol;
+			i++;
+		}
+		idx++;
+	}
+}
+
 static void
 render_body(Editor *e, Screen *d)
 {
@@ -5052,10 +5306,11 @@ render_body(Editor *e, Screen *d)
 	int gutter = gutter_width(e);
 	int text_w = text_width(e) - gutter;
 	int col0 = CHROME_LEFT + gutter;
+	int wrap = e->wrap && !e->draw_mode;
 	int i;
 	size_t len = 0;
 	const char *cur = text_line(e->t, e->cy, &len);
-	int cur_col;
+	int cur_col, cur_row = 0, cur_scol = col0;
 
 	if (text_w < 1)
 		text_w = 1;
@@ -5066,16 +5321,21 @@ render_body(Editor *e, Screen *d)
 		return;
 	}
 
-	scroll_to_cursor(e, text_h, text_w);
+	if (wrap)
+		scroll_to_cursor_wrap(e, text_h, text_w);
+	else
+		scroll_to_cursor(e, text_h, text_w);
 	cur_col = cursor_dispcol(e);
 	(void)cur;
 
 	/* When only the vertical offset moved by a few lines, scroll the text
 	 * region in the terminal instead of repainting every row; scr_present
 	 * then paints just the newly exposed lines. Gated on t->scroll (VT100
-	 * scroll region) and on a valid, like-for-like previous text frame. */
-	if (e->term->scroll && e->term->shadow_valid && e->prev_text_view &&
-	    e->left == e->prev_left && e->top != e->prev_top) {
+	 * scroll region) and on a valid, like-for-like previous text frame.
+	 * Disabled under soft wrap, where a line spans a variable row count. */
+	if (!wrap && e->term->scroll && e->term->shadow_valid &&
+	    e->prev_text_view && e->left == e->prev_left &&
+	    e->top != e->prev_top) {
 		long dv = (long)e->top - (long)e->prev_top;
 
 		if (dv > -text_h && dv < text_h)
@@ -5086,60 +5346,33 @@ render_body(Editor *e, Screen *d)
 
 	scr_clear(d);
 
-	for (i = 0; i < text_h; i++) {
-		size_t idx = e->top + (size_t)i;
-		size_t llen = 0;
-		const char *s = text_line(e->t, idx, &llen);
-		int hs = -1, he = -1;
-		const uint8_t *sty = NULL;
-		int row = CHROME_TOP + i;
+	if (wrap) {
+		render_body_wrapped(e, d, p, text_h, text_w, gutter, col0,
+		    &cur_row, &cur_scol);
+	} else {
+		for (i = 0; i < text_h; i++) {
+			size_t idx = e->top + (size_t)i;
+			size_t llen = 0;
+			const char *s = text_line(e->t, idx, &llen);
+			int hs, he, row = CHROME_TOP + i;
+			const uint8_t *sty = NULL;
 
-		if (e->sel_active && e->sel_block) {
-			/* a rectangle: the same columns highlight on every row
-			 * in range, including blank and virtual rows */
-			size_t ry1 = e->ay < e->cy ? e->ay : e->cy;
-			size_t ry2 = e->ay > e->cy ? e->ay : e->cy;
-			size_t rx1 = e->ax < e->cx ? e->ax : e->cx;
-			size_t rx2 = e->ax > e->cx ? e->ax : e->cx;
-
-			if (idx >= ry1 && idx <= ry2) {
-				hs = (int)rx1;
-				he = (int)rx2 + 1;
-			}
-		} else if (e->sel_active && s) {
-			size_t y1, x1, y2, x2;
-
-			sel_bounds(e, &y1, &x1, &y2, &x2);
-			if (idx >= y1 && idx <= y2) {
-				size_t a = (idx == y1) ? x1 : 0;
-				size_t b = (idx == y2) ? x2 : llen;
-
-				/* vi visual selects inclusively: charwise covers
-				 * the cell under the cursor, linewise whole lines.
-				 * The modeless selection (vi_visual == 0) is left
-				 * exclusive as before. */
-				if (e->vi_visual == 'V') {
-					a = 0;
-					b = llen;
-				} else if (e->vi_visual == 'v' && idx == y2 &&
-				    b < llen) {
-					b += rune_len_at(s, llen, b);
-				}
-				hs = disp_cols(s, a);
-				he = disp_cols(s, b);
+			sel_cols(e, idx, s, llen, &hs, &he);
+			render_gutter(d, e, row, gutter, idx, 1, p->content_fg,
+			    p->content_bg);
+			if (s) {
+				sty = hl_line(e, idx, s, llen);
+				scr_line(d, row, col0, s, llen, (int)e->left,
+				    text_w, hs, he, sty, p->content_fg,
+				    p->content_bg);
+			} else {
+				scr_line(d, row, col0, "", 0, (int)e->left,
+				    text_w, hs, he, NULL, p->content_fg,
+				    p->content_bg);
 			}
 		}
-
-		render_gutter(d, e, row, gutter, idx, p->content_fg,
-		    p->content_bg);
-		if (s) {
-			sty = hl_line(e, idx, s, llen);
-			scr_line(d, row, col0, s, llen, (int)e->left,
-			    text_w, hs, he, sty, p->content_fg, p->content_bg);
-		} else {
-			scr_line(d, row, col0, "", 0, (int)e->left,
-			    text_w, hs, he, NULL, p->content_fg, p->content_bg);
-		}
+		cur_row = (int)(e->cy - e->top);
+		cur_scol = col0 + cur_col - (int)e->left;
 	}
 
 	ui_menubar(e, p, -1);
@@ -5156,8 +5389,7 @@ render_body(Editor *e, Screen *d)
 		scr_cursor_shape(d, CURSOR_DEFAULT);
 
 	scr_cursor_vis(d, 1);		/* a menu overlay may have hidden it */
-	scr_cursor(d, CHROME_TOP + (int)(e->cy - e->top),
-	    col0 + cur_col - (int)e->left);
+	scr_cursor(d, CHROME_TOP + cur_row, cur_scol);
 
 	e->prev_top = e->top;		/* for the next frame's scroll decision */
 	e->prev_left = e->left;
@@ -6804,6 +7036,13 @@ run_menu_act(Editor *e, Menuact act)
 		e->show_lineno = !e->show_lineno;
 		snprintf(e->status, sizeof(e->status), "line numbers %s",
 		    e->show_lineno ? "on" : "off");
+		break;
+	case MA_WRAP:
+		e->wrap = !e->wrap;
+		if (e->wrap)
+			e->left = 0;
+		snprintf(e->status, sizeof(e->status), "word wrap %s",
+		    e->wrap ? "on" : "off");
 		break;
 	case MA_HEX:
 		e->hex_view = !e->hex_view;
@@ -11490,13 +11729,25 @@ vi_ex_exec(Editor *e, char *buf)
 		else if (strcmp(arg, "number!") == 0 || strcmp(arg, "nu!") == 0 ||
 		    strcmp(arg, "invnumber") == 0)
 			e->show_lineno = !e->show_lineno;
+		else if (strcmp(arg, "wrap") == 0)
+			e->wrap = 1;
+		else if (strcmp(arg, "nowrap") == 0)
+			e->wrap = 0;
+		else if (strcmp(arg, "wrap!") == 0 || strcmp(arg, "invwrap") == 0)
+			e->wrap = !e->wrap;
 		else {
 			snprintf(e->status, sizeof(e->status),
 			    "E518: unknown option: %.40s", arg);
 			return REQ_CONTINUE;
 		}
-		snprintf(e->status, sizeof(e->status), "line numbers %s",
-		    e->show_lineno ? "on" : "off");
+		if (e->wrap)
+			e->left = 0;
+		if (strstr(arg, "wrap"))
+			snprintf(e->status, sizeof(e->status), "word wrap %s",
+			    e->wrap ? "on" : "off");
+		else
+			snprintf(e->status, sizeof(e->status), "line numbers %s",
+			    e->show_lineno ? "on" : "off");
 		return REQ_CONTINUE;
 	}
 
