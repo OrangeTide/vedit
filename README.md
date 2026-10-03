@@ -82,6 +82,16 @@ changed row is cleared with one erase-to-EOL instead of a column of spaces.
 
 ### Color schemes
 
+### Line numbers
+
+**View > Line Numbers** toggles a line-number gutter down the left of the text,
+the text-mode counterpart of the hex view's address column. Its width follows the
+buffer's digit count, and the current line's number is drawn brighter than the
+rest. In vi keys it toggles with `:set number` / `:set nonumber` (`:set nu` /
+`:set nonu`, or `:set number!` to flip it).
+
+### Color schemes
+
 The **View > Color Scheme** menu cycles three looks: the DOS blue text area
 (the default), a black scheme that leaves the text area on the terminal's
 default background, and a monochrome scheme that uses reverse video for the
@@ -129,8 +139,8 @@ Press F2 to switch to the vi personality. NORMAL mode supports `h j k l`, `0 ^
 $`, `w b e`, `gg G`, `f F t T`, `; ,`, `{ } ( )`, `% H M L |`, counts such as
 `3j`, the operators `d c y` with motions (`dw`, `d$`, `dt`), `cc dd yy`, `x`,
 `p`, `u`, and `i a A I o O` to insert. `ZZ` writes and quits, `ZQ` quits without
-writing. The `:` line runs `w q wq q! qa wqa cq` and `:N`. `/` searches and `n`
-repeats.
+writing. The `:` line runs `w q wq q! qa wqa cq`, `:N`, and `:set number` /
+`:set nonumber`. `/` searches and `n` repeats.
 
 ## Draw mode (ASCII art and maps)
 

@@ -2133,6 +2133,7 @@ typedef struct editor {
 	int		vi_vert_prev;	/* the previous command was one */
 	char		status[160];
 	int		scheme;		/* chrome color scheme (SCHEME_*) */
+	int		show_lineno;	/* draw the line-number gutter */
 	int		hex_view;	/* render the buffer as a hex dump */
 	size_t		hex_top;	/* first visible hex row (byte offset >> 4) */
 	int		hex_ascii;	/* editing the ascii column, not the hex */
@@ -3715,6 +3716,48 @@ text_width(const Editor *e)
 	return w < 1 ? 1 : w;
 }
 
+/* Columns of the line-number gutter at the left of the text, or 0 when off. The
+ * width tracks the buffer's digit count (minimum three) plus a trailing space,
+ * so it is the text-mode counterpart of the hex view's address column. It is
+ * sized from the total line count, not the visible lines, so it does not jitter
+ * as the view scrolls. */
+static int
+gutter_width(const Editor *e)
+{
+	size_t n = text_lines(e->t);
+	int d = 1;
+
+	if (!e->show_lineno)
+		return 0;
+	while (n >= 10) {
+		n /= 10;
+		d++;
+	}
+	if (d < 3)
+		d = 3;
+	return d + 1;
+}
+
+/* Paint the gutter cells for one screen row: the 1-based number of line `idx`
+ * right-aligned, or blanks for a virtual row past the end of the buffer. The
+ * cursor's own line is drawn bright, the rest dim. */
+static void
+render_gutter(Screen *d, const Editor *e, int row, int gutter, size_t idx,
+    Color fg, Color bg)
+{
+	char num[24];
+	uint16_t at = (idx == e->cy) ? 0 : ATTR_DIM;
+	int i, n = 0;
+
+	if (gutter <= 0)
+		return;
+	if (idx < text_lines(e->t))
+		n = snprintf(num, sizeof(num), "%*zu ", gutter - 1, idx + 1);
+	for (i = 0; i < gutter; i++)
+		scr_cell(d, row, CHROME_LEFT + i,
+		    (uint32_t)(unsigned char)(i < n ? num[i] : ' '), fg, bg, at);
+}
+
 /* Paint one scrollbar cell, choosing the thumb where pos falls in [0,span). */
 static void
 scrollbar_cell(Screen *d, int row, int col, int idx, int span,
@@ -3757,7 +3800,7 @@ typedef enum menu_act {
 	MA_BUF_NEXT, MA_BUF_PREV, MA_BUF_LIST, MA_EXIT,
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE,
 	MA_FIND, MA_FIND_NEXT, MA_GOTO,
-	MA_SYNTAX, MA_SCHEME, MA_HEX, MA_DRAW, MA_VI_MODE,
+	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_HEX, MA_DRAW, MA_VI_MODE,
 	MA_HELP, MA_ABOUT,
 } Menuact;
 
@@ -3806,6 +3849,7 @@ static const Menuitem mi_search[] = {
 static const Menuitem mi_view[] = {
 	{ "&Syntax Highlight",	"",	"",	MA_SYNTAX },
 	{ "&Color Scheme",	"",	"",	MA_SCHEME },
+	{ "&Line Numbers",	"",	":set nu",	MA_LINENO },
 	{ "&Hex Dump",		"",	"",	MA_HEX },
 };
 static const Menuitem mi_options[] = {
@@ -4012,6 +4056,8 @@ menu_checked(const Editor *e, Menuact act)
 		return e->hl_on ? 1 : 0;
 	case MA_SCHEME:
 		return -1;		/* a three-way cycle, not a checkbox */
+	case MA_LINENO:
+		return e->show_lineno ? 1 : 0;
 	case MA_DRAW:
 		return e->draw_mode ? 1 : 0;
 	case MA_VI_MODE:
@@ -4999,11 +5045,16 @@ render_body(Editor *e, Screen *d)
 {
 	const Pal *p = ed_chrome(e);
 	int text_h = text_height(e);
-	int text_w = text_width(e);
+	int gutter = gutter_width(e);
+	int text_w = text_width(e) - gutter;
+	int col0 = CHROME_LEFT + gutter;
 	int i;
 	size_t len = 0;
 	const char *cur = text_line(e->t, e->cy, &len);
 	int cur_col;
+
+	if (text_w < 1)
+		text_w = 1;
 
 	if (e->hex_view) {
 		e->prev_text_view = 0;	/* hex uses hex_top, not e->top */
@@ -5075,12 +5126,14 @@ render_body(Editor *e, Screen *d)
 			}
 		}
 
+		render_gutter(d, e, row, gutter, idx, p->content_fg,
+		    p->content_bg);
 		if (s) {
 			sty = hl_line(e, idx, s, llen);
-			scr_line(d, row, CHROME_LEFT, s, llen, (int)e->left,
+			scr_line(d, row, col0, s, llen, (int)e->left,
 			    text_w, hs, he, sty, p->content_fg, p->content_bg);
 		} else {
-			scr_line(d, row, CHROME_LEFT, "", 0, (int)e->left,
+			scr_line(d, row, col0, "", 0, (int)e->left,
 			    text_w, hs, he, NULL, p->content_fg, p->content_bg);
 		}
 	}
@@ -5100,7 +5153,7 @@ render_body(Editor *e, Screen *d)
 
 	scr_cursor_vis(d, 1);		/* a menu overlay may have hidden it */
 	scr_cursor(d, CHROME_TOP + (int)(e->cy - e->top),
-	    CHROME_LEFT + cur_col - (int)e->left);
+	    col0 + cur_col - (int)e->left);
 
 	e->prev_top = e->top;		/* for the next frame's scroll decision */
 	e->prev_left = e->left;
@@ -6733,6 +6786,11 @@ run_menu_act(Editor *e, Menuact act)
 		    names[e->scheme]);
 		break;
 	}
+	case MA_LINENO:
+		e->show_lineno = !e->show_lineno;
+		snprintf(e->status, sizeof(e->status), "line numbers %s",
+		    e->show_lineno ? "on" : "off");
+		break;
 	case MA_HEX:
 		e->hex_view = !e->hex_view;
 		e->hex_top = 0;
@@ -11385,6 +11443,28 @@ vi_ex_exec(Editor *e, char *buf)
 			e->hl_on = 1;
 			e->hl_valid = 0;
 		}
+		return REQ_CONTINUE;
+	}
+
+	if (strncmp(p, "set", 3) == 0 && (p[3] == ' ' || p[3] == '\0')) {
+		const char *arg = p + 3;	/* :set number|nonumber|nu|nonu */
+
+		while (*arg == ' ')
+			arg++;
+		if (strcmp(arg, "number") == 0 || strcmp(arg, "nu") == 0)
+			e->show_lineno = 1;
+		else if (strcmp(arg, "nonumber") == 0 || strcmp(arg, "nonu") == 0)
+			e->show_lineno = 0;
+		else if (strcmp(arg, "number!") == 0 || strcmp(arg, "nu!") == 0 ||
+		    strcmp(arg, "invnumber") == 0)
+			e->show_lineno = !e->show_lineno;
+		else {
+			snprintf(e->status, sizeof(e->status),
+			    "E518: unknown option: %.40s", arg);
+			return REQ_CONTINUE;
+		}
+		snprintf(e->status, sizeof(e->status), "line numbers %s",
+		    e->show_lineno ? "on" : "off");
 		return REQ_CONTINUE;
 	}
 
