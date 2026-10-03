@@ -130,7 +130,8 @@ since its background is the terminal default and so can be cleared on any client
 with or without back-color-erase. It also drops the right border and vertical
 scrollbar so the text reaches the last column, which is what lets a whole
 trailing run of blanks be cleared with one erase. The file position is still on
-the status line.
+the status line. The scheme drives the whole interface, including the menus,
+dialogs, prompts, and the help screen, not just the text area.
 
 ### Modeless keys (the default, MS-EDIT style)
 

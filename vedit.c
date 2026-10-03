@@ -386,143 +386,6 @@ scroll_default(void)
 enum { SCHEME_DOS, SCHEME_BLACK, SCHEME_PLAIN, SCHEME_COUNT };
 
 /****************************************************************
- * TUI theme (inlined from lumi libtui) -- supplies the chrome
- * glyphs and palette. The default is the all-ASCII theme, the
- * safe choice on a primitive client; a UTF-8 locale upgrades to
- * box-drawing.
- ****************************************************************/
-
-enum {
-	TUI_BORDER_TL, TUI_BORDER_T, TUI_BORDER_TR, TUI_BORDER_L,
-	TUI_BORDER_R, TUI_BORDER_BL, TUI_BORDER_B, TUI_BORDER_BR,
-};
-
-typedef enum tui_shadow_style {
-	TUI_SHADOW_NONE,
-	TUI_SHADOW_HALF,
-	TUI_SHADOW_SHADE,
-} ShadowStyle;
-
-typedef struct tui_theme {
-	const char	*name;
-	const char	*border[8];
-	const char	*title_l;
-	const char	*title_r;
-	const char	*icon_scroll_lock;
-	const char	*icon_input_lock;
-	const char	*icon_dead;
-	const char	*scroll_up;
-	const char	*scroll_down;
-	const char	*scroll_track;
-	const char	*scroll_thumb;
-	const char	*sep_l;
-	const char	*sep_fill;
-	const char	*sep_r;
-	Color	border_fg, border_bg, title_fg;
-	Color	content_fg, content_bg;
-	Color	sel_fg, sel_bg;
-	Color	key_fg, sel_key_fg;
-	Color	focus_fg, focus_bg, unfocus_fg, unfocus_bg;
-	Color	title_focus_fg, title_idle_fg;
-	Color	close_fg, tool_fg;
-	Color	status_focus_fg, status_idle_fg;
-	Color	indicator_fg, drag_fg;
-	ShadowStyle shadow;
-	Color	shadow_fg, shadow_bg;
-} Theme;
-
-#define CI(n)  { .type = COLOR_INDEXED, { .index = (n) } }
-#define CD     { .type = COLOR_DEFAULT }
-
-static const Theme themes[] = {
-	{
-		.name = "ascii",
-		.border = { "+", "-", "+", "|", "|", "+", "-", "+" },
-		.title_l = " ", .title_r = " ",
-		.icon_scroll_lock = "S", .icon_input_lock = "I",
-		.icon_dead = "X",
-		.scroll_up = "^", .scroll_down = "v",
-		.scroll_track = ".", .scroll_thumb = "#",
-		.sep_l = "+", .sep_fill = "-", .sep_r = "+",
-		.border_fg = CI(7), .border_bg = CI(4),
-		.title_fg = CI(15),
-		.content_fg = CI(7), .content_bg = CI(4),
-		.sel_fg = CI(0), .sel_bg = CI(15),
-		.key_fg = CI(10), .sel_key_fg = CI(2),
-		.focus_fg = CI(15), .focus_bg = CI(4),
-		.unfocus_fg = CI(8), .unfocus_bg = CI(4),
-		.title_focus_fg = CI(15), .title_idle_fg = CI(8),
-		.close_fg = CI(0), .tool_fg = CI(15),
-		.status_focus_fg = CI(15), .status_idle_fg = CI(8),
-		.indicator_fg = CI(15), .drag_fg = CI(8),
-		.shadow = TUI_SHADOW_NONE,
-		.shadow_fg = CD, .shadow_bg = CD,
-	},
-	{
-		.name = "thin",
-		.border = {
-			"\xe2\x94\x8c", "\xe2\x94\x80", "\xe2\x94\x90",
-			"\xe2\x94\x82", "\xe2\x94\x82", "\xe2\x94\x94",
-			"\xe2\x94\x80", "\xe2\x94\x98",
-		},
-		.title_l = " ", .title_r = " ",
-		.icon_scroll_lock = "\xe2\x8f\xb8",
-		.icon_input_lock = "\xe2\x8a\x98",
-		.icon_dead = "\xe2\x9c\x95",
-		.scroll_up = "\xe2\x96\xb2", .scroll_down = "\xe2\x96\xbc",
-		.scroll_track = "\xe2\x96\x91", .scroll_thumb = "\xe2\x96\x88",
-		.sep_l = "\xe2\x94\x9c", .sep_fill = "\xe2\x94\x80",
-		.sep_r = "\xe2\x94\xa4",
-		.border_fg = CI(7), .border_bg = CI(4),
-		.title_fg = CI(15),
-		.content_fg = CI(7), .content_bg = CI(4),
-		.sel_fg = CI(0), .sel_bg = CI(15),
-		.key_fg = CI(10), .sel_key_fg = CI(2),
-		.focus_fg = CI(15), .focus_bg = CI(4),
-		.unfocus_fg = CI(8), .unfocus_bg = CI(4),
-		.title_focus_fg = CI(15), .title_idle_fg = CI(8),
-		.close_fg = CI(0), .tool_fg = CI(15),
-		.status_focus_fg = CI(15), .status_idle_fg = CI(8),
-		.indicator_fg = CI(15), .drag_fg = CI(8),
-		.shadow = TUI_SHADOW_HALF,
-		.shadow_fg = CI(0), .shadow_bg = CI(0),
-	},
-};
-
-#undef CI
-#undef CD
-#define THEME_COUNT ((int)(sizeof(themes) / sizeof(themes[0])))
-
-
-static const Theme *
-ui_theme_by_name(const char *name)
-{
-	int i;
-
-	for (i = 0; i < THEME_COUNT; i++)
-		if (strcmp(themes[i].name, name) == 0)
-			return &themes[i];
-	return NULL;
-}
-
-/* The theme supplies dialog colors only; the frame glyphs come from the
- * box-drawing layer. */
-static const Theme *
-ui_theme_default(void)
-{
-	const char *lang = getenv("LANG");
-
-	if (lang && (strstr(lang, "UTF-8") || strstr(lang, "utf-8") ||
-	    strstr(lang, "utf8")))
-		return ui_theme_by_name("thin");
-	lang = getenv("LC_ALL");
-	if (lang && (strstr(lang, "UTF-8") || strstr(lang, "utf-8") ||
-	    strstr(lang, "utf8")))
-		return ui_theme_by_name("thin");
-	return ui_theme_by_name("ascii");
-}
-
-/****************************************************************
  * Syntax highlighting. A small, self-contained lexer, not the
  * lumi language engine: one generic C-family tokenizer (C, C++,
  * LPC) plus a '#'-comment shell variant. syn_line() styles one
@@ -6060,15 +5923,15 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 static void
 ui_prompt(Editor *e, const char *q, const char *buf)
 {
-	const Theme *t = ui_theme_default();
+	const Pal *p = ed_chrome(e);
+	uint16_t at = (p->reverse_bars ? ATTR_REVERSE : 0) | ATTR_BOLD;
 	char line[512];
 	int col;
 	int status_row = (e->rows > 0 ? e->rows : 24) - 1;
 
 	ed_render(e, e->d);		/* paint the frame under the prompt */
 	col = snprintf(line, sizeof(line), "%s%s", q, buf ? buf : "");
-	ui_field(e->d, status_row, 0, e->cols, line, t->sel_fg, t->sel_bg,
-	    ATTR_BOLD);
+	ui_field(e->d, status_row, 0, e->cols, line, p->bar_fg, p->bar_bg, at);
 	if (col >= e->cols)
 		col = e->cols - 1;
 	scr_cursor(e->d, status_row, col);
@@ -6352,22 +6215,21 @@ static void
 ui_scroll_view(Editor *e, const char *header, const char *footer,
     int top, const char *(*get_line)(Editor *, void *, int), void *ctx)
 {
-	const Theme *t = ui_theme_default();
+	const Pal *p = ed_chrome(e);
+	uint16_t barat = (p->reverse_bars ? ATTR_REVERSE : 0) | ATTR_BOLD;
 	Screen *d = e->d;
 	int rows = e->rows > 0 ? e->rows : 24;
 	int row;
 
 	scr_clear(d);
-	ui_field(d, 0, 0, e->cols, header, t->title_fg, t->border_bg,
-	    ATTR_BOLD);
+	ui_field(d, 0, 0, e->cols, header, p->bar_fg, p->bar_bg, barat);
 	for (row = 1; row < rows - 1; row++) {
 		const char *s = get_line(e, ctx, top + row - 1);
 
-		ui_field(d, row, 0, e->cols, s ? s : "", t->content_fg,
-		    t->content_bg, 0);
+		ui_field(d, row, 0, e->cols, s ? s : "", p->content_fg,
+		    p->content_bg, 0);
 	}
-	ui_field(d, rows - 1, 0, e->cols, footer, t->title_fg, t->border_bg,
-	    ATTR_BOLD);
+	ui_field(d, rows - 1, 0, e->cols, footer, p->bar_fg, p->bar_bg, barat);
 	scr_present(d);
 }
 
