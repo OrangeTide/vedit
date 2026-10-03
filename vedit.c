@@ -4259,10 +4259,18 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 {
 	int row = e->rows - 1;
 	uint16_t at = p->reverse_bars ? ATTR_REVERSE : 0;
-	char right[64];
+	char right[80];
+	char flags[16];
 	int rlen;
 
 	scr_fill(e->d, row, 0, e->cols, ' ', p->bar_fg, p->bar_bg, at);
+
+	/* compact indicators for the sticky display toggles */
+	flags[0] = '\0';
+	if (e->wrap)
+		strcat(flags, "WRAP ");
+	if (e->show_lineno)
+		strcat(flags, "NUM ");
 
 	if (e->status[0]) {
 		scr_text(e->d, row, 1, e->status, p->bar_fg, p->bar_bg, at);
@@ -4284,8 +4292,8 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 		    p->bar_fg, p->bar_bg, at);
 	}
 
-	rlen = snprintf(right, sizeof(right), "Line:%zu  Col:%zu%s%s",
-	    e->cy + 1, (size_t)cur_col + 1,
+	rlen = snprintf(right, sizeof(right), "%sLine:%zu  Col:%zu%s%s",
+	    flags, e->cy + 1, (size_t)cur_col + 1,
 	    text_dirty(e->t) ? "  *" : "",
 	    e->in_session ? "  [session]" : "");
 	if (rlen > 0 && rlen < e->cols - 1)

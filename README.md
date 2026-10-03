@@ -101,6 +101,9 @@ whole lines; Home, End, and left/right move within the wrapped line as usual.
 Wrap does not apply in draw mode, and the scroll-region fast path is skipped
 while it is on.
 
+While either toggle is on, the status bar shows a compact flag at the right,
+`WRAP` for word wrap and `NUM` for line numbers, next to the line and column.
+
 ### Color schemes
 
 The **View > Color Scheme** menu cycles three looks: the DOS blue text area
