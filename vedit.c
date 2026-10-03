@@ -321,6 +321,37 @@ box_default(void)
 	return VEDIT_BOX_ASCII;	/* safe default; --dec opts into DEC */
 }
 
+/* Color depth the terminal is assumed to handle: 256 or 16. A forced value set
+ * from the command line, or -1 to decide from the environment. On a 16-color
+ * client the renderer maps 256-palette indices to the nearest ANSI color and
+ * emits the classic 30-37/90-97 codes, so a very primitive MUD client stays
+ * readable. An embedding host that negotiates capability (telnet MTTS) should
+ * call vedit_set_colors() instead. */
+static int g_colors_force = -1;
+
+static int
+color_default(void)
+{
+	const char *s;
+
+	if (g_colors_force > 0)
+		return g_colors_force;
+	s = getenv("VEDIT_COLORS");
+	if (s) {
+		if (strcmp(s, "256") == 0)
+			return 256;
+		if (strcmp(s, "16") == 0 || strcmp(s, "8") == 0)
+			return 16;
+	}
+	s = getenv("COLORTERM");
+	if (s && (strstr(s, "truecolor") || strstr(s, "24bit")))
+		return 256;
+	s = getenv("TERM");
+	if (s && strstr(s, "256color"))
+		return 256;
+	return 16;	/* conservative: assume a limited client */
+}
+
 /****************************************************************
  * TUI theme (inlined from lumi libtui) -- supplies the chrome
  * glyphs and palette. The default is the all-ASCII theme, the
@@ -459,10 +490,10 @@ ui_theme_default(void)
 }
 
 /****************************************************************
- * Syntax highlighting stub. vedit drops the lumi syntax engine;
- * syn_for_ext() always returns NULL, so the editor's highlight
- * paths stay inert. The types remain so the editor still
- * compiles against them.
+ * Syntax highlighting. A small, self-contained lexer, not the
+ * lumi language engine: one generic C-family tokenizer (C, C++,
+ * LPC) plus a '#'-comment shell variant. syn_line() styles one
+ * line and returns a carry state so a block comment spans lines.
  ****************************************************************/
 
 typedef enum syn_style {
@@ -472,23 +503,255 @@ typedef enum syn_style {
 } SynStyle;
 
 typedef struct syntax {
-	const char	*name;
-	uint16_t	start;
+	const char		*name;
+	uint16_t		start;		/* initial carry state (0) */
+	const char *const	*keywords;	/* NULL-terminated, or NULL */
+	const char *const	*types;		/* NULL-terminated, or NULL */
+	const char		*line_comment;	/* "//" or "#", or NULL */
+	unsigned char		block_comment;	/* 1: C-style slash-star */
+	unsigned char		preproc;	/* 1: line-initial '#' */
 } Syntax;
 
+#define SYN_INCOMMENT 1		/* carry state: inside a block comment */
+
+/* Keyword and type sets shared by the C family (C, C++, LPC). */
+static const char *const cfam_kw[] = {
+	"if", "else", "while", "do", "for", "switch", "case", "default",
+	"break", "continue", "return", "goto", "sizeof", "typedef", "struct",
+	"union", "enum", "static", "const", "extern", "volatile", "register",
+	"inline", "auto", "restrict", "true", "false", "NULL",
+	"inherit", "nomask", "varargs", "private", "public", "protected",
+	"nosave", "new", "delete", "foreach", "catch", "efun", "in", "virtual",
+	"namespace", "class", "try", "this", "operator", "template", "using",
+	NULL,
+};
+static const char *const cfam_ty[] = {
+	"void", "char", "short", "int", "long", "float", "double", "signed",
+	"unsigned", "bool", "size_t", "ssize_t", "wchar_t", "FILE", "va_list",
+	"int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t",
+	"uint32_t", "uint64_t", "intptr_t", "uintptr_t",
+	"object", "mapping", "mixed", "string", "function", "closure",
+	"status", "buffer", "array",
+	NULL,
+};
+static const char *const sh_kw[] = {
+	"if", "then", "else", "elif", "fi", "for", "while", "until", "do",
+	"done", "case", "esac", "in", "function", "select", "return", "break",
+	"continue", "local", "export", "readonly", "declare", "set", "unset",
+	"echo", "exit", "shift", "test",
+	NULL,
+};
+
+static const Syntax syn_c  = { "c",  0, cfam_kw, cfam_ty, "//", 1, 1 };
+static const Syntax syn_sh = { "sh", 0, sh_kw,   NULL,    "#",  0, 0 };
+
+static int
+syn_wstart(unsigned char c)
+{
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+	    c == '_' || c >= 0x80;
+}
+static int
+syn_wcont(unsigned char c)
+{
+	return syn_wstart(c) || (c >= '0' && c <= '9');
+}
+static int
+syn_digit(unsigned char c)
+{
+	return c >= '0' && c <= '9';
+}
+
+static int
+syn_in_list(const char *const *list, const char *word, size_t len)
+{
+	size_t i;
+
+	if (!list)
+		return 0;
+	for (i = 0; list[i]; i++)
+		if (strlen(list[i]) == len && memcmp(list[i], word, len) == 0)
+			return 1;
+	return 0;
+}
+
+/* Style one line into out[0..n) (out may be NULL to only carry state).
+ * Returns the state at end of line: SYN_INCOMMENT while a block comment is
+ * still open, else 0. */
 static uint16_t
 syn_line(const Syntax *sy, uint16_t state_in, const char *bytes,
     size_t n, uint8_t *out)
 {
-	(void)sy; (void)bytes; (void)out;
-	(void)n;
-	return state_in;
+	size_t i = 0;
+	uint16_t state = state_in;
+	int seen = 0;		/* a non-space byte has appeared on the line */
+#define SET(a, b, st) do { \
+	if (out) { size_t _k; for (_k = (a); _k < (b); _k++) out[_k] = (st); } \
+} while (0)
+
+	if (!sy)
+		return 0;
+
+	while (i < n) {
+		unsigned char c = (unsigned char)bytes[i];
+
+		if (state == SYN_INCOMMENT) {		/* close a block comment */
+			size_t j = i;
+
+			while (j < n) {
+				if (bytes[j] == '*' && j + 1 < n &&
+				    bytes[j + 1] == '/') {
+					j += 2;
+					state = 0;
+					break;
+				}
+				j++;
+			}
+			SET(i, j, SYN_COMMENT);
+			i = j;
+			continue;
+		}
+
+		if (c == ' ' || c == '\t') {
+			SET(i, i + 1, SYN_TEXT);
+			i++;
+			continue;
+		}
+
+		if (sy->preproc && c == '#' && !seen) {	/* preprocessor line */
+			SET(i, n, SYN_PREPROC);
+			break;
+		}
+		seen = 1;
+
+		if (sy->line_comment) {
+			size_t lc = strlen(sy->line_comment);
+
+			if (i + lc <= n &&
+			    memcmp(bytes + i, sy->line_comment, lc) == 0) {
+				SET(i, n, SYN_COMMENT);
+				break;
+			}
+		}
+
+		if (sy->block_comment && c == '/' && i + 1 < n &&
+		    bytes[i + 1] == '*') {
+			size_t j = i + 2;
+
+			state = SYN_INCOMMENT;
+			while (j < n) {
+				if (bytes[j] == '*' && j + 1 < n &&
+				    bytes[j + 1] == '/') {
+					j += 2;
+					state = 0;
+					break;
+				}
+				j++;
+			}
+			SET(i, j, SYN_COMMENT);
+			i = j;
+			continue;
+		}
+
+		if (c == '"' || c == '\'') {		/* string / char literal */
+			size_t j = i + 1;
+
+			while (j < n) {
+				if (bytes[j] == '\\' && j + 1 < n) {
+					j += 2;
+					continue;
+				}
+				if ((unsigned char)bytes[j] == c) {
+					j++;
+					break;
+				}
+				j++;
+			}
+			SET(i, j, SYN_STRING);
+			i = j;
+			continue;
+		}
+
+		if (syn_digit(c) || (c == '.' && i + 1 < n &&
+		    syn_digit((unsigned char)bytes[i + 1]))) {	/* number */
+			size_t j = i + 1;
+
+			while (j < n) {
+				unsigned char d = (unsigned char)bytes[j];
+
+				if (syn_wcont(d) || d == '.')
+					j++;
+				else
+					break;
+			}
+			SET(i, j, SYN_CONSTANT);
+			i = j;
+			continue;
+		}
+
+		if (syn_wstart(c)) {			/* identifier */
+			size_t j = i + 1;
+			SynStyle st;
+
+			while (j < n && syn_wcont((unsigned char)bytes[j]))
+				j++;
+			if (syn_in_list(sy->keywords, bytes + i, j - i)) {
+				st = SYN_KEYWORD;
+			} else if (syn_in_list(sy->types, bytes + i, j - i)) {
+				st = SYN_TYPE;
+			} else {
+				size_t k = j;	/* a call if '(' follows */
+
+				while (k < n && (bytes[k] == ' ' || bytes[k] == '\t'))
+					k++;
+				st = (k < n && bytes[k] == '(') ?
+				    SYN_FUNCTION : SYN_TEXT;
+			}
+			SET(i, j, st);
+			i = j;
+			continue;
+		}
+
+		SET(i, i + 1, SYN_OPERATOR);		/* punctuation */
+		i++;
+	}
+#undef SET
+	return state;
 }
 
+static int
+syn_ieq(const char *a, const char *b)
+{
+	for (; *a && *b; a++, b++) {
+		int ca = *a, cb = *b;
+
+		if (ca >= 'A' && ca <= 'Z')
+			ca += 32;
+		if (cb >= 'A' && cb <= 'Z')
+			cb += 32;
+		if (ca != cb)
+			return 0;
+	}
+	return *a == *b;
+}
+
+/* Map a file extension (or a :syntax language name) to a highlighter. */
 static const Syntax *
 syn_for_ext(const char *ext)
 {
-	(void)ext;
+	static const struct { const char *e; const Syntax *s; } map[] = {
+		{ "c", &syn_c }, { "h", &syn_c }, { "cc", &syn_c },
+		{ "cpp", &syn_c }, { "cxx", &syn_c }, { "hpp", &syn_c },
+		{ "hh", &syn_c }, { "lpc", &syn_c }, { "i", &syn_c },
+		{ "sh", &syn_sh }, { "bash", &syn_sh },
+	};
+	size_t k;
+
+	if (!ext || !*ext)
+		return NULL;
+	for (k = 0; k < sizeof(map) / sizeof(map[0]); k++)
+		if (syn_ieq(ext, map[k].e))
+			return map[k].s;
 	return NULL;
 }
 
@@ -658,9 +921,9 @@ typedef struct draw_term {
 	int		cursor_vis;
 
 	int		begun;
-	int		mouse_on;	/* accepted but unused (no mouse) */
 	int		want_resize;	/* a resize is pending for scr_wait */
 	int		box_mode;	/* enum vedit_box_mode for the glyphs */
+	int		colors;		/* 256 or 16 (downgrade palette) */
 
 	/* raw input bytes awaiting decode */
 	unsigned char	inbuf[512];
@@ -768,6 +1031,7 @@ scr_new_io(const struct vedit_io *io)
 	t->io = *io;
 	t->cursor_vis = 1;
 	t->box_mode = box_default();
+	t->colors = color_default();
 	if (t->io.getsize && t->io.getsize(t->io.ctx, &rows, &cols) == 0) {
 		if (rows < 1)
 			rows = 24;
@@ -781,12 +1045,6 @@ scr_new_io(const struct vedit_io *io)
 	return t;
 }
 
-
-static void
-scr_mouse(Scrbuf *t, int on)
-{
-	t->mouse_on = on;	/* no mouse decoding; kept for API parity */
-}
 
 /* ---- SGR emission ------------------------------------------------------- */
 
@@ -803,6 +1061,58 @@ color_eq(Color a, Color b)
 	return 1;
 }
 
+/* Nearest of the 16 ANSI colors to an RGB triple, by squared distance. */
+static int
+rgb_to_ansi16(int r, int g, int b)
+{
+	static const unsigned char ansi[16][3] = {
+		{   0,   0,   0 }, { 205,   0,   0 }, {   0, 205,   0 },
+		{ 205, 205,   0 }, {   0,   0, 238 }, { 205,   0, 205 },
+		{   0, 205, 205 }, { 229, 229, 229 }, { 127, 127, 127 },
+		{ 255,   0,   0 }, {   0, 255,   0 }, { 255, 255,   0 },
+		{  92,  92, 255 }, { 255,   0, 255 }, {   0, 255, 255 },
+		{ 255, 255, 255 },
+	};
+	int i, best = 7;
+	long bestd = -1;
+
+	for (i = 0; i < 16; i++) {
+		int dr = r - ansi[i][0];
+		int dg = g - ansi[i][1];
+		int db = b - ansi[i][2];
+		long d = (long)dr * dr + (long)dg * dg + (long)db * db;
+
+		if (bestd < 0 || d < bestd) {
+			bestd = d;
+			best = i;
+		}
+	}
+	return best;
+}
+
+/* Map an xterm-256 palette index to the nearest ANSI 16 color. Indices 0-15
+ * are already ANSI; 16-231 are the 6x6x6 cube; 232-255 the grayscale ramp. */
+static int
+color256_to_16(int idx)
+{
+	static const unsigned char cube[6] = { 0, 95, 135, 175, 215, 255 };
+	int r, g, b;
+
+	if (idx < 16)
+		return idx < 0 ? 7 : idx;
+	if (idx < 232) {
+		idx -= 16;
+		r = cube[(idx / 36) % 6];
+		g = cube[(idx / 6) % 6];
+		b = cube[idx % 6];
+	} else if (idx < 256) {
+		r = g = b = 8 + (idx - 232) * 10;
+	} else {
+		return 7;
+	}
+	return rgb_to_ansi16(r, g, b);
+}
+
 static void
 scr_sgr_color(Scrbuf *t, Color c, int is_bg)
 {
@@ -810,13 +1120,25 @@ scr_sgr_color(Scrbuf *t, Color c, int is_bg)
 
 	if (c.type == COLOR_DEFAULT) {
 		snprintf(buf, sizeof(buf), "\033[%dm", is_bg ? 49 : 39);
-	} else if (c.type == COLOR_INDEXED) {
+		scr_str(t, buf);
+		return;
+	}
+	if (t->colors < 256) {		/* 16-color client: downgrade + classic SGR */
+		int ci = (c.type == COLOR_INDEXED) ? color256_to_16(c.index)
+		    : rgb_to_ansi16(c.rgb.r, c.rgb.g, c.rgb.b);
+		int code = (ci < 8) ? (is_bg ? 40 : 30) + ci
+		    : (is_bg ? 100 : 90) + (ci - 8);
+
+		snprintf(buf, sizeof(buf), "\033[%dm", code);
+		scr_str(t, buf);
+		return;
+	}
+	if (c.type == COLOR_INDEXED)
 		snprintf(buf, sizeof(buf), "\033[%d;5;%dm", is_bg ? 48 : 38,
 		    c.index);
-	} else {
+	else
 		snprintf(buf, sizeof(buf), "\033[%d;2;%d;%d;%dm",
 		    is_bg ? 48 : 38, c.rgb.r, c.rgb.g, c.rgb.b);
-	}
 	scr_str(t, buf);
 }
 
@@ -1598,8 +1920,7 @@ typedef struct editor {
 	int		cols;
 	int		in_session;
 	Screen	*d;		/* drawing surface and input source */
-	Scrbuf *term;		/* terminal driver, for mouse control */
-	int		mouse_on;	/* editor mouse reporting is enabled */
+	Scrbuf *term;		/* terminal driver (box mode, resize) */
 	int		sel_active;	/* a selection is being extended */
 	int		sel_block;	/* the selection is a rectangle (draw mode) */
 	size_t		ay;		/* selection anchor line */
@@ -2955,21 +3276,39 @@ rune_len_at(const char *s, size_t len, size_t cx)
  * Syntax highlighting
  ****************************************************************/
 
-/* Foreground color for each highlight style. SYN_TEXT and SYN_OPERATOR fall
- * back to the terminal default foreground so ordinary code is left alone. An
- * [edit.syntax] section in lumi.conf overrides any of these at startup (see
- * load_syntax_colors). */
+/* Foreground color for each highlight style, tuned to read well on the DOS
+ * blue chrome background. The values follow Vim's "darkblue" colorscheme (its
+ * 256-color palette): light colors that stay legible on blue. SYN_TEXT and
+ * SYN_OPERATOR fall back to the terminal default so ordinary code is left
+ * alone. These are 256-color indices; a client limited to 16 colors will not
+ * render them as intended. */
 #define SYN_IDX(n) { .type = COLOR_INDEXED, { .index = (n) } }
 static Color syn_color[SYN_STYLE_COUNT] = {
 	[SYN_TEXT] = { .type = COLOR_DEFAULT },
-	[SYN_COMMENT] = SYN_IDX(244),
-	[SYN_KEYWORD] = SYN_IDX(3),
-	[SYN_TYPE] = SYN_IDX(6),
-	[SYN_CONSTANT] = SYN_IDX(5),
-	[SYN_STRING] = SYN_IDX(2),
+	[SYN_COMMENT] = SYN_IDX(111),	/* light periwinkle */
+	[SYN_KEYWORD] = SYN_IDX(227),	/* light yellow */
+	[SYN_TYPE] = SYN_IDX(118),	/* bright green */
+	[SYN_CONSTANT] = SYN_IDX(217),	/* salmon */
+	[SYN_STRING] = SYN_IDX(217),	/* salmon, as darkblue groups them */
 	[SYN_OPERATOR] = { .type = COLOR_DEFAULT },
-	[SYN_FUNCTION] = SYN_IDX(4),
-	[SYN_PREPROC] = SYN_IDX(1),
+	[SYN_FUNCTION] = SYN_IDX(123),	/* light cyan */
+	[SYN_PREPROC] = SYN_IDX(213),	/* light pink */
+};
+
+/* A separate palette for 16-color clients. The darkblue pastels above are light,
+ * so mapping them to the nearest ANSI color collapses several to white; this
+ * set uses punchy base-16 colors that stay distinct on the blue background.
+ * Strings and numbers share a color, as darkblue groups them. */
+static Color syn_color16[SYN_STYLE_COUNT] = {
+	[SYN_TEXT] = { .type = COLOR_DEFAULT },
+	[SYN_COMMENT] = SYN_IDX(8),	/* grey */
+	[SYN_KEYWORD] = SYN_IDX(11),	/* bright yellow */
+	[SYN_TYPE] = SYN_IDX(10),	/* bright green */
+	[SYN_CONSTANT] = SYN_IDX(13),	/* bright magenta */
+	[SYN_STRING] = SYN_IDX(13),	/* bright magenta */
+	[SYN_OPERATOR] = { .type = COLOR_DEFAULT },
+	[SYN_FUNCTION] = SYN_IDX(14),	/* bright cyan */
+	[SYN_PREPROC] = SYN_IDX(9),	/* bright red */
 };
 #undef SYN_IDX
 
@@ -3194,8 +3533,7 @@ typedef enum menu_act {
 	MA_BUF_NEXT, MA_BUF_PREV, MA_BUF_LIST, MA_EXIT,
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE,
 	MA_FIND, MA_FIND_NEXT, MA_GOTO,
-	MA_RUN, MA_COMPILE, MA_MAKE, MA_NEXT_ERR, MA_PREV_ERR,
-	MA_SYNTAX, MA_SCHEME, MA_HEX, MA_DRAW, MA_VI_MODE, MA_MOUSE,
+	MA_SYNTAX, MA_SCHEME, MA_HEX, MA_DRAW, MA_VI_MODE,
 	MA_HELP, MA_ABOUT,
 } Menuact;
 
@@ -3241,14 +3579,6 @@ static const Menuitem mi_search[] = {
 	{ "&Repeat Find",	"",		"n",	MA_FIND_NEXT },
 	{ "&Go to Line...",	"Ctrl+L",	"G",	MA_GOTO },
 };
-static const Menuitem mi_build[] = {
-	{ "&Run",	"F5",	"",	MA_RUN },
-	{ "&Compile",	"F6",	"",	MA_COMPILE },
-	{ "&Make",	"F7",	"",	MA_MAKE },
-	{ "",		"",	"",	MA_SEP },
-	{ "&Next Error","F4",	"",	MA_NEXT_ERR },
-	{ "&Prev Error","Shift+F4", "",	MA_PREV_ERR },
-};
 static const Menuitem mi_view[] = {
 	{ "&Syntax Highlight",	"",	"",	MA_SYNTAX },
 	{ "&Color Scheme",	"",	"",	MA_SCHEME },
@@ -3257,7 +3587,6 @@ static const Menuitem mi_view[] = {
 static const Menuitem mi_options[] = {
 	{ "&Draw Mode",	"Ins",	"",	MA_DRAW },
 	{ "&Vi Keys",	"F2",	"",	MA_VI_MODE },
-	{ "&Mouse",	"",	"",	MA_MOUSE },
 };
 static const Menuitem mi_help[] = {
 	{ "&Key Bindings",	"F1",	"",	MA_HELP },
@@ -3269,9 +3598,8 @@ static const Menu MENUS[] = {
 	{ "&File",	1,	MENU_ITEMS(mi_file) },
 	{ "&Edit",	7,	MENU_ITEMS(mi_edit) },
 	{ "&Search",	13,	MENU_ITEMS(mi_search) },
-	{ "&Build",	21,	MENU_ITEMS(mi_build) },
-	{ "&View",	28,	MENU_ITEMS(mi_view) },
-	{ "&Options",	34,	MENU_ITEMS(mi_options) },
+	{ "&View",	21,	MENU_ITEMS(mi_view) },
+	{ "&Options",	27,	MENU_ITEMS(mi_options) },
 	{ "&Help",	0,	MENU_ITEMS(mi_help) },	/* col set dynamically */
 };
 #undef MENU_ITEMS
@@ -3464,8 +3792,6 @@ menu_checked(const Editor *e, Menuact act)
 		return e->draw_mode ? 1 : 0;
 	case MA_VI_MODE:
 		return e->mode != MODE_MODELESS ? 1 : 0;
-	case MA_MOUSE:
-		return e->mouse_on ? 1 : 0;
 	default:
 		return -1;
 	}
@@ -3736,7 +4062,8 @@ scr_line(Screen *d, int row, int col0, const char *s, size_t len,
 		 * edges, so a whole rune is in or out); syntax colors the fg */
 		rev = (hl_start < hl_end && col >= hl_start && col < hl_end);
 		attrs = rev ? ATTR_REVERSE : 0;
-		fg = sty ? syn_color[sty[i]] : base_fg;
+		fg = sty ? (d->t->colors < 256 ? syn_color16[sty[i]]
+		    : syn_color[sty[i]]) : base_fg;
 
 		if (r == '\t' || r < 0x20 || r == 0x7f) {
 			/* render as spaces, clipped at both edges */
@@ -5433,8 +5760,6 @@ static const struct {
 	{ "Ctrl-Z / Ctrl-Y",	"Undo / redo" },
 	{ "Ctrl-S",		"Save (asks for a name if none)" },
 	{ "Ctrl-Q",		"Quit (asks if there are unsaved changes)" },
-	{ "F5 / F6 / F7",	"Run / compile / make (see Build menu)" },
-	{ "F4 / Shift+F4",	"Next / previous build error in this file" },
 	{ "F1",			"Show this help" },
 	{ "F2",			"Toggle vi keys (modal editing)" },
 };
@@ -5464,8 +5789,6 @@ static const struct {
 	{ ":w  :q  :wq / :x",	"Write, quit, write and quit" },
 	{ ":q!  ZZ  ZQ",	"Quit discarding, save and quit, quit" },
 	{ ":N  :cq",		"Go to a line, quit with an error code" },
-	{ "F5 / F6 / F7",	"Run / compile / make (see Build menu)" },
-	{ "F4 / Shift+F4",	"Next / previous build error in this file" },
 	{ "F1 / F2",		"Show this help / back to modeless keys" },
 };
 
@@ -6154,15 +6477,6 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_GOTO:
 		goto_prompt(e);
 		break;
-	case MA_RUN:
-	case MA_COMPILE:
-	case MA_MAKE:
-	case MA_NEXT_ERR:
-	case MA_PREV_ERR:
-		/* build commands are not part of vedit */
-		snprintf(e->status, sizeof(e->status),
-		    "build commands are disabled in vedit");
-		break;
 	case MA_SYNTAX:
 		e->hl_on = !e->hl_on;
 		e->hl_valid = 0;
@@ -6189,14 +6503,6 @@ run_menu_act(Editor *e, Menuact act)
 		break;
 	case MA_VI_MODE:
 		toggle_vi(e);
-		break;
-	case MA_MOUSE:
-		e->mouse_on = !e->mouse_on;
-		if (e->term)
-			scr_mouse(e->term, e->mouse_on);
-		snprintf(e->status, sizeof(e->status), "mouse %s%s",
-		    e->mouse_on ? "on" : "off",
-		    e->mouse_on ? "" : " (terminal selection restored)");
 		break;
 	case MA_HELP:
 		dlg_help(e);
@@ -6409,7 +6715,7 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: %s [--utf8|--dec|-a|--ascii] [file]\n"
+	    "usage: %s [--utf8|--dec|-a|--ascii] [--16color|--256color] [file]\n"
 	    "\n"
 	    "A single-file visual text editor for primitive terminals.\n"
 	    "\n"
@@ -6418,6 +6724,10 @@ usage(void)
 	    "  -a, --ascii   draw the frame with plain ASCII (+ - |)\n"
 	    "                Default: UTF-8 under a UTF-8 locale, else ASCII.\n"
 	    "                Also set by VEDIT_BOX=utf8|dec|ascii or VEDIT_ASCII.\n"
+	    "  --16color     map colors to the 16 ANSI colors for old clients\n"
+	    "  --256color    use the full 256-color palette\n"
+	    "                Default: 256 when TERM/COLORTERM says so, else 16.\n"
+	    "                Also set by VEDIT_COLORS=256|16.\n"
 	    "\n"
 	    "Modeless (MS-EDIT) keys:\n"
 	    "  arrows        move the cursor\n"
@@ -6951,11 +7261,10 @@ static void
 editor_init(Editor *e)
 {
 	memset(e, 0, sizeof(*e));
-	e->hl_on = 0;		/* no syntax engine in vedit */
+	e->hl_on = 1;		/* highlight when a file type is recognized */
 	e->hex_pending = -1;
 	e->hex_cols = 16;
 	e->dos_chrome = 1;	/* MS-EDIT look by default; toggleable */
-	e->mouse_on = 0;	/* no mouse decoding */
 }
 
 /* Run the event loop until the editor exits. Returns a process-style code:
@@ -7202,6 +7511,17 @@ vedit_set_box_mode(struct vedit *v, enum vedit_box_mode mode)
 		v->e.term->box_mode = mode;
 }
 
+/* Tell the editor how many colors the client supports: 256 for the full
+ * palette, anything less for the 16 ANSI colors (256-palette indices are then
+ * mapped to the nearest ANSI color and sent as classic SGR codes). A host that
+ * negotiates this (telnet MTTS/TTYPE) should call it before vedit_run(). */
+void
+vedit_set_colors(struct vedit *v, int colors)
+{
+	if (v->e.term)
+		v->e.term->colors = (colors >= 256) ? 256 : 16;
+}
+
 /* Deliver a new terminal size. The host calls this from wherever it learns the
  * size (telnet NAWS, a SIGWINCH it caught, a resize message). The change is
  * picked up by the run loop, which repaints. */
@@ -7405,6 +7725,14 @@ main(int argc, char **argv)
 		}
 		if (strcmp(argv[i], "--utf8") == 0) {
 			g_box_force = VEDIT_BOX_UTF8;	/* Unicode box-drawing */
+			continue;
+		}
+		if (strcmp(argv[i], "--16color") == 0) {
+			g_colors_force = 16;		/* primitive clients */
+			continue;
+		}
+		if (strcmp(argv[i], "--256color") == 0) {
+			g_colors_force = 256;
 			continue;
 		}
 		if (!file) {

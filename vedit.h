@@ -85,6 +85,13 @@ void vedit_set_size(struct vedit *v, int rows, int cols);
  * otherwise ASCII; VEDIT_BOX=utf8|dec|ascii and VEDIT_ASCII override). */
 void vedit_set_box_mode(struct vedit *v, enum vedit_box_mode mode);
 
+/* Tell the editor the client's color depth: 256 for the full palette, or 16
+ * (any value < 256) to map colors to the nearest of the 16 ANSI colors and emit
+ * the classic SGR codes, for a primitive client. Call before vedit_run(). When
+ * never called, the depth is taken from TERM/COLORTERM (VEDIT_COLORS overrides),
+ * defaulting to 16 when nothing indicates 256. */
+void vedit_set_colors(struct vedit *v, int colors);
+
 /* Run the editor to completion. Returns 0 on a normal quit, 1 on end of input
  * or vi ':cq'. */
 int vedit_run(struct vedit *v);

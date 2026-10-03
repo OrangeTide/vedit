@@ -45,6 +45,20 @@ dec|ascii` and `VEDIT_ASCII` set it from the environment. DEC line-drawing is a
 good middle ground for older clients that cannot render UTF-8 box-drawing but do
 support the VT100 alternate charset.
 
+### Color depth
+
+```sh
+vedit --256color file   # full xterm 256-color palette
+vedit --16color file    # map everything to the 16 ANSI colors
+```
+
+The default is 256 when `TERM` or `COLORTERM` says the terminal supports it, and
+16 otherwise; `VEDIT_COLORS=256|16` overrides. In 16-color mode every color is
+mapped to the nearest of the 16 ANSI colors and sent with the classic `30`-`37` /
+`90`-`97` SGR codes, which the most limited clients understand. Syntax
+highlighting uses a separate, punchier palette in this mode, since the 256-color
+scheme's pastels would otherwise collapse toward white.
+
 ### Modeless keys (the default, MS-EDIT style)
 
 | Key | Action |
@@ -114,6 +128,24 @@ Because the blanks you draw are real spaces, draw mode does not trim trailing
 whitespace on save. That is what you want for art; keep it in mind when drawing
 a diagram into a source file.
 
+## Syntax highlighting
+
+vedit has a small built-in highlighter, aimed at editing MUD source and scripts
+over the connection. It is not a full language engine. One generic C-family
+tokenizer covers C, C++, and LPC, and a second covers shell-style scripts. It
+colors keywords, types, strings, character and number literals, line and block
+comments (a block comment may span lines), preprocessor lines, and function calls.
+
+The language is chosen from the file extension: `.c .h .cc .cpp .cxx .hpp .hh
+.lpc .i` use the C-family rules, and `.sh .bash` use the shell rules. Highlighting
+is on by default when the type is recognized, and files with no match are left
+plain. Toggle it from the View menu, or with the vi `:syntax` command: `:syntax
+off`, `:syntax on`, or `:syntax c` / `:syntax lpc` / `:syntax sh` to force a
+language. The colors stay in the 16-color range so they render on limited clients.
+
+To add a dialect, extend the keyword and type tables and the extension map in the
+syntax section of `vedit.c`; the tokenizer itself is reused.
+
 ## Embedding in a host (for example a MUD)
 
 vedit owns no file descriptors and installs no signal handlers of its own. All
@@ -136,6 +168,7 @@ struct vedit *v = vedit_new(&io);
 vedit_open(v, "note.txt");
 vedit_set_size(v, rows, cols);         /* for example from telnet NAWS */
 vedit_set_box_mode(v, VEDIT_BOX_DEC);  /* pick a frame style for this client */
+vedit_set_colors(v, 16);               /* 16 or 256, from MTTS negotiation */
 int rc = vedit_run(v);                 /* blocks until the player quits */
 vedit_free(v);
 ```
@@ -156,15 +189,15 @@ push-style state machine is not provided.
 The lumi editor sits on about ten libraries. vedit keeps the text buffer with
 undo and redo, the modeless and vi personalities, the MS-EDIT chrome (menu bar,
 frame, scrollbars, dialogs), find, selection and an internal clipboard,
-goto-line, multiple buffers, a hex view, and a 2D/block draw mode. It replaces
-the drawing stack with
+goto-line, multiple buffers, a hex view, a 2D/block draw mode, and lightweight
+syntax highlighting. It replaces the drawing stack with
 a self-contained ANSI renderer over the io vtable, and the keyboard decoder with
 a compact one that covers UTF-8 text, control keys, arrows, navigation keys,
 function keys, CSI modifiers, Alt+letter, and bracketed paste.
 
 It drops, as overworked for a primitive-terminal editor:
 
-- syntax highlighting (the whole language engine),
+- lumi's language engine (replaced by a small built-in highlighter, below),
 - the build / compile / make commands and the quickfix error list,
 - the config file,
 - mouse input,
