@@ -92,6 +92,14 @@ void vedit_set_box_mode(struct vedit *v, enum vedit_box_mode mode);
  * defaulting to 16 when nothing indicates 256. */
 void vedit_set_colors(struct vedit *v, int colors);
 
+/* Turn the VT100 scroll-region fast path on (nonzero) or off. When on, the
+ * editor scrolls the text area with the terminal's scroll region instead of
+ * repainting every row, which is much cheaper on a slow link when scrolling or
+ * inserting lines. It needs a client that supports the scroll region (most do;
+ * the most primitive line-at-a-time clients do not), so it is off by default.
+ * Call before vedit_run(). When never called, it is taken from VEDIT_SCROLL. */
+void vedit_set_scroll(struct vedit *v, int on);
+
 /* Run the editor to completion. Returns 0 on a normal quit, 1 on end of input
  * or vi ':cq'. */
 int vedit_run(struct vedit *v);

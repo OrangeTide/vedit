@@ -352,6 +352,39 @@ color_default(void)
 	return 16;	/* conservative: assume a limited client */
 }
 
+/* Whether to use the terminal's scroll region (DECSTBM + IND/RI) to move the
+ * text area when the viewport scrolls or a line is inserted, instead of
+ * repainting every row. It turns a one-line scroll into a single control
+ * sequence plus the one newly exposed row, a large saving on a slow link. It
+ * is off by default because it relies on VT100 scroll-region support, which
+ * the most primitive clients lack; --scroll or VEDIT_SCROLL turns it on, and
+ * an embedding host that knows the client calls vedit_set_scroll(). */
+static int g_scroll_force = -1;
+
+static int
+scroll_default(void)
+{
+	const char *s;
+
+	if (g_scroll_force >= 0)
+		return g_scroll_force;
+	s = getenv("VEDIT_SCROLL");
+	if (s) {
+		if (strcmp(s, "1") == 0 || strcmp(s, "on") == 0 ||
+		    strcmp(s, "yes") == 0)
+			return 1;
+		if (strcmp(s, "0") == 0 || strcmp(s, "off") == 0 ||
+		    strcmp(s, "no") == 0)
+			return 0;
+	}
+	return 0;	/* conservative: dumb full-row repaint */
+}
+
+/* Chrome color schemes, cycled by View > Color Scheme (MA_SCHEME). The black
+ * scheme leaves the text-area background at the terminal default, which lets
+ * scr_present clear trailing blanks with erase-to-EOL (see there). */
+enum { SCHEME_DOS, SCHEME_BLACK, SCHEME_PLAIN, SCHEME_COUNT };
+
 /****************************************************************
  * TUI theme (inlined from lumi libtui) -- supplies the chrome
  * glyphs and palette. The default is the all-ASCII theme, the
@@ -924,6 +957,8 @@ typedef struct draw_term {
 	int		want_resize;	/* a resize is pending for scr_wait */
 	int		box_mode;	/* enum vedit_box_mode for the glyphs */
 	int		colors;		/* 256 or 16 (downgrade palette) */
+	int		scroll;		/* use the terminal scroll region */
+	int		shadow_valid;	/* the shadow matches the screen (safe to scroll) */
 
 	/* raw input bytes awaiting decode */
 	unsigned char	inbuf[512];
@@ -1032,6 +1067,7 @@ scr_new_io(const struct vedit_io *io)
 	t->cursor_vis = 1;
 	t->box_mode = box_default();
 	t->colors = color_default();
+	t->scroll = scroll_default();
 	if (t->io.getsize && t->io.getsize(t->io.ctx, &rows, &cols) == 0) {
 		if (rows < 1)
 			rows = 24;
@@ -1219,6 +1255,20 @@ cell_eq(const Cell *a, const Cell *b)
 	    color_eq(a->bg, b->bg);
 }
 
+/* A blank cell on the terminal default background: a run of these at the end of
+ * a row can be produced with one erase-to-EOL (ESC [ K), which clears to the
+ * default background on every client, with or without back-color-erase. (A
+ * themed background such as the DOS blue is not default, so such a row falls
+ * back to emitting the spaces; the black scheme keeps the text area default so
+ * the saving applies there.) The glyph is a space, so its foreground does not
+ * matter. */
+static int
+cell_is_blank_default(const Cell *c)
+{
+	return c->codepoint == ' ' && c->attrs == 0 &&
+	    c->bg.type == COLOR_DEFAULT;
+}
+
 /* ---- the draw surface API the editor calls ------------------------------ */
 
 static Screen *
@@ -1256,6 +1306,7 @@ scr_resize(Screen *d, int rows, int cols)
 		return;
 	for (i = 0; i < rows; i++)
 		t->rowdirty[i] = 1;
+	t->shadow_valid = 0;		/* grid reallocated; shadow is blank */
 }
 
 static void
@@ -1357,9 +1408,72 @@ scr_cursor_shape(Screen *d, CursorShape shape)
 	(void)d; (void)shape;	/* primitive terminals ignore cursor shape */
 }
 
+/* Emit one cell's glyph at the cursor, tracking the pen and the DEC
+ * line-drawing charset (*acs) across calls. The caller positions the cursor and
+ * relies on the terminal to advance it. */
+static void
+scr_emit_cell(Scrbuf *t, Pen *pen, int *acs, const Cell *cell)
+{
+	uint32_t cp = cell->codepoint;
+	unsigned char ub[4];
+	int n;
+
+	if (cp == CELL_CONT)
+		return;			/* trailing half of a wide cell */
+	scr_pen(t, pen, cell->fg, cell->bg, cell->attrs);
+
+	if (BOX_IS(cp)) {
+		const BoxDef *b = &box_tab[BOX_ID(cp)];
+
+		if (t->box_mode == VEDIT_BOX_DEC && b->dec) {
+			if (!*acs) {
+				scr_str(t, "\033(0");
+				*acs = 1;
+			}
+			ub[0] = b->dec;
+			scr_bytes(t, (const char *)ub, 1);
+			return;
+		}
+		if (*acs) {
+			scr_str(t, "\033(B");
+			*acs = 0;
+		}
+		cp = (t->box_mode == VEDIT_BOX_UTF8) ? b->uni
+		    : (uint32_t)b->ascii;
+		n = utf8_encode(ub, cp);
+		scr_bytes(t, (const char *)ub, (size_t)n);
+		return;
+	}
+
+	if (*acs) {			/* back to ASCII for ordinary text */
+		scr_str(t, "\033(B");
+		*acs = 0;
+	}
+	if (cp < 0x20 || cp == 0x7f)
+		n = utf8_encode(ub, ' ');
+	else
+		n = utf8_encode(ub, cp);
+	if (n <= 0) {
+		ub[0] = ' ';
+		n = 1;
+	}
+	scr_bytes(t, (const char *)ub, (size_t)n);
+}
+
+/* Shortest blank-default run (in columns) worth replacing with an erase-to-EOL
+ * plus a repaint of whatever non-blank cells follow it. The EL path costs a
+ * reset, the EL, and a reposition-and-redraw of the trailing non-blank cells
+ * (in the framed editor that is just the border/scrollbar column), so it only
+ * pays off once the run of spaces it saves is longer than that overhead. */
+#define SCR_EL_MIN 16
+
 /* Present the current grid: for every row that differs from the shadow, move
- * to its start and repaint the whole row, then sync the shadow. Only changed
- * rows reach the wire, which keeps a redraw cheap over a slow link. */
+ * to its first changed column and repaint only the changed span (an in-row span
+ * diff), then sync the shadow. On a row whose changed span holds a long run of
+ * default-background blanks, that run is cleared with one erase-to-EOL and the
+ * cells past it repainted, instead of emitting a column of spaces; this needs a
+ * default background (the black scheme keeps one, the DOS blue does not). Both
+ * savings matter on a slow link. */
 static void
 scr_present(Screen *d)
 {
@@ -1367,79 +1481,96 @@ scr_present(Screen *d)
 	int r, c;
 	char mv[32];
 	Pen pen;
-	int acs = 0;			/* DEC line-drawing charset is active */
 
 	scr_str(t, "\033[?25l");		/* hide cursor during the paint */
 	for (r = 0; r < t->rows; r++) {
 		Cell *row = &t->cur[(size_t)r * t->cols];
 		Cell *srow = &t->shadow[(size_t)r * t->cols];
-		int dirty = t->rowdirty[r];
+		int acs = 0;		/* DEC line-drawing charset is active */
+		int first, last, g0 = 0, run, gap0 = 0, gap1 = 0;
 
-		if (!dirty) {
-			for (c = 0; c < t->cols; c++)
-				if (!cell_eq(&row[c], &srow[c])) {
-					dirty = 1;
-					break;
-				}
-		}
-		if (!dirty)
+		/* first and last columns that differ from the shadow */
+		first = 0;
+		while (first < t->cols && cell_eq(&row[first], &srow[first]))
+			first++;
+		if (first >= t->cols) {
+			t->rowdirty[r] = 0;	/* nothing on this row changed */
 			continue;
+		}
+		last = t->cols - 1;
+		while (last > first && cell_eq(&row[last], &srow[last]))
+			last--;
 
-		snprintf(mv, sizeof(mv), "\033[%d;1H", r + 1);
-		scr_str(t, mv);
+		/* never start or end in the trailing half of a wide glyph */
+		while (first > 0 && row[first].codepoint == CELL_CONT)
+			first--;
+		if (last + 1 < t->cols && row[last + 1].codepoint == CELL_CONT)
+			last++;
+
+		/* longest run of default-background blanks within the changed
+		 * span, as a candidate for erase-to-EOL */
+		run = 0;
+		for (c = first; c <= last; c++) {
+			if (cell_is_blank_default(&row[c])) {
+				if (run == 0)
+					g0 = c;
+				run++;
+				if (run > gap1 - gap0) {
+					gap0 = g0;
+					gap1 = c + 1;
+				}
+			} else {
+				run = 0;
+			}
+		}
+
 		pen_reset(&pen);
-		for (c = 0; c < t->cols; c++) {
-			Cell *cell = &row[c];
-			uint32_t cp = cell->codepoint;
-			unsigned char ub[4];
-			int n;
-
-			if (cp == CELL_CONT)
-				continue;	/* trailing half of a wide cell */
-			scr_pen(t, &pen, cell->fg, cell->bg, cell->attrs);
-
-			if (BOX_IS(cp)) {
-				const BoxDef *b = &box_tab[BOX_ID(cp)];
-
-				if (t->box_mode == VEDIT_BOX_DEC && b->dec) {
-					if (!acs) {
-						scr_str(t, "\033(0");
-						acs = 1;
-					}
-					ub[0] = b->dec;
-					scr_bytes(t, (const char *)ub, 1);
+		if (gap1 - gap0 >= SCR_EL_MIN) {
+			/* paint up to the blank run, erase it (and everything to
+			 * the row's end) with one EL, then repaint the non-blank
+			 * cells that follow; EL clears to the default background,
+			 * which is why this path needs one */
+			snprintf(mv, sizeof(mv), "\033[%d;%dH", r + 1, first + 1);
+			scr_str(t, mv);
+			for (c = first; c < gap0; c++)
+				scr_emit_cell(t, &pen, &acs, &row[c]);
+			if (acs) {
+				scr_str(t, "\033(B");
+				acs = 0;
+			}
+			scr_str(t, "\033[0m");	/* default bg, so EL clears right */
+			scr_str(t, "\033[K");
+			pen_reset(&pen);
+			for (c = gap1; c < t->cols; c++) {
+				if (cell_is_blank_default(&row[c]) ||
+				    row[c].codepoint == CELL_CONT)
 					continue;
+				snprintf(mv, sizeof(mv), "\033[%d;%dH", r + 1,
+				    c + 1);
+				scr_str(t, mv);
+				pen_reset(&pen);
+				while (c < t->cols &&
+				    !cell_is_blank_default(&row[c])) {
+					scr_emit_cell(t, &pen, &acs, &row[c]);
+					c++;
 				}
 				if (acs) {
 					scr_str(t, "\033(B");
 					acs = 0;
 				}
-				cp = (t->box_mode == VEDIT_BOX_UTF8) ? b->uni
-				    : (uint32_t)b->ascii;
-				n = utf8_encode(ub, cp);
-				scr_bytes(t, (const char *)ub, (size_t)n);
-				continue;
+				c--;		/* the for loop re-increments */
 			}
-
-			if (acs) {		/* back to ASCII for ordinary text */
+		} else {
+			snprintf(mv, sizeof(mv), "\033[%d;%dH", r + 1, first + 1);
+			scr_str(t, mv);
+			for (c = first; c <= last; c++)
+				scr_emit_cell(t, &pen, &acs, &row[c]);
+			if (acs) {	/* never leave a row in line-drawing mode */
 				scr_str(t, "\033(B");
 				acs = 0;
 			}
-			if (cp < 0x20 || cp == 0x7f)
-				n = utf8_encode(ub, ' ');
-			else
-				n = utf8_encode(ub, cp);
-			if (n <= 0) {
-				ub[0] = ' ';
-				n = 1;
-			}
-			scr_bytes(t, (const char *)ub, (size_t)n);
+			scr_str(t, "\033[0m");
 		}
-		if (acs) {		/* never leave a row in line-drawing mode */
-			scr_str(t, "\033(B");
-			acs = 0;
-		}
-		scr_str(t, "\033[0m");
 		t->rowdirty[r] = 0;
 		memcpy(srow, row, (size_t)t->cols * sizeof(*row));
 	}
@@ -1448,7 +1579,68 @@ scr_present(Screen *d)
 	    t->cursor_c + 1);
 	scr_str(t, mv);
 	scr_str(t, t->cursor_vis ? "\033[?25h" : "\033[?25l");
+	t->shadow_valid = 1;
 	scr_flush(t);
+}
+
+/* Scroll a band of rows [top, top+count) in the terminal by `delta` lines
+ * (positive moves content up, exposing new rows at the bottom; negative moves
+ * it down) using the VT100 scroll region, then shift the shadow to match so
+ * scr_present repaints only the newly exposed rows. The caller gates this on
+ * t->scroll and on the shadow being valid; see render_body. */
+static void
+scr_blank_row(Cell *row, int cols)
+{
+	int c;
+
+	for (c = 0; c < cols; c++)
+		vt_cell_clear(&row[c]);
+}
+
+static void
+scr_scroll(Screen *d, int top, int count, int delta)
+{
+	Scrbuf *t = d->t;
+	int cols = t->cols;
+	int bot = top + count;		/* exclusive, 0-based */
+	int k = delta < 0 ? -delta : delta;
+	char buf[32];
+	int i, r;
+
+	if (k < 1 || k >= count || top < 0 || bot > t->rows)
+		return;
+
+	scr_str(t, "\033[0m");		/* scrolled-in lines take the default bg */
+	snprintf(buf, sizeof(buf), "\033[%d;%dr", top + 1, bot);
+	scr_str(t, buf);		/* set the scroll region (1-based) */
+	if (delta > 0) {		/* content up: IND at the bottom margin */
+		snprintf(buf, sizeof(buf), "\033[%d;1H", bot);
+		scr_str(t, buf);
+		for (i = 0; i < k; i++)
+			scr_str(t, "\033D");
+	} else {			/* content down: RI at the top margin */
+		snprintf(buf, sizeof(buf), "\033[%d;1H", top + 1);
+		scr_str(t, buf);
+		for (i = 0; i < k; i++)
+			scr_str(t, "\033M");
+	}
+	scr_str(t, "\033[r");		/* restore the full-screen region */
+
+	if (delta > 0) {
+		for (r = top; r < bot - k; r++)
+			memcpy(&t->shadow[(size_t)r * cols],
+			    &t->shadow[(size_t)(r + k) * cols],
+			    (size_t)cols * sizeof(Cell));
+		for (r = bot - k; r < bot; r++)
+			scr_blank_row(&t->shadow[(size_t)r * cols], cols);
+	} else {
+		for (r = bot - 1; r >= top + k; r--)
+			memcpy(&t->shadow[(size_t)r * cols],
+			    &t->shadow[(size_t)(r - k) * cols],
+			    (size_t)cols * sizeof(Cell));
+		for (r = top; r < top + k; r++)
+			scr_blank_row(&t->shadow[(size_t)r * cols], cols);
+	}
 }
 
 static void
@@ -1466,6 +1658,7 @@ scr_begin(Screen *d)
 	scr_str(t, "\033[H");
 	for (i = 0; i < t->rows; i++)
 		t->rowdirty[i] = 1;
+	t->shadow_valid = 0;		/* screen just cleared; do not scroll yet */
 	scr_flush(t);
 }
 
@@ -1916,6 +2109,9 @@ typedef struct editor {
 	size_t		cx;		/* cursor byte offset within the line */
 	size_t		top;		/* first visible line */
 	size_t		left;		/* horizontal scroll, display columns */
+	size_t		prev_top;	/* e->top at the last text-view paint */
+	size_t		prev_left;	/* e->left at the last text-view paint */
+	int		prev_text_view;	/* the last paint was the scrollable text */
 	int		rows;
 	int		cols;
 	int		in_session;
@@ -1936,7 +2132,7 @@ typedef struct editor {
 	int		vi_vert_run;	/* this command was a vertical j/k/$ move */
 	int		vi_vert_prev;	/* the previous command was one */
 	char		status[160];
-	int		dos_chrome;	/* DOS EDIT chrome + palette on */
+	int		scheme;		/* chrome color scheme (SCHEME_*) */
 	int		hex_view;	/* render the buffer as a hex dump */
 	size_t		hex_top;	/* first visible hex row (byte offset >> 4) */
 	int		hex_ascii;	/* editing the ascii column, not the hex */
@@ -3436,8 +3632,10 @@ static void ui_field(Screen *d, int row, int col, int width,
 #define GL_TRACK	BOX_CP(BG_TRACK)
 #define GL_CHECK	BOX_CP(BG_CHECK)
 
-/* Editor chrome palette. The two presets are the DOS look (blue text area,
- * gray bars) and a monochrome fallback that leans on reverse video. */
+/* Editor chrome palette. Three presets: the DOS look (blue text area, gray
+ * bars), a black look (text area left on the terminal default background, which
+ * lets scr_present use erase-to-EOL for trailing blanks), and a monochrome
+ * fallback that leans on reverse video. */
 typedef struct chrome_pal {
 	Color	content_fg, content_bg;	/* the text area */
 	Color	frame_fg, frame_bg;	/* window border + scrollbars */
@@ -3456,6 +3654,16 @@ static Pal chrome_dos = {
 	.bar_fg = CIDX(0), .bar_bg = CIDX(7),
 	.reverse_bars = 0,
 };
+/* Black look: the text area stays on the terminal default background, so
+ * scr_present can clear trailing blanks with erase-to-EOL on any client. The
+ * bars keep the DOS gray so the chrome still reads as chrome. */
+static const Pal chrome_black = {
+	.content_fg = CIDX(15), .content_bg = CDEF,
+	.frame_fg = CIDX(6), .frame_bg = CDEF,
+	.title_fg = CIDX(15),
+	.bar_fg = CIDX(0), .bar_bg = CIDX(7),
+	.reverse_bars = 0,
+};
 static const Pal chrome_plain = {
 	.content_fg = CDEF, .content_bg = CDEF,
 	.frame_fg = CDEF, .frame_bg = CDEF,
@@ -3470,7 +3678,14 @@ static const Pal chrome_plain = {
 static const Pal *
 ed_chrome(const Editor *e)
 {
-	return e->dos_chrome ? &chrome_dos : &chrome_plain;
+	switch (e->scheme) {
+	case SCHEME_BLACK:
+		return &chrome_black;
+	case SCHEME_PLAIN:
+		return &chrome_plain;
+	default:
+		return &chrome_dos;
+	}
 }
 
 /* Height of the framed text area (rows minus menu, two borders, status). */
@@ -3787,7 +4002,7 @@ menu_checked(const Editor *e, Menuact act)
 	case MA_SYNTAX:
 		return e->hl_on ? 1 : 0;
 	case MA_SCHEME:
-		return e->dos_chrome ? 1 : 0;
+		return -1;		/* a three-way cycle, not a checkbox */
 	case MA_DRAW:
 		return e->draw_mode ? 1 : 0;
 	case MA_VI_MODE:
@@ -4781,6 +4996,7 @@ render_body(Editor *e, Screen *d)
 	int cur_col;
 
 	if (e->hex_view) {
+		e->prev_text_view = 0;	/* hex uses hex_top, not e->top */
 		hex_render(e, d);
 		return;
 	}
@@ -4788,6 +5004,18 @@ render_body(Editor *e, Screen *d)
 	scroll_to_cursor(e, text_h, text_w);
 	cur_col = cursor_dispcol(e);
 	(void)cur;
+
+	/* When only the vertical offset moved by a few lines, scroll the text
+	 * region in the terminal instead of repainting every row; scr_present
+	 * then paints just the newly exposed lines. Gated on t->scroll (VT100
+	 * scroll region) and on a valid, like-for-like previous text frame. */
+	if (e->term->scroll && e->term->shadow_valid && e->prev_text_view &&
+	    e->left == e->prev_left && e->top != e->prev_top) {
+		long dv = (long)e->top - (long)e->prev_top;
+
+		if (dv > -text_h && dv < text_h)
+			scr_scroll(d, CHROME_TOP, text_h, (int)dv);
+	}
 
 	hl_ensure(e, e->top + (size_t)text_h);
 
@@ -4863,6 +5091,10 @@ render_body(Editor *e, Screen *d)
 	scr_cursor_vis(d, 1);		/* a menu overlay may have hidden it */
 	scr_cursor(d, CHROME_TOP + (int)(e->cy - e->top),
 	    CHROME_LEFT + cur_col - (int)e->left);
+
+	e->prev_top = e->top;		/* for the next frame's scroll decision */
+	e->prev_left = e->left;
+	e->prev_text_view = 1;
 }
 
 static void
@@ -6483,11 +6715,14 @@ run_menu_act(Editor *e, Menuact act)
 		snprintf(e->status, sizeof(e->status),
 		    "syntax highlight %s", e->hl_on ? "on" : "off");
 		break;
-	case MA_SCHEME:
-		e->dos_chrome = !e->dos_chrome;
+	case MA_SCHEME: {
+		static const char *const names[] = { "DOS", "black", "plain" };
+
+		e->scheme = (e->scheme + 1) % SCHEME_COUNT;
 		snprintf(e->status, sizeof(e->status), "%s colors",
-		    e->dos_chrome ? "DOS" : "plain");
+		    names[e->scheme]);
 		break;
+	}
 	case MA_HEX:
 		e->hex_view = !e->hex_view;
 		e->hex_top = 0;
@@ -6715,7 +6950,8 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: %s [--utf8|--dec|-a|--ascii] [--16color|--256color] [file]\n"
+	    "usage: %s [--utf8|--dec|-a|--ascii] [--16color|--256color]"
+	    " [--scroll] [file]\n"
 	    "\n"
 	    "A single-file visual text editor for primitive terminals.\n"
 	    "\n"
@@ -6728,6 +6964,9 @@ usage(void)
 	    "  --256color    use the full 256-color palette\n"
 	    "                Default: 256 when TERM/COLORTERM says so, else 16.\n"
 	    "                Also set by VEDIT_COLORS=256|16.\n"
+	    "  --scroll      use the VT100 scroll region when scrolling (faster\n"
+	    "                on a slow link; needs a client that supports it)\n"
+	    "  --no-scroll   repaint instead (the default; also VEDIT_SCROLL=0|1)\n"
 	    "\n"
 	    "Modeless (MS-EDIT) keys:\n"
 	    "  arrows        move the cursor\n"
@@ -7264,7 +7503,7 @@ editor_init(Editor *e)
 	e->hl_on = 1;		/* highlight when a file type is recognized */
 	e->hex_pending = -1;
 	e->hex_cols = 16;
-	e->dos_chrome = 1;	/* MS-EDIT look by default; toggleable */
+	e->scheme = SCHEME_DOS;	/* MS-EDIT look by default; View cycles it */
 }
 
 /* Run the event loop until the editor exits. Returns a process-style code:
@@ -7522,6 +7761,17 @@ vedit_set_colors(struct vedit *v, int colors)
 		v->e.term->colors = (colors >= 256) ? 256 : 16;
 }
 
+/* Enable or disable the VT100 scroll-region fast path (see scroll_default).
+ * A host that knows the client supports a scroll region (most do; the oldest
+ * line-at-a-time clients do not) turns it on for a large saving when the user
+ * scrolls or inserts lines. Off by default. Call before vedit_run(). */
+void
+vedit_set_scroll(struct vedit *v, int on)
+{
+	if (v->e.term)
+		v->e.term->scroll = on ? 1 : 0;
+}
+
 /* Deliver a new terminal size. The host calls this from wherever it learns the
  * size (telnet NAWS, a SIGWINCH it caught, a resize message). The change is
  * picked up by the run loop, which repaints. */
@@ -7733,6 +7983,14 @@ main(int argc, char **argv)
 		}
 		if (strcmp(argv[i], "--256color") == 0) {
 			g_colors_force = 256;
+			continue;
+		}
+		if (strcmp(argv[i], "--scroll") == 0) {
+			g_scroll_force = 1;		/* VT100 scroll region */
+			continue;
+		}
+		if (strcmp(argv[i], "--no-scroll") == 0) {
+			g_scroll_force = 0;
 			continue;
 		}
 		if (!file) {

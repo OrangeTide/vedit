@@ -59,6 +59,36 @@ mapped to the nearest of the 16 ANSI colors and sent with the classic `30`-`37` 
 highlighting uses a separate, punchier palette in this mode, since the 256-color
 scheme's pastels would otherwise collapse toward white.
 
+### Fast scrolling
+
+```sh
+vedit --scroll file     # use the terminal scroll region (fewer bytes)
+vedit --no-scroll file  # repaint instead (the default)
+```
+
+When the viewport scrolls or a line is inserted, the whole text area normally
+shifts, so without help every visible row is repainted. With `--scroll` the
+editor moves the text region with the terminal's scroll region (DECSTBM plus
+`IND` / `RI`) and repaints only the one newly exposed line, which is a large
+saving on a slow link. It is off by default because it relies on VT100
+scroll-region support, which the most primitive line-at-a-time clients lack.
+`VEDIT_SCROLL=1` turns it on from the environment, and an embedding host that
+knows the client calls `vedit_set_scroll()`.
+
+Two redraw savings are always on and need no flag: only rows that changed are
+sent, and within a row only the columns between the first and last change are
+repainted. On the black color scheme (below), a long run of trailing blanks in a
+changed row is cleared with one erase-to-EOL instead of a column of spaces.
+
+### Color schemes
+
+The **View > Color Scheme** menu cycles three looks: the DOS blue text area
+(the default), a black scheme that leaves the text area on the terminal's
+default background, and a monochrome scheme that uses reverse video for the
+bars. The black scheme is the one where the erase-to-EOL redraw saving applies,
+since its background is the terminal default and so can be cleared on any client
+with or without back-color-erase.
+
 ### Modeless keys (the default, MS-EDIT style)
 
 | Key | Action |
@@ -169,6 +199,7 @@ vedit_open(v, "note.txt");
 vedit_set_size(v, rows, cols);         /* for example from telnet NAWS */
 vedit_set_box_mode(v, VEDIT_BOX_DEC);  /* pick a frame style for this client */
 vedit_set_colors(v, 16);               /* 16 or 256, from MTTS negotiation */
+vedit_set_scroll(v, 1);                /* client supports a VT100 scroll region */
 int rc = vedit_run(v);                 /* blocks until the player quits */
 vedit_free(v);
 ```
@@ -203,8 +234,11 @@ It drops, as overworked for a primitive-terminal editor:
 - mouse input,
 - the differential compositor and terminfo capability lookup.
 
-The renderer repaints only the rows that changed and emits color escapes only
-when the pen changes, which keeps a redraw small on a slow link.
+The renderer repaints only the rows that changed, and within a row only the
+columns between the first and last change, and emits color escapes only when the
+pen changes. With `--scroll` it also moves the text area with the terminal
+scroll region instead of repainting it. All of this keeps a redraw small on a
+slow link.
 
 ### Ways to make it smaller or larger
 
