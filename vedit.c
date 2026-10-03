@@ -3697,11 +3697,20 @@ text_height(const Editor *e)
 	return h < 1 ? 1 : h;
 }
 
-/* Width of the framed text area (cols minus the two border columns). */
+/* Columns reserved to the right of the text. The black scheme drops the right
+ * border and vertical scrollbar so the text reaches the last column, which lets
+ * scr_present clear trailing blanks with erase-to-EOL (see there). */
+static int
+chrome_right(const Editor *e)
+{
+	return e->scheme == SCHEME_BLACK ? 0 : CHROME_RIGHT;
+}
+
+/* Width of the framed text area (cols minus the border columns). */
 static int
 text_width(const Editor *e)
 {
-	int w = e->cols - CHROME_LEFT - CHROME_RIGHT;
+	int w = e->cols - CHROME_LEFT - chrome_right(e);
 
 	return w < 1 ? 1 : w;
 }
@@ -4122,7 +4131,8 @@ ui_frame(Editor *e, const Pal *p)
 	Color fg = p->frame_fg, bg = p->frame_bg;
 	int top = CHROME_TOP - 1;	/* top border row, under the menu bar */
 	int bot = e->rows - CHROME_BOTTOM;	/* bottom border row */
-	int sb = e->cols - CHROME_RIGHT;	/* right border / vertical bar */
+	int sb = e->cols - chrome_right(e);	/* right border / vertical bar
+						 * (off-screen when borderless) */
 	int th = text_height(e);
 	int i;
 	size_t nlines = text_lines(e->t);
@@ -4180,7 +4190,7 @@ ui_frame(Editor *e, const Pal *p)
 
 	/* horizontal scrollbar embedded in the bottom border */
 	if (e->cols >= 6) {
-		int hspan = e->cols - CHROME_LEFT - CHROME_RIGHT; /* corners off */
+		int hspan = e->cols - CHROME_LEFT - chrome_right(e); /* corners off */
 
 		hthumb = thumb_index(e->left, max_left, hspan);
 		for (i = 0; i < hspan; i++)

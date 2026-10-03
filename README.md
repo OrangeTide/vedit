@@ -87,7 +87,10 @@ The **View > Color Scheme** menu cycles three looks: the DOS blue text area
 default background, and a monochrome scheme that uses reverse video for the
 bars. The black scheme is the one where the erase-to-EOL redraw saving applies,
 since its background is the terminal default and so can be cleared on any client
-with or without back-color-erase.
+with or without back-color-erase. It also drops the right border and vertical
+scrollbar so the text reaches the last column, which is what lets a whole
+trailing run of blanks be cleared with one erase. The file position is still on
+the status line.
 
 ### Modeless keys (the default, MS-EDIT style)
 
