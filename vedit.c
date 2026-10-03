@@ -280,9 +280,19 @@ vedit_cfg_load(Cfg *c, const char *path)
 		*tmp = '\0';
 		{
 			char *name = base, *value = cfg_skip_ws(tmp + 1);
+			size_t vlen;
 
 			cfg_trim_end(name);
 			cfg_trim_end(value);
+			/* Strip surrounding quotes, so a value may hold a '#'
+			 * (a hex color) or trailing spaces without being taken
+			 * for a comment. */
+			vlen = strlen(value);
+			if (vlen >= 2 && value[0] == '"' &&
+			    value[vlen - 1] == '"') {
+				value[vlen - 1] = '\0';
+				value++;
+			}
 			if (section[0] == '\0' && strchr(name, '.') != NULL) {
 				/* shorthand: a trimmed name with a dot is already
 				 * a full dotted key */

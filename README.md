@@ -138,7 +138,7 @@ then selects, alongside the three built-ins:
     content.bg   = default
     frame.fg     = 60         # window border and scrollbars
     frame.bg     = default
-    title.fg     = 231        # file name in the top border
+    title.fg     = "#ffd787"  # file name in the top border (quote a hex color)
     bar.fg       = 231        # menu bar and status bar
     bar.bg       = 54
     reverse-bars = off        # draw the bars in reverse video
@@ -147,7 +147,9 @@ then selects, alongside the three built-ins:
 
 A color is `default` (the terminal's own color), a 0-255 palette index,
 `#rrggbb`, or one of the sixteen ANSI names (`red`, `cyan`, ..., with a
-`bright-` prefix for 8-15). Unset fields keep the base preset's value, and `base
+`bright-` prefix for 8-15). A `#rrggbb` value must be quoted, since an unquoted
+`#` starts a comment; quoting also protects any value with a `#` or trailing
+spaces. Unset fields keep the base preset's value, and `base
 = black` turns `borderless` on unless the theme sets it off. Up to eight themes
 can be defined.
 

@@ -364,7 +364,8 @@ t_cfg_parse(Test *t)
 	    "  scheme = black ; trailing comment\n"
 	    "  wrap = on\n"
 	    "[theme \"midnight\"]\n"
-	    "  content.fg = 250\n";
+	    "  content.fg = 250\n"
+	    "  title.fg = \"#ff8000\"\n";	/* quoted: '#' is not a comment */
 	char path[256];
 	Cfg *c = load_cfg_text(text, path, sizeof(path));
 	const char *v;
@@ -379,6 +380,9 @@ t_cfg_parse(Test *t)
 	TAP_CHECKF(t, v && strcmp(v, "on") == 0, "ui.wrap=%s", v ? v : "(nil)");
 	v = cfg_get(c, "theme.midnight.content.fg");
 	TAP_CHECKF(t, v && strcmp(v, "250") == 0, "theme fg=%s",
+	    v ? v : "(nil)");
+	v = cfg_get(c, "theme.midnight.title.fg");	/* quotes stripped, # kept */
+	TAP_CHECKF(t, v && strcmp(v, "#ff8000") == 0, "quoted hex=%s",
 	    v ? v : "(nil)");
 	TAP_CHECK(t, cfg_get(c, "comment") == NULL);	/* comment not a key */
 	TAP_CHECK(t, cfg_bool(c, "ui.wrap", 0) == 1);
