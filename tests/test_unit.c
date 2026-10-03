@@ -504,6 +504,91 @@ t_cfg_theme(Test *t)
 	unlink(path);
 }
 
+static void
+t_jsf_charset(Test *t)
+{
+	uint8_t set[32];
+
+	TAP_CHECK(t, jsf_charset("*", set) && (set[0] == 0xff));
+	TAP_ASSERT(t, jsf_charset("\"a-c\"", set));
+	TAP_CHECK(t, (set['a' >> 3] & (1 << ('a' & 7))));
+	TAP_CHECK(t, (set['c' >> 3] & (1 << ('c' & 7))));
+	TAP_CHECK(t, !(set['d' >> 3] & (1 << ('d' & 7))));
+	TAP_ASSERT(t, jsf_charset("\"0-9\\t\"", set));
+	TAP_CHECK(t, (set['5' >> 3] & (1 << ('5' & 7))));
+	TAP_CHECK(t, (set['\t' >> 3] & (1 << ('\t' & 7))));
+}
+
+static int
+jsf_class_of(int lang, const char *name)
+{
+	int k;
+
+	for (k = 0; k < g_jsf[lang].nclasses; k++)
+		if (strcmp(g_jsf[lang].classname[k], name) == 0)
+			return k;
+	return -1;
+}
+
+static void
+t_jsf_highlight(Test *t)
+{
+	static const char *text =
+	    "[language \"mini\"]\n"
+	    "[color \"mini\"]\n"
+	    "  kw  = yellow\n"
+	    "  num = cyan\n"
+	    "[words \"mini.w\"]\n"
+	    "  list = if while\n"
+	    "[state \"mini.idle\"]\n"
+	    "  color = text\n"
+	    "  rule = \"0-9\" num recolor\n"
+	    "  rule = \"a-z\" word buffer\n"
+	    "  rule = * idle\n"
+	    "[state \"mini.num\"]\n"
+	    "  color = num\n"
+	    "  rule = \"0-9\" num\n"
+	    "  rule = * idle noeat\n"
+	    "[state \"mini.word\"]\n"
+	    "  color = text\n"
+	    "  rule = \"a-z\" word\n"
+	    "  rule = * idle noeat kw=mini.w:kw\n";
+	char path[256];
+	Cfg *c = load_cfg_text(text, path, sizeof(path));
+	const Cfg *old = g_cfg;
+	const Syntax *sy;
+	const char *line = "if 42x";
+	uint8_t out[16];
+	int lang, kw, num, txt;
+
+	TAP_ASSERT(t, c != NULL);
+	g_cfg = c;
+	syntax_load_cfg(c);
+	lang = jsf_find("mini");
+	TAP_ASSERT(t, lang >= 0);
+	kw = jsf_class_of(lang, "kw");
+	num = jsf_class_of(lang, "num");
+	txt = jsf_class_of(lang, "text");
+	TAP_ASSERT(t, kw > 0 && num > 0 && txt >= 0);
+
+	sy = syn_for_ext("mini");		/* resolves to the FSM language */
+	TAP_ASSERT(t, sy && sy->fsm);
+	memset(out, 0xee, sizeof(out));
+	syn_line(sy, sy->start, line, strlen(line), out);
+
+	/* "if 42x" -> keyword, keyword, text, num, num, text */
+	TAP_CHECKF(t, out[0] == kw && out[1] == kw, "kw [%d %d]", out[0], out[1]);
+	TAP_CHECK(t, out[2] == txt);
+	TAP_CHECKF(t, out[3] == num && out[4] == num, "num [%d %d]",
+	    out[3], out[4]);
+	TAP_CHECK(t, out[5] == txt);
+
+	g_cfg = old;
+	syntax_load_cfg(NULL);			/* clear registry for other tests */
+	vedit_cfg_free(c);
+	unlink(path);
+}
+
 const Case tap_cases[] = {
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },
@@ -526,5 +611,7 @@ const Case tap_cases[] = {
 	{ "cfg_resolve", t_cfg_resolve },
 	{ "cfg_color", t_cfg_color },
 	{ "cfg_theme", t_cfg_theme },
+	{ "jsf_charset", t_jsf_charset },
+	{ "jsf_highlight", t_jsf_highlight },
 	{ NULL, NULL },
 };

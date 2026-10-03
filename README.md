@@ -161,8 +161,60 @@ itself; the command-line front end reads it and hands it in through
 `vedit_set_config()`, which an embedding host can also call with a config it
 builds from `vedit_cfg_new()` / `vedit_cfg_load()`.
 
-The joe-style syntax highlighting rules are not yet configurable here; that is
-the planned next step.
+### Custom syntax highlighting
+
+Beyond the built-in C and shell highlighters, the config file can define a
+language as a small state machine (the model joe uses), authored in the same
+gitconfig format, no separate file. A language is a set of states; each state
+has an ordered list of transition `rule` lines keyed on a character set.
+
+```ini
+[syntax]
+    enable = on
+    mn = mini             # map an extension to a language (or :syntax mini)
+
+[color "mini"]            # class -> color [attrs], same grammar as themes
+    kw  = "#ffd700"
+    num = cyan
+
+[words "mini.keywords"]   # keyword groups; split on spaces, multiple lines ok
+    list = if else while return
+    list = for do break continue
+
+[state "mini.idle"]       # the first state is the start (or language.mini.start)
+    color = text
+    rule = "0-9"       num   recolor
+    rule = "a-zA-Z_"   word  buffer
+    rule = *           idle
+
+[state "mini.num"]
+    color = num
+    rule = "0-9."      num
+    rule = *           idle  noeat
+
+[state "mini.word"]
+    color = text
+    rule = "a-zA-Z0-9_" word
+    rule = *            idle noeat kw=mini.keywords:kw
+```
+
+Each `rule` is `charset  target-state  [options]`:
+
+- **charset** is `*` (any byte, put it last) or a quoted set with ranges and
+  escapes, for example `"a-zA-Z0-9_"`, `"0-9"`, `"\t\n"`, `"\""`.
+- **options**: `noeat` re-processes the byte in the target state without
+  consuming it; `recolor` (or `recolor=N`) repaints the last byte (or N bytes)
+  in the target state's color; `buffer` starts recording a token; and
+  `kw=<group>:<class>` matches the buffered token against a `[words]` group and,
+  on a hit, repaints it in `<class>`. Colors accept attributes (`bold`,
+  `underline`, `reverse`, `dim`, `italic`), e.g. `keyword = yellow bold`.
+
+The carry state between lines is the current state, so multi-line constructs
+(block comments, here-strings) work by staying in a state at end of line. A
+language whose name matches a file extension is picked up automatically; a
+`syntax.<ext> = <name>` line maps any other extension. The core reads no files:
+the rules are config data, loaded through `vedit_set_config()` like everything
+else. (Region markers and state includes are not in this first cut.)
 
 ### Color schemes
 

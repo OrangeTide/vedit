@@ -97,24 +97,14 @@ vedit_cfg_free(Cfg *c)
 	free(c);
 }
 
-/* Store or overwrite a normalized key. Silently drops the pair on an
- * allocation failure, which leaves the earlier config intact. */
+/* Append a normalized key/value. Like git config, every occurrence is kept in
+ * file order: a scalar read (cfg_get) takes the last, and a multivar read walks
+ * them in order. Silently drops the pair on an allocation failure. */
 static void
 cfg_set(Cfg *c, const char *key, const char *value)
 {
 	char *k, *v;
-	int i;
 
-	for (i = 0; i < c->count; i++) {
-		if (strcmp(c->entries[i].key, key) == 0) {
-			v = cfg_dup(value);
-			if (!v)
-				return;
-			free(c->entries[i].value);
-			c->entries[i].value = v;
-			return;
-		}
-	}
 	if (c->count >= c->alloc) {
 		int na = c->alloc ? c->alloc * 2 : 16;
 		Cfgent *ne = realloc(c->entries, (size_t)na * sizeof(*ne));
@@ -136,17 +126,19 @@ cfg_set(Cfg *c, const char *key, const char *value)
 	c->count++;
 }
 
+/* The last value set for key (later occurrences win), or NULL. */
 static const char *
 cfg_get(const Cfg *c, const char *key)
 {
+	const char *hit = NULL;
 	int i;
 
 	if (!c)
 		return NULL;
 	for (i = 0; i < c->count; i++)
 		if (strcmp(c->entries[i].key, key) == 0)
-			return c->entries[i].value;
-	return NULL;
+			hit = c->entries[i].value;
+	return hit;
 }
 
 /* Interpret a string as a boolean, returning def when it is not recognized. */
@@ -512,6 +504,96 @@ vt_cell_clear(Cell *c)
 	c->width = 1;
 }
 
+/* Parse a color: "default", a 0-255 palette index, "#rrggbb", or one of the 16
+ * ANSI names (with a "bright-" prefix for 8-15). Returns 1 on success. Used by
+ * the config file for both chrome themes and syntax classes. */
+static int
+cfg_color(const char *s, Color *out)
+{
+	static const char *const names[8] = {
+		"black", "red", "green", "yellow",
+		"blue", "magenta", "cyan", "white"
+	};
+	int i;
+
+	if (!s || !s[0])
+		return 0;
+	if (strcmp(s, "default") == 0) {
+		out->type = COLOR_DEFAULT;
+		return 1;
+	}
+	if (s[0] == '#' && strlen(s) == 7) {
+		unsigned r, g, b;
+
+		if (sscanf(s + 1, "%2x%2x%2x", &r, &g, &b) == 3) {
+			out->type = COLOR_RGB;
+			out->rgb.r = (uint8_t)r;
+			out->rgb.g = (uint8_t)g;
+			out->rgb.b = (uint8_t)b;
+			return 1;
+		}
+		return 0;
+	}
+	if (s[0] >= '0' && s[0] <= '9') {
+		char *end;
+		long n = strtol(s, &end, 10);
+
+		if (*end == '\0' && n >= 0 && n <= 255) {
+			out->type = COLOR_INDEXED;
+			out->index = (uint8_t)n;
+			return 1;
+		}
+		return 0;
+	}
+	{
+		const char *base = s;
+		int bright = 0;
+
+		if (strncmp(s, "bright-", 7) == 0) {
+			base = s + 7;
+			bright = 8;
+		}
+		for (i = 0; i < 8; i++)
+			if (strcmp(base, names[i]) == 0) {
+				out->type = COLOR_INDEXED;
+				out->index = (uint8_t)(i + bright);
+				return 1;
+			}
+	}
+	return 0;
+}
+
+/* Parse a color spec "COLOR [attr...]" (attrs: bold, underline, reverse, dim,
+ * italic) into fg and attr. Returns 1 when the color parsed. */
+static int
+cfg_style(const char *spec, Color *fg, uint16_t *attr)
+{
+	char buf[64], *tok, *save = NULL;
+	int first = 1, ok = 0;
+
+	*attr = 0;
+	if (!spec)
+		return 0;
+	snprintf(buf, sizeof(buf), "%s", spec);
+	for (tok = strtok_r(buf, " \t", &save); tok;
+	    tok = strtok_r(NULL, " \t", &save)) {
+		if (first) {
+			ok = cfg_color(tok, fg);
+			first = 0;
+		} else if (strcmp(tok, "bold") == 0)
+			*attr |= ATTR_BOLD;
+		else if (strcmp(tok, "underline") == 0)
+			*attr |= ATTR_UNDERLINE;
+		else if (strcmp(tok, "reverse") == 0)
+			*attr |= ATTR_REVERSE;
+		else if (strcmp(tok, "dim") == 0)
+			*attr |= ATTR_DIM;
+		else if (strcmp(tok, "italic") == 0)
+			*attr |= ATTR_ITALIC;
+	}
+	return ok;
+}
+
 /****************************************************************
  * Box-drawing abstraction
  *
@@ -690,17 +772,572 @@ typedef enum syn_style {
 	SYN_STYLE_COUNT,
 } SynStyle;
 
+typedef struct jsf Jsf;		/* data-driven FSM highlighter from config */
+
 typedef struct syntax {
 	const char		*name;
-	uint16_t		start;		/* initial carry state (0) */
+	uint16_t		start;		/* initial carry state / FSM state */
 	const char *const	*keywords;	/* NULL-terminated, or NULL */
 	const char *const	*types;		/* NULL-terminated, or NULL */
 	const char		*line_comment;	/* "//" or "#", or NULL */
 	unsigned char		block_comment;	/* 1: C-style slash-star */
 	unsigned char		preproc;	/* 1: line-initial '#' */
+	const Jsf		*fsm;		/* non-NULL: use the FSM instead */
 } Syntax;
 
 #define SYN_INCOMMENT 1		/* carry state: inside a block comment */
+
+/****************************************************************
+ * Data-driven highlighter (joe-style FSM authored in the config file).
+ *
+ * A language is a set of states; each state has an ordered list of transition
+ * rules keyed on a character set. A rule may recolor earlier bytes, not consume
+ * the current byte (noeat), start buffering a token (buffer), and match that
+ * token against keyword groups (kw=group:class). The carry state across lines
+ * is just the current state index, which the line cache already stores. Built
+ * from g_cfg by syntax_load_cfg(); the core opens no files.
+ ****************************************************************/
+
+#define JSF_CLASS_MAX	32
+#define JSF_STATE_MAX	128
+#define JSF_NAME	48
+#define JSF_LANG_MAX	8
+
+enum { JSF_F_NOEAT = 1, JSF_F_BUFFER = 2 };
+
+typedef struct jsf_kw { int group; uint8_t klass; } Jsfkw;
+
+typedef struct jsf_rule {
+	uint8_t		set[32];	/* 256-bit charset bitmap */
+	uint16_t	next;		/* target state index */
+	uint8_t		flags;		/* JSF_F_* */
+	uint8_t		recolor;	/* 0 none; 255 whole token; else N bytes */
+	int		kw_first, kw_n;	/* slice into Jsf.kws */
+} Jsfrule;
+
+typedef struct jsf_state {
+	char		name[JSF_NAME];
+	uint8_t		klass;		/* default color class for this state */
+	int		rule_first, rule_n;
+} Jsfstate;
+
+typedef struct jsf_word { const char *s; int len; } Jsfword;	/* into g_cfg */
+typedef struct jsf_group { char name[JSF_NAME]; int first, n; } Jsfgroup;
+
+struct jsf {
+	char		name[JSF_NAME];
+	Jsfstate	states[JSF_STATE_MAX];	int nstates;
+	Jsfrule		*rules;	int nrules, rulecap;
+	Jsfkw		*kws;	int nkws, kwcap;
+	Jsfword		*words;	int nwords, wordcap;
+	Jsfgroup	groups[JSF_CLASS_MAX];	int ngroups;
+	char		classname[JSF_CLASS_MAX][24];	int nclasses;
+	Color		fg[JSF_CLASS_MAX];
+	uint16_t	attr[JSF_CLASS_MAX];
+	uint16_t	start;
+};
+
+static Jsf	g_jsf[JSF_LANG_MAX];
+static Syntax	g_jsf_syn[JSF_LANG_MAX];	/* Syntax wrappers over g_jsf */
+static int	g_jsf_count;
+
+static int
+jsf_find(const char *name)
+{
+	int i;
+
+	for (i = 0; i < g_jsf_count; i++)
+		if (strcmp(g_jsf[i].name, name) == 0)
+			return i;
+	return -1;
+}
+
+/* Intern a class name, returning its index; class 0 is the default (terminal
+ * color, no attrs). */
+static int
+jsf_class(Jsf *j, const char *name)
+{
+	int i;
+
+	for (i = 0; i < j->nclasses; i++)
+		if (strcmp(j->classname[i], name) == 0)
+			return i;
+	if (j->nclasses >= JSF_CLASS_MAX)
+		return 0;
+	i = j->nclasses++;
+	snprintf(j->classname[i], sizeof(j->classname[i]), "%s", name);
+	j->fg[i].type = COLOR_DEFAULT;
+	j->attr[i] = 0;
+	return i;
+}
+
+static int
+jsf_state_idx(Jsf *j, const char *name)
+{
+	int i;
+
+	for (i = 0; i < j->nstates; i++)
+		if (strcmp(j->states[i].name, name) == 0)
+			return i;
+	if (j->nstates >= JSF_STATE_MAX)
+		return 0;
+	i = j->nstates++;
+	snprintf(j->states[i].name, sizeof(j->states[i].name), "%s", name);
+	j->states[i].klass = 0;
+	j->states[i].rule_first = j->nrules;
+	j->states[i].rule_n = 0;
+	return i;
+}
+
+static int
+jsf_group_idx(Jsf *j, const char *name)
+{
+	int i;
+
+	for (i = 0; i < j->ngroups; i++)
+		if (strcmp(j->groups[i].name, name) == 0)
+			return i;
+	if (j->ngroups >= JSF_CLASS_MAX)
+		return -1;
+	i = j->ngroups++;
+	snprintf(j->groups[i].name, sizeof(j->groups[i].name), "%s", name);
+	j->groups[i].first = j->nwords;
+	j->groups[i].n = 0;
+	return i;
+}
+
+static int
+jsf_group_has(const Jsf *j, int g, const char *s, int len)
+{
+	int i;
+
+	if (g < 0)
+		return 0;
+	for (i = 0; i < j->groups[g].n; i++) {
+		const Jsfword *w = &j->words[j->groups[g].first + i];
+
+		if (w->len == len && memcmp(w->s, s, (size_t)len) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+/* Fill a 256-bit set from "*" or a quoted "a-z..." spec (escapes \n \t \r \\
+ * \" \xHH, and X-Y ranges). Returns 1 on success. */
+static int
+jsf_charset(const char *tok, uint8_t set[32])
+{
+	const char *p;
+	int prev = -1;
+
+	memset(set, 0, 32);
+	if (strcmp(tok, "*") == 0) {
+		memset(set, 0xff, 32);
+		return 1;
+	}
+	if (tok[0] != '"')
+		return 0;
+	p = tok + 1;
+	while (*p && *p != '"') {
+		int ch;
+
+		if (*p == '\\' && p[1]) {
+			p++;
+			switch (*p) {
+			case 'n': ch = '\n'; break;
+			case 't': ch = '\t'; break;
+			case 'r': ch = '\r'; break;
+			case 'x': {
+				unsigned v = 0;
+				int k;
+
+				for (k = 0; k < 2 && isxdigit((unsigned char)p[1]);
+				    k++) {
+					p++;
+					v = v * 16 + (isdigit((unsigned char)*p)
+					    ? *p - '0'
+					    : (tolower(*p) - 'a' + 10));
+				}
+				ch = (int)v;
+				break;
+			}
+			default: ch = (unsigned char)*p; break;
+			}
+			p++;
+		} else if (p[1] == '-' && p[2] && p[2] != '"' && prev < 0) {
+			int lo = (unsigned char)p[0], hi = (unsigned char)p[2];
+			int x;
+
+			if (hi >= lo)
+				for (x = lo; x <= hi; x++)
+					set[x >> 3] |= (uint8_t)(1 << (x & 7));
+			p += 3;
+			continue;
+		} else {
+			ch = (unsigned char)*p;
+			p++;
+		}
+		if (ch >= 0 && ch < 256)
+			set[ch >> 3] |= (uint8_t)(1 << (ch & 7));
+		prev = -1;
+	}
+	return 1;
+}
+
+static Jsfrule *
+jsf_add_rule(Jsf *j)
+{
+	if (j->nrules >= j->rulecap) {
+		int nc = j->rulecap ? j->rulecap * 2 : 32;
+		Jsfrule *n = realloc(j->rules, (size_t)nc * sizeof(*n));
+
+		if (!n)
+			return NULL;
+		j->rules = n;
+		j->rulecap = nc;
+	}
+	return &j->rules[j->nrules];
+}
+
+/* Run the FSM over one line into out[] (class per byte); return the end state. */
+static uint16_t
+jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
+    uint8_t *out)
+{
+	size_t i = 0, tok = 0;
+	uint16_t st = state_in < j->nstates ? state_in : j->start;
+	int buffering = 0, hops = 0;
+
+	while (i < n) {
+		unsigned char c = (unsigned char)bytes[i];
+		const Jsfstate *S = &j->states[st];
+		const Jsfrule *R = NULL;
+		int r;
+
+		for (r = 0; r < S->rule_n; r++) {
+			const Jsfrule *cand = &j->rules[S->rule_first + r];
+
+			if (cand->set[c >> 3] & (1 << (c & 7))) {
+				R = cand;
+				break;
+			}
+		}
+		if (!R) {			/* no rule: color and consume */
+			if (out)
+				out[i] = S->klass;
+			i++;
+			continue;
+		}
+		/* keyword match on the buffered token at a transition */
+		if (R->kw_n && buffering && out && i > tok) {
+			int k;
+
+			for (k = 0; k < R->kw_n; k++) {
+				const Jsfkw *kw = &j->kws[R->kw_first + k];
+				size_t p;
+
+				if (!jsf_group_has(j, kw->group, bytes + tok,
+				    (int)(i - tok)))
+					continue;
+				for (p = tok; p < i; p++)
+					out[p] = kw->klass;
+				break;
+			}
+		}
+		if (R->flags & JSF_F_BUFFER) {
+			tok = i;
+			buffering = 1;
+		}
+		/* color the consumed byte with this state's class first, then
+		 * let recolor override it (and any earlier bytes) */
+		if (out && !(R->flags & JSF_F_NOEAT))
+			out[i] = S->klass;
+		if (R->recolor && out) {
+			size_t cnt = R->recolor;
+			size_t from = cnt > i + 1 ? 0 : (i + 1 - cnt);
+			uint8_t nk = j->states[R->next].klass;
+			size_t p;
+
+			for (p = from; p <= i; p++)
+				out[p] = nk;
+		}
+		if (R->flags & JSF_F_NOEAT) {
+			st = R->next;
+			if (++hops > 16) {	/* break a malformed noeat cycle */
+				if (out)
+					out[i] = j->states[st].klass;
+				i++;
+				hops = 0;
+			}
+			continue;
+		}
+		st = R->next;
+		hops = 0;
+		i++;
+	}
+	return st;
+}
+
+static void
+jsf_reset(void)
+{
+	int i;
+
+	for (i = 0; i < g_jsf_count; i++) {
+		free(g_jsf[i].rules);
+		free(g_jsf[i].kws);
+		free(g_jsf[i].words);
+	}
+	memset(g_jsf, 0, sizeof(g_jsf));
+	g_jsf_count = 0;
+}
+
+/* Intern a language slot by name. */
+static Jsf *
+jsf_lang(const char *name)
+{
+	int i = jsf_find(name);
+
+	if (i >= 0)
+		return &g_jsf[i];
+	if (g_jsf_count >= JSF_LANG_MAX)
+		return NULL;
+	i = g_jsf_count++;
+	snprintf(g_jsf[i].name, sizeof(g_jsf[i].name), "%s", name);
+	g_jsf[i].nclasses = 1;		/* class 0 = default */
+	g_jsf[i].classname[0][0] = '\0';
+	g_jsf[i].fg[0].type = COLOR_DEFAULT;
+	g_jsf[i].attr[0] = 0;
+	return &g_jsf[i];
+}
+
+/* Split "a.b.c" at the first dot: head into buf, return the tail (or NULL). */
+static const char *
+jsf_split(const char *s, char *buf, size_t bufsz)
+{
+	const char *dot = strchr(s, '.');
+	size_t nl;
+
+	if (!dot)
+		return NULL;
+	nl = (size_t)(dot - s);
+	if (nl >= bufsz)
+		return NULL;
+	memcpy(buf, s, nl);
+	buf[nl] = '\0';
+	return dot + 1;
+}
+
+/* Append space-separated words from val into group g of j (slices into val,
+ * which lives in the borrowed g_cfg). */
+static void
+jsf_add_words(Jsf *j, int g, const char *val)
+{
+	const char *p = val;
+
+	while (*p) {
+		const char *start;
+
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (!*p)
+			break;
+		start = p;
+		while (*p && *p != ' ' && *p != '\t')
+			p++;
+		if (j->nwords >= j->wordcap) {
+			int nc = j->wordcap ? j->wordcap * 2 : 32;
+			Jsfword *n = realloc(j->words, (size_t)nc * sizeof(*n));
+
+			if (!n)
+				return;
+			j->words = n;
+			j->wordcap = nc;
+		}
+		j->words[j->nwords].s = start;
+		j->words[j->nwords].len = (int)(p - start);
+		j->nwords++;
+		j->groups[g].n++;
+	}
+}
+
+/* Parse one rule value "charset target [options]" into state st of j. */
+static void
+jsf_parse_rule(Jsf *j, int st, const char *val)
+{
+	char buf[512], *tok, *save = NULL;
+	Jsfrule *R = jsf_add_rule(j);
+	int field = 0;
+
+	if (!R)
+		return;
+	memset(R, 0, sizeof(*R));
+	R->kw_first = j->nkws;
+	snprintf(buf, sizeof(buf), "%s", val);
+	for (tok = strtok_r(buf, " \t", &save); tok;
+	    tok = strtok_r(NULL, " \t", &save)) {
+		if (field == 0) {
+			if (!jsf_charset(tok, R->set))
+				return;		/* drop a malformed rule */
+		} else if (field == 1) {
+			R->next = (uint16_t)jsf_state_idx(j, tok);
+		} else if (strcmp(tok, "noeat") == 0) {
+			R->flags |= JSF_F_NOEAT;
+		} else if (strcmp(tok, "buffer") == 0) {
+			R->flags |= JSF_F_BUFFER;
+		} else if (strcmp(tok, "recolor") == 0) {
+			R->recolor = 1;
+		} else if (strncmp(tok, "recolor=", 8) == 0) {
+			int v = atoi(tok + 8);
+
+			R->recolor = (uint8_t)(v < 1 ? 1 : v > 254 ? 254 : v);
+		} else if (strncmp(tok, "kw=", 3) == 0) {
+			char grp[JSF_NAME];
+			const char *colon = strchr(tok + 3, ':');
+			const char *cls = NULL;
+			int g, cl;
+
+			if (colon) {		/* kw=<group>:<class> */
+				size_t gl = (size_t)(colon - (tok + 3));
+
+				if (gl < sizeof(grp)) {
+					memcpy(grp, tok + 3, gl);
+					grp[gl] = '\0';
+					cls = colon + 1;
+				}
+			}
+			if (cls && j->nkws < JSF_CLASS_MAX * 4) {
+				g = jsf_group_idx(j, grp);
+				cl = jsf_class(j, cls);
+				if (g >= 0) {
+					if (j->nkws >= j->kwcap) {
+						int nc = j->kwcap ? j->kwcap * 2
+						    : 16;
+						Jsfkw *nk = realloc(j->kws,
+						    (size_t)nc * sizeof(*nk));
+
+						if (nk) {
+							j->kws = nk;
+							j->kwcap = nc;
+						}
+					}
+					if (j->nkws < j->kwcap) {
+						j->kws[j->nkws].group = g;
+						j->kws[j->nkws].klass =
+						    (uint8_t)cl;
+						j->nkws++;
+						R->kw_n++;
+					}
+				}
+			}
+		}
+		field++;
+	}
+	if (field < 2)			/* need at least charset + target */
+		return;
+	if (j->states[st].rule_n == 0)	/* first rule: anchor the slice here */
+		j->states[st].rule_first = j->nrules;
+	j->states[st].rule_n++;
+	j->nrules++;
+}
+
+/* Build g_jsf from the config. Pass 1 interns languages, classes, groups, and
+ * states; pass 2 parses rules (so forward references resolve) and the start
+ * state, then builds the Syntax wrappers. */
+static void
+syntax_load_cfg(const Cfg *c)
+{
+	int pass, i;
+
+	jsf_reset();
+	if (!c)
+		return;
+	for (pass = 0; pass < 2; pass++) {
+		for (i = 0; i < c->count; i++) {
+			const char *key = c->entries[i].key;
+			const char *val = c->entries[i].value;
+			char lang[JSF_NAME];
+			const char *rest, *tail;
+			Jsf *j;
+
+			if (strncmp(key, "color.", 6) == 0) {
+				if (pass)
+					continue;
+				rest = jsf_split(key + 6, lang, sizeof(lang));
+				if (!rest)
+					continue;
+				j = jsf_lang(lang);
+				if (j)
+					cfg_style(val,
+					    &j->fg[jsf_class(j, rest)],
+					    &j->attr[jsf_class(j, rest)]);
+			} else if (strncmp(key, "words.", 6) == 0) {
+				char grp[JSF_NAME];
+
+				if (pass)
+					continue;
+				rest = jsf_split(key + 6, lang, sizeof(lang));
+				if (!rest)
+					continue;
+				/* rest = "<group>.list"; keep "<lang>.<group>" */
+				tail = jsf_split(rest, grp, sizeof(grp));
+				if (!tail || strcmp(tail, "list") != 0)
+					continue;
+				j = jsf_lang(lang);
+				if (j) {
+					char full[JSF_NAME];
+
+					if (snprintf(full, sizeof(full), "%s.%s",
+					    lang, grp) >= (int)sizeof(full))
+						continue;	/* name too long */
+					jsf_add_words(j, jsf_group_idx(j, full),
+					    val);
+				}
+			} else if (strncmp(key, "state.", 6) == 0) {
+				char sname[JSF_NAME];
+
+				rest = jsf_split(key + 6, lang, sizeof(lang));
+				if (!rest)
+					continue;
+				tail = jsf_split(rest, sname, sizeof(sname));
+				if (!tail)
+					continue;
+				j = jsf_lang(lang);
+				if (!j)
+					continue;
+				if (pass == 0) {
+					jsf_state_idx(j, sname);
+				} else if (strcmp(tail, "color") == 0) {
+					j->states[jsf_state_idx(j, sname)].klass =
+					    (uint8_t)jsf_class(j, val);
+				} else if (strcmp(tail, "rule") == 0) {
+					jsf_parse_rule(j,
+					    jsf_state_idx(j, sname), val);
+				}
+			} else if (strncmp(key, "language.", 9) == 0) {
+				if (pass)
+					continue;
+				rest = jsf_split(key + 9, lang, sizeof(lang));
+				if (rest)
+					jsf_lang(lang);
+			}
+		}
+	}
+	/* resolve start states and build Syntax wrappers */
+	for (i = 0; i < g_jsf_count; i++) {
+		char sk[JSF_NAME + 24];
+		const char *sv = NULL;
+
+		if (snprintf(sk, sizeof(sk), "language.%s.start",
+		    g_jsf[i].name) < (int)sizeof(sk))
+			sv = cfg_get(c, sk);
+		g_jsf[i].start = sv ? (uint16_t)jsf_state_idx(&g_jsf[i], sv) : 0;
+		memset(&g_jsf_syn[i], 0, sizeof(g_jsf_syn[i]));
+		g_jsf_syn[i].name = g_jsf[i].name;
+		g_jsf_syn[i].start = g_jsf[i].start;
+		g_jsf_syn[i].fsm = &g_jsf[i];
+	}
+}
 
 /* Keyword and type sets shared by the C family (C, C++, LPC). */
 static const char *const cfam_kw[] = {
@@ -730,8 +1367,8 @@ static const char *const sh_kw[] = {
 	NULL,
 };
 
-static const Syntax syn_c  = { "c",  0, cfam_kw, cfam_ty, "//", 1, 1 };
-static const Syntax syn_sh = { "sh", 0, sh_kw,   NULL,    "#",  0, 0 };
+static const Syntax syn_c  = { "c",  0, cfam_kw, cfam_ty, "//", 1, 1, NULL };
+static const Syntax syn_sh = { "sh", 0, sh_kw,   NULL,    "#",  0, 0, NULL };
 
 static int
 syn_wstart(unsigned char c)
@@ -779,6 +1416,8 @@ syn_line(const Syntax *sy, uint16_t state_in, const char *bytes,
 
 	if (!sy)
 		return 0;
+	if (sy->fsm)
+		return jsf_line(sy->fsm, state_in, bytes, n, out);
 
 	while (i < n) {
 		unsigned char c = (unsigned char)bytes[i];
@@ -923,9 +1562,8 @@ syn_ieq(const char *a, const char *b)
 	return *a == *b;
 }
 
-/* Map a file extension (or a :syntax language name) to a highlighter. */
 static const Syntax *
-syn_for_ext(const char *ext)
+syn_builtin(const char *name)
 {
 	static const struct { const char *e; const Syntax *s; } map[] = {
 		{ "c", &syn_c }, { "h", &syn_c }, { "cc", &syn_c },
@@ -935,12 +1573,38 @@ syn_for_ext(const char *ext)
 	};
 	size_t k;
 
-	if (!ext || !*ext)
-		return NULL;
 	for (k = 0; k < sizeof(map) / sizeof(map[0]); k++)
-		if (syn_ieq(ext, map[k].e))
+		if (syn_ieq(name, map[k].e))
 			return map[k].s;
 	return NULL;
+}
+
+/* Map a file extension (or a :syntax language name) to a highlighter. A config
+ * FSM language is used first: by its own name (so :syntax <lang> and a matching
+ * extension both work), then via a "syntax.<ext> = <lang>" mapping, and finally
+ * the built-in C/sh lexers. */
+static const Syntax *
+syn_for_ext(const char *ext)
+{
+	char key[JSF_NAME + 16];
+	const char *mapped;
+	int i;
+
+	if (!ext || !*ext)
+		return NULL;
+	i = jsf_find(ext);
+	if (i >= 0)
+		return &g_jsf_syn[i];
+	snprintf(key, sizeof(key), "syntax.%s", ext);
+	mapped = cfg_get(g_cfg, key);
+	if (mapped) {
+		i = jsf_find(mapped);
+		if (i >= 0)
+			return &g_jsf_syn[i];
+		if (syn_builtin(mapped))
+			return syn_builtin(mapped);
+	}
+	return syn_builtin(ext);
 }
 
 
@@ -3851,64 +4515,6 @@ typedef struct user_theme {
 static Usertheme	g_user_themes[USER_THEME_MAX];
 static int		g_user_theme_count;
 
-/* Parse a color: "default", a 0-255 palette index, "#rrggbb", or one of the 16
- * ANSI names (with a "bright-" prefix for 8-15). Returns 1 on success. */
-static int
-cfg_color(const char *s, Color *out)
-{
-	static const char *const names[8] = {
-		"black", "red", "green", "yellow",
-		"blue", "magenta", "cyan", "white"
-	};
-	int i;
-
-	if (!s || !s[0])
-		return 0;
-	if (strcmp(s, "default") == 0) {
-		out->type = COLOR_DEFAULT;
-		return 1;
-	}
-	if (s[0] == '#' && strlen(s) == 7) {
-		unsigned r, g, b;
-
-		if (sscanf(s + 1, "%2x%2x%2x", &r, &g, &b) == 3) {
-			out->type = COLOR_RGB;
-			out->rgb.r = (uint8_t)r;
-			out->rgb.g = (uint8_t)g;
-			out->rgb.b = (uint8_t)b;
-			return 1;
-		}
-		return 0;
-	}
-	if (s[0] >= '0' && s[0] <= '9') {
-		char *end;
-		long n = strtol(s, &end, 10);
-
-		if (*end == '\0' && n >= 0 && n <= 255) {
-			out->type = COLOR_INDEXED;
-			out->index = (uint8_t)n;
-			return 1;
-		}
-		return 0;
-	}
-	{
-		const char *base = s;
-		int bright = 0;
-
-		if (strncmp(s, "bright-", 7) == 0) {
-			base = s + 7;
-			bright = 8;
-		}
-		for (i = 0; i < 8; i++)
-			if (strcmp(base, names[i]) == 0) {
-				out->type = COLOR_INDEXED;
-				out->index = (uint8_t)(i + bright);
-				return 1;
-			}
-	}
-	return 0;
-}
-
 static int
 theme_by_name(const char *name)
 {
@@ -4664,6 +5270,7 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 static void
 scr_line(Screen *d, int row, int col0, const char *s, size_t len,
     int left, int width, int hl_start, int hl_end, const uint8_t *sty,
+    const Color *pal, const uint16_t *pal_attr, int npal,
     Color base_fg, Color base_bg)
 {
 	const unsigned char *p = (const unsigned char *)s;
@@ -4702,8 +5309,13 @@ scr_line(Screen *d, int row, int col0, const char *s, size_t len,
 		 * edges, so a whole rune is in or out); syntax colors the fg */
 		rev = (hl_start < hl_end && col >= hl_start && col < hl_end);
 		attrs = rev ? ATTR_REVERSE : 0;
-		fg = sty ? (d->t->colors < 256 ? syn_color16[sty[i]]
-		    : syn_color[sty[i]]) : base_fg;
+		if (sty && pal && sty[i] < npal) {
+			fg = pal[sty[i]];
+			if (pal_attr && !rev)
+				attrs |= pal_attr[sty[i]];
+		} else {
+			fg = base_fg;
+		}
 
 		if (r == '\t' || r < 0x20 || r == 0x7f) {
 			/* render as spaces, clipped at both edges */
@@ -5573,6 +6185,24 @@ scroll_to_cursor_wrap(Editor *e, int text_h, int W)
 	}
 }
 
+/* Resolve the syntax palette for the active language: the FSM's per-class
+ * colors and attributes when one is in use, else the built-in style palette for
+ * the client's color depth. */
+static void
+syn_palette(const Editor *e, const Screen *d, const Color **pal,
+    const uint16_t **pa, int *np)
+{
+	if (e->hl_on && e->syn && e->syn->fsm) {
+		*pal = e->syn->fsm->fg;
+		*pa = e->syn->fsm->attr;
+		*np = e->syn->fsm->nclasses;
+	} else {
+		*pal = (d->t->colors < 256) ? syn_color16 : syn_color;
+		*pa = NULL;
+		*np = SYN_STYLE_COUNT;
+	}
+}
+
 /* Paint the text area with soft wrap: each buffer line flows across as many
  * screen rows as it needs. Returns the cursor's screen row/col through the out
  * params (col0-based column). */
@@ -5582,7 +6212,11 @@ render_body_wrapped(Editor *e, Screen *d, const Pal *p, int text_h,
 {
 	int i = 0;
 	size_t idx = e->top;
+	const Color *pal;
+	const uint16_t *pa;
+	int np;
 
+	syn_palette(e, d, &pal, &pa, &np);
 	*cur_row = 0;
 	*cur_col = col0;
 	while (i < text_h) {
@@ -5597,7 +6231,7 @@ render_body_wrapped(Editor *e, Screen *d, const Pal *p, int text_h,
 			render_gutter(d, e, row, gutter, idx, 0, p->content_fg,
 			    p->content_bg);
 			scr_line(d, row, col0, "", 0, 0, text_w, -1, -1, NULL,
-			    p->content_fg, p->content_bg);
+			    pal, pa, np, p->content_fg, p->content_bg);
 			if (idx == e->cy) {
 				*cur_row = i;
 				*cur_col = col0;
@@ -5614,7 +6248,7 @@ render_body_wrapped(Editor *e, Screen *d, const Pal *p, int text_h,
 			render_gutter(d, e, row, gutter, idx, 1, p->content_fg,
 			    p->content_bg);
 			scr_line(d, row, col0, "", 0, 0, text_w, hs, he, NULL,
-			    p->content_fg, p->content_bg);
+			    pal, pa, np, p->content_fg, p->content_bg);
 			if (idx == e->cy) {
 				*cur_row = i;
 				*cur_col = col0;
@@ -5638,7 +6272,7 @@ render_body_wrapped(Editor *e, Screen *d, const Pal *p, int text_h,
 			render_gutter(d, e, row, gutter, idx, seg == 0,
 			    p->content_fg, p->content_bg);
 			scr_line(d, row, col0, s, end, acol, text_w, hs, he,
-			    sty, p->content_fg, p->content_bg);
+			    sty, pal, pa, np, p->content_fg, p->content_bg);
 			if (idx == e->cy && (e->cx < next || next >= llen)) {
 				int cc = disp_cols(s, e->cx) - acol;
 
@@ -5710,6 +6344,11 @@ render_body(Editor *e, Screen *d)
 		render_body_wrapped(e, d, p, text_h, text_w, gutter, col0,
 		    &cur_row, &cur_scol);
 	} else {
+		const Color *pal;
+		const uint16_t *pa;
+		int np;
+
+		syn_palette(e, d, &pal, &pa, &np);
 		for (i = 0; i < text_h; i++) {
 			size_t idx = e->top + (size_t)i;
 			size_t llen = 0;
@@ -5723,12 +6362,12 @@ render_body(Editor *e, Screen *d)
 			if (s) {
 				sty = hl_line(e, idx, s, llen);
 				scr_line(d, row, col0, s, llen, (int)e->left,
-				    text_w, hs, he, sty, p->content_fg,
-				    p->content_bg);
+				    text_w, hs, he, sty, pal, pa, np,
+				    p->content_fg, p->content_bg);
 			} else {
 				scr_line(d, row, col0, "", 0, (int)e->left,
-				    text_w, hs, he, NULL, p->content_fg,
-				    p->content_bg);
+				    text_w, hs, he, NULL, pal, pa, np,
+				    p->content_fg, p->content_bg);
 			}
 		}
 		cur_row = (int)(e->cy - e->top);
@@ -9114,6 +9753,7 @@ vedit_set_config(struct vedit *v, const struct cfg *c)
 {
 	g_cfg = c;
 	themes_load_cfg(c);		/* before ed_apply_config resolves scheme */
+	syntax_load_cfg(c);		/* register config FSM languages */
 	if (v->e.term) {
 		v->e.term->box_mode = box_default();
 		v->e.term->colors = color_default();
