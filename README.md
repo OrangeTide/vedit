@@ -9,6 +9,10 @@ ssh link to a simple terminal emulator such as a MUD client.
 vedit is a port of the editor from the lumi project, reduced to one source file
 (`vedit.c`) plus a public header for embedding (`vedit.h`).
 
+`docs/demo.html` is a self-contained page that illustrates the rendering work
+(the scroll fast path, the color schemes, the line-number gutter, word wrap, and
+the unified palette), with mockups drawn from vedit's real output.
+
 ## Building
 
 ```sh

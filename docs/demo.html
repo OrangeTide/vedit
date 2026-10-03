@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600&display=swap">
+<title>vedit scroll &amp; schemes</title>
+<meta name="description" content="How vedit's scroll-region fast path, in-row span diff, and borderless black scheme cut the bytes sent when scrolling over a slow link.">
+<style>
+  :root {
+    --page-bg: #14161c;
+    --page-fg: #e7e9ee;
+    --muted: #9aa0ac;
+    --rule: #2a2e39;
+    --panel: #1b1e26;
+    --accent: #87d7ff;
+
+    /* the two editor looks */
+    --dos-blue: #0000a8;   /* DOS content bg (ANSI 4) */
+    --term-black: #05070a;  /* black scheme content bg (terminal default) */
+    --code-fg: #ffffff;
+    --bar-bg: #c0c0c0;
+    --bar-fg: #101010;
+    --frame-dos: #e8e8e8;
+    --frame-blk: #38c7c7;  /* ANSI 6 cyan frame on black */
+    --scrollbar: #c9ccd4;
+
+    --sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --page-bg: #f4f5f8; --page-fg: #1c1f27; --muted: #5a6170;
+      --rule: #d9dce4; --panel: #ffffff; --accent: #0b74b8;
+      color-scheme: light;
+    }
+  }
+  :root[data-theme="light"] {
+    --page-bg: #f4f5f8; --page-fg: #1c1f27; --muted: #5a6170;
+    --rule: #d9dce4; --panel: #ffffff; --accent: #0b74b8;
+    color-scheme: light;
+  }
+
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page-bg); color: var(--page-fg); font-family: var(--sans); }
+  .wrap { max-width: 980px; margin: 0 auto; padding-inline: 16px; padding-block: 40px 56px; }
+
+  header { margin-bottom: 26px; }
+  h1 { font-weight: 600; font-size: clamp(1.5rem, 1.1rem + 1.8vw, 2.15rem); letter-spacing: -0.01em; margin: 0 0 8px; text-wrap: balance; }
+  .lede { color: var(--muted); max-width: 64ch; line-height: 1.55; margin: 0; }
+  .lede code { font-family: var(--mono); color: var(--page-fg); font-size: 0.92em; }
+
+  h2 { font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); font-weight: 600; margin: 36px 0 14px; }
+
+  /* savings bars */
+  .bars { display: grid; gap: 12px; }
+  .bar { display: grid; grid-template-columns: 190px 1fr; gap: 12px; align-items: center; }
+  .bar .lab { font-size: 0.86rem; }
+  .bar .track { background: var(--panel); border: 1px solid var(--rule); border-radius: 5px; height: 30px; position: relative; overflow: hidden; }
+  .bar .fill { height: 100%; display: flex; align-items: center; padding-right: 9px; justify-content: flex-end; font-family: var(--mono); font-size: 0.8rem; color: #04121a; font-weight: 600; border-radius: 4px 0 0 4px; }
+  .bar.b0 .fill { width: 100%; background: #6b7280; color: #fff; }
+  .bar.b1 .fill { width: 49.6%; background: #7bd3f0; }
+  .bar.b2 .fill { width: 35.9%; background: #4ec77e; }
+  .bar .pct { font-size: 0.78rem; color: var(--muted); font-family: var(--mono); }
+  @media (max-width: 560px) { .bar { grid-template-columns: 1fr; gap: 5px; } }
+
+  /* terminal panels */
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+  .panel { min-width: 0; }
+  .cap { display: flex; align-items: baseline; gap: 8px; margin: 0 0 10px; flex-wrap: wrap; }
+  .cap b { font-weight: 600; font-size: 0.95rem; }
+  .cap span { color: var(--muted); font-size: 0.8rem; }
+
+  .term { border-radius: 5px; overflow: hidden; box-shadow: 0 8px 30px rgba(0,0,0,.33); font-family: var(--mono); font-size: 12.5px; line-height: 1.5; }
+  .term.dos { background: var(--dos-blue); border: 1px solid var(--frame-dos); }
+  .term.blk { background: var(--term-black); border: 1px solid var(--frame-blk); }
+  .menubar { display: flex; gap: 1.3em; background: var(--bar-bg); color: var(--bar-fg); padding: 3px 10px; }
+  .menubar .sp { margin-left: auto; }
+  pre.scr { margin: 0; padding: 0; overflow-x: auto; -webkit-text-size-adjust: 100%; }
+  pre.scr .row { display: block; white-space: pre; padding: 0 0 0 2px; }
+  .dos .frame { color: var(--frame-dos); }
+  .blk .frame { color: var(--frame-blk); }
+  .code { color: var(--code-fg); }
+  .sbar { color: var(--scrollbar); }
+  /* line-number gutter + syntax tokens (vedit's darkblue palette) */
+  .gut { color: #6f78c0; }
+  .gut.cur { color: #ffffff; font-weight: 600; }
+  .cm { color: #87afff; } .kw { color: #ffff5f; } .ty { color: #87ff00; }
+  .st { color: #ffafaf; } .fn { color: #87ffff; } .pp { color: #ff87ff; }
+  .nu { color: #ffafaf; }
+  .statusbar { background: var(--bar-bg); color: var(--bar-fg); padding: 2px 10px; display: flex; justify-content: space-between; }
+  pre.scr .hbar { background: var(--bar-bg); color: var(--bar-fg); font-weight: 600; }
+  .hl { background: #2b2bbf; } /* cursor-line tint stand-in on dos */
+  .blk .hl { background: #1c1c44; }
+
+  .how { margin-top: 36px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  @media (max-width: 720px) { .how { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 15px 16px; }
+  .card h3 { margin: 0 0 6px; font-size: 0.92rem; }
+  .card p { margin: 0; color: var(--muted); font-size: 0.83rem; line-height: 1.5; }
+  .card code { font-family: var(--mono); color: var(--page-fg); font-size: 0.86em; }
+  .note { margin-top: 26px; color: var(--muted); font-size: 0.82rem; line-height: 1.6; max-width: 72ch; }
+  .note code { font-family: var(--mono); color: var(--page-fg); }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header>
+    <h1>vedit scroll &amp; schemes</h1>
+    <p class="lede">The same action, scrolling 40 lines through a file, measured by the bytes vedit actually sends. A terminal scroll region and an in-row diff cut the redraw; the black scheme trims more by clearing blank tails with one erase.</p>
+  </header>
+
+  <h2>Bytes sent &mdash; cursor Down &times;60, 40 one-line scrolls</h2>
+  <div class="bars">
+    <div class="bar b0">
+      <div class="lab">DOS, repaint <span class="pct">(default)</span></div>
+      <div class="track"><div class="fill">35,484 B</div></div>
+    </div>
+    <div class="bar b1">
+      <div class="lab">DOS, <code style="font-family:var(--mono)">--scroll</code></div>
+      <div class="track"><div class="fill">17,585 B</div></div>
+    </div>
+    <div class="bar b2">
+      <div class="lab">black borderless, <code style="font-family:var(--mono)">--scroll</code></div>
+      <div class="track"><div class="fill">12,740 B</div></div>
+    </div>
+  </div>
+  <p class="note" style="margin-top:14px">That is a 50% cut from the scroll region alone, and 64% once the black scheme lets trailing blanks go out with one erase-to-EOL instead of a column of spaces.</p>
+
+  <h2>Same scroll position, two schemes</h2>
+  <div class="grid">
+    <div class="panel">
+      <p class="cap"><b>DOS scheme</b> <span>blue, bordered, right scrollbar</span></p>
+      <div class="term dos">
+        <div class="menubar"><span>File</span><span>Edit</span><span>Search</span><span>View</span><span>Options</span><span class="sp">Help</span></div>
+<pre class="scr"><span class="row frame">+- tall.txt ------------------------------------------+</span><span class="row"><span class="frame">|</span><span class="code">line 017 the quick brown fox                         </span><span class="sbar">^</span></span><span class="row"><span class="frame">|</span><span class="code">line 018 the quick brown fox                         </span><span class="sbar">#</span></span><span class="row"><span class="frame">|</span><span class="code">line 019 the quick brown fox                         </span><span class="sbar">:</span></span><span class="row hl"><span class="frame">|</span><span class="code">line 020 the quick brown fox                         </span><span class="sbar">:</span></span><span class="row"><span class="frame">|</span><span class="code">line 021 the quick brown fox                         </span><span class="sbar">:</span></span><span class="row"><span class="frame">|</span><span class="code">line 022 the quick brown fox                         </span><span class="sbar">v</span></span><span class="row frame">+&lt;#::::::::::::::::::::::::::::::::::::::::::::::::::&gt;+</span></pre>
+        <div class="statusbar"><span>&nbsp;Press F1 for help</span><span>Line:36 Col:1&nbsp;</span></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <p class="cap"><b>black scheme</b> <span>default bg, borderless right</span></p>
+      <div class="term blk">
+        <div class="menubar"><span>File</span><span>Edit</span><span>Search</span><span>View</span><span>Options</span><span class="sp">Help</span></div>
+<pre class="scr"><span class="row frame">+- tall.txt -------------------------------------------</span><span class="row"><span class="frame">|</span><span class="code">line 017 the quick brown fox                          </span></span><span class="row"><span class="frame">|</span><span class="code">line 018 the quick brown fox                          </span></span><span class="row"><span class="frame">|</span><span class="code">line 019 the quick brown fox                          </span></span><span class="row hl"><span class="frame">|</span><span class="code">line 020 the quick brown fox                          </span></span><span class="row"><span class="frame">|</span><span class="code">line 021 the quick brown fox                          </span></span><span class="row"><span class="frame">|</span><span class="code">line 022 the quick brown fox                          </span></span><span class="row frame">+&lt;#::::::::::::::::::::::::::::::::::::::::::::::::::::&gt;</span></pre>
+        <div class="statusbar"><span>&nbsp;Press F1 for help</span><span>Line:36 Col:1&nbsp;</span></div>
+      </div>
+    </div>
+  </div>
+
+  <h2>Line-number gutter</h2>
+  <p class="note" style="margin-top:0;margin-bottom:12px">Toggle it from <b>View &rsaquo; Line Numbers</b> or, in vi keys, with <code>:set number</code>. The current line's number is drawn bright, the rest dim. It is the text-mode counterpart of the hex view's address column, and because each number rides with its line, the scroll fast path needs no extra work.</p>
+  <div class="term dos">
+    <div class="menubar"><span>File</span><span>Edit</span><span>Search</span><span>View</span><span>Options</span><span class="sp">Help</span></div>
+<pre class="scr"><span class="row frame">+- count.c --------------------------------------------+</span><span class="row"><span class="frame">|</span><span class="gut">  1 </span><span class="pp">#include &lt;stdio.h&gt;</span></span><span class="row"><span class="frame">|</span><span class="gut">  2 </span></span><span class="row"><span class="frame">|</span><span class="gut">  3 </span><span class="cm">/* count words on a line */</span></span><span class="row"><span class="frame">|</span><span class="gut">  4 </span><span class="ty">int</span><span class="code"> </span><span class="fn">count_words</span><span class="code">(</span><span class="ty">const char</span><span class="code"> *s)</span></span><span class="row"><span class="frame">|</span><span class="gut">  5 </span><span class="code">{</span></span><span class="row hl"><span class="frame">|</span><span class="gut cur">  6 </span><span class="ty">int</span><span class="code"> n = </span><span class="nu">0</span><span class="code">, in = </span><span class="nu">0</span><span class="code">;</span></span><span class="row"><span class="frame">|</span><span class="gut">  7 </span><span class="kw">while</span><span class="code"> (*s) {</span></span><span class="row"><span class="frame">|</span><span class="gut">  8 </span><span class="kw">if</span><span class="code"> (*s == </span><span class="st">' '</span><span class="code">) in = </span><span class="nu">0</span><span class="code">;</span></span><span class="row"><span class="frame">|</span><span class="gut">  9 </span><span class="kw">else</span><span class="code"> </span><span class="kw">if</span><span class="code"> (!in) { in = </span><span class="nu">1</span><span class="code">; n++; }</span></span><span class="row"><span class="frame">|</span><span class="gut"> 10 </span><span class="code">s++;</span></span><span class="row"><span class="frame">|</span><span class="gut"> 11 </span><span class="code">}</span></span><span class="row"><span class="frame">|</span><span class="gut"> 12 </span><span class="kw">return</span><span class="code"> n;</span></span><span class="row"><span class="frame">|</span><span class="gut"> 13 </span><span class="code">}</span></span><span class="row frame">+&lt;#::::::::::::::::::::::::::::::::::::::::::::::::::::&gt;+</span></pre>
+    <div class="statusbar"><span>&nbsp;line numbers on</span><span>Line:6 Col:1&nbsp;</span></div>
+  </div>
+
+  <h2>Word wrap</h2>
+  <p class="note" style="margin-top:0;margin-bottom:12px">Toggle from <b>View &rsaquo; Word Wrap</b> or <code>:set wrap</code>. Long lines flow across rows at word boundaries instead of scrolling off the right edge. Display-only, so the file is unchanged.</p>
+  <div class="grid">
+    <div class="panel">
+      <p class="cap"><b>:set nowrap</b> <span>line truncated at the border</span></p>
+      <div class="term dos">
+        <div class="menubar"><span>File</span><span>Edit</span><span>Search</span><span>View</span><span>Options</span><span class="sp">Help</span></div>
+<pre class="scr"><span class="row frame">+- prose.txt -----------------------------------------+</span><span class="row"><span class="frame">|</span><span class="code">Word wrap flows a long line across as many screen row</span><span class="sbar">^</span></span><span class="row"><span class="frame">|</span><span class="code">next line.                                           </span><span class="sbar">:</span></span><span class="row"><span class="frame">|</span><span class="code">                                                     </span><span class="sbar">:</span></span><span class="row"><span class="frame">|</span><span class="code">                                                     </span><span class="sbar">v</span></span><span class="row frame">+&lt;#::::::::::::::::::::::::::::::::::::::::::::::::::&gt;+</span></pre>
+        <div class="statusbar"><span>&nbsp;word wrap off</span><span>Line:1 Col:1&nbsp;</span></div>
+      </div>
+    </div>
+    <div class="panel">
+      <p class="cap"><b>:set wrap</b> <span>flows across rows</span></p>
+      <div class="term dos">
+        <div class="menubar"><span>File</span><span>Edit</span><span>Search</span><span>View</span><span>Options</span><span class="sp">Help</span></div>
+<pre class="scr"><span class="row frame">+- prose.txt -----------------------------------------+</span><span class="row"><span class="frame">|</span><span class="code">Word wrap flows a long line across as many screen</span><span class="sbar">    ^</span></span><span class="row"><span class="frame">|</span><span class="code">rows as it needs, breaking at word boundaries so</span><span class="sbar">     #</span></span><span class="row"><span class="frame">|</span><span class="code">nothing runs off the right edge.</span><span class="sbar">                     :</span></span><span class="row"><span class="frame">|</span><span class="code">next line.</span><span class="sbar">                                           v</span></span><span class="row frame">+&lt;#::::::::::::::::::::::::::::::::::::::::::::::::::&gt;+</span></pre>
+        <div class="statusbar"><span>&nbsp;word wrap on</span><span>Line:1 Col:1&nbsp;</span></div>
+      </div>
+    </div>
+  </div>
+
+  <h2>One palette everywhere</h2>
+  <p class="note" style="margin-top:0;margin-bottom:12px">The color scheme now drives the whole interface, not just the text body. The help screen used to be hardwired blue; here it is in both schemes. Header and footer take the bar colors; the body takes the text-area colors, so on the black scheme it falls through to the terminal default.</p>
+  <div class="grid">
+    <div class="panel">
+      <p class="cap"><b>Help</b> <span>DOS scheme</span></p>
+      <div class="term dos">
+<pre class="scr"><span class="row hbar"> lumi edit -- key bindings                             </span><span class="row"><span class="code">  arrows               Move the cursor                 </span></span><span class="row"><span class="code">  Home / End           Start / end of line            </span></span><span class="row"><span class="code">  Ctrl+Home / End      Start / end of the file         </span></span><span class="row"><span class="code">  PgUp / PgDn          Scroll by a screen             </span></span><span class="row"><span class="code">  Ctrl-F               Find                           </span></span><span class="row"><span class="code">  F2                   Toggle vi keys                 </span></span><span class="row hbar"> Press any key to return                               </span></pre>
+      </div>
+    </div>
+    <div class="panel">
+      <p class="cap"><b>Help</b> <span>black scheme</span></p>
+      <div class="term blk">
+<pre class="scr"><span class="row hbar"> lumi edit -- key bindings                             </span><span class="row"><span class="code">  arrows               Move the cursor                 </span></span><span class="row"><span class="code">  Home / End           Start / end of line            </span></span><span class="row"><span class="code">  Ctrl+Home / End      Start / end of the file         </span></span><span class="row"><span class="code">  PgUp / PgDn          Scroll by a screen             </span></span><span class="row"><span class="code">  Ctrl-F               Find                           </span></span><span class="row"><span class="code">  F2                   Toggle vi keys                 </span></span><span class="row hbar"> Press any key to return                               </span></pre>
+      </div>
+    </div>
+  </div>
+
+  <h2>How</h2>
+  <div class="how">
+    <div class="card">
+      <h3>Scroll region</h3>
+      <p>On a one-line scroll, set the VT100 region (<code>DECSTBM</code>) and emit one <code>IND</code>/<code>RI</code>, then repaint only the newly exposed line. Gated behind <code>--scroll</code>, off by default.</p>
+    </div>
+    <div class="card">
+      <h3>In-row span diff</h3>
+      <p>Repaint only the columns between the first and last change on a row. After a scroll the moving scrollbar thumb costs one cell per row, not a whole row.</p>
+    </div>
+    <div class="card">
+      <h3>Erase-to-EOL</h3>
+      <p>On the black scheme the text area is the terminal default background and runs to the last column, so a trailing blank run clears with one <code>ESC [ K</code>, safe with or without back-color-erase.</p>
+    </div>
+  </div>
+
+  <p class="note">The black scheme drops the right border and vertical scrollbar to reach the last column; the file position stays on the status line. Both schemes, and the scroll fast path, are chosen per editor instance, so an embedding host can match each client. Mockups redrawn from vedit's real output; byte counts are from its actual wire traffic.</p>
+</div>
+</body>
+</html>
