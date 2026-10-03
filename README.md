@@ -229,8 +229,11 @@ vedit owns no file descriptors and installs no signal handlers of its own. All
 terminal I/O passes through a read/write/select-style vtable (`struct
 vedit_io`). A host fills that vtable over its own transport, drives the editor
 with `vedit_run()`, and delivers window resizes with `vedit_set_size()`. Raw
-mode and SIGWINCH belong to the command-line binding only; in an embedded host
-the `begin`/`end` callbacks are a no-op.
+mode and signals belong to the command-line binding only; it catches SIGWINCH
+for resizes and SIGTERM/SIGHUP to restore the terminal before it dies, so a
+closed window or a kill does not leave the shell in raw mode and the alt screen.
+In an embedded host the `begin`/`end` callbacks are a no-op and the host owns its
+own signals.
 
 ```c
 #include "vedit.h"

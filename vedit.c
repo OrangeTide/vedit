@@ -8170,6 +8170,28 @@ tty_on_winch(int sig)
 	g_winch = 1;
 }
 
+/* Restore the terminal when the process is killed (SIGTERM/SIGHUP), so a
+ * closed window or a kill does not leave the shell in raw mode and the alt
+ * screen. Uses only async-signal-safe calls, then re-raises with the default
+ * handler so the exit status reflects the signal. (Ctrl-C and friends do not
+ * reach here: raw mode clears ISIG, so they arrive as ordinary keys.) */
+static void
+tty_on_fatal(int sig)
+{
+	static const char restore[] =
+	    "\033[0m\033[?2004l\033[?25h\033[?1049l";
+	ssize_t wr;
+
+	if (g_tty.raw) {
+		tcsetattr(g_tty.in_fd, TCSANOW, &g_tty.saved);
+		g_tty.raw = 0;
+	}
+	wr = write(g_tty.out_fd, restore, sizeof(restore) - 1);
+	(void)wr;
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
 static long
 tty_read(void *ctx, void *buf, long n)
 {
@@ -8247,6 +8269,9 @@ tty_begin(void *ctx)
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = tty_on_winch;
 	sigaction(SIGWINCH, &sa, NULL);
+	sa.sa_handler = tty_on_fatal;		/* restore on a kill */
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGHUP, &sa, NULL);
 }
 
 static void
@@ -8258,6 +8283,8 @@ tty_end(void *ctx)
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = SIG_DFL;
 	sigaction(SIGWINCH, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGHUP, &sa, NULL);
 	if (t->raw) {
 		tcsetattr(t->in_fd, TCSAFLUSH, &t->saved);
 		t->raw = 0;
