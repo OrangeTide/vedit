@@ -124,6 +124,23 @@ while it is on.
 While either toggle is on, the status bar shows a compact flag at the right,
 `WRAP` for word wrap and `NUM` for line numbers, next to the line and column.
 
+### File browser
+
+**File > Open...** shows a modal file browser instead of a bare filename
+prompt. It lists the current directory with sub-directories first (each marked
+with a trailing `/`), then files, sorted. The arrow keys, PgUp/PgDn, and
+Home/End move the selection, and typing a letter jumps to the next entry that
+starts with it. Enter on a directory descends into it (`../` goes up), and Enter
+on a file opens it. A `File:` entry line at the top (reached with Tab) takes a
+typed name or path: a directory there changes into it, any other name is opened
+and may be a new file.
+
+The browser is one client of a reusable list-picker control (`dlg_pick` with a
+`Picksrc` of callbacks). The control owns the box, scrolling, selection, and
+keys; a source supplies the rows and decides what choosing one means. The intent
+is to reuse it for other lists later, such as mailboxes for a mail reader or
+module and function lists for editing scripts.
+
 ### Color schemes
 
 The **View > Color Scheme** menu cycles three looks: the DOS blue text area

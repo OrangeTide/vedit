@@ -180,6 +180,116 @@ t_multiline_buffer(Test *t)
 	text_free(tx);
 }
 
+static void
+t_pick_fit(Test *t)
+{
+	char buf[16];
+	int w;
+
+	w = pick_fit(buf, sizeof(buf), "hello", 10);
+	TAP_CHECKF(t, w == 5 && strcmp(buf, "hello") == 0, "fit full: %s", buf);
+	w = pick_fit(buf, sizeof(buf), "hello world", 5);
+	TAP_CHECKF(t, w == 5 && strcmp(buf, "hello") == 0, "fit clip: %s", buf);
+	w = pick_fit(buf, sizeof(buf), "abc", 0);
+	TAP_CHECKF(t, w == 0 && buf[0] == '\0', "fit zero: '%s'", buf);
+}
+
+static void
+t_filepick_cmp(Test *t)
+{
+	Fpent e[4] = {
+		{ (char *)"zebra", 0 },
+		{ (char *)"apple/", 1 },
+		{ (char *)"beta", 0 },
+		{ (char *)"alpha/", 1 },
+	};
+
+	qsort(e, 4, sizeof(e[0]), filepick_cmp);
+	TAP_CHECKF(t, e[0].isdir && strcmp(e[0].name, "alpha/") == 0,
+	    "first %s", e[0].name);
+	TAP_CHECKF(t, e[1].isdir && strcmp(e[1].name, "apple/") == 0,
+	    "second %s", e[1].name);
+	TAP_CHECKF(t, !e[2].isdir && strcmp(e[2].name, "beta") == 0,
+	    "third %s", e[2].name);
+	TAP_CHECKF(t, !e[3].isdir && strcmp(e[3].name, "zebra") == 0,
+	    "fourth %s", e[3].name);
+}
+
+/* A picker source backed by a fixed string array, for pick_jump. */
+static const char *t_jump_rows[] = { "alpha", "beta", "banana", "gamma" };
+
+static int
+t_jump_count(void *ctx)
+{
+	(void)ctx;
+	return 4;
+}
+
+static const char *
+t_jump_label(void *ctx, int i)
+{
+	(void)ctx;
+	return t_jump_rows[i];
+}
+
+static void
+t_pick_jump(Test *t)
+{
+	Picksrc src = { NULL, NULL, t_jump_count, t_jump_label, NULL, NULL,
+	    NULL };
+	Picker pk;
+
+	memset(&pk, 0, sizeof(pk));
+	pk.src = &src;
+	pk.sel = 0;
+	pick_jump(&pk, 4, 'b');			/* -> beta */
+	TAP_CHECKF(t, pk.sel == 1, "first b at %d", pk.sel);
+	pick_jump(&pk, 4, 'b');			/* -> banana (next b) */
+	TAP_CHECKF(t, pk.sel == 2, "second b at %d", pk.sel);
+	pick_jump(&pk, 4, 'g');			/* -> gamma */
+	TAP_CHECKF(t, pk.sel == 3, "g at %d", pk.sel);
+	pick_jump(&pk, 4, 'z');			/* no match, stay */
+	TAP_CHECKF(t, pk.sel == 3, "no match stays %d", pk.sel);
+}
+
+static void
+t_filepick_load(Test *t)
+{
+	char tmpl[] = "/tmp/vedit_fpXXXXXX";
+	char *dir = mkdtemp(tmpl);
+	char path[PATH_MAX];
+	Filepick fp;
+	int i, saw_sub = 0, saw_file = 0;
+
+	TAP_ASSERT(t, dir != NULL);
+	snprintf(path, sizeof(path), "%s/sub", dir);
+	TAP_ASSERT(t, mkdir(path, 0700) == 0);
+	snprintf(path, sizeof(path), "%s/zfile", dir);
+	TAP_ASSERT(t, fclose(fopen(path, "w")) == 0);
+
+	memset(&fp, 0, sizeof(fp));
+	snprintf(fp.dir, sizeof(fp.dir), "%s", dir);
+	filepick_load(&fp);
+	/* .. and sub (dirs) sort before zfile */
+	TAP_CHECKF(t, fp.n == 3, "entry count %d", fp.n);
+	TAP_CHECK(t, fp.ent[fp.n - 1].isdir == 0);	/* file last */
+	for (i = 0; i < fp.n; i++) {
+		if (strcmp(fp.ent[i].name, "sub/") == 0 && fp.ent[i].isdir)
+			saw_sub = 1;
+		if (strcmp(fp.ent[i].name, "zfile") == 0 && !fp.ent[i].isdir)
+			saw_file = 1;
+	}
+	TAP_CHECK(t, saw_sub && saw_file);
+	filepick_clear(&fp);
+	free(fp.ent);
+
+	snprintf(path, sizeof(path), "%s/sub", dir);
+	rmdir(path);
+	snprintf(path, sizeof(path), "%s/zfile", dir);
+	unlink(path);
+	rmdir(dir);
+}
+
 const Case tap_cases[] = {
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },
@@ -193,5 +303,9 @@ const Case tap_cases[] = {
 	{ "syntax_block_comment_carry", t_syntax_block_comment_carry },
 	{ "text_edit_undo", t_text_edit_undo },
 	{ "multiline_buffer", t_multiline_buffer },
+	{ "pick_fit", t_pick_fit },
+	{ "filepick_cmp", t_filepick_cmp },
+	{ "pick_jump", t_pick_jump },
+	{ "filepick_load", t_filepick_load },
 	{ NULL, NULL },
 };

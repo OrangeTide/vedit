@@ -19,6 +19,7 @@
  */
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -29,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -5328,6 +5330,359 @@ dlg_run(Editor *e, int w, int h, void *ctx,
 }
 
 /****************************************************************
+ * Reusable list picker
+ *
+ * A modal panel that shows a scrollable list and lets the user pick a row.
+ * The panel owns the box, scrolling, selection and keys; a Picksrc supplies
+ * the rows and decides what choosing one means. The file browser below is the
+ * first client; the same control is meant to serve mailbox lists (a mail
+ * reader) and module/function lists (a script IDE) later, so it knows nothing
+ * about files.
+ ****************************************************************/
+
+/* What the panel does after the source handles a chosen row or typed entry. */
+enum { PICK_STAY, PICK_DONE, PICK_CANCEL };
+
+typedef struct picksrc Picksrc;
+struct picksrc {
+	void		*ctx;
+	const char	*(*title)(void *ctx);		/* panel title */
+	int		 (*count)(void *ctx);		/* number of rows */
+	const char	*(*label)(void *ctx, int i);	/* text of row i */
+	/* Row i was activated. Return PICK_DONE to close, PICK_CANCEL to
+	 * abort, or PICK_STAY to stay open after the source replaced its
+	 * listing (for example on descending into a directory). count/label
+	 * are re-queried after a PICK_STAY. */
+	int		 (*choose)(void *ctx, int i);
+	/* Optional entry line. When entry_label is non-NULL the panel shows an
+	 * editable field; submit is called with the typed text on Enter and
+	 * returns the same tri-state as choose. */
+	const char	*entry_label;
+	int		 (*submit)(void *ctx, const char *text);
+};
+
+typedef struct picker {
+	const Picksrc	*src;
+	int		 sel;		/* selected row */
+	int		 top;		/* first visible row */
+	int		 vis;		/* visible list rows (set by draw) */
+	int		 listy;		/* first list row on screen (set by draw) */
+	int		 focus;		/* 0 list, 1 entry */
+	char		 entry[PATH_MAX];
+} Picker;
+
+/* Copy src into dst keeping at most w display columns; return columns used. */
+static int
+pick_fit(char *dst, size_t dstsz, const char *src, int w)
+{
+	size_t si = 0, di = 0, slen = strlen(src);
+	int col = 0;
+
+	while (si < slen && col < w) {
+		uint32_t cp;
+		int n = utf8_decode(&cp, (const unsigned char *)src + si,
+		    slen - si);
+		int cw;
+
+		if (n <= 0)
+			n = 1;
+		cw = rune_width(cp);
+		if (cw < 1)
+			cw = 1;
+		if (col + cw > w || di + (size_t)n + 1 > dstsz)
+			break;
+		memcpy(dst + di, src + si, (size_t)n);
+		di += (size_t)n;
+		si += (size_t)n;
+		col += cw;
+	}
+	dst[di] = '\0';
+	return col;
+}
+
+/* Keep sel on a valid row and scroll so it stays visible. */
+static void
+pick_clamp(Picker *pk, int n)
+{
+	if (pk->sel >= n)
+		pk->sel = n - 1;
+	if (pk->sel < 0)
+		pk->sel = 0;
+	if (pk->vis > 0) {
+		if (pk->sel < pk->top)
+			pk->top = pk->sel;
+		if (pk->sel >= pk->top + pk->vis)
+			pk->top = pk->sel - pk->vis + 1;
+	}
+	if (pk->top > n - pk->vis)
+		pk->top = n - pk->vis;
+	if (pk->top < 0)
+		pk->top = 0;
+}
+
+/* Jump the selection to the next row whose label starts with ch. */
+static void
+pick_jump(Picker *pk, int n, int ch)
+{
+	int i, lc = tolower(ch);
+
+	for (i = 1; i <= n; i++) {
+		int r = (pk->sel + i) % n;
+		const char *s = pk->src->label(pk->src->ctx, r);
+
+		if (s && tolower((unsigned char)s[0]) == lc) {
+			pk->sel = r;
+			return;
+		}
+	}
+}
+
+static void
+pick_draw(Editor *e, const Modal *m, Picker *pk)
+{
+	const Picksrc *src = pk->src;
+	Screen *d = e->d;
+	const char *title = src->title ? src->title(src->ctx) : "";
+	int n = src->count(src->ctx);
+	int inner = m->w - 4;		/* interior minus borders and one pad */
+	int listx = m->x + 2;
+	int row, i;
+	uint16_t sel_at = m->base ^ ATTR_REVERSE;
+	char buf[PATH_MAX];
+
+	/* title centered in the top border */
+	if (title && title[0]) {
+		int tw = pick_fit(buf, sizeof(buf), title, m->w - 4);
+
+		scr_cell(d, m->y, m->x + (m->w - tw - 2) / 2, ' ',
+		    m->fg, m->bg, m->base);
+		scr_text(d, m->y, m->x + (m->w - tw - 2) / 2 + 1, buf,
+		    m->fg, m->bg, m->base);
+		scr_cell(d, m->y, m->x + (m->w - tw - 2) / 2 + 1 + tw, ' ',
+		    m->fg, m->bg, m->base);
+	}
+
+	row = m->y + 1;
+	if (src->entry_label) {
+		int lw;
+
+		scr_fill(d, row, m->x + 1, m->w - 2, ' ', m->fg, m->bg, m->base);
+		lw = scr_text(d, row, listx, src->entry_label,
+		    m->fg, m->bg, m->base);
+		pick_fit(buf, sizeof(buf), pk->entry,
+		    m->x + m->w - 2 - lw);
+		scr_text(d, row, lw, buf, m->fg, m->bg, m->base);
+		row++;
+		scr_fill(d, row, m->x + 1, m->w - 2, GL_H, m->fg, m->bg,
+		    m->base);
+		row++;
+	}
+
+	pk->listy = row;
+	pk->vis = m->y + m->h - 1 - row;
+	if (pk->vis < 1)
+		pk->vis = 1;
+	pick_clamp(pk, n);
+
+	for (i = 0; i < pk->vis; i++) {
+		int r = pk->top + i;
+		uint16_t at = (r == pk->sel && pk->focus == 0) ?
+		    sel_at : m->base;
+
+		scr_fill(d, row + i, m->x + 1, m->w - 2, ' ',
+		    m->fg, m->bg, at);
+		if (r < n) {
+			pick_fit(buf, sizeof(buf),
+			    src->label(src->ctx, r), inner);
+			scr_text(d, row + i, listx, buf, m->fg, m->bg, at);
+		}
+	}
+
+	if (pk->focus == 1 && src->entry_label) {
+		int lw = disp_cols(src->entry_label, strlen(src->entry_label));
+
+		scr_cursor(d, m->y + 1,
+		    listx + lw + disp_cols(pk->entry, strlen(pk->entry)));
+		scr_cursor_vis(d, 1);
+	} else {
+		scr_cursor_vis(d, 0);
+	}
+}
+
+/* Edit the entry line in response to one key. */
+static void
+pick_entry_key(Picker *pk, const struct tkbd_seq *k)
+{
+	size_t len = strlen(pk->entry);
+
+	if (k->key == TKBD_KEY_BACKSPACE || k->key == TKBD_KEY_BACKSPACE2) {
+		while (len > 0 && ((unsigned char)pk->entry[len - 1] & 0xc0)
+		    == 0x80)
+			len--;
+		if (len > 0)
+			len--;
+		pk->entry[len] = '\0';
+		return;
+	}
+	if (!(k->mod & TKBD_MOD_CTRL) && k->ch != TKBD_CH_NONE &&
+	    k->ch >= 0x20 && k->ch != 0x7f) {
+		unsigned char enc[8];
+		int el = utf8_encode(enc, k->ch);
+
+		if (el > 0 && len + (size_t)el < sizeof(pk->entry)) {
+			memcpy(pk->entry + len, enc, (size_t)el);
+			pk->entry[len + (size_t)el] = '\0';
+		}
+	}
+}
+
+/* Run the picker panel. Returns 1 if a row or entry was chosen (PICK_DONE),
+ * 0 if cancelled. */
+static int
+dlg_pick(Editor *e, const Picksrc *src)
+{
+	Picker pk;
+	Modal m;
+	int boxw, boxh, maxw = 0, n, i;
+
+	memset(&pk, 0, sizeof(pk));
+	pk.src = src;
+
+	n = src->count(src->ctx);
+	for (i = 0; i < n; i++) {
+		const char *s = src->label(src->ctx, i);
+		int w = s ? disp_cols(s, strlen(s)) : 0;
+
+		if (w > maxw)
+			maxw = w;
+	}
+	if (src->title) {
+		int w = disp_cols(src->title(src->ctx),
+		    strlen(src->title(src->ctx)));
+
+		if (w > maxw)
+			maxw = w;
+	}
+	boxw = maxw + 6;			/* borders + two spaces of pad */
+	if (boxw < 40)
+		boxw = 40;
+	if (boxw > e->cols - 2)
+		boxw = e->cols - 2;
+	boxh = n + 2;				/* list rows + top/bottom border */
+	if (src->entry_label)
+		boxh += 2;			/* entry line + separator */
+	if (boxh < 7)
+		boxh = 7;
+	if (boxh > e->rows - 2)
+		boxh = e->rows - 2;
+
+	dlg_palette(e, &m.fg, &m.bg, &m.base);
+	m.w = boxw;
+	m.h = boxh;
+	dlg_center(e, m.w, m.h, &m.x, &m.y);
+
+	for (;;) {
+		Event ev;
+		struct tkbd_seq *k;
+		int act = PICK_STAY;
+
+		render_body(e, e->d);
+		scr_box(e->d, m.x, m.y, m.w, m.h, m.fg, m.bg, m.base);
+		pick_draw(e, &m, &pk);
+		scr_present(e->d);
+
+		switch (scr_wait(e->d, &ev)) {
+		case EVENT_EOF:
+			return 0;
+		case EVENT_RESIZE:
+		case EVENT_RESUME:
+			scr_size(e->d, &e->rows, &e->cols);
+			if (m.w > e->cols - 2)
+				m.w = e->cols - 2;
+			if (m.h > e->rows - 2)
+				m.h = e->rows - 2;
+			dlg_center(e, m.w, m.h, &m.x, &m.y);
+			continue;
+		case EVENT_KEY:
+			break;
+		default:
+			continue;
+		}
+		if (ev.key.type != TKBD_KEY)
+			continue;
+		k = &ev.key;
+		n = src->count(src->ctx);
+
+		if (k->key == TKBD_KEY_ESC)
+			return 0;
+		if (k->key == TKBD_KEY_TAB && src->entry_label) {
+			pk.focus = !pk.focus;
+			continue;
+		}
+		if (pk.focus == 1) {		/* entry line has focus */
+			if (k->key == TKBD_KEY_ENTER) {
+				act = src->submit(src->ctx, pk.entry);
+			} else if (k->key == TKBD_KEY_UP ||
+			    k->key == TKBD_KEY_DOWN) {
+				pk.focus = 0;
+				continue;
+			} else {
+				pick_entry_key(&pk, k);
+				continue;
+			}
+		} else {			/* list has focus */
+			switch (k->key) {
+			case TKBD_KEY_UP:
+				pk.sel--;
+				pick_clamp(&pk, n);
+				continue;
+			case TKBD_KEY_DOWN:
+				pk.sel++;
+				pick_clamp(&pk, n);
+				continue;
+			case TKBD_KEY_PGUP:
+				pk.sel -= pk.vis > 0 ? pk.vis : 1;
+				pick_clamp(&pk, n);
+				continue;
+			case TKBD_KEY_PGDN:
+				pk.sel += pk.vis > 0 ? pk.vis : 1;
+				pick_clamp(&pk, n);
+				continue;
+			case TKBD_KEY_HOME:
+				pk.sel = 0;
+				pick_clamp(&pk, n);
+				continue;
+			case TKBD_KEY_END:
+				pk.sel = n - 1;
+				pick_clamp(&pk, n);
+				continue;
+			case TKBD_KEY_ENTER:
+				if (n > 0)
+					act = src->choose(src->ctx, pk.sel);
+				break;
+			default:
+				if (!(k->mod & TKBD_MOD_CTRL) &&
+				    k->ch != TKBD_CH_NONE && k->ch >= 0x20 &&
+				    k->ch < 0x7f && n > 0) {
+					pick_jump(&pk, n, (int)k->ch);
+					pick_clamp(&pk, n);
+				}
+				continue;
+			}
+		}
+
+		if (act == PICK_DONE)
+			return 1;
+		if (act == PICK_CANCEL)
+			return 0;
+		/* PICK_STAY: listing may have changed, reset the view */
+		pk.sel = 0;
+		pk.top = 0;
+		pk.entry[0] = '\0';
+	}
+}
+
+/****************************************************************
  * Editing operations
  ****************************************************************/
 
@@ -6687,6 +7042,197 @@ ed_new(Editor *e)
 	snprintf(e->status, sizeof(e->status), "new buffer");
 }
 
+/****************************************************************
+ * File browser (a picker client)
+ ****************************************************************/
+
+typedef struct fpent {
+	char	*name;		/* entry name, with a trailing '/' on a dir */
+	int	 isdir;
+} Fpent;
+
+typedef struct filepick {
+	Fpent	*ent;
+	int	 n, cap;
+	char	 dir[PATH_MAX];		/* current directory, canonical */
+	char	 title[PATH_MAX + 16];
+	char	 chosen[PATH_MAX];	/* result on PICK_DONE */
+} Filepick;
+
+static void
+filepick_clear(Filepick *fp)
+{
+	int i;
+
+	for (i = 0; i < fp->n; i++)
+		free(fp->ent[i].name);
+	fp->n = 0;
+}
+
+static int
+filepick_cmp(const void *a, const void *b)
+{
+	const Fpent *x = a, *y = b;
+
+	if (x->isdir != y->isdir)
+		return y->isdir - x->isdir;	/* directories first */
+	return strcmp(x->name, y->name);
+}
+
+/* Read fp->dir into fp->ent (directories first, then files, each sorted). */
+static void
+filepick_load(Filepick *fp)
+{
+	DIR *dp;
+	struct dirent *de;
+
+	filepick_clear(fp);
+	snprintf(fp->title, sizeof(fp->title), "Open  %s", fp->dir);
+	dp = opendir(fp->dir);
+	if (!dp)
+		return;
+	while ((de = readdir(dp)) != NULL) {
+		char path[PATH_MAX];
+		struct stat st;
+		int isdir, len;
+		char *nm;
+
+		if (strcmp(de->d_name, ".") == 0)
+			continue;
+		if (snprintf(path, sizeof(path), "%s/%s", fp->dir,
+		    de->d_name) >= (int)sizeof(path))
+			continue;
+		if (stat(path, &st) != 0)
+			continue;
+		isdir = S_ISDIR(st.st_mode) ? 1 : 0;
+		if (fp->n == fp->cap) {
+			int nc = fp->cap ? fp->cap * 2 : 32;
+			Fpent *ne = realloc(fp->ent, (size_t)nc * sizeof(*ne));
+
+			if (!ne)
+				break;
+			fp->ent = ne;
+			fp->cap = nc;
+		}
+		len = (int)strlen(de->d_name);
+		nm = malloc((size_t)len + 2);
+		if (!nm)
+			break;
+		memcpy(nm, de->d_name, (size_t)len);
+		if (isdir)
+			nm[len++] = '/';
+		nm[len] = '\0';
+		fp->ent[fp->n].name = nm;
+		fp->ent[fp->n].isdir = isdir;
+		fp->n++;
+	}
+	closedir(dp);
+	qsort(fp->ent, (size_t)fp->n, sizeof(*fp->ent), filepick_cmp);
+}
+
+/* Move into dir (an absolute or dir-relative path) and relist. */
+static void
+filepick_chdir(Filepick *fp, const char *path)
+{
+	char real[PATH_MAX];
+
+	if (realpath(path, real)) {
+		snprintf(fp->dir, sizeof(fp->dir), "%s", real);
+		filepick_load(fp);
+	}
+}
+
+static const char *
+filepick_title(void *ctx)
+{
+	return ((Filepick *)ctx)->title;
+}
+
+static int
+filepick_count(void *ctx)
+{
+	return ((Filepick *)ctx)->n;
+}
+
+static const char *
+filepick_label(void *ctx, int i)
+{
+	Filepick *fp = ctx;
+
+	return (i >= 0 && i < fp->n) ? fp->ent[i].name : "";
+}
+
+static int
+filepick_choose(void *ctx, int i)
+{
+	Filepick *fp = ctx;
+	char path[PATH_MAX];
+
+	if (i < 0 || i >= fp->n)
+		return PICK_STAY;
+	if (snprintf(path, sizeof(path), "%s/%s", fp->dir,
+	    fp->ent[i].name) >= (int)sizeof(path))
+		return PICK_STAY;
+	if (fp->ent[i].isdir) {
+		filepick_chdir(fp, path);
+		return PICK_STAY;
+	}
+	snprintf(fp->chosen, sizeof(fp->chosen), "%s", path);
+	return PICK_DONE;
+}
+
+/* The entry line: a typed directory descends, anything else opens (or creates)
+ * a file by that name. */
+static int
+filepick_submit(void *ctx, const char *text)
+{
+	Filepick *fp = ctx;
+	char cand[PATH_MAX];
+	struct stat st;
+
+	if (!text[0])
+		return PICK_STAY;
+	if (text[0] == '/') {
+		if (snprintf(cand, sizeof(cand), "%s", text)
+		    >= (int)sizeof(cand))
+			return PICK_STAY;
+	} else if (snprintf(cand, sizeof(cand), "%s/%s", fp->dir, text)
+	    >= (int)sizeof(cand)) {
+		return PICK_STAY;
+	}
+	if (stat(cand, &st) == 0 && S_ISDIR(st.st_mode)) {
+		filepick_chdir(fp, cand);
+		return PICK_STAY;
+	}
+	snprintf(fp->chosen, sizeof(fp->chosen), "%s", cand);
+	return PICK_DONE;
+}
+
+/* Browse for a file to open. Returns 1 with out filled, 0 on cancel. */
+static int
+dlg_open_file(Editor *e, char *out, size_t outsz)
+{
+	static const Picksrc src = {
+		NULL, filepick_title, filepick_count, filepick_label,
+		filepick_choose, "File: ", filepick_submit
+	};
+	Picksrc s = src;
+	Filepick fp;
+	int ok;
+
+	memset(&fp, 0, sizeof(fp));
+	if (!realpath(".", fp.dir))
+		snprintf(fp.dir, sizeof(fp.dir), "/");
+	filepick_load(&fp);
+	s.ctx = &fp;
+	ok = dlg_pick(e, &s);
+	if (ok)
+		snprintf(out, outsz, "%s", fp.chosen);
+	filepick_clear(&fp);
+	free(fp.ent);
+	return ok;
+}
+
 static void
 ed_open(Editor *e)
 {
@@ -6696,7 +7242,7 @@ ed_open(Editor *e)
 	if (!dlg_confirm_discard(e))
 		return;
 	path[0] = '\0';
-	if (!dlg_prompt_line(e, "Open file: ", path, sizeof(path)))
+	if (!dlg_open_file(e, path, sizeof(path)))
 		return;
 	nt = text_new();
 	if (!nt) {
