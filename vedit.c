@@ -3336,6 +3336,8 @@ typedef enum cmd {
 	CMD_DOWN,
 	CMD_HOME,
 	CMD_END,
+	CMD_TOP,		/* jump to the start of the file */
+	CMD_BOTTOM,		/* jump to the end of the file */
 	CMD_PGUP,
 	CMD_PGDN,
 	CMD_UNDO,
@@ -3375,6 +3377,8 @@ static const Keybind keymap[] = {
 	{ TKBD_KEY_DOWN,	0, CMD_DOWN },
 	{ TKBD_KEY_HOME,	0, CMD_HOME },
 	{ TKBD_KEY_END,		0, CMD_END },
+	{ TKBD_KEY_HOME,	1, CMD_TOP },	/* Ctrl+Home: start of file */
+	{ TKBD_KEY_END,		1, CMD_BOTTOM },	/* Ctrl+End: end of file */
 	{ TKBD_KEY_PGUP,	0, CMD_PGUP },
 	{ TKBD_KEY_PGDN,	0, CMD_PGDN },
 	{ TKBD_KEY_ENTER,	0, CMD_NEWLINE },
@@ -5781,6 +5785,14 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 	case CMD_END:
 		e->cx = text_line_len(e->t, e->cy);
 		break;
+	case CMD_TOP:
+		e->cy = 0;
+		e->cx = 0;
+		break;
+	case CMD_BOTTOM:
+		e->cy = text_lines(e->t) ? text_lines(e->t) - 1 : 0;
+		e->cx = text_line_len(e->t, e->cy);
+		break;
 	case CMD_PGUP:
 		e->cy = e->cy > (size_t)page ? e->cy - (size_t)page : 0;
 		clamp_col(e);
@@ -6043,6 +6055,7 @@ static const struct {
 } help_entries[] = {
 	{ "arrows",		"Move the cursor" },
 	{ "Home / End",		"Start / end of line" },
+	{ "Ctrl+Home / End",	"Start / end of the file" },
 	{ "PgUp / PgDn",	"Scroll by a screen" },
 	{ "Shift+arrows",	"Extend a selection" },
 	{ "Enter",		"Split the line" },
@@ -6071,6 +6084,7 @@ static const struct {
 	{ "0 ^ $",		"Line start / first word / line end" },
 	{ "w b e / W B E",	"Word forward / back / end" },
 	{ "gg / G",		"First / last line" },
+	{ "Ctrl+Home / End",	"First / last line (same as gg / G)" },
 	{ "{ } ( )",		"Paragraph / sentence motion" },
 	{ "% H M L |",		"Match pair, screen high/mid/low, column" },
 	{ "f F t T ; ,",	"Find a char in the line, then repeat" },
@@ -7039,6 +7053,7 @@ usage(void)
 	    "Modeless (MS-EDIT) keys:\n"
 	    "  arrows        move the cursor\n"
 	    "  Home / End    start / end of line\n"
+	    "  Ctrl+Home/End start / end of the file\n"
 	    "  PgUp / PgDn   scroll by a screen\n"
 	    "  Enter         split the line\n"
 	    "  Backspace     delete left; Delete removes right\n"
@@ -10193,6 +10208,19 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 		case TKBD_KEY_B:
 			vi_move_lines(e, -page);
 			break;
+		case TKBD_KEY_HOME:		/* Ctrl+Home: start of file (gg) */
+			e->cy = 0;
+			e->cx = first_nonblank(e, 0);
+			vi_clamp(e);
+			break;
+		case TKBD_KEY_END: {		/* Ctrl+End: end of file (G) */
+			size_t last = text_lines(e->t);
+
+			e->cy = last ? last - 1 : 0;
+			e->cx = first_nonblank(e, e->cy);
+			vi_clamp(e);
+			break;
+		}
 		case TKBD_KEY_R:
 			e->sel_active = 0;
 			e->vi_suppress_dot = 1;		/* redo is not a '.' */
@@ -10583,9 +10611,13 @@ vi_insert_key(Editor *e, const struct tkbd_seq *seq)
 		}
 		return REQ_CONTINUE;
 	case TKBD_KEY_HOME:
+		if (ctrl)			/* Ctrl+Home: start of file */
+			e->cy = 0;
 		e->cx = 0;
 		return REQ_CONTINUE;
 	case TKBD_KEY_END:
+		if (ctrl)			/* Ctrl+End: end of file */
+			e->cy = text_lines(e->t) ? text_lines(e->t) - 1 : 0;
 		e->cx = text_line_len(e->t, e->cy);
 		return REQ_CONTINUE;
 	default:

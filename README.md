@@ -108,6 +108,7 @@ the status line.
 | --- | --- |
 | arrows | move the cursor |
 | Home / End | start / end of line |
+| Ctrl-Home / Ctrl-End | start / end of the file |
 | PgUp / PgDn | scroll by a screen |
 | Enter | split the line |
 | Backspace / Delete | delete left / right |
@@ -138,9 +139,11 @@ it.
 Press F2 to switch to the vi personality. NORMAL mode supports `h j k l`, `0 ^
 $`, `w b e`, `gg G`, `f F t T`, `; ,`, `{ } ( )`, `% H M L |`, counts such as
 `3j`, the operators `d c y` with motions (`dw`, `d$`, `dt`), `cc dd yy`, `x`,
-`p`, `u`, and `i a A I o O` to insert. `ZZ` writes and quits, `ZQ` quits without
-writing. The `:` line runs `w q wq q! qa wqa cq`, `:N`, and `:set number` /
-`:set nonumber`. `/` searches and `n` repeats.
+`p`, `u`, and `i a A I o O` to insert. `Ctrl-Home` and `Ctrl-End` jump to the
+first and last line, the same as `gg` and `G`, and work in insert mode too. `ZZ`
+writes and quits, `ZQ` quits without writing. The `:` line runs
+`w q wq q! qa wqa cq`, `:N`, and `:set number` / `:set nonumber`. `/` searches
+and `n` repeats.
 
 ## Draw mode (ASCII art and maps)
 
