@@ -21,6 +21,22 @@ make install            # install to ~/.local/bin (override PREFIX)
 The only requirement is a C11 compiler and a POSIX system. There are no library
 dependencies.
 
+## Testing
+
+```sh
+make test
+```
+
+The tests live in `tests/` and run through a vendored copy of the `taptest`
+TAP framework (its driver plus `test.h` / `testmain.c`). There are no external
+dependencies. Each test file includes `vedit.c` as a single unit, with `main`
+renamed, so it can call the internal helpers directly; integration tests drive
+the editor over an in-memory `vedit_io` (`tests/memio.h`) that feeds scripted
+keystrokes and captures the output, so no terminal is needed. `test_unit.c`
+covers the pure helpers (UTF-8, rune width, color mapping, word-wrap layout, the
+syntax tokenizer, buffer edits and undo); `test_render.c` drives whole-editor
+behavior (cursor jumps, wrap, the gutter, status flags).
+
 ## Running
 
 ```sh

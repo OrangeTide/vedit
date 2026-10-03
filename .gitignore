@@ -1,2 +1,5 @@
 /vedit
 *.o
+/tests/taptest
+/tests/test_unit
+/tests/test_render

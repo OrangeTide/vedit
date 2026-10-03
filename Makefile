@@ -16,7 +16,12 @@ else
 CFLAGS += -g
 endif
 
-.PHONY: all clean install uninstall
+TESTDIR  = tests
+TESTBINS = $(TESTDIR)/test_unit $(TESTDIR)/test_render
+# Tests include vedit.c as one unit, so they build with the same warnings.
+TESTCFLAGS = -std=gnu11 -Wall -Wextra -g
+
+.PHONY: all clean install uninstall test
 
 all: $(PROG)
 
@@ -28,8 +33,22 @@ $(PROG): $(SRC) $(HDR)
 static:
 	$(MAKE) CC=musl-gcc LDFLAGS=-static RELEASE=1
 
+# Unit and integration tests, run through the vendored taptest driver.
+$(TESTDIR)/taptest: $(TESTDIR)/taptest.c $(TESTDIR)/taptest_selftest.c \
+    $(TESTDIR)/taptest.h
+	$(CC) $(TESTCFLAGS) -o $@ $(TESTDIR)/taptest.c \
+	    $(TESTDIR)/taptest_selftest.c
+
+$(TESTDIR)/test_%: $(TESTDIR)/test_%.c $(TESTDIR)/testmain.c $(TESTDIR)/test.h \
+    $(TESTDIR)/memio.h $(SRC) $(HDR)
+	$(CC) $(TESTCFLAGS) -o $@ $(TESTDIR)/test_$*.c $(TESTDIR)/testmain.c \
+	    $(LDFLAGS)
+
+test: $(TESTDIR)/taptest $(TESTBINS)
+	$(TESTDIR)/taptest --self-test --exe $(TESTBINS)
+
 clean:
-	rm -f $(PROG)
+	rm -f $(PROG) $(TESTDIR)/taptest $(TESTBINS)
 
 install: $(PROG)
 	mkdir -p $(DESTDIR)$(BINDIR)
