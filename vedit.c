@@ -7224,6 +7224,36 @@ filepick_submit(void *ctx, const char *text)
  * file, the browser opens in its directory; a non-empty init pre-fills the
  * entry line and (with focus_entry) starts focus there, for a save prompt.
  * Returns 1 with out filled, 0 on cancel. */
+/* Resolve the directory the browser should open in, given a start hint.
+ * A directory hint is used directly, a file-path hint resolves to its
+ * directory, and anything else (NULL, empty, or no match) falls back to the
+ * current directory, then "/". The result is written canonical to out. */
+static void
+filepick_start_dir(const char *start, char *out, size_t outsz)
+{
+	char dirpart[PATH_MAX];
+	struct stat st;
+	const char *d = NULL;
+
+	if (start && start[0] && stat(start, &st) == 0 && S_ISDIR(st.st_mode)) {
+		d = start;			/* start is itself a directory */
+	} else if (start && start[0]) {
+		const char *slash = strrchr(start, '/');
+
+		if (slash) {			/* directory part of a file path */
+			snprintf(dirpart, sizeof(dirpart), "%.*s",
+			    slash == start ? 1 : (int)(slash - start), start);
+			d = dirpart;
+		}
+	}
+	if (!d)
+		d = ".";
+	if (realpath(d, out))
+		return;
+	if (!realpath(".", out))
+		snprintf(out, outsz, "/");
+}
+
 static int
 dlg_file(Editor *e, const char *verb, const char *start, const char *init,
     int focus_entry, char *out, size_t outsz)
@@ -7238,29 +7268,7 @@ dlg_file(Editor *e, const char *verb, const char *start, const char *init,
 
 	memset(&fp, 0, sizeof(fp));
 	fp.verb = verb;
-	{
-		char dirpart[PATH_MAX];
-		struct stat st;
-		const char *d = NULL;
-
-		if (start && start[0] && stat(start, &st) == 0 &&
-		    S_ISDIR(st.st_mode)) {
-			d = start;		/* start is itself a directory */
-		} else if (start && start[0]) {
-			const char *slash = strrchr(start, '/');
-
-			if (slash) {		/* directory part of a file path */
-				snprintf(dirpart, sizeof(dirpart), "%.*s",
-				    slash == start ? 1 : (int)(slash - start),
-				    start);
-				d = dirpart;
-			}
-		}
-		if (!d)
-			d = ".";
-		if (!realpath(d, fp.dir) && !realpath(".", fp.dir))
-			snprintf(fp.dir, sizeof(fp.dir), "/");
-	}
+	filepick_start_dir(start, fp.dir, sizeof(fp.dir));
 	filepick_load(&fp);
 	s.ctx = &fp;
 	s.entry_init = init;

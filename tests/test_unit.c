@@ -290,6 +290,43 @@ t_filepick_load(Test *t)
 	rmdir(dir);
 }
 
+static void
+t_filepick_start_dir(Test *t)
+{
+	char tmpl[] = "/tmp/vedit_sdXXXXXX";
+	char *dir = mkdtemp(tmpl);
+	char sub[PATH_MAX], file[PATH_MAX], real[PATH_MAX], out[PATH_MAX];
+
+	TAP_ASSERT(t, dir != NULL);
+	TAP_ASSERT(t, realpath(dir, real) != NULL);	/* canonical form */
+	snprintf(sub, sizeof(sub), "%s/sub", dir);
+	TAP_ASSERT(t, mkdir(sub, 0700) == 0);
+	snprintf(file, sizeof(file), "%s/afile", dir);
+	TAP_ASSERT(t, fclose(fopen(file, "w")) == 0);
+
+	/* a directory hint resolves to itself */
+	filepick_start_dir(dir, out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, real) == 0, "dir hint -> %s", out);
+
+	/* a file-path hint resolves to its containing directory */
+	filepick_start_dir(file, out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, real) == 0, "file hint -> %s", out);
+
+	/* a missing file under a real dir still resolves to that dir */
+	snprintf(file, sizeof(file), "%s/nope.txt", dir);
+	filepick_start_dir(file, out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, real) == 0, "new-file hint -> %s", out);
+
+	/* NULL falls back to the current directory */
+	filepick_start_dir(NULL, out, sizeof(out));
+	TAP_CHECK(t, realpath(".", real) && strcmp(out, real) == 0);
+
+	rmdir(sub);
+	snprintf(file, sizeof(file), "%s/afile", dir);
+	unlink(file);
+	rmdir(dir);
+}
+
 const Case tap_cases[] = {
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },
@@ -307,5 +344,6 @@ const Case tap_cases[] = {
 	{ "filepick_cmp", t_filepick_cmp },
 	{ "pick_jump", t_pick_jump },
 	{ "filepick_load", t_filepick_load },
+	{ "filepick_start_dir", t_filepick_start_dir },
 	{ NULL, NULL },
 };
