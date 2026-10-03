@@ -149,13 +149,10 @@ cfg_get(const Cfg *c, const char *key)
 	return NULL;
 }
 
-/* Interpret a config value as a boolean. Returns def when c has no such key or
- * the value is not recognized. */
+/* Interpret a string as a boolean, returning def when it is not recognized. */
 static int
-cfg_bool(const Cfg *c, const char *key, int def)
+str_bool(const char *v, int def)
 {
-	const char *v = cfg_get(c, key);
-
 	if (!v)
 		return def;
 	if (strcmp(v, "on") == 0 || strcmp(v, "yes") == 0 ||
@@ -165,6 +162,14 @@ cfg_bool(const Cfg *c, const char *key, int def)
 	    strcmp(v, "false") == 0 || strcmp(v, "0") == 0)
 		return 0;
 	return def;
+}
+
+/* Interpret a config value as a boolean. Returns def when c has no such key or
+ * the value is not recognized. */
+static int
+cfg_bool(const Cfg *c, const char *key, int def)
+{
+	return str_bool(cfg_get(c, key), def);
 }
 
 static char *
@@ -3821,10 +3826,198 @@ static const Pal chrome_plain = {
 #undef CIDX
 #undef CDEF
 
+/* User color themes defined in the config file as [theme "name"] sections.
+ * They extend the three built-in schemes: e->scheme holds SCHEME_COUNT + index
+ * to select one. */
+#define USER_THEME_MAX 8
+
+typedef struct user_theme {
+	char	name[32];
+	Pal	pal;
+	int	borderless;	/* drop the right border, like the black scheme */
+	int	used;
+} Usertheme;
+
+static Usertheme	g_user_themes[USER_THEME_MAX];
+static int		g_user_theme_count;
+
+/* Parse a color: "default", a 0-255 palette index, "#rrggbb", or one of the 16
+ * ANSI names (with a "bright-" prefix for 8-15). Returns 1 on success. */
+static int
+cfg_color(const char *s, Color *out)
+{
+	static const char *const names[8] = {
+		"black", "red", "green", "yellow",
+		"blue", "magenta", "cyan", "white"
+	};
+	int i;
+
+	if (!s || !s[0])
+		return 0;
+	if (strcmp(s, "default") == 0) {
+		out->type = COLOR_DEFAULT;
+		return 1;
+	}
+	if (s[0] == '#' && strlen(s) == 7) {
+		unsigned r, g, b;
+
+		if (sscanf(s + 1, "%2x%2x%2x", &r, &g, &b) == 3) {
+			out->type = COLOR_RGB;
+			out->rgb.r = (uint8_t)r;
+			out->rgb.g = (uint8_t)g;
+			out->rgb.b = (uint8_t)b;
+			return 1;
+		}
+		return 0;
+	}
+	if (s[0] >= '0' && s[0] <= '9') {
+		char *end;
+		long n = strtol(s, &end, 10);
+
+		if (*end == '\0' && n >= 0 && n <= 255) {
+			out->type = COLOR_INDEXED;
+			out->index = (uint8_t)n;
+			return 1;
+		}
+		return 0;
+	}
+	{
+		const char *base = s;
+		int bright = 0;
+
+		if (strncmp(s, "bright-", 7) == 0) {
+			base = s + 7;
+			bright = 8;
+		}
+		for (i = 0; i < 8; i++)
+			if (strcmp(base, names[i]) == 0) {
+				out->type = COLOR_INDEXED;
+				out->index = (uint8_t)(i + bright);
+				return 1;
+			}
+	}
+	return 0;
+}
+
+static int
+theme_by_name(const char *name)
+{
+	int i;
+
+	for (i = 0; i < g_user_theme_count; i++)
+		if (g_user_themes[i].used &&
+		    strcmp(g_user_themes[i].name, name) == 0)
+			return i;
+	return -1;
+}
+
+/* Find or create a slot for a theme name, initialized to the DOS preset. */
+static int
+theme_slot(const char *name)
+{
+	int i = theme_by_name(name);
+
+	if (i >= 0)
+		return i;
+	if (g_user_theme_count >= USER_THEME_MAX ||
+	    strlen(name) >= sizeof(g_user_themes[0].name))
+		return -1;
+	i = g_user_theme_count++;
+	snprintf(g_user_themes[i].name, sizeof(g_user_themes[i].name), "%s",
+	    name);
+	g_user_themes[i].pal = chrome_dos;
+	g_user_themes[i].borderless = 0;
+	g_user_themes[i].used = 1;
+	return i;
+}
+
+/* Load the [theme "name"] sections from the config into g_user_themes. Pass 0
+ * creates the slots and applies each theme's "base" preset; pass 1 overlays the
+ * individual color fields, so field and base order in the file does not matter.
+ */
+static void
+themes_load_cfg(const Cfg *c)
+{
+	int pass, i;
+
+	g_user_theme_count = 0;
+	memset(g_user_themes, 0, sizeof(g_user_themes));
+	if (!c)
+		return;
+	for (pass = 0; pass < 2; pass++) {
+		for (i = 0; i < c->count; i++) {
+			const char *key = c->entries[i].key;
+			const char *val = c->entries[i].value;
+			const char *rest, *dot, *field;
+			char name[32];
+			size_t nl;
+			int slot;
+			Pal *p;
+
+			if (strncmp(key, "theme.", 6) != 0)
+				continue;
+			rest = key + 6;
+			dot = strchr(rest, '.');
+			if (!dot)
+				continue;
+			nl = (size_t)(dot - rest);
+			if (nl == 0 || nl >= sizeof(name))
+				continue;
+			memcpy(name, rest, nl);
+			name[nl] = '\0';
+			field = dot + 1;
+			slot = theme_slot(name);
+			if (slot < 0)
+				continue;
+			p = &g_user_themes[slot].pal;
+
+			if (pass == 0) {
+				if (strcmp(field, "base") != 0)
+					continue;
+				if (strcmp(val, "black") == 0) {
+					*p = chrome_black;
+					g_user_themes[slot].borderless = 1;
+				} else if (strcmp(val, "plain") == 0) {
+					*p = chrome_plain;
+				} else {
+					*p = chrome_dos;
+				}
+				continue;
+			}
+			if (strcmp(field, "base") == 0)
+				continue;		/* applied in pass 0 */
+			else if (strcmp(field, "content.fg") == 0)
+				cfg_color(val, &p->content_fg);
+			else if (strcmp(field, "content.bg") == 0)
+				cfg_color(val, &p->content_bg);
+			else if (strcmp(field, "frame.fg") == 0)
+				cfg_color(val, &p->frame_fg);
+			else if (strcmp(field, "frame.bg") == 0)
+				cfg_color(val, &p->frame_bg);
+			else if (strcmp(field, "title.fg") == 0)
+				cfg_color(val, &p->title_fg);
+			else if (strcmp(field, "bar.fg") == 0)
+				cfg_color(val, &p->bar_fg);
+			else if (strcmp(field, "bar.bg") == 0)
+				cfg_color(val, &p->bar_bg);
+			else if (strcmp(field, "reverse-bars") == 0)
+				p->reverse_bars = str_bool(val, p->reverse_bars);
+			else if (strcmp(field, "borderless") == 0)
+				g_user_themes[slot].borderless =
+				    str_bool(val, g_user_themes[slot].borderless);
+		}
+	}
+}
 
 static const Pal *
 ed_chrome(const Editor *e)
 {
+	if (e->scheme >= SCHEME_COUNT) {
+		int i = e->scheme - SCHEME_COUNT;
+
+		if (i < g_user_theme_count)
+			return &g_user_themes[i].pal;
+	}
 	switch (e->scheme) {
 	case SCHEME_BLACK:
 		return &chrome_black;
@@ -3850,7 +4043,15 @@ text_height(const Editor *e)
 static int
 chrome_right(const Editor *e)
 {
-	return e->scheme == SCHEME_BLACK ? 0 : CHROME_RIGHT;
+	if (e->scheme == SCHEME_BLACK)
+		return 0;
+	if (e->scheme >= SCHEME_COUNT) {
+		int i = e->scheme - SCHEME_COUNT;
+
+		if (i < g_user_theme_count && g_user_themes[i].borderless)
+			return 0;
+	}
+	return CHROME_RIGHT;
 }
 
 /* Width of the framed text area (cols minus the border columns). */
@@ -8870,12 +9071,16 @@ ed_apply_config(Editor *e)
 		return;
 	s = cfg_get(g_cfg, "ui.scheme");
 	if (s) {
+		int ti;
+
 		if (strcmp(s, "dos") == 0)
 			e->scheme = SCHEME_DOS;
 		else if (strcmp(s, "black") == 0)
 			e->scheme = SCHEME_BLACK;
 		else if (strcmp(s, "plain") == 0)
 			e->scheme = SCHEME_PLAIN;
+		else if ((ti = theme_by_name(s)) >= 0)
+			e->scheme = SCHEME_COUNT + ti;
 	}
 	e->wrap = cfg_bool(g_cfg, "ui.wrap", e->wrap);
 	e->show_lineno = cfg_bool(g_cfg, "ui.number", e->show_lineno);
@@ -8898,6 +9103,7 @@ void
 vedit_set_config(struct vedit *v, const struct cfg *c)
 {
 	g_cfg = c;
+	themes_load_cfg(c);		/* before ed_apply_config resolves scheme */
 	if (v->e.term) {
 		v->e.term->box_mode = box_default();
 		v->e.term->colors = color_default();

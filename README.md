@@ -128,6 +128,29 @@ Booleans accept `on`/`off`, `yes`/`no`, `true`/`false`, or `1`/`0`. A missing or
 unreadable file is ignored (an explicit `--config` path that cannot be read
 prints a warning and the editor still starts).
 
+A `[theme "name"]` section defines a custom color scheme that `ui.scheme = name`
+then selects, alongside the three built-ins:
+
+```ini
+[theme "midnight"]
+    base         = black      # start from dos | black | plain (default dos)
+    content.fg   = 189        # the text area
+    content.bg   = default
+    frame.fg     = 60         # window border and scrollbars
+    frame.bg     = default
+    title.fg     = 231        # file name in the top border
+    bar.fg       = 231        # menu bar and status bar
+    bar.bg       = 54
+    reverse-bars = off        # draw the bars in reverse video
+    borderless   = on         # drop the right border so text reaches the edge
+```
+
+A color is `default` (the terminal's own color), a 0-255 palette index,
+`#rrggbb`, or one of the sixteen ANSI names (`red`, `cyan`, ..., with a
+`bright-` prefix for 8-15). Unset fields keep the base preset's value, and `base
+= black` turns `borderless` on unless the theme sets it off. Up to eight themes
+can be defined.
+
 Settings rank from weakest to strongest: built-in default, then the config file,
 then the `VEDIT_*` environment variables, then the command-line flags, then an
 embedding host's `vedit_set_*()` calls. So a `--dec` flag or `VEDIT_BOX` beats
@@ -136,8 +159,8 @@ itself; the command-line front end reads it and hands it in through
 `vedit_set_config()`, which an embedding host can also call with a config it
 builds from `vedit_cfg_new()` / `vedit_cfg_load()`.
 
-The color schemes, themes, and the joe-style syntax rules are not yet
-configurable here; that is the planned next step.
+The joe-style syntax highlighting rules are not yet configurable here; that is
+the planned next step.
 
 ### Color schemes
 

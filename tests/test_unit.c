@@ -442,6 +442,64 @@ t_cfg_resolve(Test *t)
 	unlink(path);
 }
 
+static void
+t_cfg_color(Test *t)
+{
+	Color c;
+
+	TAP_CHECK(t, cfg_color("default", &c) && c.type == COLOR_DEFAULT);
+	TAP_CHECK(t, cfg_color("250", &c) && c.type == COLOR_INDEXED &&
+	    c.index == 250);
+	TAP_CHECK(t, cfg_color("#ff8000", &c) && c.type == COLOR_RGB &&
+	    c.rgb.r == 0xff && c.rgb.g == 0x80 && c.rgb.b == 0);
+	TAP_CHECK(t, cfg_color("blue", &c) && c.type == COLOR_INDEXED &&
+	    c.index == 4);
+	TAP_CHECK(t, cfg_color("bright-red", &c) && c.type == COLOR_INDEXED &&
+	    c.index == 9);
+	TAP_CHECK(t, !cfg_color("nope", &c));
+	TAP_CHECK(t, !cfg_color("300", &c));
+}
+
+static void
+t_cfg_theme(Test *t)
+{
+	static const char *text =
+	    "[ui]\n"
+	    "scheme = midnight\n"
+	    "[theme \"midnight\"]\n"
+	    "base = black\n"		/* borderless preset... */
+	    "content.fg = 250\n"
+	    "bar.bg = 244\n"
+	    "borderless = off\n";	/* ...overridden back on */
+	char path[256];
+	Cfg *c = load_cfg_text(text, path, sizeof(path));
+	const Cfg *old = g_cfg;
+	const Pal *p;
+	Editor e;
+	int ti;
+
+	TAP_ASSERT(t, c != NULL);
+	g_cfg = c;
+	themes_load_cfg(c);
+	ti = theme_by_name("midnight");
+	TAP_ASSERT(t, ti >= 0);
+
+	editor_init(&e);
+	ed_apply_config(&e);
+	TAP_CHECK(t, e.scheme == SCHEME_COUNT + ti);	/* ui.scheme resolves */
+	p = ed_chrome(&e);
+	TAP_CHECK(t, p->content_fg.type == COLOR_INDEXED &&
+	    p->content_fg.index == 250);
+	TAP_CHECK(t, p->bar_bg.type == COLOR_INDEXED && p->bar_bg.index == 244);
+	TAP_CHECK(t, p->content_bg.type == COLOR_DEFAULT);	/* from black base */
+	TAP_CHECK(t, chrome_right(&e) == CHROME_RIGHT);	/* borderless=off wins */
+
+	g_cfg = old;
+	themes_load_cfg(NULL);			/* clear for other tests */
+	vedit_cfg_free(c);
+	unlink(path);
+}
+
 const Case tap_cases[] = {
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },
@@ -462,5 +520,7 @@ const Case tap_cases[] = {
 	{ "filepick_start_dir", t_filepick_start_dir },
 	{ "cfg_parse", t_cfg_parse },
 	{ "cfg_resolve", t_cfg_resolve },
+	{ "cfg_color", t_cfg_color },
+	{ "cfg_theme", t_cfg_theme },
 	{ NULL, NULL },
 };
