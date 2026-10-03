@@ -2074,6 +2074,7 @@ void buf_switch(Editor *e, int i);
 int buf_cycle(Editor *e, int dir);		/* next/prev; new index */
 int buf_close(Editor *e, int i);			/* 0 ok, -1 refused */
 void buf_list(Editor *e);			/* summarize into status */
+static int dlg_save_file(Editor *e, char *out, size_t outsz);
 void insert_clip(Editor *e);
 void insert_bytes(Editor *e, const char *bytes, size_t len);
 char *region_text(Editor *e, size_t y1, size_t x1, size_t y2, size_t x2,
@@ -5356,8 +5357,11 @@ struct picksrc {
 	int		 (*choose)(void *ctx, int i);
 	/* Optional entry line. When entry_label is non-NULL the panel shows an
 	 * editable field; submit is called with the typed text on Enter and
-	 * returns the same tri-state as choose. */
+	 * returns the same tri-state as choose. entry_init pre-fills it, and
+	 * focus_entry starts focus there (for a save-style prompt). */
 	const char	*entry_label;
+	const char	*entry_init;
+	int		 focus_entry;
 	int		 (*submit)(void *ctx, const char *text);
 };
 
@@ -5547,6 +5551,10 @@ dlg_pick(Editor *e, const Picksrc *src)
 
 	memset(&pk, 0, sizeof(pk));
 	pk.src = src;
+	if (src->entry_label && src->entry_init)
+		snprintf(pk.entry, sizeof(pk.entry), "%s", src->entry_init);
+	if (src->entry_label && src->focus_entry)
+		pk.focus = 1;
 
 	n = src->count(src->ctx);
 	for (i = 0; i < n; i++) {
@@ -6353,12 +6361,14 @@ save_editor(Editor *e)
 		char name[PATH_MAX];
 
 		name[0] = '\0';
-		if (!dlg_prompt_line(e, "Save as: ", name, sizeof(name))) {
+		if (!dlg_save_file(e, name, sizeof(name))) {
 			snprintf(e->status, sizeof(e->status), "save cancelled");
 			return -1;
 		}
 		snprintf(e->path, sizeof(e->path), "%s", name);
 		e->has_name = 1;
+		e->syn = syn_for_ext(file_ext(e->path));
+		e->hl_valid = 0;
 	}
 
 	if (text_save(e->t, e->path) < 0) {
@@ -7052,11 +7062,12 @@ typedef struct fpent {
 } Fpent;
 
 typedef struct filepick {
-	Fpent	*ent;
-	int	 n, cap;
-	char	 dir[PATH_MAX];		/* current directory, canonical */
-	char	 title[PATH_MAX + 16];
-	char	 chosen[PATH_MAX];	/* result on PICK_DONE */
+	Fpent		*ent;
+	int		 n, cap;
+	const char	*verb;		/* "Open" or "Save As", for the title */
+	char		 dir[PATH_MAX];	/* current directory, canonical */
+	char		 title[PATH_MAX + 16];
+	char		 chosen[PATH_MAX];	/* result on PICK_DONE */
 } Filepick;
 
 static void
@@ -7087,7 +7098,8 @@ filepick_load(Filepick *fp)
 	struct dirent *de;
 
 	filepick_clear(fp);
-	snprintf(fp->title, sizeof(fp->title), "Open  %s", fp->dir);
+	snprintf(fp->title, sizeof(fp->title), "%s  %s",
+	    fp->verb ? fp->verb : "Open", fp->dir);
 	dp = opendir(fp->dir);
 	if (!dp)
 		return;
@@ -7208,29 +7220,80 @@ filepick_submit(void *ctx, const char *text)
 	return PICK_DONE;
 }
 
-/* Browse for a file to open. Returns 1 with out filled, 0 on cancel. */
+/* Run the file browser. verb names the action in the title. When start names a
+ * file, the browser opens in its directory; a non-empty init pre-fills the
+ * entry line and (with focus_entry) starts focus there, for a save prompt.
+ * Returns 1 with out filled, 0 on cancel. */
 static int
-dlg_open_file(Editor *e, char *out, size_t outsz)
+dlg_file(Editor *e, const char *verb, const char *start, const char *init,
+    int focus_entry, char *out, size_t outsz)
 {
-	static const Picksrc src = {
-		NULL, filepick_title, filepick_count, filepick_label,
-		filepick_choose, "File: ", filepick_submit
+	Picksrc s = {
+		.title = filepick_title, .count = filepick_count,
+		.label = filepick_label, .choose = filepick_choose,
+		.entry_label = "File: ", .submit = filepick_submit,
 	};
-	Picksrc s = src;
 	Filepick fp;
 	int ok;
 
 	memset(&fp, 0, sizeof(fp));
-	if (!realpath(".", fp.dir))
-		snprintf(fp.dir, sizeof(fp.dir), "/");
+	fp.verb = verb;
+	{
+		char dirpart[PATH_MAX];
+		struct stat st;
+		const char *d = NULL;
+
+		if (start && start[0] && stat(start, &st) == 0 &&
+		    S_ISDIR(st.st_mode)) {
+			d = start;		/* start is itself a directory */
+		} else if (start && start[0]) {
+			const char *slash = strrchr(start, '/');
+
+			if (slash) {		/* directory part of a file path */
+				snprintf(dirpart, sizeof(dirpart), "%.*s",
+				    slash == start ? 1 : (int)(slash - start),
+				    start);
+				d = dirpart;
+			}
+		}
+		if (!d)
+			d = ".";
+		if (!realpath(d, fp.dir) && !realpath(".", fp.dir))
+			snprintf(fp.dir, sizeof(fp.dir), "/");
+	}
 	filepick_load(&fp);
 	s.ctx = &fp;
+	s.entry_init = init;
+	s.focus_entry = focus_entry;
 	ok = dlg_pick(e, &s);
 	if (ok)
 		snprintf(out, outsz, "%s", fp.chosen);
 	filepick_clear(&fp);
 	free(fp.ent);
 	return ok;
+}
+
+/* Browse for a file to open. Returns 1 with out filled, 0 on cancel. */
+static int
+dlg_open_file(Editor *e, char *out, size_t outsz)
+{
+	return dlg_file(e, "Open", NULL, NULL, 0, out, outsz);
+}
+
+/* Browse for a path to save to, pre-filled with the current file name and
+ * opened in its directory. Returns 1 with out filled, 0 on cancel. */
+static int
+dlg_save_file(Editor *e, char *out, size_t outsz)
+{
+	const char *start = e->has_name ? e->path : NULL;
+	const char *base = NULL;
+
+	if (e->has_name) {
+		const char *slash = strrchr(e->path, '/');
+
+		base = slash ? slash + 1 : e->path;
+	}
+	return dlg_file(e, "Save As", start, base, 1, out, outsz);
 }
 
 static void
@@ -7271,9 +7334,7 @@ ed_save_as(Editor *e)
 	char path[PATH_MAX];
 
 	path[0] = '\0';
-	if (e->has_name)
-		snprintf(path, sizeof(path), "%s", e->path);
-	if (!dlg_prompt_line(e, "Save as: ", path, sizeof(path)))
+	if (!dlg_save_file(e, path, sizeof(path)))
 		return;
 	snprintf(e->path, sizeof(e->path), "%s", path);
 	e->has_name = 1;

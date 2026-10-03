@@ -135,6 +135,12 @@ on a file opens it. A `File:` entry line at the top (reached with Tab) takes a
 typed name or path: a directory there changes into it, any other name is opened
 and may be a new file.
 
+**File > Save As** (and the first save of an untitled buffer) uses the same
+browser, but it starts with the `File:` entry line focused and pre-filled with
+the current name, opened in the current file's directory. Type or edit the name
+and press Enter to write there, or pick an existing file from the list to save
+over it.
+
 The browser is one client of a reusable list-picker control (`dlg_pick` with a
 `Picksrc` of callbacks). The control owns the box, scrolling, selection, and
 keys; a source supplies the rows and decides what choosing one means. The intent
