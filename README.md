@@ -367,7 +367,7 @@ dialogs, prompts, and the help screen, not just the text area.
 | F8 / Shift-F8 | next / previous open buffer |
 | F10 | activate the menu bar (then a letter opens that menu) |
 | Alt+letter | open a menu directly (File, Edit, ...) |
-| F1 | show the key bindings |
+| F1 | show the key bindings (press `t` there for the tutorial) |
 | F2 | toggle vi keys |
 
 Ctrl-F searches incrementally: the cursor follows the first match from where
@@ -443,7 +443,9 @@ block.
 Draw mode turns vedit into a 2D canvas for maps, box diagrams, and block art,
 in the spirit of tools like DuhDraw. Toggle it with the **Insert** key (in either
 personality), the Options menu, or the vi `:draw` command. The status line shows
-`-- DRAW --` while it is on, and leaving it restores normal insert editing.
+`-- DRAW --` while it is on, and leaving it restores normal insert editing. A
+walkthrough is built in: open Help > Tutorial, or press `t` on the F1
+key-bindings screen.
 
 In draw mode:
 

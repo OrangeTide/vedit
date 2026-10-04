@@ -6683,7 +6683,7 @@ typedef enum menu_act {
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE, MA_OSC_COPY, MA_OSC_COPY_FILE,
 	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_GOTO,
 	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_HEX, MA_DRAW, MA_VI_MODE,
-	MA_HELP, MA_ABOUT,
+	MA_HELP, MA_TUTORIAL, MA_ABOUT,
 } Menuact;
 
 /* draw mode toggle, defined with the draw-mode module further down */
@@ -6746,6 +6746,7 @@ static const Menuitem mi_options[] = {
 };
 static const Menuitem mi_help[] = {
 	{ "&Key Bindings",	"F1",	"",	MA_HELP },
+	{ "&Tutorial",		"",	"",	MA_TUTORIAL },
 	{ "&About",		"",	"",	MA_ABOUT },
 };
 
@@ -10052,7 +10053,148 @@ help_line(Editor *e, void *ctx, int idx)
 	return line;
 }
 
-/* Show the help screen and wait for one key press to dismiss it. */
+/* ---- tutorials (Help > Tutorial, and 't' on the key-bindings screen) ----
+ *
+ * A tutorial is a title and an array of body lines, shown in a scrollable
+ * full-screen view. Each line is pre-laid-out plain text (keep it within about
+ * 72 columns so it fits a narrow terminal). Add a tutorial by writing its line
+ * array and appending an entry to g_tutorials. */
+
+static const char *const tut_draw[] = {
+	"Draw mode turns the editor into a 2D canvas for box diagrams,",
+	"maps, and block art. The blanks you draw are real spaces, so a",
+	"drawing drops into any text file as-is.",
+	"",
+	"Turning it on and off",
+	"",
+	"  - Press Insert to toggle draw mode. It works in both the",
+	"    modeless and vi personalities. Options > Draw Mode and the",
+	"    vi :draw command do the same.",
+	"  - The status line shows -- DRAW -- while draw mode is on.",
+	"  - Press Insert again to return to normal editing.",
+	"",
+	"Moving and typing",
+	"",
+	"  - The cursor moves freely over a virtual grid. The arrows (or",
+	"    vi h j k l) step one cell in any direction, even past the",
+	"    end of a line or below the last line. The edges do not wrap.",
+	"  - Typing overwrites the cell under the cursor; insert is off.",
+	"    Drawing in empty space pads the line with spaces and adds",
+	"    blank lines as needed, so you can draw anywhere.",
+	"  - Enter moves down one row and back to column 0.",
+	"  - Backspace and Delete erase a cell to a space. They never",
+	"    join lines the way they do in normal editing.",
+	"",
+	"Boxes and lines",
+	"",
+	"  - Hold Shift and press the arrows to mark a rectangle.",
+	"  - Ctrl-B draws a border around the marked rectangle: + at the",
+	"    corners, - and | along the edges.",
+	"  - A selection one cell wide or one cell tall collapses to a",
+	"    straight line, so Ctrl-B draws lines as well as boxes.",
+	"  - The glyphs are plain ASCII, so the drawing shows on any",
+	"    terminal.",
+	"",
+	"Moving blocks around",
+	"",
+	"  - With a rectangle marked, Ctrl-C copies it and Ctrl-X cuts",
+	"    it, blanking the rectangle in place.",
+	"  - Ctrl-V overlays the copied block at the cursor, drawing over",
+	"    whatever cells are there.",
+	"",
+	"Your first drawing",
+	"",
+	"  1. Press Insert to enter draw mode.",
+	"  2. Move to some open space.",
+	"  3. Hold Shift and arrow right, then down, to mark a rectangle.",
+	"  4. Press Ctrl-B to draw its border.",
+	"  5. Move inside the box and type a label.",
+	"  6. Press Insert to leave draw mode, then Ctrl-S to save.",
+	"",
+	"Because a drawing is made of real spaces, draw mode does not",
+	"trim trailing whitespace when it saves.",
+};
+
+typedef struct tutorial {
+	const char	*title;
+	const char *const *lines;
+	int		 n;
+} Tutorial;
+
+#define TUT(arr) (arr), (int)(sizeof(arr) / sizeof((arr)[0]))
+static const Tutorial g_tutorials[] = {
+	{ "Line Draw Mode",	TUT(tut_draw) },
+};
+#undef TUT
+#define TUTORIAL_COUNT ((int)(sizeof(g_tutorials) / sizeof(g_tutorials[0])))
+
+/* Line provider for dlg_text_view: one body line by absolute index. */
+static const char *
+tutorial_line(Editor *e, void *ctx, int idx)
+{
+	const Tutorial *t = ctx;
+
+	(void)e;
+	if (idx < 0 || idx >= t->n)
+		return NULL;
+	return t->lines[idx];
+}
+
+/* Show one tutorial in a scrollable view: Up/Down and PgUp/PgDn scroll,
+ * Home/End jump, Esc or q returns. */
+static void
+dlg_tutorial_show(Editor *e, const Tutorial *t)
+{
+	char hdr[128];
+	int top = 0;
+
+	snprintf(hdr, sizeof(hdr), " vedit tutorial -- %s", t->title);
+	for (;;) {
+		int rows = e->rows > 0 ? e->rows : 24;
+		int body = rows - 2;		/* header and footer rows */
+		int maxtop = (t->n > body) ? t->n - body : 0;
+		Event ev;
+
+		if (top > maxtop)
+			top = maxtop;
+		if (top < 0)
+			top = 0;
+		ui_scroll_view(e, hdr,
+		    " Up/Down PgUp/PgDn Home/End scroll   Esc or q returns",
+		    top, tutorial_line, (void *)t);
+		if (scr_wait(e->d, &ev) == EVENT_EOF)
+			return;
+		if (ev.type == EVENT_RESIZE || ev.type == EVENT_RESUME) {
+			scr_size(e->d, &e->rows, &e->cols);
+			continue;
+		}
+		if (ev.type != EVENT_KEY || ev.key.type != TKBD_KEY)
+			continue;
+		switch (ev.key.key) {
+		case TKBD_KEY_UP:	top -= 1; break;
+		case TKBD_KEY_DOWN:	top += 1; break;
+		case TKBD_KEY_PGUP:	top -= body; break;
+		case TKBD_KEY_PGDN:	top += body; break;
+		case TKBD_KEY_HOME:	top = 0; break;
+		case TKBD_KEY_END:	top = maxtop; break;
+		case TKBD_KEY_ESC:	return;
+		default:
+			if (ev.key.ch == 'q' || ev.key.ch == 'Q')
+				return;
+			break;
+		}
+	}
+}
+
+/* Open the tutorials. With a single tutorial it opens straight away. */
+static void
+dlg_tutorial(Editor *e)
+{
+	dlg_tutorial_show(e, &g_tutorials[0]);
+}
+
+/* Show the help screen and wait for a key. Any key returns to editing, except
+ * 't', which opens the tutorial. */
 static void
 dlg_help(Editor *e)
 {
@@ -10062,13 +10204,18 @@ dlg_help(Editor *e)
 	for (;;) {
 		Event ev;
 
-		ui_scroll_view(e, hdr, " Press any key to return", 0,
+		ui_scroll_view(e, hdr,
+		    " Press t for the tutorial, any other key to return", 0,
 		    help_line, NULL);
 		switch (scr_wait(e->d, &ev)) {
 		case EVENT_KEY:
-			if (ev.key.type == TKBD_KEY)
-				return;		/* any key returns to editing */
-			break;
+			if (ev.key.type != TKBD_KEY)
+				break;
+			if (ev.key.ch == 't' || ev.key.ch == 'T') {
+				dlg_tutorial(e);
+				break;		/* back to the key list */
+			}
+			return;			/* any other key returns */
 		case EVENT_RESIZE:
 		case EVENT_RESUME:
 			scr_size(e->d, &e->rows, &e->cols);
@@ -11362,6 +11509,9 @@ run_menu_act(Editor *e, Menuact act)
 		break;
 	case MA_HELP:
 		dlg_help(e);
+		break;
+	case MA_TUTORIAL:
+		dlg_tutorial(e);
 		break;
 	case MA_ABOUT:
 		dlg_about(e);
