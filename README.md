@@ -132,6 +132,7 @@ A gitconfig-style file sets the startup defaults. It is read from the first of
     box    = dec         # utf8 | dec | ascii
     colors = 256         # 256 | 16
     scroll = on          # VT100 scroll-region fast path
+    clipboard = off      # also mirror every copy/yank to the terminal (OSC 52)
 
 [edit]
     mode = vi            # vi | modeless
@@ -381,6 +382,20 @@ Ctrl-R replaces by regular expression. It asks for a pattern and a replacement
 template, then walks the matches from the cursor to the end of the buffer and
 confirms each one. The template understands `&` and `\1`..`\9` for the whole
 match and captured groups, and `\U \L \u \l \E` to change case.
+
+### Clipboards
+
+The copy, cut, and yank keys use an internal clipboard that paste reads back, so
+they work the same on every terminal. To reach the terminal's own selection
+buffer, the Edit menu adds **Copy to Terminal** (the selection, or the current
+line) and **Copy File to Terminal** (the whole buffer); both send the text with
+an OSC 52 escape, which the terminal copies to its clipboard. This is the way to
+lift text out of a vedit running over ssh or telnet, where there is no local
+clipboard to share. A terminal that does not implement OSC 52 ignores the
+escape, so the commands are harmless there, just without effect. Setting
+`ui.clipboard = on` also mirrors every ordinary copy, cut, and yank to the
+terminal through OSC 52, so the internal clipboard and the terminal's stay in
+sync.
 
 The menu bar works the MS-EDIT way. Press F10 to activate it, then press a
 menu's highlighted letter (F, E, S, B, V, O, H) to open it, or use the arrow

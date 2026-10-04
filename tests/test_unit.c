@@ -907,6 +907,33 @@ t_regex_engine(Test *t)
 	rx_free(re);
 }
 
+/* Base64 encoder used for the OSC 52 terminal clipboard, against the RFC 4648
+ * test vectors (padding and all). */
+static void
+t_base64(Test *t)
+{
+	static const struct { const char *in; const char *out; } v[] = {
+		{ "", "" },
+		{ "f", "Zg==" },
+		{ "fo", "Zm8=" },
+		{ "foo", "Zm9v" },
+		{ "foob", "Zm9vYg==" },
+		{ "fooba", "Zm9vYmE=" },
+		{ "foobar", "Zm9vYmFy" },
+	};
+	size_t k;
+
+	for (k = 0; k < sizeof(v) / sizeof(v[0]); k++) {
+		char buf[16];
+		size_t n = b64_encode((const unsigned char *)v[k].in,
+		    strlen(v[k].in), buf);
+
+		TAP_CHECKF(t, n == strlen(v[k].out) &&
+		    strcmp(buf, v[k].out) == 0, "b64('%s') = '%s' (want '%s')",
+		    v[k].in, buf, v[k].out);
+	}
+}
+
 static void
 t_bufpick(Test *t)
 {
@@ -1120,6 +1147,7 @@ const Case tap_cases[] = {
 	{ "jsf_include", t_jsf_include },
 	{ "replace", t_replace },
 	{ "regex_engine", t_regex_engine },
+	{ "base64", t_base64 },
 	{ "bufpick", t_bufpick },
 	{ "sym_classify", t_sym_classify },
 	{ "symscan", t_symscan },

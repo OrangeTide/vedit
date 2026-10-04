@@ -4412,10 +4412,63 @@ scr_free(Screen *d)
 	free(d);
 }
 
+/* Base64-encode n bytes of in into out, which must hold ((n + 2) / 3) * 4 + 1
+ * bytes. Returns the encoded length (excluding the trailing NUL). */
+static size_t
+b64_encode(const unsigned char *in, size_t n, char *out)
+{
+	static const char tab[] =
+	    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	size_t i, o = 0;
+
+	for (i = 0; i + 3 <= n; i += 3) {
+		unsigned v = (unsigned)in[i] << 16 | (unsigned)in[i + 1] << 8 |
+		    in[i + 2];
+
+		out[o++] = tab[(v >> 18) & 0x3f];
+		out[o++] = tab[(v >> 12) & 0x3f];
+		out[o++] = tab[(v >> 6) & 0x3f];
+		out[o++] = tab[v & 0x3f];
+	}
+	if (n - i == 1) {
+		unsigned v = (unsigned)in[i] << 16;
+
+		out[o++] = tab[(v >> 18) & 0x3f];
+		out[o++] = tab[(v >> 12) & 0x3f];
+		out[o++] = '=';
+		out[o++] = '=';
+	} else if (n - i == 2) {
+		unsigned v = (unsigned)in[i] << 16 | (unsigned)in[i + 1] << 8;
+
+		out[o++] = tab[(v >> 18) & 0x3f];
+		out[o++] = tab[(v >> 12) & 0x3f];
+		out[o++] = tab[(v >> 6) & 0x3f];
+		out[o++] = '=';
+	}
+	out[o] = '\0';
+	return o;
+}
+
+/* Copy n bytes to the terminal's selection buffer with OSC 52. A terminal that
+ * does not implement it ignores the unknown control string, so this is safe to
+ * emit; whether it takes effect is "on supported terminals". */
 static void
 scr_set_clipboard(Screen *d, const char *utf8, size_t n)
 {
-	(void)d; (void)utf8; (void)n;	/* no OSC 52 on primitive clients */
+	size_t b64cap = ((n + 2) / 3) * 4 + 1, b64len;
+	char *b64;
+
+	if (n == 0 || !d || !d->t)
+		return;
+	b64 = malloc(b64cap);
+	if (!b64)
+		return;
+	b64len = b64_encode((const unsigned char *)utf8, n, b64);
+	scr_str(d->t, "\033]52;c;");	/* OSC 52, clipboard "c" */
+	scr_bytes(d->t, b64, b64len);
+	scr_str(d->t, "\033\\");	/* ST */
+	scr_flush(d->t);
+	free(b64);
 }
 
 /* ---- input decoding ----------------------------------------------------- */
@@ -4842,6 +4895,7 @@ typedef struct editor {
 	size_t		clip_len;	/* length of clip in bytes */
 	int		clip_linewise;	/* clip holds whole lines (vi p/P) */
 	int		clip_block;	/* clip holds a rectangle (draw mode) */
+	int		clip_osc52;	/* mirror every copy/yank through OSC 52 */
 	int		draw_mode;	/* 2D/block draw mode: free cursor + overtype */
 	char		last_find[256];	/* last search string, for repeat */
 	char		last_replace[256]; /* last replacement string */
@@ -6626,7 +6680,7 @@ typedef enum menu_act {
 	MA_NONE, MA_SEP,
 	MA_NEW, MA_OPEN, MA_SAVE, MA_SAVE_AS,
 	MA_BUF_NEXT, MA_BUF_PREV, MA_BUF_LIST, MA_EXIT,
-	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE,
+	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE, MA_OSC_COPY, MA_OSC_COPY_FILE,
 	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_GOTO,
 	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_HEX, MA_DRAW, MA_VI_MODE,
 	MA_HELP, MA_ABOUT,
@@ -6668,6 +6722,9 @@ static const Menuitem mi_edit[] = {
 	{ "Cu&t",	"Ctrl+X",	"dd",		MA_CUT },
 	{ "&Copy",	"Ctrl+C",	"yy",		MA_COPY },
 	{ "&Paste",	"Ctrl+V",	"p",		MA_PASTE },
+	{ "",		"",		"",		MA_SEP },
+	{ "Copy to T&erminal",	 "",	"",	MA_OSC_COPY },
+	{ "Copy &File to Terminal","",	"",	MA_OSC_COPY_FILE },
 };
 static const Menuitem mi_search[] = {
 	{ "&Find...",		"Ctrl+F",	"/",	MA_FIND },
@@ -8988,8 +9045,10 @@ clip_set(Editor *e, char *bytes, size_t len)
 	free(e->clip);
 	e->clip = bytes;
 	e->clip_len = len;
-	/* mirror to the system clipboard; the driver emits OSC 52 */
-	if (len > 0 && len <= OSC52_MAX)
+	/* Mirror to the terminal's clipboard via OSC 52 only when the config
+	 * opted in; by default a copy stays in the internal clipboard so the
+	 * common case never depends on OSC 52 working. */
+	if (e->clip_osc52 && len > 0 && len <= OSC52_MAX)
 		scr_set_clipboard(e->d, bytes, len);
 }
 
@@ -9006,6 +9065,75 @@ current_selection_text(Editor *e, size_t *len)
 		return NULL;
 	sel_bounds(e, &y1, &x1, &y2, &x2);
 	return region_text(e, y1, x1, y2, x2, len);
+}
+
+/* Send len bytes to the terminal's clipboard via OSC 52, reporting what
+ * happened. Unlike clip_set, this always emits (it is the point of the
+ * command) and does not touch the internal clipboard. */
+static void
+osc_copy(Editor *e, const char *bytes, size_t len, const char *what)
+{
+	if (len == 0) {
+		snprintf(e->status, sizeof(e->status), "nothing to copy");
+		return;
+	}
+	if (len > OSC52_MAX) {
+		snprintf(e->status, sizeof(e->status),
+		    "%s is too large for the terminal clipboard (%d bytes max)",
+		    what, OSC52_MAX);
+		return;
+	}
+	scr_set_clipboard(e->d, bytes, len);
+	snprintf(e->status, sizeof(e->status),
+	    "copied %s to the terminal clipboard (%zu bytes)", what, len);
+}
+
+/* Copy the selection, or the current line when nothing is selected, to the
+ * terminal clipboard with OSC 52. */
+static void
+osc_copy_selection(Editor *e)
+{
+	char *text;
+	size_t len = 0;
+
+	if (e->sel_active) {
+		text = current_selection_text(e, &len);
+	} else {
+		size_t ll = 0;
+		const char *s = text_line(e->t, e->cy, &ll);
+
+		text = malloc(ll ? ll : 1);
+		if (text && ll)
+			memcpy(text, s, ll);
+		len = ll;
+	}
+	if (!text) {
+		snprintf(e->status, sizeof(e->status), "out of memory");
+		return;
+	}
+	osc_copy(e, text, len, e->sel_active ? "selection" : "line");
+	free(text);
+}
+
+/* Copy the whole buffer to the terminal clipboard with OSC 52. */
+static void
+osc_copy_file(Editor *e)
+{
+	size_t nlines = text_lines(e->t), lastlen = 0, len = 0;
+	char *text;
+
+	if (nlines == 0) {
+		snprintf(e->status, sizeof(e->status), "nothing to copy");
+		return;
+	}
+	text_line(e->t, nlines - 1, &lastlen);
+	text = region_text(e, 0, 0, nlines - 1, lastlen, &len);
+	if (!text) {
+		snprintf(e->status, sizeof(e->status), "out of memory");
+		return;
+	}
+	osc_copy(e, text, len, "file");
+	free(text);
 }
 
 /* Carry out one command, returning what the main loop must do next. */
@@ -11165,6 +11293,12 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_PASTE:
 		(void)ed_dispatch(e, CMD_PASTE, NULL);
 		break;
+	case MA_OSC_COPY:
+		osc_copy_selection(e);
+		break;
+	case MA_OSC_COPY_FILE:
+		osc_copy_file(e);
+		break;
 	case MA_FIND:
 		find_prompt(e);
 		break;
@@ -12295,6 +12429,7 @@ ed_apply_config(Editor *e)
 	e->wrap = cfg_bool(g_cfg, "ui.wrap", e->wrap);
 	e->show_lineno = cfg_bool(g_cfg, "ui.number", e->show_lineno);
 	e->hl_on = cfg_bool(g_cfg, "syntax.enable", e->hl_on);
+	e->clip_osc52 = cfg_bool(g_cfg, "ui.clipboard", e->clip_osc52);
 	s = cfg_get(g_cfg, "edit.mode");
 	if (s) {
 		if (strcmp(s, "vi") == 0)
