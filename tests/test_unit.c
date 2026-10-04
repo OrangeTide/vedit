@@ -934,6 +934,99 @@ t_base64(Test *t)
 	}
 }
 
+/* Write raw bytes to a fresh temp file, returning its path in `path`. */
+static int
+write_tmp(const char *bytes, size_t n, char *path, size_t pathsz)
+{
+	int fd;
+	FILE *f;
+
+	snprintf(path, pathsz, "/tmp/vedit_eolXXXXXX");
+	fd = mkstemp(path);
+	if (fd < 0)
+		return -1;
+	f = fdopen(fd, "wb");
+	if (!f) {
+		close(fd);
+		return -1;
+	}
+	if (n)
+		fwrite(bytes, 1, n, f);
+	fclose(f);
+	return 0;
+}
+
+/* Read a whole file into buf; returns the byte count, or -1. */
+static long
+read_file(const char *path, char *buf, size_t cap)
+{
+	FILE *f = fopen(path, "rb");
+	size_t n;
+
+	if (!f)
+		return -1;
+	n = fread(buf, 1, cap, f);
+	fclose(f);
+	return (long)n;
+}
+
+/* Line-ending detection on load and emission on save, for LF, CRLF, and NUL. */
+static void
+t_eol(Test *t)
+{
+	char path[64], buf[32];
+	Text *tx;
+	size_t l0 = 0, l1 = 0;
+	const char *s0, *s1;
+
+	/* CRLF is detected and the trailing CR is stripped from each line */
+	TAP_ASSERT(t, write_tmp("a\r\nbb\r\n", 7, path, sizeof(path)) == 0);
+	tx = text_new();
+	TAP_ASSERT(t, tx != NULL && text_load(tx, path) == OK);
+	TAP_CHECKF(t, text_eol(tx) == EOL_CRLF, "eol %d", text_eol(tx));
+	TAP_CHECKF(t, text_lines(tx) == 2, "lines %zu", text_lines(tx));
+	s0 = text_line(tx, 0, &l0);
+	s1 = text_line(tx, 1, &l1);
+	TAP_CHECKF(t, l0 == 1 && s0[0] == 'a', "line0 len %zu", l0);
+	TAP_CHECKF(t, l1 == 2 && s1[0] == 'b', "line1 len %zu", l1);
+	TAP_CHECK(t, text_final_newline(tx));
+	remove(path);
+	text_free(tx);
+
+	/* a NUL byte marks NUL-separated records */
+	TAP_ASSERT(t, write_tmp("x\0yz\0", 5, path, sizeof(path)) == 0);
+	tx = text_new();
+	TAP_ASSERT(t, tx != NULL && text_load(tx, path) == OK);
+	TAP_CHECKF(t, text_eol(tx) == EOL_NUL, "eol %d", text_eol(tx));
+	TAP_CHECKF(t, text_lines(tx) == 2, "lines %zu", text_lines(tx));
+	remove(path);
+	text_free(tx);
+
+	/* plain LF, no trailing terminator */
+	TAP_ASSERT(t, write_tmp("one\ntwo", 7, path, sizeof(path)) == 0);
+	tx = text_new();
+	TAP_ASSERT(t, tx != NULL && text_load(tx, path) == OK);
+	TAP_CHECK(t, text_eol(tx) == EOL_LF);
+	TAP_CHECKF(t, text_lines(tx) == 2, "lines %zu", text_lines(tx));
+	TAP_CHECK(t, !text_final_newline(tx));
+
+	/* set CRLF and save: the content keeps no trailing terminator */
+	text_set_eol(tx, EOL_CRLF);
+	TAP_CHECK(t, text_dirty(tx));		/* the change dirtied the buffer */
+	TAP_ASSERT(t, text_save(tx, path) == OK);
+	TAP_CHECKF(t, read_file(path, buf, sizeof(buf)) == 8 &&
+	    memcmp(buf, "one\r\ntwo", 8) == 0, "crlf save");
+
+	/* set NUL and save */
+	text_set_eol(tx, EOL_NUL);
+	TAP_ASSERT(t, text_save(tx, path) == OK);
+	TAP_CHECKF(t, read_file(path, buf, sizeof(buf)) == 7 &&
+	    memcmp(buf, "one\0two", 7) == 0, "nul save");
+
+	remove(path);
+	text_free(tx);
+}
+
 #ifndef VEDIT_NO_TOOLS
 /* The $(...) substitution the per-language tool commands use. */
 static void
@@ -1251,6 +1344,7 @@ const Case tap_cases[] = {
 	{ "replace", t_replace },
 	{ "regex_engine", t_regex_engine },
 	{ "base64", t_base64 },
+	{ "eol", t_eol },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_expand", t_tool_expand },
 	{ "tool_parse", t_tool_parse },

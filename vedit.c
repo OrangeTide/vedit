@@ -5096,11 +5096,20 @@ struct estack {
 	size_t		cap;
 };
 
+/* Line-ending style: how lines are separated on disk. The in-memory lines
+ * never hold the terminator; load splits it off and save writes it back. */
+enum eol {
+	EOL_LF,			/* "\n" (Unix) */
+	EOL_CRLF,		/* "\r\n" (DOS) */
+	EOL_NUL,		/* "\0" (NUL-separated records) */
+};
+
 struct text {
 	Line	*lines;
 	size_t		nlines;
 	size_t		cap;
-	int		final_newline;	/* source ended with a newline */
+	int		final_newline;	/* source ended with a line terminator */
+	int		eol;		/* enum eol: the line-ending style */
 	int		dirty;
 	size_t		rev;		/* bumped on every primitive mutation */
 
@@ -5233,6 +5242,7 @@ text_new(void)
 		return NULL;
 	}
 	t->final_newline = 0;
+	t->eol = EOL_LF;		/* a new buffer defaults to Unix line endings */
 	t->dirty = 0;
 	return t;
 }
@@ -5299,27 +5309,59 @@ text_load(Text *t, const char *path)
 	t->can_coalesce = 0;
 	t->group_depth = 0;
 	t->cur_group = 0;
-	t->final_newline = (len > 0 && data[len - 1] == '\n');
 
-	start = 0;
-	for (i = 0; i < len; i++) {
-		if (data[i] == '\n') {
-			if (lines_insert_at(t, t->nlines, data + start,
-			    i - start) != OK) {
+	/* Detect the line-ending style: a NUL byte means NUL-separated records,
+	 * otherwise a "\r\n" before the first newline means DOS, else Unix. The
+	 * separator is one byte ('\n' or '\0'); the trailing '\r' of a DOS line
+	 * is stripped from each line below. */
+	t->eol = EOL_LF;
+	{
+		char sep = '\n';
+
+		for (i = 0; i < len; i++) {
+			if (data[i] == '\0') {
+				t->eol = EOL_NUL;
+				sep = '\0';
+				break;
+			}
+			if (data[i] == '\n') {
+				if (i > 0 && data[i - 1] == '\r')
+					t->eol = EOL_CRLF;
+				break;
+			}
+		}
+		t->final_newline = (len > 0 && data[len - 1] == sep);
+
+		start = 0;
+		for (i = 0; i < len; i++) {
+			size_t llen;
+
+			if (data[i] != sep)
+				continue;
+			llen = i - start;
+			if (t->eol == EOL_CRLF && llen > 0 &&
+			    data[start + llen - 1] == '\r')
+				llen--;		/* drop the DOS line's trailing CR */
+			if (lines_insert_at(t, t->nlines, data + start, llen)
+			    != OK) {
 				free(data);
 				errno = ENOMEM;
 				return ERR;
 			}
 			start = i + 1;
 		}
-	}
-	/* trailing bytes with no newline form a final line */
-	if (start < len) {
-		if (lines_insert_at(t, t->nlines, data + start,
-		    len - start) != OK) {
-			free(data);
-			errno = ENOMEM;
-			return ERR;
+		/* trailing bytes with no terminator form a final line */
+		if (start < len) {
+			size_t llen = len - start;
+
+			if (t->eol == EOL_CRLF && data[start + llen - 1] == '\r')
+				llen--;
+			if (lines_insert_at(t, t->nlines, data + start, llen)
+			    != OK) {
+				free(data);
+				errno = ENOMEM;
+				return ERR;
+			}
 		}
 	}
 	free(data);
@@ -5336,6 +5378,9 @@ text_save(Text *t, const char *path)
 	FILE *fp;
 	size_t i;
 	int saved_errno;
+	const char *term = (t->eol == EOL_CRLF) ? "\r\n" :
+	    (t->eol == EOL_NUL) ? "\0" : "\n";
+	size_t termlen = (t->eol == EOL_CRLF) ? 2 : 1;
 
 	fp = fopen(path, "wb");
 	if (!fp)
@@ -5346,10 +5391,10 @@ text_save(Text *t, const char *path)
 		    fwrite(t->lines[i].buf, 1, t->lines[i].len, fp)
 		    != t->lines[i].len)
 			goto werr;
-		/* newline between lines, and after the last only when the
-		 * source carried a trailing newline */
+		/* a terminator between lines, and after the last only when the
+		 * source carried a trailing terminator */
 		if (i + 1 < t->nlines || t->final_newline) {
-			if (fputc('\n', fp) == EOF)
+			if (fwrite(term, 1, termlen, fp) != termlen)
 				goto werr;
 		}
 	}
@@ -5403,6 +5448,35 @@ int
 text_final_newline(const Text *t)
 {
 	return t->final_newline;
+}
+
+/* The buffer's line-ending style (enum eol). */
+int
+text_eol(const Text *t)
+{
+	return t->eol;
+}
+
+/* Set the line-ending style. Marks the buffer dirty when it changes, since the
+ * bytes written to disk will differ. */
+void
+text_set_eol(Text *t, int eol)
+{
+	if (eol != t->eol) {
+		t->eol = eol;
+		t->dirty = 1;
+	}
+}
+
+/* A short name for a line-ending style, for the status bar and messages. */
+static const char *
+eol_name(int eol)
+{
+	switch (eol) {
+	case EOL_CRLF:	return "CRLF";
+	case EOL_NUL:	return "NUL";
+	default:	return "LF";
+	}
 }
 
 size_t
@@ -6719,7 +6793,8 @@ typedef enum menu_act {
 	MA_BUF_NEXT, MA_BUF_PREV, MA_BUF_LIST, MA_EXIT,
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE, MA_OSC_COPY, MA_OSC_COPY_FILE,
 	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_GOTO,
-	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_HEX, MA_DRAW, MA_VI_MODE,
+	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_HEX, MA_DRAW,
+	MA_VI_MODE,
 #ifndef VEDIT_NO_TOOLS
 	MA_COMPILE, MA_MAKE, MA_RUN, MA_VIEW_OUTPUT, MA_ERR_NEXT, MA_ERR_PREV,
 #endif
@@ -6778,6 +6853,7 @@ static const Menuitem mi_view[] = {
 	{ "&Color Scheme",	"",	"",	MA_SCHEME },
 	{ "&Line Numbers",	"",	":set nu",	MA_LINENO },
 	{ "&Word Wrap",		"",	":set wrap",	MA_WRAP },
+	{ "Line &Endings",	"",	":set ff",	MA_EOL },
 	{ "&Hex Dump",		"",	"",	MA_HEX },
 };
 static const Menuitem mi_options[] = {
@@ -7199,17 +7275,20 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 	int row = e->rows - 1;
 	uint16_t at = p->reverse_bars ? ATTR_REVERSE : 0;
 	char right[80];
-	char flags[16];
+	char flags[32];
 	int rlen;
 
 	scr_fill(e->d, row, 0, e->cols, ' ', p->bar_fg, p->bar_bg, at);
 
-	/* compact indicators for the sticky display toggles */
+	/* compact indicators for the sticky display toggles, then the line-ending
+	 * style, which is always shown */
 	flags[0] = '\0';
 	if (e->wrap)
 		strcat(flags, "WRAP ");
 	if (e->show_lineno)
 		strcat(flags, "NUM ");
+	strcat(flags, eol_name(text_eol(e->t)));
+	strcat(flags, "  ");
 
 	if (e->status[0]) {
 		scr_text(e->d, row, 1, e->status, p->bar_fg, p->bar_bg, at);
@@ -12203,6 +12282,15 @@ run_menu_act(Editor *e, Menuact act)
 		snprintf(e->status, sizeof(e->status), "word wrap %s",
 		    e->wrap ? "on" : "off");
 		break;
+	case MA_EOL: {
+		/* cycle LF -> CRLF -> NUL */
+		int next = (text_eol(e->t) + 1) % 3;
+
+		text_set_eol(e->t, next);
+		snprintf(e->status, sizeof(e->status), "line endings: %s",
+		    eol_name(next));
+		break;
+	}
 	case MA_HEX:
 		e->hex_view = !e->hex_view;
 		e->hex_top = 0;
@@ -17212,7 +17300,27 @@ vi_ex_exec(Editor *e, char *buf)
 			e->wrap = 0;
 		else if (strcmp(arg, "wrap!") == 0 || strcmp(arg, "invwrap") == 0)
 			e->wrap = !e->wrap;
-		else {
+		else if (strncmp(arg, "ff=", 3) == 0 ||
+		    strncmp(arg, "fileformat=", 11) == 0) {
+			const char *val = strchr(arg, '=') + 1;
+			int eol;
+
+			if (strcmp(val, "unix") == 0 || strcmp(val, "lf") == 0)
+				eol = EOL_LF;
+			else if (strcmp(val, "dos") == 0 || strcmp(val, "crlf") == 0)
+				eol = EOL_CRLF;
+			else if (strcmp(val, "nul") == 0)
+				eol = EOL_NUL;
+			else {
+				snprintf(e->status, sizeof(e->status),
+				    "E474: invalid fileformat: %.20s", val);
+				return REQ_CONTINUE;
+			}
+			text_set_eol(e->t, eol);
+			snprintf(e->status, sizeof(e->status),
+			    "fileformat=%s", eol_name(eol));
+			return REQ_CONTINUE;
+		} else {
 			snprintf(e->status, sizeof(e->status),
 			    "E518: unknown option: %.40s", arg);
 			return REQ_CONTINUE;

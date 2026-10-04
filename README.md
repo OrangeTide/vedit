@@ -288,6 +288,18 @@ while it is on.
 While either toggle is on, the status bar shows a compact flag at the right,
 `WRAP` for word wrap and `NUM` for line numbers, next to the line and column.
 
+### Line endings
+
+**View > Line Endings** sets how lines are separated on disk, cycling through
+`LF` (Unix, `\n`), `CRLF` (DOS, `\r\n`), and `NUL` (NUL-separated records, `\0`).
+The style is detected when a file is loaded: a NUL byte means NUL-separated, a
+`\r\n` means DOS, and anything else is Unix. A new buffer defaults to LF. The
+in-memory text never holds the terminator, so changing the style only changes
+what a save writes. Changing it marks the buffer modified, since the bytes on
+disk will differ. In vi keys it is `:set ff=unix|dos|nul` (`:set fileformat=`
+also works). The current style always shows in the status bar, next to the line
+and column.
+
 ### File browser
 
 **File > Open...** shows a modal file browser instead of a bare filename
@@ -607,7 +619,8 @@ vedit has a text buffer with undo and redo, the modeless and vi personalities,
 the MS-EDIT chrome (menu bar, frame, scrollbars, dialogs), regex find and
 replace, selection and an internal clipboard, goto-line, multiple buffers, a hex
 view, a 2D/block draw mode, per-language build commands with a quickfix error
-list, and lightweight syntax highlighting. It draws through a self-contained ANSI
+list, selectable line endings (LF, CRLF, NUL), and lightweight syntax
+highlighting. It draws through a self-contained ANSI
 renderer over the io vtable, and decodes the keyboard with a compact decoder that
 covers UTF-8 text, control keys, arrows, navigation keys, function keys, CSI
 modifiers, Alt+letter, and bracketed paste.
