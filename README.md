@@ -9,6 +9,8 @@ ssh link to a simple terminal emulator such as a MUD client.
 vedit is one source file (`vedit.c`) plus a public header for embedding
 (`vedit.h`).
 
+![Editing a C file, with syntax highlighting and the MS-EDIT chrome](docs/shot-edit.png)
+
 `docs/demo.html` is a self-contained page that illustrates the rendering work
 (the scroll fast path, the color schemes, the line-number gutter, word wrap, and
 the unified palette), with mockups drawn from vedit's real output.
@@ -404,6 +406,8 @@ terminal emulators capture Alt+letter for their own menus, so F10 then a letter
 is the reliable path. Inside an open menu, each item's highlighted letter runs
 it.
 
+![The Edit menu open, with the terminal-clipboard commands](docs/shot-menu.png)
+
 ### vi keys
 
 Press F2 to switch to the vi personality. NORMAL mode supports `h j k l`, `0 ^
@@ -446,6 +450,8 @@ personality), the Options menu, or the vi `:draw` command. The status line shows
 `-- DRAW --` while it is on, and leaving it restores normal insert editing. A
 walkthrough is built in: open Help > Tutorial, or press `t` on the F1
 key-bindings screen.
+
+![Draw mode, with the free cursor over a box-and-arrow diagram](docs/shot-draw.png)
 
 In draw mode:
 
