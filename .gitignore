@@ -3,3 +3,9 @@
 /tests/taptest
 /tests/test_unit
 /tests/test_render
+/tests/torturet
+/tests/*-asan
+/tests/*-ubsan
+/tests/*.gcno
+/tests/*.gcda
+/tests/*.gcov

@@ -156,6 +156,168 @@ t_status_flags(Test *t)
 	memio_free(&m);
 }
 
+#ifndef VEDIT_NO_TOOLS
+/* A fake tool runner, so the IDE-command tests drive the whole event loop
+ * (key -> dispatch -> command -> output pane) without forking a shell. */
+static const char *g_fake_output;	/* bytes run_capture emits */
+static int g_fake_rc;			/* exit status it returns */
+static char g_fake_cmd[256];		/* the command line it was handed */
+static char g_fake_dir[PATH_MAX];	/* the directory it was handed */
+static int g_fake_fg;			/* run_foreground was called */
+
+static int
+fake_capture(void *ctx, const char *cmd, const char *dir,
+    void (*emit)(void *sink, const char *buf, size_t n), void *sink)
+{
+	(void)ctx;
+	snprintf(g_fake_cmd, sizeof(g_fake_cmd), "%s", cmd);
+	snprintf(g_fake_dir, sizeof(g_fake_dir), "%s", dir ? dir : "");
+	if (g_fake_output)
+		emit(sink, g_fake_output, strlen(g_fake_output));
+	return g_fake_rc;
+}
+
+static int
+fake_foreground(void *ctx, const char *cmd, const char *dir)
+{
+	(void)ctx;
+	(void)dir;
+	g_fake_fg = 1;
+	snprintf(g_fake_cmd, sizeof(g_fake_cmd), "%s", cmd);
+	return 0;
+}
+
+static const struct vedit_tool_api fake_tools = {
+	NULL, fake_capture, fake_foreground,
+};
+
+/* Load a one-section config from an in-memory string (cfg_load_mem mutates its
+ * input, so it is handed a private copy). */
+static Cfg *
+cfg_from_text(const char *text)
+{
+	Cfg *c = vedit_cfg_new();
+	char *dup;
+
+	if (!c)
+		return NULL;
+	dup = cfg_dup(text);
+	if (!dup) {
+		vedit_cfg_free(c);
+		return NULL;
+	}
+	cfg_load_mem(c, dup);
+	free(dup);
+	return c;
+}
+
+/* F9 (Make): the whole path end to end. The key reaches the dispatcher, the
+ * per-language build command is expanded and run, the captured output is parsed
+ * into the quickfix list, and the output pane renders it. The pane and then the
+ * loop both exit on end of input. */
+static void
+t_tool_f9_make(Test *t)
+{
+	const char keys[] = "\033[20~";	/* F9 */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Cfg *cfg;
+
+	g_fake_output =
+	    "gcc -c test.c\n"
+	    "test.c:3:12: error: 'bad' undeclared\n"
+	    "other.c:7: warning: unused variable\n";
+	g_fake_rc = 1;
+	g_fake_cmd[0] = '\0';
+	g_fake_fg = 0;
+
+	cfg = cfg_from_text("[command \"c\"]\n\tbuild = make $(filenoext)\n");
+	TAP_ASSERT(t, cfg != NULL);
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config(v, cfg);
+	vedit_set_tools(v, &fake_tools);
+	vedit_open(v, "test.c");		/* named .c buffer: syntax is C */
+
+	vedit_run(v);
+
+	/* $(filenoext) expanded to the base name without extension */
+	TAP_CHECKF(t, strcmp(g_fake_cmd, "make test") == 0,
+	    "ran command '%s'", g_fake_cmd);
+	TAP_CHECKF(t, g_fake_fg == 0, "capture command must not run foreground");
+
+	/* both diagnostics were parsed, with and without a column */
+	TAP_CHECKF(t, v->e.tool_nerr == 2, "diagnostics %d", v->e.tool_nerr);
+	if (v->e.tool_nerr >= 2) {
+		TAP_CHECKF(t, strcmp(v->e.tool_errs[0].file, "test.c") == 0 &&
+		    v->e.tool_errs[0].line == 3 && v->e.tool_errs[0].col == 12,
+		    "err0 %s:%zu:%zu", v->e.tool_errs[0].file,
+		    v->e.tool_errs[0].line, v->e.tool_errs[0].col);
+		TAP_CHECKF(t, strcmp(v->e.tool_errs[1].file, "other.c") == 0 &&
+		    v->e.tool_errs[1].line == 7 && v->e.tool_errs[1].col == 0,
+		    "err1 %s:%zu:%zu", v->e.tool_errs[1].file,
+		    v->e.tool_errs[1].line, v->e.tool_errs[1].col);
+	}
+
+	/* the output pane rendered the captured text */
+	TAP_CHECK(t, m.out && strstr(m.out, "undeclared") != NULL);
+
+	vedit_free(v);
+	memio_free(&m);
+	/* vedit_set_config keeps the config in a global; drop that reference
+	 * before freeing it, since the next case builds another editor. */
+	g_cfg = NULL;
+	vedit_cfg_free(cfg);
+}
+
+/* Ctrl+F9 (Run) with an interactive command takes the foreground branch: it
+ * runs through run_foreground and opens no capture pane. */
+static void
+t_tool_ctrl_f9_run(Test *t)
+{
+	const char keys[] = "\033[20;5~";	/* Ctrl+F9 */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Cfg *cfg;
+
+	g_fake_output = NULL;
+	g_fake_rc = 0;
+	g_fake_cmd[0] = '\0';
+	g_fake_fg = 0;
+
+	cfg = cfg_from_text("[command \"c\"]\n"
+	    "\trun = ./$(filenoext)\n"
+	    "\trun.interactive = on\n");
+	TAP_ASSERT(t, cfg != NULL);
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config(v, cfg);
+	vedit_set_tools(v, &fake_tools);
+	vedit_open(v, "test.c");
+
+	vedit_run(v);
+
+	TAP_CHECKF(t, g_fake_fg == 1, "run.interactive did not run foreground");
+	TAP_CHECKF(t, strcmp(g_fake_cmd, "./test") == 0,
+	    "ran command '%s'", g_fake_cmd);
+	TAP_CHECKF(t, v->e.tool_nerr == 0, "foreground run left %d diagnostics",
+	    v->e.tool_nerr);
+
+	vedit_free(v);
+	memio_free(&m);
+	g_cfg = NULL;			/* see t_tool_f9_make */
+	vedit_cfg_free(cfg);
+}
+#endif /* VEDIT_NO_TOOLS */
+
 const Case tap_cases[] = {
 	{ "cursor_end_home", t_cursor_end_home },
 	{ "cursor_home", t_cursor_home },
@@ -163,5 +325,9 @@ const Case tap_cases[] = {
 	{ "nowrap_truncates_tail", t_nowrap_truncates_tail },
 	{ "gutter_numbers", t_gutter_numbers },
 	{ "status_flags", t_status_flags },
+#ifndef VEDIT_NO_TOOLS
+	{ "tool_f9_make", t_tool_f9_make },
+	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },
+#endif
 	{ NULL, NULL },
 };
