@@ -217,6 +217,7 @@ vedit_cfg_load(Cfg *c, const char *path)
 		char *base, *tmp;
 
 		line++;
+		buf[strcspn(buf, "\r\n")] = '\0';	/* drop the line terminator */
 		/* strip a comment, honoring quoted regions */
 		for (tmp = buf; *tmp; tmp++) {
 			if (*tmp == '#' || *tmp == ';') {

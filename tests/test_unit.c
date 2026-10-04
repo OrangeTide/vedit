@@ -358,11 +358,14 @@ t_cfg_parse(Test *t)
 {
 	static const char *text =
 	    "# a comment\n"
+	    "\n"			/* a blank line must not fail the parse */
 	    "ui.scheme = dos\n"		/* shorthand, overwritten below */
 	    "edit.mode = vi\n"
+	    "\n"
 	    "[ui]\n"
 	    "  scheme = black ; trailing comment\n"
 	    "  wrap = on\n"
+	    "\t\n"			/* a whitespace-only line is also blank */
 	    "[theme \"midnight\"]\n"
 	    "  content.fg = 250\n"
 	    "  title.fg = \"#ff8000\"\n";	/* quoted: '#' is not a comment */
