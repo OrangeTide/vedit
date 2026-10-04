@@ -165,6 +165,9 @@ then selects, alongside the three built-ins:
     borderless   = on         # drop the right border so text reaches the edge
 ```
 
+A `[command "<lang>"]` section sets the per-language build commands (see
+[Build commands](#build-commands-a-primitive-ide)).
+
 A color is `default` (the terminal's own color), a 0-255 palette index,
 `#rrggbb`, or one of the sixteen ANSI names (`red`, `cyan`, ..., with a
 `bright-` prefix for 8-15). A `#rrggbb` value must be quoted, since an unquoted
@@ -400,7 +403,7 @@ terminal through OSC 52, so the internal clipboard and the terminal's stay in
 sync.
 
 The menu bar works the MS-EDIT way. Press F10 to activate it, then press a
-menu's highlighted letter (F, E, S, B, V, O, H) to open it, or use the arrow
+menu's highlighted letter (F, E, S, V, O, C, R, H) to open it, or use the arrow
 keys and Enter. Alt+letter opens a menu in one step, but note that many desktop
 terminal emulators capture Alt+letter for their own menus, so F10 then a letter
 is the reliable path. Inside an open menu, each item's highlighted letter runs
@@ -441,6 +444,64 @@ matches within a single line. The engine lives in `vedit.c` between the
 block.
 
 [rx]: https://github.com/OrangeTide/rx
+
+### Build commands (a primitive IDE)
+
+vedit can compile, build, and run the file you are editing, with a Turbo C++ key
+set that also matches MS-EDIT. The commands are per language, taken from the
+config, so each file type gets its own compile and run lines. The **Compile** and
+**Run** menus and these keys drive them:
+
+| Key        | Command     | What it does                                  |
+|------------|-------------|-----------------------------------------------|
+| `Alt+F9`   | Compile     | compile the current file                      |
+| `F9`       | Make        | build the project                             |
+| `Ctrl+F9`  | Run         | run the program                               |
+| `Alt+F5`   | View Output | reopen the last captured output pane          |
+| `F4`       | Next Error  | jump to the next diagnostic                   |
+| `Shift+F4` | Prev Error  | jump to the previous diagnostic               |
+
+Define the commands in a `[command "<lang>"]` section, where `<lang>` is the
+syntax language name of the file (for example `c` or `sh`). Each command line may
+use these variables, expanded before the command runs:
+
+| Variable         | Expands to                                  |
+|------------------|---------------------------------------------|
+| `$(file)`        | the file path                               |
+| `$(filename)`    | the base name, with extension               |
+| `$(filenoext)`   | the base name, without extension            |
+| `$(fileext)`     | the extension, without the dot              |
+| `$(dir)`         | the directory holding the file              |
+
+A command runs in the file's directory, so the base-name forms are usually what
+you want. For example:
+
+```ini
+[command "c"]
+    compile = gcc -Wall -c $(filename) -o $(filenoext).o
+    build   = make
+    run     = ./$(filenoext)
+    run.interactive = on
+```
+
+Compile and Make capture the command's output into a scrollable pane. Output that
+looks like a gcc or clang diagnostic (`file:line:col: ...` or `file:line: ...`)
+becomes a jump target: press Enter on it in the pane, or use `F4` and `Shift+F4`
+from the editor to step through the diagnostics. A diagnostic in another file
+opens or switches to that file. A command marked with a sibling
+`<command>.interactive = on` key runs on the real terminal instead, for a program
+that reads input or draws its own screen. vedit leaves the alternate screen while
+it runs and returns when it exits.
+
+Finding headers across a large project would need to read a
+`compile_commands.json` database. vedit has no JSON parser, so it does not do
+this today. Point the commands at a `Makefile` or a wrapper script when the build
+needs include paths or flags that a single command line cannot carry.
+
+The whole subsystem is compiled in by default and can be dropped by building with
+`-DVEDIT_NO_TOOLS`, which removes the commands, the menus, and the output pane.
+An embedding host supplies its own command runner (or none) through
+`vedit_set_tools`; see [Embedding in a host](#embedding-in-a-host-for-example-a-mud).
 
 ## Draw mode (ASCII art and maps)
 
@@ -545,14 +606,14 @@ push-style state machine is not provided.
 vedit has a text buffer with undo and redo, the modeless and vi personalities,
 the MS-EDIT chrome (menu bar, frame, scrollbars, dialogs), regex find and
 replace, selection and an internal clipboard, goto-line, multiple buffers, a hex
-view, a 2D/block draw mode, and lightweight syntax highlighting. It draws through
-a self-contained ANSI renderer over the io vtable, and decodes the keyboard with
-a compact decoder that covers UTF-8 text, control keys, arrows, navigation keys,
-function keys, CSI modifiers, Alt+letter, and bracketed paste.
+view, a 2D/block draw mode, per-language build commands with a quickfix error
+list, and lightweight syntax highlighting. It draws through a self-contained ANSI
+renderer over the io vtable, and decodes the keyboard with a compact decoder that
+covers UTF-8 text, control keys, arrows, navigation keys, function keys, CSI
+modifiers, Alt+letter, and bracketed paste.
 
 It deliberately leaves out, as overworked for a primitive-terminal editor:
 
-- build / compile / make commands and a quickfix error list,
 - mouse input,
 - a differential compositor and terminfo capability lookup.
 

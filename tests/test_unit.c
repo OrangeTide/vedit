@@ -934,6 +934,109 @@ t_base64(Test *t)
 	}
 }
 
+#ifndef VEDIT_NO_TOOLS
+/* The $(...) substitution the per-language tool commands use. */
+static void
+t_tool_expand(Test *t)
+{
+	char *s;
+
+	/* Commands run in the file's directory, so filename/filenoext are the
+	 * bare basename; file keeps the full path and dir names the directory. */
+	s = tool_expand("gcc -c $(filename) -o $(filenoext).o", "src/main.c");
+	TAP_ASSERT(t, s != NULL);
+	TAP_CHECKF(t, strcmp(s, "gcc -c main.c -o main.o") == 0,
+	    "expand: '%s'", s);
+	free(s);
+
+	s = tool_expand("$(file) $(fileext) $(dir)", "src/main.c");
+	TAP_ASSERT(t, s != NULL);
+	TAP_CHECKF(t, strcmp(s, "src/main.c c src") == 0, "parts: '%s'", s);
+	free(s);
+
+	/* no directory: dir is ".", so $(file) gets a leading "./" */
+	s = tool_expand("$(file) $(dir)", "note.txt");
+	TAP_ASSERT(t, s != NULL);
+	TAP_CHECKF(t, strcmp(s, "./note.txt .") == 0, "nodir: '%s'", s);
+	free(s);
+
+	/* an unknown $(name) is copied through verbatim */
+	s = tool_expand("x $(bogus) y", "a.c");
+	TAP_ASSERT(t, s != NULL);
+	TAP_CHECKF(t, strcmp(s, "x $(bogus) y") == 0, "unknown: '%s'", s);
+	free(s);
+}
+
+/* The gcc/clang diagnostic parser that feeds the quickfix list. */
+static void
+t_tool_parse(Test *t)
+{
+	Editor e;
+	const char *out =
+	    "gcc -c main.c\n"
+	    "main.c:10:5: error: 'x' undeclared\n"
+	    "util.h:3: warning: unused\n"
+	    "make: *** [all] Error 1\n";
+
+	editor_init(&e);
+	sb_append(&e.tool_raw, &e.tool_rawlen, &e.tool_rawcap, out, strlen(out));
+	tool_parse_output(&e);
+
+	TAP_CHECKF(t, e.tool_nlines == 4, "lines %d", e.tool_nlines);
+	TAP_CHECKF(t, e.tool_nerr == 2, "errors %d", e.tool_nerr);
+	if (e.tool_nerr == 2) {
+		TAP_CHECKF(t, strcmp(e.tool_errs[0].file, "main.c") == 0 &&
+		    e.tool_errs[0].line == 10 && e.tool_errs[0].col == 5 &&
+		    e.tool_errs[0].outline == 1, "err0 %s:%zu:%zu@%d",
+		    e.tool_errs[0].file, e.tool_errs[0].line,
+		    e.tool_errs[0].col, e.tool_errs[0].outline);
+		TAP_CHECKF(t, strcmp(e.tool_errs[1].file, "util.h") == 0 &&
+		    e.tool_errs[1].line == 3 && e.tool_errs[1].col == 0 &&
+		    e.tool_errs[1].outline == 2, "err1 %s:%zu:%zu@%d",
+		    e.tool_errs[1].file, e.tool_errs[1].line,
+		    e.tool_errs[1].col, e.tool_errs[1].outline);
+	}
+	tool_free(&e);
+}
+/* The standalone binary's shell spawner: capture stdout, and the exit status. */
+struct capbuf { char data[256]; size_t len; };
+
+static void
+cap_emit(void *sink, const char *buf, size_t n)
+{
+	struct capbuf *c = sink;
+
+	if (c->len + n < sizeof(c->data)) {
+		memcpy(c->data + c->len, buf, n);
+		c->len += n;
+		c->data[c->len] = '\0';
+	}
+}
+
+static void
+t_tool_run(Test *t)
+{
+	struct capbuf c = { {0}, 0 };
+	int rc;
+
+	rc = cli_run_capture(NULL, "printf 'hi:%s\\n' there", ".", cap_emit, &c);
+	TAP_CHECKF(t, rc == 0, "printf exit %d", rc);
+	TAP_CHECKF(t, strcmp(c.data, "hi:there\n") == 0, "out '%s'", c.data);
+
+	/* the child's directory is the dir argument */
+	c.len = 0;
+	c.data[0] = '\0';
+	rc = cli_run_capture(NULL, "basename \"$(pwd)\"", "/tmp", cap_emit, &c);
+	TAP_CHECKF(t, rc == 0 && strcmp(c.data, "tmp\n") == 0, "pwd '%s'", c.data);
+
+	/* a nonzero exit status is reported */
+	c.len = 0;
+	c.data[0] = '\0';
+	rc = cli_run_capture(NULL, "exit 3", ".", cap_emit, &c);
+	TAP_CHECKF(t, rc == 3, "exit-status %d", rc);
+}
+#endif /* VEDIT_NO_TOOLS */
+
 static void
 t_bufpick(Test *t)
 {
@@ -1148,6 +1251,11 @@ const Case tap_cases[] = {
 	{ "replace", t_replace },
 	{ "regex_engine", t_regex_engine },
 	{ "base64", t_base64 },
+#ifndef VEDIT_NO_TOOLS
+	{ "tool_expand", t_tool_expand },
+	{ "tool_parse", t_tool_parse },
+	{ "tool_run", t_tool_run },
+#endif
 	{ "bufpick", t_bufpick },
 	{ "sym_classify", t_sym_classify },
 	{ "symscan", t_symscan },

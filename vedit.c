@@ -31,6 +31,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -4637,6 +4638,12 @@ tkbd_decode(struct tkbd_seq *seq, const unsigned char *buf, int len)
 		case 'D': seq_simple(seq, TKBD_KEY_LEFT, mod); return i + 1;
 		case 'H': seq_simple(seq, TKBD_KEY_HOME, mod); return i + 1;
 		case 'F': seq_simple(seq, TKBD_KEY_END, mod); return i + 1;
+		/* Modified F1-F4 arrive as CSI 1;mod P..S (xterm). The
+		 * unmodified forms come through SS3 above. */
+		case 'P': seq_simple(seq, TKBD_KEY_F1, mod); return i + 1;
+		case 'Q': seq_simple(seq, TKBD_KEY_F2, mod); return i + 1;
+		case 'R': seq_simple(seq, TKBD_KEY_F3, mod); return i + 1;
+		case 'S': seq_simple(seq, TKBD_KEY_F4, mod); return i + 1;
 		case 'Z': seq_simple(seq, TKBD_KEY_TAB, TKBD_MOD_SHIFT);
 			return i + 1;
 		case '~':
@@ -4868,6 +4875,16 @@ typedef enum req {
 	REQ_QUIT_ERR,		/* vi ':cq' -- leave with a nonzero exit code */
 } Req;
 
+#ifndef VEDIT_NO_TOOLS
+/* A parsed compiler diagnostic: where it points, and which captured output
+ * line it came from (so the pane can highlight that line). */
+typedef struct toolerr {
+	char	file[PATH_MAX];
+	size_t	line, col;		/* 1-based; col is 0 when absent */
+	int	outline;		/* index into the captured output lines */
+} Toolerr;
+#endif
+
 typedef struct editor {
 	Buf	*bufs;		/* open buffers; active mirrors into flat */
 	int		nbuf;		/* number of open buffers */
@@ -4896,6 +4913,18 @@ typedef struct editor {
 	int		clip_linewise;	/* clip holds whole lines (vi p/P) */
 	int		clip_block;	/* clip holds a rectangle (draw mode) */
 	int		clip_osc52;	/* mirror every copy/yank through OSC 52 */
+#ifndef VEDIT_NO_TOOLS
+	const struct vedit_tool_api *tools;	/* borrowed; NULL = no building */
+	char	**tool_lines;		/* captured output, one line per entry */
+	int		tool_nlines, tool_lines_cap;
+	char	*tool_raw;		/* byte accumulator during a capture */
+	size_t		tool_rawlen, tool_rawcap;
+	Toolerr	*tool_errs;		/* parsed diagnostics */
+	int		tool_nerr, tool_errs_cap;
+	int		tool_curerr;		/* selected error (F4/Shift+F4), -1 */
+	char	tool_title[64];		/* label of the last command, for the pane */
+	char	tool_dir[PATH_MAX];	/* directory the last command ran in */
+#endif
 	int		draw_mode;	/* 2D/block draw mode: free cursor + overtype */
 	char		last_find[256];	/* last search string, for repeat */
 	char		last_replace[256]; /* last replacement string */
@@ -6127,6 +6156,14 @@ typedef enum cmd {
 	CMD_HELP,		/* show the key bindings */
 	CMD_SAVE,
 	CMD_QUIT,
+#ifndef VEDIT_NO_TOOLS
+	CMD_COMPILE,		/* compile the current file (Alt+F9) */
+	CMD_MAKE,		/* build the project (F9) */
+	CMD_RUN,		/* run the program (Ctrl+F9) */
+	CMD_VIEW_OUTPUT,	/* reopen the last output pane (Alt+F5) */
+	CMD_ERR_NEXT,		/* jump to the next diagnostic (F4) */
+	CMD_ERR_PREV,		/* jump to the previous diagnostic (Shift+F4) */
+#endif
 } Cmd;
 
 typedef struct keybind {
@@ -6683,6 +6720,9 @@ typedef enum menu_act {
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE, MA_OSC_COPY, MA_OSC_COPY_FILE,
 	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_GOTO,
 	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_HEX, MA_DRAW, MA_VI_MODE,
+#ifndef VEDIT_NO_TOOLS
+	MA_COMPILE, MA_MAKE, MA_RUN, MA_VIEW_OUTPUT, MA_ERR_NEXT, MA_ERR_PREV,
+#endif
 	MA_HELP, MA_TUTORIAL, MA_ABOUT,
 } Menuact;
 
@@ -6744,6 +6784,19 @@ static const Menuitem mi_options[] = {
 	{ "&Draw Mode",	"Ins",	"",	MA_DRAW },
 	{ "&Vi Keys",	"F2",	"",	MA_VI_MODE },
 };
+#ifndef VEDIT_NO_TOOLS
+static const Menuitem mi_compile[] = {
+	{ "&Compile",	"Alt+F9",	"",	MA_COMPILE },
+	{ "&Make",	"F9",		"",	MA_MAKE },
+};
+static const Menuitem mi_run[] = {
+	{ "&Run",		"Ctrl+F9",	"",	MA_RUN },
+	{ "&View Output",	"Alt+F5",	"",	MA_VIEW_OUTPUT },
+	{ "",			"",		"",	MA_SEP },
+	{ "&Next Error",	"F4",		"",	MA_ERR_NEXT },
+	{ "&Prev Error",	"Shift+F4",	"",	MA_ERR_PREV },
+};
+#endif
 static const Menuitem mi_help[] = {
 	{ "&Key Bindings",	"F1",	"",	MA_HELP },
 	{ "&Tutorial",		"",	"",	MA_TUTORIAL },
@@ -6757,6 +6810,10 @@ static const Menu MENUS[] = {
 	{ "&Search",	13,	MENU_ITEMS(mi_search) },
 	{ "&View",	21,	MENU_ITEMS(mi_view) },
 	{ "&Options",	27,	MENU_ITEMS(mi_options) },
+#ifndef VEDIT_NO_TOOLS
+	{ "&Compile",	36,	MENU_ITEMS(mi_compile) },
+	{ "&Run",	45,	MENU_ITEMS(mi_run) },
+#endif
 	{ "&Help",	0,	MENU_ITEMS(mi_help) },	/* col set dynamically */
 };
 #undef MENU_ITEMS
@@ -9347,6 +9404,16 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 		break;
 	case CMD_NONE:
 		break;
+#ifndef VEDIT_NO_TOOLS
+	case CMD_COMPILE:
+	case CMD_MAKE:
+	case CMD_RUN:
+	case CMD_VIEW_OUTPUT:
+	case CMD_ERR_NEXT:
+	case CMD_ERR_PREV:
+		/* tool commands are dispatched from the main loop, not here */
+		break;
+#endif
 	}
 	if (grouped)
 		text_undo_group_end(e->t);
@@ -9975,6 +10042,12 @@ static const struct {
 	{ "Ctrl-Q",		"Quit (asks if there are unsaved changes)" },
 	{ "F1",			"Show this help" },
 	{ "F2",			"Toggle vi keys (modal editing)" },
+	{ "F8 / Shift+F8",	"Next / previous open buffer" },
+#ifndef VEDIT_NO_TOOLS
+	{ "Alt+F9 / F9",	"Compile the file / make the project" },
+	{ "Ctrl+F9 / Alt+F5",	"Run the program / view the last output" },
+	{ "F4 / Shift+F4",	"Next / previous build diagnostic" },
+#endif
 };
 
 #define HELP_COUNT ((int)(sizeof(help_entries) / sizeof(help_entries[0])))
@@ -11390,10 +11463,649 @@ dlg_about(Editor *e)
 	dlg_run(e, boxw, a.nlines + 4, &a, dlg_about_draw, dlg_about_key);
 }
 
-/* vedit has no build commands (compile / make / run and a quickfix error
- * list) by design: a MUD or primitive-terminal editor should not spawn
- * compilers, and leaving them out removes the fork/exec and config-file
- * machinery. */
+/****************************************************************
+ * External tool commands: a per-language compile / make / run
+ * layer. The command strings come from the config ([command
+ * "<lang>"]); the editor expands their $(...) variables and hands
+ * the final shell line to the tool API (see vedit.h). Capture
+ * commands feed an output pane with a gcc/clang quickfix list;
+ * an interactive command runs on the real terminal. Compiled out
+ * by defining VEDIT_NO_TOOLS.
+ ****************************************************************/
+#ifndef VEDIT_NO_TOOLS
+
+/* The syntax language name that keys [command "<lang>"], or NULL. */
+static const char *
+tool_lang(Editor *e)
+{
+	if (e->syn && e->syn->name && e->syn->name[0])
+		return e->syn->name;
+	return NULL;
+}
+
+/* command.<lang>.<which> from the config, or NULL. */
+static const char *
+tool_template(Editor *e, const char *which)
+{
+	const char *lang = tool_lang(e);
+	char key[128];
+
+	if (!lang || !g_cfg)
+		return NULL;
+	snprintf(key, sizeof(key), "command.%s.%s", lang, which);
+	return cfg_get(g_cfg, key);
+}
+
+/* Whether command.<lang>.<which>.interactive is set. */
+static int
+tool_interactive(Editor *e, const char *which)
+{
+	const char *lang = tool_lang(e);
+	char key[160];
+
+	if (!lang || !g_cfg)
+		return 0;
+	snprintf(key, sizeof(key), "command.%s.%s.interactive", lang, which);
+	return cfg_bool(g_cfg, key, 0);
+}
+
+/* Append n bytes to a growable, NUL-terminated string. Returns -1 on OOM. */
+static int
+sb_append(char **buf, size_t *len, size_t *cap, const char *s, size_t n)
+{
+	if (*len + n + 1 > *cap) {
+		size_t c = *cap ? *cap : 64;
+		char *p;
+
+		while (c < *len + n + 1)
+			c *= 2;
+		p = realloc(*buf, c);
+		if (!p)
+			return -1;
+		*buf = p;
+		*cap = c;
+	}
+	memcpy(*buf + *len, s, n);
+	*len += n;
+	(*buf)[*len] = '\0';
+	return 0;
+}
+
+/* Split path into directory, basename, stem (no extension), and extension (no
+ * dot). dir is "." when there is no slash; ext is "" when there is no dot. */
+static void
+tool_split_path(const char *path, char *dir, char *base, char *stem, char *ext)
+{
+	const char *slash = strrchr(path, '/');
+	const char *dot;
+
+	if (slash) {
+		size_t n = (size_t)(slash - path);
+
+		if (n >= PATH_MAX)
+			n = PATH_MAX - 1;
+		memcpy(dir, path, n);
+		dir[n] = '\0';
+		snprintf(base, PATH_MAX, "%s", slash + 1);
+	} else {
+		snprintf(dir, PATH_MAX, ".");
+		snprintf(base, PATH_MAX, "%s", path);
+	}
+	dot = strrchr(base, '.');
+	if (dot && dot != base) {
+		size_t n = (size_t)(dot - base);
+
+		if (n >= PATH_MAX)
+			n = PATH_MAX - 1;
+		memcpy(stem, base, n);
+		stem[n] = '\0';
+		snprintf(ext, PATH_MAX, "%s", dot + 1);
+	} else {
+		snprintf(stem, PATH_MAX, "%s", base);
+		ext[0] = '\0';
+	}
+}
+
+/* Expand $(file) $(filename) $(filenoext) $(fileext) $(dir) in tmpl against
+ * path. An unknown $(name) is copied verbatim. Returns malloc'd, or NULL. */
+static char *
+tool_expand(const char *tmpl, const char *path)
+{
+	char dir[PATH_MAX], base[PATH_MAX], stem[PATH_MAX], ext[PATH_MAX];
+	char full[PATH_MAX];
+	char *out = NULL;
+	size_t olen = 0, ocap = 0;
+	const char *p = tmpl;
+
+	tool_split_path(path, dir, base, stem, ext);
+	if (snprintf(full, sizeof(full), "%s/%s", dir, base) >= (int)sizeof(full))
+		snprintf(full, sizeof(full), "%s", path);	/* too long: use path */
+
+	while (*p) {
+		if (p[0] == '$' && p[1] == '(') {
+			const char *end = strchr(p + 2, ')');
+
+			if (end) {
+				size_t n = (size_t)(end - (p + 2));
+				const char *v = p + 2, *val = NULL;
+
+				if (n == 4 && memcmp(v, "file", 4) == 0)
+					val = full;
+				else if (n == 8 && memcmp(v, "filename", 8) == 0)
+					val = base;
+				else if (n == 9 && memcmp(v, "filenoext", 9) == 0)
+					val = stem;
+				else if (n == 7 && memcmp(v, "fileext", 7) == 0)
+					val = ext;
+				else if (n == 3 && memcmp(v, "dir", 3) == 0)
+					val = dir;
+				if (val) {
+					if (sb_append(&out, &olen, &ocap, val,
+					    strlen(val)) < 0)
+						goto oom;
+					p = end + 1;
+					continue;
+				}
+			}
+		}
+		if (sb_append(&out, &olen, &ocap, p, 1) < 0)
+			goto oom;
+		p++;
+	}
+	if (!out)
+		out = calloc(1, 1);
+	return out;
+oom:
+	free(out);
+	return NULL;
+}
+
+/* ---- captured output and diagnostics ---- */
+
+static void
+tool_clear_output(Editor *e)
+{
+	int i;
+
+	for (i = 0; i < e->tool_nlines; i++)
+		free(e->tool_lines[i]);
+	free(e->tool_lines);
+	e->tool_lines = NULL;
+	e->tool_nlines = e->tool_lines_cap = 0;
+	free(e->tool_errs);
+	e->tool_errs = NULL;
+	e->tool_nerr = e->tool_errs_cap = 0;
+	free(e->tool_raw);
+	e->tool_raw = NULL;
+	e->tool_rawlen = e->tool_rawcap = 0;
+	e->tool_curerr = -1;
+}
+
+/* The emit sink for run_capture: accumulate the bytes. */
+static void
+tool_emit(void *sink, const char *buf, size_t n)
+{
+	Editor *e = sink;
+
+	(void)sb_append(&e->tool_raw, &e->tool_rawlen, &e->tool_rawcap, buf, n);
+}
+
+static int
+tool_add_line(Editor *e, const char *s, size_t n)
+{
+	char *copy = malloc(n + 1);
+
+	if (!copy)
+		return -1;
+	memcpy(copy, s, n);
+	copy[n] = '\0';
+	if (e->tool_nlines == e->tool_lines_cap) {
+		int c = e->tool_lines_cap ? e->tool_lines_cap * 2 : 32;
+		char **p = realloc(e->tool_lines, (size_t)c * sizeof(*p));
+
+		if (!p) {
+			free(copy);
+			return -1;
+		}
+		e->tool_lines = p;
+		e->tool_lines_cap = c;
+	}
+	e->tool_lines[e->tool_nlines++] = copy;
+	return 0;
+}
+
+static void
+tool_add_err(Editor *e, const char *file, size_t line, size_t col, int outline)
+{
+	Toolerr *te;
+
+	if (e->tool_nerr == e->tool_errs_cap) {
+		int c = e->tool_errs_cap ? e->tool_errs_cap * 2 : 16;
+		Toolerr *p = realloc(e->tool_errs, (size_t)c * sizeof(*p));
+
+		if (!p)
+			return;
+		e->tool_errs = p;
+		e->tool_errs_cap = c;
+	}
+	te = &e->tool_errs[e->tool_nerr++];
+	snprintf(te->file, sizeof(te->file), "%s", file);
+	te->line = line;
+	te->col = col;
+	te->outline = outline;
+}
+
+/* The decimal value of capture group m within s. */
+static size_t
+tool_group_num(const char *s, const rx_match *m)
+{
+	char buf[24];
+	size_t n = (size_t)(m->eo - m->so);
+
+	if (n >= sizeof(buf))
+		n = sizeof(buf) - 1;
+	memcpy(buf, s + m->so, n);
+	buf[n] = '\0';
+	return (size_t)strtoul(buf, NULL, 10);
+}
+
+/* Record a diagnostic if line s matches a gcc/clang "file:line[:col]:" form. */
+static void
+tool_parse_line(Editor *e, rx_t *re_col, rx_t *re_nocol, const char *s,
+    int outline)
+{
+	rx_match m[4];
+	char file[PATH_MAX];
+	size_t n;
+
+	if (re_col && rx_exec(re_col, s, strlen(s), 0, m, 4) == 1) {
+		n = (size_t)(m[1].eo - m[1].so);
+		if (n >= sizeof(file))
+			n = sizeof(file) - 1;
+		memcpy(file, s + m[1].so, n);
+		file[n] = '\0';
+		tool_add_err(e, file, tool_group_num(s, &m[2]),
+		    tool_group_num(s, &m[3]), outline);
+	} else if (re_nocol && rx_exec(re_nocol, s, strlen(s), 0, m, 3) == 1) {
+		n = (size_t)(m[1].eo - m[1].so);
+		if (n >= sizeof(file))
+			n = sizeof(file) - 1;
+		memcpy(file, s + m[1].so, n);
+		file[n] = '\0';
+		tool_add_err(e, file, tool_group_num(s, &m[2]), 0, outline);
+	}
+}
+
+/* Split the captured bytes into lines and build the diagnostic list. */
+static void
+tool_parse_output(Editor *e)
+{
+	rx_t *re_col = rx_compile("^([^:]+):([0-9]+):([0-9]+): ", 0, NULL);
+	rx_t *re_nocol = rx_compile("^([^:]+):([0-9]+): ", 0, NULL);
+	size_t i, start = 0;
+
+	for (i = 0; e->tool_raw && i < e->tool_rawlen; i++) {
+		if (e->tool_raw[i] != '\n')
+			continue;
+		if (tool_add_line(e, e->tool_raw + start, i - start) == 0)
+			tool_parse_line(e, re_col, re_nocol,
+			    e->tool_lines[e->tool_nlines - 1],
+			    e->tool_nlines - 1);
+		start = i + 1;
+	}
+	if (e->tool_raw && start < e->tool_rawlen) {	/* final partial line */
+		if (tool_add_line(e, e->tool_raw + start,
+		    e->tool_rawlen - start) == 0)
+			tool_parse_line(e, re_col, re_nocol,
+			    e->tool_lines[e->tool_nlines - 1],
+			    e->tool_nlines - 1);
+	}
+	rx_free(re_col);
+	rx_free(re_nocol);
+}
+
+/* ---- jumping to a diagnostic ---- */
+
+/* True when a and b resolve to the same file on disk. */
+static int
+tool_same_file(const char *a, const char *b)
+{
+	char ra[PATH_MAX], rb[PATH_MAX];
+
+	if (!realpath(a, ra) || !realpath(b, rb))
+		return 0;
+	return strcmp(ra, rb) == 0;
+}
+
+/* Resolve a diagnostic's file against the directory the command ran in. */
+static void
+tool_resolve(Editor *e, const char *file, char *out, size_t outsz)
+{
+	if (file[0] == '/')
+		snprintf(out, outsz, "%s", file);
+	else if (snprintf(out, outsz, "%s/%s", e->tool_dir, file) >= (int)outsz)
+		snprintf(out, outsz, "%s", file);	/* too long: use it as given */
+}
+
+/* Switch to (or open) diagnostic ei's file and position the cursor. */
+static int
+tool_goto_err(Editor *e, int ei)
+{
+	Toolerr *te;
+	char target[PATH_MAX];
+
+	if (ei < 0 || ei >= e->tool_nerr)
+		return -1;
+	te = &e->tool_errs[ei];
+	tool_resolve(e, te->file, target, sizeof(target));
+	if (!(e->has_name && tool_same_file(target, e->path))) {
+		if (buf_open(e, target) < 0)
+			return -1;		/* buf_open set the status */
+	}
+	if (text_lines(e->t) == 0)
+		return -1;
+	e->cy = te->line ? te->line - 1 : 0;
+	if (e->cy >= text_lines(e->t))
+		e->cy = text_lines(e->t) - 1;
+	e->cx = te->col ? te->col - 1 : 0;
+	e->sel_active = 0;
+	clamp_col(e);
+	e->tool_curerr = ei;
+	snprintf(e->status, sizeof(e->status), "error %d/%d: %.120s:%zu",
+	    ei + 1, e->tool_nerr, te->file, te->line);
+	return 0;
+}
+
+/* F4 / Shift+F4: jump to the next or previous diagnostic. */
+static void
+ed_err_step(Editor *e, int dir)
+{
+	int next;
+
+	if (e->tool_nerr == 0) {
+		snprintf(e->status, sizeof(e->status), "no diagnostics");
+		return;
+	}
+	next = e->tool_curerr + dir;
+	if (next < 0)
+		next = 0;
+	if (next >= e->tool_nerr)
+		next = e->tool_nerr - 1;
+	tool_goto_err(e, next);
+}
+
+/* The diagnostic shown on output line `outline`, or -1. */
+static int
+tool_err_at(Editor *e, int outline)
+{
+	int i;
+
+	for (i = 0; i < e->tool_nerr; i++)
+		if (e->tool_errs[i].outline == outline)
+			return i;
+	return -1;
+}
+
+/* An indexed terminal color as a value (CIDX is a struct initializer only). */
+static Color
+tool_color(uint8_t idx)
+{
+	Color c;
+
+	c.type = COLOR_INDEXED;
+	c.index = idx;
+	return c;
+}
+
+/* The output pane: Up/Down (and PgUp/PgDn, Home/End) move the cursor line,
+ * n / N step between diagnostics, Enter jumps to the one on the cursor line,
+ * Esc or q closes. Diagnostic lines are drawn in red. */
+static void
+dlg_tool_output(Editor *e)
+{
+	const Pal *p = ed_chrome(e);
+	uint16_t barat = (p->reverse_bars ? ATTR_REVERSE : 0) | ATTR_BOLD;
+	char hdr[160];
+	int cur = 0, top = 0;
+
+	if (e->tool_nlines == 0) {
+		snprintf(e->status, sizeof(e->status), "no output to show");
+		return;
+	}
+	if (e->tool_nerr > 0)
+		cur = e->tool_errs[0].outline;
+	snprintf(hdr, sizeof(hdr), " Output: %s  (%d diagnostic%s)",
+	    e->tool_title, e->tool_nerr, e->tool_nerr == 1 ? "" : "s");
+
+	for (;;) {
+		Screen *d = e->d;
+		int rows = e->rows > 0 ? e->rows : 24;
+		int body = rows - 2;
+		int row;
+		Event ev;
+
+		if (cur < 0)
+			cur = 0;
+		if (cur >= e->tool_nlines)
+			cur = e->tool_nlines - 1;
+		if (cur < top)
+			top = cur;
+		if (body > 0 && cur >= top + body)
+			top = cur - body + 1;
+		if (top < 0)
+			top = 0;
+
+		scr_clear(d);
+		ui_field(d, 0, 0, e->cols, hdr, p->bar_fg, p->bar_bg, barat);
+		for (row = 1; row < rows - 1; row++) {
+			int idx = top + row - 1;
+			const char *s = (idx < e->tool_nlines) ?
+			    e->tool_lines[idx] : "";
+			Color fg = p->content_fg;
+			uint16_t at = 0;
+
+			if (idx < e->tool_nlines && tool_err_at(e, idx) >= 0)
+				fg = tool_color(9);	/* diagnostic: red */
+			if (idx == cur)
+				at = ATTR_REVERSE;
+			ui_field(d, row, 0, e->cols, s, fg, p->content_bg, at);
+		}
+		ui_field(d, rows - 1, 0, e->cols,
+		    " Up/Down n/N move   Enter jump   Esc close",
+		    p->bar_fg, p->bar_bg, barat);
+		scr_present(d);
+
+		if (scr_wait(d, &ev) == EVENT_EOF)
+			return;
+		if (ev.type == EVENT_RESIZE || ev.type == EVENT_RESUME) {
+			scr_size(d, &e->rows, &e->cols);
+			continue;
+		}
+		if (ev.type != EVENT_KEY || ev.key.type != TKBD_KEY)
+			continue;
+		switch (ev.key.key) {
+		case TKBD_KEY_UP:	cur -= 1; break;
+		case TKBD_KEY_DOWN:	cur += 1; break;
+		case TKBD_KEY_PGUP:	cur -= body; break;
+		case TKBD_KEY_PGDN:	cur += body; break;
+		case TKBD_KEY_HOME:	cur = 0; break;
+		case TKBD_KEY_END:	cur = e->tool_nlines - 1; break;
+		case TKBD_KEY_ENTER: {
+			int ei = tool_err_at(e, cur);
+
+			if (ei >= 0) {
+				tool_goto_err(e, ei);
+				return;
+			}
+			break;
+		}
+		case TKBD_KEY_ESC:
+			return;
+		default:
+			if (ev.key.ch == 'q' || ev.key.ch == 'Q')
+				return;
+			if ((ev.key.ch == 'n' || ev.key.ch == 'N') &&
+			    e->tool_nerr > 0) {
+				int step = (ev.key.ch == 'N') ? -1 : 1;
+				int ei = (e->tool_curerr < 0) ? 0 :
+				    e->tool_curerr + step;
+
+				if (ei < 0)
+					ei = 0;
+				if (ei >= e->tool_nerr)
+					ei = e->tool_nerr - 1;
+				e->tool_curerr = ei;
+				cur = e->tool_errs[ei].outline;
+			}
+			break;
+		}
+	}
+}
+
+/* ---- running a command ---- */
+
+/* The directory the command runs in: the file's directory, absolute. */
+static void
+tool_build_dir(Editor *e, char *out, size_t outsz)
+{
+	char dir[PATH_MAX], base[PATH_MAX], stem[PATH_MAX], ext[PATH_MAX];
+	char real[PATH_MAX];
+
+	tool_split_path(e->path, dir, base, stem, ext);
+	if (realpath(dir, real))
+		snprintf(out, outsz, "%s", real);
+	else
+		snprintf(out, outsz, "%s", dir);
+}
+
+/* Resolve and run the per-language command `which` (labelled `label`). Compile
+ * and make capture to the pane; a command marked interactive runs on the tty. */
+static void
+ed_tool_run(Editor *e, const char *which, const char *label)
+{
+	const char *tmpl;
+	char *cmd;
+	char dir[PATH_MAX];
+	int interactive, rc;
+
+	if (!e->tools ||
+	    (!e->tools->run_capture && !e->tools->run_foreground)) {
+		snprintf(e->status, sizeof(e->status),
+		    "building is not available");
+		return;
+	}
+	if (!e->has_name) {			/* building needs a path */
+		if (save_editor(e) != 0)
+			return;
+	}
+	tmpl = tool_template(e, which);
+	if (!tmpl || !tmpl[0]) {
+		snprintf(e->status, sizeof(e->status), "no %s command for %s",
+		    which, tool_lang(e) ? tool_lang(e) : "this file type");
+		return;
+	}
+	if (text_dirty(e->t)) {
+		int k = dlg_prompt_key(e, "Save before building? (y)es (n)o ");
+
+		if (k == 'y' || k == '\n') {
+			if (save_editor(e) != 0)
+				return;
+		} else if (k != 'n') {
+			snprintf(e->status, sizeof(e->status), "cancelled");
+			return;
+		}
+	}
+	cmd = tool_expand(tmpl, e->path);
+	if (!cmd) {
+		snprintf(e->status, sizeof(e->status), "out of memory");
+		return;
+	}
+	tool_build_dir(e, dir, sizeof(dir));
+	snprintf(e->tool_dir, sizeof(e->tool_dir), "%s", dir);
+	interactive = tool_interactive(e, which);
+
+	if (interactive && e->tools->run_foreground) {
+		scr_end(e->d);			/* leave the alt screen */
+		rc = e->tools->run_foreground(e->tools->ctx, cmd, dir);
+		scr_begin(e->d);		/* re-enter; forces a full repaint */
+		if (rc < 0)
+			snprintf(e->status, sizeof(e->status),
+			    "could not run: %.80s", cmd);
+		else
+			snprintf(e->status, sizeof(e->status),
+			    "%s finished (exit %d)", label, rc);
+	} else if (e->tools->run_capture) {
+		tool_clear_output(e);
+		snprintf(e->tool_title, sizeof(e->tool_title), "%s", label);
+		rc = e->tools->run_capture(e->tools->ctx, cmd, dir, tool_emit,
+		    e);
+		tool_parse_output(e);
+		e->tool_curerr = -1;
+		if (rc < 0)
+			snprintf(e->status, sizeof(e->status),
+			    "could not run: %.80s", cmd);
+		else
+			snprintf(e->status, sizeof(e->status),
+			    "%s exited %d, %d diagnostic%s", label, rc,
+			    e->tool_nerr, e->tool_nerr == 1 ? "" : "s");
+		dlg_tool_output(e);
+	} else {
+		snprintf(e->status, sizeof(e->status),
+		    "this command is interactive but no tty runner is set");
+	}
+	free(cmd);
+}
+
+/* Map a tool key to its command, or CMD_NONE. Active in both personalities. */
+static Cmd
+tool_key_to_cmd(const struct tkbd_seq *seq)
+{
+	int ctrl, alt, shift;
+
+	if (seq->type != TKBD_KEY)
+		return CMD_NONE;
+	ctrl = (seq->mod & TKBD_MOD_CTRL) != 0;
+	alt = (seq->mod & TKBD_MOD_ALT) != 0;
+	shift = (seq->mod & TKBD_MOD_SHIFT) != 0;
+
+	if (seq->key == TKBD_KEY_F9 && alt && !ctrl)
+		return CMD_COMPILE;
+	if (seq->key == TKBD_KEY_F9 && ctrl && !alt)
+		return CMD_RUN;
+	if (seq->key == TKBD_KEY_F9 && !ctrl && !alt && !shift)
+		return CMD_MAKE;
+	if (seq->key == TKBD_KEY_F5 && alt)
+		return CMD_VIEW_OUTPUT;
+	if (seq->key == TKBD_KEY_F4 && !shift && !ctrl && !alt)
+		return CMD_ERR_NEXT;
+	if (seq->key == TKBD_KEY_F4 && shift)
+		return CMD_ERR_PREV;
+	return CMD_NONE;
+}
+
+/* Carry out a tool command chosen by key or menu. */
+static void
+run_tool_cmd(Editor *e, Cmd c)
+{
+	switch (c) {
+	case CMD_COMPILE:	ed_tool_run(e, "compile", "Compile"); break;
+	case CMD_MAKE:		ed_tool_run(e, "build", "Make"); break;
+	case CMD_RUN:		ed_tool_run(e, "run", "Run"); break;
+	case CMD_VIEW_OUTPUT:	dlg_tool_output(e); break;
+	case CMD_ERR_NEXT:	ed_err_step(e, +1); break;
+	case CMD_ERR_PREV:	ed_err_step(e, -1); break;
+	default:		break;
+	}
+}
+
+/* Release the captured output and diagnostics. */
+static void
+tool_free(Editor *e)
+{
+	tool_clear_output(e);
+}
+
+#endif /* VEDIT_NO_TOOLS */
 
 /* Carry out a chosen menu action. Returns 1 when the editor should quit. */
 static int
@@ -11507,6 +12219,26 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_VI_MODE:
 		toggle_vi(e);
 		break;
+#ifndef VEDIT_NO_TOOLS
+	case MA_COMPILE:
+		run_tool_cmd(e, CMD_COMPILE);
+		break;
+	case MA_MAKE:
+		run_tool_cmd(e, CMD_MAKE);
+		break;
+	case MA_RUN:
+		run_tool_cmd(e, CMD_RUN);
+		break;
+	case MA_VIEW_OUTPUT:
+		run_tool_cmd(e, CMD_VIEW_OUTPUT);
+		break;
+	case MA_ERR_NEXT:
+		run_tool_cmd(e, CMD_ERR_NEXT);
+		break;
+	case MA_ERR_PREV:
+		run_tool_cmd(e, CMD_ERR_PREV);
+		break;
+#endif
 	case MA_HELP:
 		dlg_help(e);
 		break;
@@ -12387,6 +13119,20 @@ editor_loop(Editor *e)
 			continue;
 		}
 
+#ifndef VEDIT_NO_TOOLS
+		/* The IDE keys (Compile, Make, Run, error stepping) work in both
+		 * personalities and insert mode, like the function-key bindings. */
+		{
+			Cmd tc = tool_key_to_cmd(&seq);
+
+			if (tc != CMD_NONE) {
+				run_tool_cmd(e, tc);
+				ed_render(e, e->d);
+				continue;
+			}
+		}
+#endif
+
 		if (seq.type == TKBD_KEY && seq.key == TKBD_KEY_PASTE_BEGIN) {
 			if (e->mode == MODE_NORMAL)
 				paste_discard(e);
@@ -12456,6 +13202,9 @@ editor_teardown(Editor *e)
 	free(e->vi_dot.ev);
 	free(e->vi_rec.ev);
 	free(e->hl_buf);
+#ifndef VEDIT_NO_TOOLS
+	tool_free(e);
+#endif
 }
 
 /****************************************************************
@@ -12608,6 +13357,15 @@ vedit_set_config(struct vedit *v, const struct cfg *c)
 	}
 	ed_apply_config(&v->e);
 }
+
+#ifndef VEDIT_NO_TOOLS
+/* Install the tool runner (public API). NULL disables building. */
+void
+vedit_set_tools(struct vedit *v, const struct vedit_tool_api *api)
+{
+	v->e.tools = api;
+}
+#endif
 
 /* Deliver a new terminal size. The host calls this from wherever it learns the
  * size (telnet NAWS, a SIGWINCH it caught, a resize message). The change is
@@ -12812,6 +13570,97 @@ tty_getsize(void *ctx, int *rows, int *cols)
 	return -1;
 }
 
+#ifndef VEDIT_NO_TOOLS
+/* The standalone binary's default tool runner: it spawns "sh -c <cmd>" in the
+ * file's directory. An embedding host installs its own vedit_tool_api instead
+ * (for example to run the command inside a sandbox), or passes NULL to disable
+ * building entirely. */
+
+/* Run cmd in dir, piping its combined stdout and stderr to emit(). Returns the
+ * child's exit status, or -1 if it could not be started. */
+static int
+cli_run_capture(void *ctx, const char *cmd, const char *dir,
+    void (*emit)(void *sink, const char *buf, size_t n), void *sink)
+{
+	int pipefd[2];
+	pid_t pid;
+	int status;
+
+	(void)ctx;
+	if (pipe(pipefd) != 0)
+		return -1;
+	pid = fork();
+	if (pid < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return -1;
+	}
+	if (pid == 0) {			/* child */
+		close(pipefd[0]);
+		dup2(pipefd[1], STDOUT_FILENO);
+		dup2(pipefd[1], STDERR_FILENO);
+		if (pipefd[1] != STDOUT_FILENO && pipefd[1] != STDERR_FILENO)
+			close(pipefd[1]);
+		if (dir && dir[0] && chdir(dir) != 0)
+			_exit(127);
+		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+		_exit(127);
+	}
+	close(pipefd[1]);
+	for (;;) {
+		char buf[4096];
+		ssize_t n = read(pipefd[0], buf, sizeof(buf));
+
+		if (n > 0)
+			emit(sink, buf, (size_t)n);
+		else if (n == 0)
+			break;
+		else if (errno != EINTR)
+			break;
+	}
+	close(pipefd[0]);
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+		;
+	if (WIFEXITED(status))
+		return WEXITSTATUS(status);
+	if (WIFSIGNALED(status))
+		return 128 + WTERMSIG(status);
+	return -1;
+}
+
+/* Run cmd in dir connected to the real terminal, for an interactive program.
+ * The caller has already left the alt screen. Returns the exit status, or -1. */
+static int
+cli_run_foreground(void *ctx, const char *cmd, const char *dir)
+{
+	pid_t pid;
+	int status;
+
+	(void)ctx;
+	fflush(stdout);
+	pid = fork();
+	if (pid < 0)
+		return -1;
+	if (pid == 0) {			/* child: inherits the tty */
+		if (dir && dir[0] && chdir(dir) != 0)
+			_exit(127);
+		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+		_exit(127);
+	}
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+		;
+	if (WIFEXITED(status))
+		return WEXITSTATUS(status);
+	if (WIFSIGNALED(status))
+		return 128 + WTERMSIG(status);
+	return -1;
+}
+
+static const struct vedit_tool_api cli_tools = {
+	NULL, cli_run_capture, cli_run_foreground,
+};
+#endif /* VEDIT_NO_TOOLS */
+
 /* Pick the config file path. An explicit --config (opt) or $VEDIT_CONFIG is
  * used as given; otherwise the first of $XDG_CONFIG_HOME/vedit/config and
  * ~/.veditrc that exists. Writes buf and returns 1, or returns 0 for none. */
@@ -12934,6 +13783,9 @@ main(int argc, char **argv)
 		fprintf(stderr, "%s: out of memory\n", progname);
 		return 1;
 	}
+#ifndef VEDIT_NO_TOOLS
+	vedit_set_tools(v, &cli_tools);		/* the default shell spawner */
+#endif
 	if (!no_config && cli_config_path(cfg_opt, cfg_path, sizeof(cfg_path))) {
 		cfg = vedit_cfg_new();
 		if (cfg && vedit_cfg_load(cfg, cfg_path) == 0) {

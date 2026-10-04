@@ -113,6 +113,37 @@ int vedit_cfg_load(struct cfg *c, const char *path);
 void vedit_cfg_free(struct cfg *c);
 void vedit_set_config(struct vedit *v, const struct cfg *c);
 
+#ifndef VEDIT_NO_TOOLS
+/*
+ * External tool commands (compile / make / run), the "primitive IDE" layer.
+ * The editor resolves a per-language command from the config (a [command
+ * "<lang>"] section), expands its $(...) variables, and hands the final shell
+ * command line to this vtable. The core itself spawns nothing: the standalone
+ * binary installs a default implementation that forks a shell, and an
+ * embedding host can install its own (or leave it NULL to disable building).
+ * Define VEDIT_NO_TOOLS before including vedit.c to drop the whole subsystem.
+ */
+struct vedit_tool_api {
+	void	*ctx;
+	/* Run cmd (a shell command line) in directory dir, capturing combined
+	 * stdout and stderr by calling emit(sink, buf, n) for each chunk.
+	 * Returns the command's exit status (>=0), or -1 if it could not run. */
+	int	(*run_capture)(void *ctx, const char *cmd, const char *dir,
+		    void (*emit)(void *sink, const char *buf, size_t n),
+		    void *sink);
+	/* Run cmd in directory dir connected to the real terminal (foreground),
+	 * for an interactive program. Returns the exit status, or -1. May be
+	 * NULL, in which case interactive commands fall back to run_capture. */
+	int	(*run_foreground)(void *ctx, const char *cmd, const char *dir);
+};
+
+/* Install the tool runner. Pass NULL to disable the build/run commands. The
+ * api is borrowed, not copied, so it must outlive the editor. Call before
+ * vedit_run(). The standalone binary installs a default shell-spawning runner;
+ * an embedding host that wants the IDE commands installs its own. */
+void vedit_set_tools(struct vedit *v, const struct vedit_tool_api *api);
+#endif /* VEDIT_NO_TOOLS */
+
 /* Run the editor to completion. Returns 0 on a normal quit, 1 on end of input
  * or vi ':cq'. */
 int vedit_run(struct vedit *v);
