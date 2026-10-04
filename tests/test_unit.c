@@ -654,6 +654,115 @@ t_jsf_linecomment(Test *t)
 	unlink(path);
 }
 
+static void
+t_jsf_recolormark(Test *t)
+{
+	/* A "<...>" region whose length is unknown until ">" is seen: mark at
+	 * "<", then recolormark repaints the whole span once the end matches. */
+	static const char *text =
+	    "[color \"rm\"]\n"
+	    "  reg = magenta\n"
+	    "[state \"rm.idle\"]\n"
+	    "  color = text\n"
+	    "  rule = \"<\" open mark\n"
+	    "  rule = * idle\n"
+	    "[state \"rm.open\"]\n"
+	    "  color = text\n"
+	    "  rule = \">\" close recolormark\n"
+	    "  rule = * open\n"
+	    "[state \"rm.close\"]\n"
+	    "  color = reg\n"
+	    "  rule = * idle noeat\n";
+	char path[256];
+	Cfg *c = load_cfg_text(text, path, sizeof(path));
+	const Cfg *old = g_cfg;
+	const Syntax *sy;
+	const char *line = "a<bcd>e";
+	uint8_t out[16];
+	int lang, reg, txt;
+
+	TAP_ASSERT(t, c != NULL);
+	g_cfg = c;
+	syntax_load_cfg(c);
+	lang = jsf_find("rm");
+	TAP_ASSERT(t, lang >= 0);
+	reg = jsf_class_of(lang, "reg");
+	txt = jsf_class_of(lang, "text");
+	TAP_ASSERT(t, reg > 0 && txt >= 0);
+	sy = syn_for_ext("rm");
+	TAP_ASSERT(t, sy && sy->fsm);
+
+	memset(out, 0xee, sizeof(out));
+	syn_line(sy, sy->start, line, strlen(line), out);
+
+	/* "a<bcd>e": the "<bcd" span is repainted reg, ">" and the rest are not */
+	TAP_CHECKF(t, out[0] == txt, "pre [%d]", out[0]);
+	TAP_CHECKF(t, out[1] == reg && out[2] == reg && out[3] == reg &&
+	    out[4] == reg, "region [%d %d %d %d]",
+	    out[1], out[2], out[3], out[4]);
+	TAP_CHECKF(t, out[5] == txt && out[6] == txt, "post [%d %d]",
+	    out[5], out[6]);
+
+	g_cfg = old;
+	syntax_load_cfg(NULL);
+	vedit_cfg_free(c);
+	unlink(path);
+}
+
+static void
+t_jsf_include(Test *t)
+{
+	/* State "sa" has no rules of its own; it includes "shared", so it
+	 * borrows shared's transitions while keeping its own color. */
+	static const char *text =
+	    "[language \"inc\"]\n"
+	    "  start = sa\n"
+	    "[color \"inc\"]\n"
+	    "  a = red\n"
+	    "  b = green\n"
+	    "[state \"inc.sa\"]\n"
+	    "  color = a\n"
+	    "  include = shared\n"
+	    "[state \"inc.sb\"]\n"
+	    "  color = b\n"
+	    "  rule = \"x\" sa\n"
+	    "[state \"inc.shared\"]\n"
+	    "  color = text\n"
+	    "  rule = \"x\" sb\n"
+	    "  rule = * shared\n";
+	char path[256];
+	Cfg *c = load_cfg_text(text, path, sizeof(path));
+	const Cfg *old = g_cfg;
+	const Syntax *sy;
+	uint8_t out[16];
+	int lang, ca, cb;
+
+	TAP_ASSERT(t, c != NULL);
+	g_cfg = c;
+	syntax_load_cfg(c);
+	lang = jsf_find("inc");
+	TAP_ASSERT(t, lang >= 0);
+	ca = jsf_class_of(lang, "a");
+	cb = jsf_class_of(lang, "b");
+	TAP_ASSERT(t, ca > 0 && cb > 0);
+	sy = syn_for_ext("inc");
+	TAP_ASSERT(t, sy && sy->fsm);
+
+	memset(out, 0xee, sizeof(out));
+	syn_line(sy, sy->start, "xy", 2, out);
+
+	/* "x" matches shared's borrowed rule but is colored with sa's own
+	 * class, then transitions to sb; "y" falls through sb as sb's color */
+	TAP_CHECKF(t, out[0] == ca, "own color on borrowed rule [%d]", out[0]);
+	TAP_CHECKF(t, out[1] == cb, "transitioned via borrowed rule [%d]",
+	    out[1]);
+
+	g_cfg = old;
+	syntax_load_cfg(NULL);
+	vedit_cfg_free(c);
+	unlink(path);
+}
+
 const Case tap_cases[] = {
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },
@@ -679,5 +788,7 @@ const Case tap_cases[] = {
 	{ "jsf_charset", t_jsf_charset },
 	{ "jsf_highlight", t_jsf_highlight },
 	{ "jsf_linecomment", t_jsf_linecomment },
+	{ "jsf_recolormark", t_jsf_recolormark },
+	{ "jsf_include", t_jsf_include },
 	{ NULL, NULL },
 };

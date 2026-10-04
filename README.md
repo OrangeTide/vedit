@@ -204,10 +204,25 @@ Each `rule` is `charset  target-state  [options]`:
   escapes, for example `"a-zA-Z0-9_"`, `"0-9"`, `"\t\n"`, `"\""`.
 - **options**: `noeat` re-processes the byte in the target state without
   consuming it; `recolor` (or `recolor=N`) repaints the last byte (or N bytes)
-  in the target state's color; `buffer` starts recording a token; and
+  in the target state's color; `buffer` starts recording a token;
   `kw=<group>:<class>` matches the buffered token against a `[words]` group and,
-  on a hit, repaints it in `<class>`. Colors accept attributes (`bold`,
-  `underline`, `reverse`, `dim`, `italic`), e.g. `keyword = yellow bold`.
+  on a hit, repaints it in `<class>`; `mark` and `recolormark` handle a region
+  whose length is not known until its end is seen (see below). Colors accept
+  attributes (`bold`, `underline`, `reverse`, `dim`, `italic`), e.g.
+  `keyword = yellow bold`.
+
+A state may also set `include = <other-state>`: when none of its own rules
+match the byte, the machine falls through to the included state's rules (and
+their includes, in turn). The including state keeps its own color, so a shared
+rule set (operators, identifiers, whitespace) can be written once and reused.
+
+`mark` records the current position, and a later rule with `recolormark`
+repaints everything from that mark up to the current byte in the target state's
+color. Unlike `recolor=N`, the span length need not be known in advance, so a
+preprocessor line, an include like `<stdio.h>`, or a here-document body can be
+colored as one region once its end matches. The mark is per line and defaults
+to the start of the line, so on a continuation line of a multi-line region the
+repaint starts at the left edge.
 
 The carry state between lines is the current state, so multi-line constructs
 (block comments, here-strings) work by staying in a state at end of line. At the
@@ -218,7 +233,7 @@ newline flush also lets a bare keyword at the very end of a line be recognized.
 A language whose name matches a file extension is picked up automatically; a
 `syntax.<ext> = <name>` line maps any other extension. The core reads no files:
 the rules are config data, loaded through `vedit_set_config()` like everything
-else. (Region markers and state includes are not in this first cut.)
+else.
 
 ### Color schemes
 

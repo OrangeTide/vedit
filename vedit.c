@@ -803,7 +803,12 @@ typedef struct syntax {
 #define JSF_NAME	48
 #define JSF_LANG_MAX	8
 
-enum { JSF_F_NOEAT = 1, JSF_F_BUFFER = 2 };
+enum {
+	JSF_F_NOEAT = 1,	/* do not consume the byte; re-dispatch in next */
+	JSF_F_BUFFER = 2,	/* start a token here for a later keyword match */
+	JSF_F_MARK = 4,		/* set the region mark to the current position */
+	JSF_F_RECOLORMARK = 8	/* repaint [mark, here) with the target color */
+};
 
 typedef struct jsf_kw { int group; uint8_t klass; } Jsfkw;
 
@@ -819,6 +824,7 @@ typedef struct jsf_state {
 	char		name[JSF_NAME];
 	uint8_t		klass;		/* default color class for this state */
 	int		rule_first, rule_n;
+	int		include;	/* fall back to this state's rules, or -1 */
 } Jsfstate;
 
 typedef struct jsf_word { const char *s; int len; } Jsfword;	/* into g_cfg */
@@ -886,6 +892,7 @@ jsf_state_idx(Jsf *j, const char *name)
 	j->states[i].klass = 0;
 	j->states[i].rule_first = j->nrules;
 	j->states[i].rule_n = 0;
+	j->states[i].include = -1;
 	return i;
 }
 
@@ -1004,7 +1011,7 @@ static uint16_t
 jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
     uint8_t *out)
 {
-	size_t i = 0, tok = 0;
+	size_t i = 0, tok = 0, markpos = 0;
 	uint16_t st = state_in < j->nstates ? state_in : j->start;
 	int buffering = 0, hops = 0;
 
@@ -1016,15 +1023,26 @@ jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
 		unsigned char c = i < n ? (unsigned char)bytes[i] : '\n';
 		const Jsfstate *S = &j->states[st];
 		const Jsfrule *R = NULL;
-		int r;
+		int r, cur = st, guard = 0;
 
-		for (r = 0; r < S->rule_n; r++) {
-			const Jsfrule *cand = &j->rules[S->rule_first + r];
+		/* Match against this state's rules; if none fire, fall through
+		 * the include chain (cur = that state's include) so a state can
+		 * borrow another's transitions. The current state's color still
+		 * applies, since S stays the real state. */
+		while (cur >= 0 && guard++ < JSF_STATE_MAX) {
+			const Jsfstate *CS = &j->states[cur];
 
-			if (cand->set[c >> 3] & (1 << (c & 7))) {
-				R = cand;
-				break;
+			for (r = 0; r < CS->rule_n; r++) {
+				const Jsfrule *cand = &j->rules[CS->rule_first + r];
+
+				if (cand->set[c >> 3] & (1 << (c & 7))) {
+					R = cand;
+					break;
+				}
 			}
+			if (R)
+				break;
+			cur = CS->include;
 		}
 		if (!R) {			/* no rule: color and consume */
 			if (out && i < n)
@@ -1052,10 +1070,20 @@ jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
 			tok = i;
 			buffering = 1;
 		}
+		if (R->flags & JSF_F_MARK)
+			markpos = i;
 		/* color the consumed byte with this state's class first, then
 		 * let recolor override it (and any earlier bytes) */
 		if (out && i < n && !(R->flags & JSF_F_NOEAT))
 			out[i] = S->klass;
+		if ((R->flags & JSF_F_RECOLORMARK) && out) {
+			uint8_t nk = j->states[R->next].klass;
+			size_t end = i < n ? i : n;
+			size_t p;
+
+			for (p = markpos; p < end; p++)
+				out[p] = nk;
+		}
 		if (R->recolor && out) {
 			size_t last = i < n ? i : (n ? n - 1 : 0);
 			size_t cnt = R->recolor;
@@ -1191,6 +1219,10 @@ jsf_parse_rule(Jsf *j, int st, const char *val)
 			R->flags |= JSF_F_NOEAT;
 		} else if (strcmp(tok, "buffer") == 0) {
 			R->flags |= JSF_F_BUFFER;
+		} else if (strcmp(tok, "mark") == 0) {
+			R->flags |= JSF_F_MARK;
+		} else if (strcmp(tok, "recolormark") == 0) {
+			R->flags |= JSF_F_RECOLORMARK;
 		} else if (strcmp(tok, "recolor") == 0) {
 			R->recolor = 1;
 		} else if (strncmp(tok, "recolor=", 8) == 0) {
@@ -1316,6 +1348,9 @@ syntax_load_cfg(const Cfg *c)
 				} else if (strcmp(tail, "color") == 0) {
 					j->states[jsf_state_idx(j, sname)].klass =
 					    (uint8_t)jsf_class(j, val);
+				} else if (strcmp(tail, "include") == 0) {
+					j->states[jsf_state_idx(j, sname)].include =
+					    jsf_state_idx(j, val);
 				} else if (strcmp(tail, "rule") == 0) {
 					jsf_parse_rule(j,
 					    jsf_state_idx(j, sname), val);
