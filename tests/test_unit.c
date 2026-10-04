@@ -943,6 +943,37 @@ t_symscan(Test *t)
 	text_free(e.t);
 }
 
+static void
+t_isearch(Test *t)
+{
+	Editor e;
+	size_t my, mx;
+
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "foo bar", 7);
+	lines_insert_at(e.t, 1, "baz foo", 7);
+
+	/* from the very start, the first match is in place */
+	TAP_CHECK(t, isearch_scan(&e, "foo", 0, 0, &my, &mx) &&
+	    my == 0 && mx == 0);
+
+	/* past the first match, the next is on line 2 */
+	TAP_CHECKF(t, isearch_scan(&e, "foo", 0, 1, &my, &mx) &&
+	    my == 1 && mx == 4, "forward: L%zu C%zu", my, mx);
+
+	/* past the last match, it wraps back to the first */
+	TAP_CHECKF(t, isearch_scan(&e, "foo", 1, 5, &my, &mx) &&
+	    my == 0 && mx == 0, "wrap: L%zu C%zu", my, mx);
+
+	/* a miss and an empty query both report nothing */
+	TAP_CHECK(t, !isearch_scan(&e, "zzz", 0, 0, &my, &mx));
+	TAP_CHECK(t, !isearch_scan(&e, "", 0, 0, &my, &mx));
+
+	text_free(e.t);
+}
+
 const Case tap_cases[] = {
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },
@@ -974,5 +1005,6 @@ const Case tap_cases[] = {
 	{ "bufpick", t_bufpick },
 	{ "sym_classify", t_sym_classify },
 	{ "symscan", t_symscan },
+	{ "isearch", t_isearch },
 	{ NULL, NULL },
 };

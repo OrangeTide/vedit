@@ -332,7 +332,7 @@ dialogs, prompts, and the help screen, not just the text area.
 | Shift-arrows | extend a selection |
 | Ctrl-C / Ctrl-X | copy / cut (Ctrl-C with no selection copies the line) |
 | Ctrl-V | paste the internal clipboard |
-| Ctrl-F | find (Enter repeats the last search) |
+| Ctrl-F | incremental find (Enter repeats the last search) |
 | Ctrl-R | replace, confirming each match (y / n / a / q) |
 | Ctrl-T | go to a symbol defined in the buffer |
 | Ctrl-L | go to a line number |
@@ -345,6 +345,13 @@ dialogs, prompts, and the help screen, not just the text area.
 | Alt+letter | open a menu directly (File, Edit, ...) |
 | F1 | show the key bindings |
 | F2 | toggle vi keys |
+
+Ctrl-F searches incrementally: the cursor follows the first match from where
+you started as you type, the status line shows the query (marked `(failing)`
+when nothing matches), and the view scrolls to keep the match in sight. Enter
+accepts and leaves the cursor on the match, storing the query so Repeat Find and
+a later empty-query Ctrl-F jump to the next one. Esc cancels and restores the
+starting position.
 
 The menu bar works the MS-EDIT way. Press F10 to activate it, then press a
 menu's highlighted letter (F, E, S, B, V, O, H) to open it, or use the arrow

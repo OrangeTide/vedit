@@ -7785,20 +7785,147 @@ ed_find(Editor *e, const char *q)
 	ed_find_dir(e, q, 1);
 }
 
-/* Prompt for a search string (defaulting to the last one, so Enter repeats)
- * and jump to the next match. */
+/* Find q forward from (oy, ox) inclusive, wrapping once back to the origin.
+ * Matches never cross a line. Returns 1 with the position in *my, *mx. Used by
+ * the incremental search, which re-scans from a fixed origin as the query
+ * grows. */
+static int
+isearch_scan(Editor *e, const char *q, size_t oy, size_t ox,
+    size_t *my, size_t *mx)
+{
+	size_t nlines = text_lines(e->t), i;
+
+	if (!q[0] || nlines == 0)
+		return 0;
+	for (i = 0; i <= nlines; i++) {
+		size_t ln = (oy + i) % nlines;
+		size_t llen = 0;
+		const char *s = text_line(e->t, ln, &llen);
+		size_t from = (i == 0) ? ox : 0;
+		const char *hit;
+
+		if (!s || from > llen)
+			continue;
+		hit = strstr(s + from, q);
+		if (hit) {
+			size_t col = (size_t)(hit - s);
+
+			/* On the final wrap back to the origin line, only a
+			 * match before the origin column is new. */
+			if (i == nlines && col >= ox)
+				break;
+			*my = ln;
+			*mx = col;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* Paint the editor with the cursor already moved to the live match, then
+ * overlay the query on the status row. ed_render leaves the hardware cursor at
+ * the match, and ui_field does not move it, so the cursor sits on the match. */
+static void
+isearch_draw(Editor *e, const char *q, int found)
+{
+	const Pal *p = ed_chrome(e);
+	uint16_t at = (p->reverse_bars ? ATTR_REVERSE : 0) | ATTR_BOLD;
+	char line[512];
+	int status_row = (e->rows > 0 ? e->rows : 24) - 1;
+
+	ed_render(e, e->d);
+	snprintf(line, sizeof(line), "%sISearch: %s",
+	    found ? "" : "(failing) ", q);
+	ui_field(e->d, status_row, 0, e->cols, line, p->bar_fg, p->bar_bg, at);
+	scr_present(e->d);
+}
+
+/* Incremental search: the cursor follows the first match from the starting
+ * position as the query is typed. Enter accepts (and stores the query for
+ * Repeat Find); on an empty query Enter repeats the last search. Esc or Ctrl-C
+ * cancels and restores the starting view. */
 static void
 find_prompt(Editor *e)
 {
+	size_t oy = e->cy, ox = e->cx, otop = e->top, oleft = e->left;
 	char q[256];
+	size_t len = 0;
+	int found = 1;
 
-	snprintf(q, sizeof(q), "%s", e->last_find);
-	if (!dlg_prompt_line(e, "Search: ", q, sizeof(q))) {
-		snprintf(e->status, sizeof(e->status), "search cancelled");
-		return;
+	q[0] = '\0';
+	for (;;) {
+		Event ev;
+		struct tkbd_seq seq;
+		size_t my = oy, mx = ox;
+
+		if (len > 0 && (found = isearch_scan(e, q, oy, ox, &my, &mx))) {
+			e->cy = my;
+			e->cx = mx;
+			e->sel_active = 0;
+		} else {			/* empty or failing: rest at origin */
+			e->cy = oy;
+			e->cx = ox;
+			e->top = otop;
+			e->left = oleft;
+			if (len == 0)
+				found = 1;
+		}
+		isearch_draw(e, q, found);
+
+		if (scr_wait(e->d, &ev) == EVENT_EOF) {
+			e->cy = oy, e->cx = ox, e->top = otop, e->left = oleft;
+			return;
+		}
+		if (ev.type != EVENT_KEY) {
+			scr_size(e->d, &e->rows, &e->cols);
+			continue;
+		}
+		seq = ev.key;
+		if (seq.type != TKBD_KEY)
+			continue;
+		if (seq.key == TKBD_KEY_ENTER) {
+			if (len == 0) {
+				if (e->last_find[0])
+					ed_find(e, e->last_find);
+				return;
+			}
+			snprintf(e->last_find, sizeof(e->last_find), "%s", q);
+			if (found)
+				snprintf(e->status, sizeof(e->status),
+				    "found '%.80s'", q);
+			else
+				snprintf(e->status, sizeof(e->status),
+				    "not found: %.80s", q);
+			return;
+		}
+		if (seq.key == TKBD_KEY_ESC ||
+		    ((seq.mod & TKBD_MOD_CTRL) && seq.key == TKBD_KEY_C)) {
+			e->cy = oy, e->cx = ox, e->top = otop, e->left = oleft;
+			snprintf(e->status, sizeof(e->status), "search cancelled");
+			return;
+		}
+		if (seq.key == TKBD_KEY_BACKSPACE ||
+		    seq.key == TKBD_KEY_BACKSPACE2) {
+			while (len > 0 &&
+			    ((unsigned char)q[len - 1] & 0xc0) == 0x80)
+				len--;
+			if (len > 0)
+				len--;
+			q[len] = '\0';
+			continue;
+		}
+		if (!(seq.mod & TKBD_MOD_CTRL) && seq.ch != TKBD_CH_NONE &&
+		    seq.ch >= 0x20 && seq.ch != 0x7f) {
+			unsigned char enc[8];
+			int el = utf8_encode(enc, seq.ch);
+
+			if (el > 0 && len + (size_t)el < sizeof(q)) {
+				memcpy(q + len, enc, (size_t)el);
+				len += (size_t)el;
+				q[len] = '\0';
+			}
+		}
 	}
-	snprintf(e->last_find, sizeof(e->last_find), "%s", q);
-	ed_find(e, q);
 }
 
 /* Prompt for a 1-based line number and move the cursor to that line. A number
@@ -7841,7 +7968,7 @@ static const struct {
 	{ "Shift+arrows",	"Extend a selection" },
 	{ "Enter",		"Split the line" },
 	{ "Backspace / Del",	"Delete before / after the cursor" },
-	{ "Ctrl-F",		"Find (Enter repeats the last search)" },
+	{ "Ctrl-F",		"Incremental find (Enter repeats the last)" },
 	{ "Ctrl-R",		"Replace, confirming each match (y/n/a/q)" },
 	{ "Ctrl-T",		"Go to a symbol defined in the buffer" },
 	{ "Ctrl-L",		"Go to a line number" },
@@ -9476,7 +9603,7 @@ usage(void)
 	    "  Shift-arrows  extend a selection\n"
 	    "  Ctrl-C / Ctrl-X  copy / cut (Ctrl-C with no selection copies the line)\n"
 	    "  Ctrl-V        paste the internal clipboard\n"
-	    "  Ctrl-F        find (Enter repeats the last search)\n"
+	    "  Ctrl-F        incremental find (Enter repeats the last)\n"
 	    "  Ctrl-R        replace, confirming each match (y/n/a/q)\n"
 	    "  Ctrl-T        go to a symbol defined in the buffer\n"
 	    "  Ctrl-L        go to a line number\n"
