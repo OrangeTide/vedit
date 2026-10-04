@@ -6,8 +6,8 @@ small cell grid that emits a fixed subset of ANSI control codes, with no
 terminfo database and no differential compositor, so it runs over a telnet or
 ssh link to a simple terminal emulator such as a MUD client.
 
-vedit is a port of the editor from the lumi project, reduced to one source file
-(`vedit.c`) plus a public header for embedding (`vedit.h`).
+vedit is one source file (`vedit.c`) plus a public header for embedding
+(`vedit.h`).
 
 `docs/demo.html` is a self-contained page that illustrates the rendering work
 (the scroll fast path, the color schemes, the line-number gutter, word wrap, and
@@ -500,23 +500,24 @@ In a single-threaded event-loop host, run the editor on its own thread or
 coroutine, or supply a `poll` callback that yields to the host loop. A
 push-style state machine is not provided.
 
-## What this port keeps and what it drops
+## What it includes and what it leaves out
 
-The lumi editor sits on about ten libraries. vedit keeps the text buffer with
-undo and redo, the modeless and vi personalities, the MS-EDIT chrome (menu bar,
-frame, scrollbars, dialogs), regex find and replace, selection and an internal clipboard,
-goto-line, multiple buffers, a hex view, a 2D/block draw mode, and lightweight
-syntax highlighting. It replaces the drawing stack with
-a self-contained ANSI renderer over the io vtable, and the keyboard decoder with
-a compact one that covers UTF-8 text, control keys, arrows, navigation keys,
+vedit has a text buffer with undo and redo, the modeless and vi personalities,
+the MS-EDIT chrome (menu bar, frame, scrollbars, dialogs), regex find and
+replace, selection and an internal clipboard, goto-line, multiple buffers, a hex
+view, a 2D/block draw mode, and lightweight syntax highlighting. It draws through
+a self-contained ANSI renderer over the io vtable, and decodes the keyboard with
+a compact decoder that covers UTF-8 text, control keys, arrows, navigation keys,
 function keys, CSI modifiers, Alt+letter, and bracketed paste.
 
-It drops, as overworked for a primitive-terminal editor:
+It deliberately leaves out, as overworked for a primitive-terminal editor:
 
-- lumi's language engine (replaced by the data-driven FSM highlighter, below),
-- the build / compile / make commands and the quickfix error list,
+- build / compile / make commands and a quickfix error list,
 - mouse input,
-- the differential compositor and terminfo capability lookup.
+- a differential compositor and terminfo capability lookup.
+
+Syntax highlighting is a data-driven FSM highlighter (see below) rather than a
+general language engine.
 
 The renderer repaints only the rows that changed, and within a row only the
 columns between the first and last change, and emits color escapes only when the

@@ -1,11 +1,11 @@
 /*
  * vedit : a single-file visual text editor for primitive terminals.
  *
- * vedit is a self-contained port of the lumi editor. It emulates a modeless
- * Microsoft EDIT personality and a vi personality, drawn through a small cell
- * grid that emits a fixed subset of ANSI control codes. It carries no terminfo
- * database, no differential compositor, and no syntax engine, so it runs over
- * a telnet or ssh link to a primitive terminal emulator such as a MUD client.
+ * vedit is a self-contained text editor. It emulates a modeless Microsoft EDIT
+ * personality and a vi personality, drawn through a small cell grid that emits
+ * a fixed subset of ANSI control codes. It carries no terminfo database, no
+ * differential compositor, and no syntax engine, so it runs over a telnet or
+ * ssh link to a primitive terminal emulator such as a MUD client.
  *
  * All terminal I/O passes through a read()/write()/select()-style vtable
  * (struct vedit_io). The command-line binding wires that to a real tty with
@@ -2182,7 +2182,7 @@ vedit_cfg_load(Cfg *c, const char *path)
 }
 
 /****************************************************************
- * UTF-8 (inlined from lumi libutf8)
+ * UTF-8
  ****************************************************************/
 
 #define UTF8_RUNE_ERROR 0xFFFDu
@@ -2274,9 +2274,9 @@ utf8_encode(unsigned char *buf, uint32_t rune)
 }
 
 /****************************************************************
- * Character width -- a compact wcwidth in place of lumi's
- * generated Unicode tables. Combining marks are zero width, the
- * common CJK and emoji ranges are two, everything else is one.
+ * Character width -- a compact wcwidth. Combining marks are zero
+ * width, the common CJK and emoji ranges are two, everything else
+ * is one.
  ****************************************************************/
 
 typedef struct wrange { uint32_t lo, hi; } Wrange;
@@ -2338,7 +2338,7 @@ rune_width(uint32_t cp)
 }
 
 /****************************************************************
- * Terminal cell (inlined from lumi libvt)
+ * Terminal cell
  ****************************************************************/
 
 typedef enum vt_attr {
@@ -2640,10 +2640,9 @@ scroll_default(void)
 enum { SCHEME_DOS, SCHEME_BLACK, SCHEME_PLAIN, SCHEME_COUNT };
 
 /****************************************************************
- * Syntax highlighting. A small, self-contained lexer, not the
- * lumi language engine: one generic C-family tokenizer (C, C++,
- * LPC) plus a '#'-comment shell variant. syn_line() styles one
- * line and returns a carry state so a block comment spans lines.
+ * Syntax highlighting. A small, self-contained lexer: one generic C-family
+ * tokenizer (C, C++, LPC) plus a '#'-comment shell variant. syn_line() styles
+ * one line and returns a carry state so a block comment spans lines.
  ****************************************************************/
 
 typedef struct jsf Jsf;		/* data-driven FSM highlighter from config */
@@ -3510,14 +3509,12 @@ syn_for_ext(const char *ext)
 
 
 #define VEDIT_VERSION "vedit 0.1"
-#define LUMI_VERSION VEDIT_VERSION
 
 /****************************************************************
- * Keyboard input decoding -- a compact replacement for lumi
- * libtermlib. It fills the same struct tkbd_seq the editor reads,
- * decoding UTF-8 text, control keys, arrows, Home/End/PgUp/PgDn,
- * Insert/Delete, function keys, CSI modifiers, Alt+letter, and
- * bracketed paste. Mouse decoding is intentionally omitted.
+ * Keyboard input decoding -- It fills the same struct tkbd_seq the editor
+ * reads, decoding UTF-8 text, control keys, arrows, Home/End/PgUp/PgDn,
+ * Insert/Delete, function keys, CSI modifiers, Alt+letter, and bracketed
+ * paste. Mouse decoding is intentionally omitted.
  ****************************************************************/
 
 #define TKBD_SEQ_MAX 32
@@ -3604,7 +3601,7 @@ struct tkbd_seq {
 #define TKBD_KEY_Y 0x59
 #define TKBD_KEY_Z 0x5A
 
-/* Function keys map to the low alpha range, matching lumi's tkbd. */
+/* Function keys map to the low alpha range. */
 #define TKBD_KEY_F1  0x61
 #define TKBD_KEY_F2  0x62
 #define TKBD_KEY_F3  0x63
@@ -4485,9 +4482,9 @@ tkbd_decode(struct tkbd_seq *seq, const unsigned char *buf, int len)
 			return 1;
 		}
 		/* a printable character. Lowercase maps to the uppercase key
-		 * code (as lumi's tkbd does) so letters never collide with the
-		 * function-key codes, which share the 0x61-0x6d range; the glyph
-		 * itself is carried in ch. */
+		 * code so letters never collide with the function-key codes,
+		 * which share the 0x61-0x6d range; the glyph itself is carried
+		 * in ch. */
 		{
 			uint32_t cp;
 			int n = utf8_decode(&cp, buf, len);
@@ -4739,14 +4736,14 @@ scr_wait(Screen *d, Event *ev)
 }
 
 /****************************************************************
- * Editor core types (from lumi editor.h)
+ * Editor core types
  ****************************************************************/
-/* editor.h : the editor core shared between edit.c and vi.c.
+/* The editor core shared between the modeless and vi personalities.
  *
- * edit.c holds the buffer, rendering, chrome, menus, dialogs, and the
- * modeless personality; vi.c holds the vi personality layered on top. This
- * header carries the state both share (Editor and its enums), the core
- * helpers vi.c calls, and the vi entry points edit.c calls. */
+ * The modeless personality holds the buffer, rendering, chrome, menus,
+ * dialogs, and editing; the vi personality is layered on top. These types are
+ * the state both share (Editor and its enums), the core helpers the vi code
+ * calls, and the vi entry points the modeless code calls. */
 
 
 
@@ -4974,9 +4971,9 @@ size_t vi_col_to_byte(Editor *e, size_t y, int target_col);
 
 
 /****************************************************************
- * Text buffer (from lumi libtext)
+ * Text buffer
  ****************************************************************/
-/* text.c : editable text buffer with a line index */
+/* An editable text buffer with a line index. */
 
 
 
@@ -5717,9 +5714,9 @@ text_redo(Text *t, size_t *line, size_t *col)
 }
 
 /****************************************************************
- * Hex view (from lumi edit/hex.c)
+ * Hex view
  ****************************************************************/
-/* hex.c : hex-dump view helpers for lumi edit.
+/* Hex-dump view helpers.
  *
  * The editor can render the current buffer as a hex dump instead of as text.
  * Both views share one Text, so these helpers reconstruct the byte
@@ -6033,14 +6030,14 @@ found:
 }
 
 /****************************************************************
- * Modeless editor / MS-EDIT personality (from lumi edit/edit.c)
+ * Modeless editor / MS-EDIT personality
  ****************************************************************/
-/* edit.c : lumi edit -- modeless text editor */
+/* The modeless (nano/MS-EDIT-style) text editor. */
 
 
 
 
-static const char *progname = "lumi-edit";
+static const char *progname = "vedit";
 
 
 /* One parsed compiler/make diagnostic (see the build section). */
@@ -9986,7 +9983,7 @@ static void
 dlg_help(Editor *e)
 {
 	const char *hdr = e->mode != MODE_MODELESS ?
-	    " lumi edit -- vi key bindings" : " lumi edit -- key bindings";
+	    " vedit -- vi key bindings" : " vedit -- key bindings";
 
 	for (;;) {
 		Event ev;
@@ -11151,9 +11148,9 @@ static void
 dlg_about(Editor *e)
 {
 	static const char *const lines[] = {
-		"lumi edit",
-		"a lumimux full-screen editor",
-		"version " LUMI_VERSION,
+		"vedit",
+		"a full-screen text editor",
+		"version " VEDIT_VERSION,
 	};
 	Aboutctx a = {
 		lines, (int)(sizeof(lines) / sizeof(lines[0])), "[ OK ]"
@@ -11172,10 +11169,10 @@ dlg_about(Editor *e)
 	dlg_run(e, boxw, a.nlines + 4, &a, dlg_about_draw, dlg_about_key);
 }
 
-/* The lumi build commands (compile / make / run and the quickfix error list)
- * are intentionally omitted from vedit: a MUD or primitive-terminal editor
- * should not spawn compilers, and dropping them removes the fork/exec and
- * config-file machinery. */
+/* vedit has no build commands (compile / make / run and a quickfix error
+ * list) by design: a MUD or primitive-terminal editor should not spawn
+ * compilers, and leaving them out removes the fork/exec and config-file
+ * machinery. */
 
 /* Carry out a chosen menu action. Returns 1 when the editor should quit. */
 static int
@@ -12732,9 +12729,9 @@ main(int argc, char **argv)
 }
 
 /****************************************************************
- * vi personality (from lumi edit/vi.c)
+ * vi personality
  ****************************************************************/
-/* vi.c : the vi personality for lumi edit.
+/* The vi personality.
  *
  * A self-contained modal layer over the modeless editor's buffer operations
  * in edit.c. It keeps its state on Editor (mode, a pending count, a
@@ -16004,9 +16001,9 @@ vi_ex_read_file(Editor *e, size_t at, const char *cmd)
 }
 
 /* Run an already-entered ex command line. Returns REQ_FORCE_QUIT when the
- * command asks to leave, otherwise REQ_CONTINUE. lumi edit holds a single
- * buffer, so the "all" variants (:qa, :wqa, :xa) behave like their single
- * forms. Split from vi_colon so it can run without the interactive prompt. */
+ * command asks to leave, otherwise REQ_CONTINUE. The "all" variants (:qa,
+ * :wqa, :xa) behave like their single forms. Split from vi_colon so it can run
+ * without the interactive prompt. */
 static Req
 vi_ex_exec(Editor *e, char *buf)
 {
