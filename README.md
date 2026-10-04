@@ -144,6 +144,9 @@ A gitconfig-style file sets the startup defaults. It is read from the first of
 [indent]
     expand = off         # off = indent with tabs, on = with spaces
 
+[tags]
+    file = /path/to/tags # ctags index; else a "tags" file beside the buffer
+
 [syntax]
     enable = on          # highlight recognized file types
 ```
@@ -389,6 +392,36 @@ both the `name(args)` and the BSD split style are caught), a `struct` / `union`
 cover C, C++, LPC, and shell `name()` functions. This is the picker's third
 client and the first step toward editing larger sources.
 
+When a `tags` file is available, its entries are merged into the same list, so
+the picker reaches definitions across the whole project, not just the current
+buffer. Each row is marked `[buffer]` (from the live scan) or `[tags]` (from the
+file), and a tags row shows the file it points into instead of a line number.
+Choosing a tags row opens or switches to that file and positions the cursor,
+following the tag's line number or search pattern. A tags entry that points back
+into the current file is dropped, since the live scan already lists it.
+
+The tags file is the Exuberant or Universal ctags format (also classic vi tags):
+one line per definition, `name <TAB> file <TAB> address`, where the address is a
+line number or a `/pattern/` search, with optional `;"`-delimited fields for the
+kind. Generate it with `ctags *.c` (see [ctags.io][ctags] or the older
+[ctags.sourceforge.net][ectags]). vedit looks for a file named `tags` in the
+current buffer's directory, or at the path set by `tags.file` in the config:
+
+```ini
+[tags]
+    file = /path/to/project/tags
+```
+
+vi users also get the familiar jumps: **Ctrl-]** jumps to the tag named by the
+identifier under the cursor, and **`:tag NAME`** (abbreviated `:ta`) jumps to a
+named tag. When a name has several matches the picker opens on just those;
+`:tag /pattern` opens the picker filtered to names containing the pattern. A
+single match jumps straight there. vedit keeps no tag stack, so there is no
+`:pop`; use the buffer switcher (F8) to return.
+
+[ctags]: https://ctags.io/
+[ectags]: https://ctags.sourceforge.net/
+
 ### Color schemes
 
 The **View > Color Scheme** menu cycles three looks: the DOS blue text area
@@ -417,7 +450,8 @@ dialogs, prompts, and the help screen, not just the text area.
 | Ctrl-V | paste the internal clipboard |
 | Ctrl-F | incremental find, by regular expression (Enter repeats the last search) |
 | Ctrl-R | replace by regular expression, confirming each match (y / n / a / q) |
-| Ctrl-T | go to a symbol defined in the buffer |
+| Ctrl-T | go to a symbol (buffer definitions, plus the tags file if present) |
+| Ctrl-] | jump to the tag under the cursor (needs a tags file) |
 | Ctrl-L | go to a line number |
 | Ctrl-Z / Ctrl-Y | undo / redo |
 | Ctrl-S | save (prompts for a name if the buffer has none) |
@@ -662,7 +696,8 @@ the MS-EDIT chrome (menu bar, frame, scrollbars, dialogs), regex find and
 replace, selection and an internal clipboard, goto-line, multiple buffers, a hex
 view, a 2D/block draw mode, per-language build commands with a quickfix error
 list, selectable line endings (LF, CRLF, NUL), tab display with auto-indent and
-tab/space conversion, and lightweight syntax highlighting. It draws through a
+tab/space conversion, a symbol picker that merges a buffer scan with a ctags
+tags file, and lightweight syntax highlighting. It draws through a
 self-contained ANSI
 renderer over the io vtable, and decodes the keyboard with a compact decoder that
 covers UTF-8 text, control keys, arrows, navigation keys, function keys, CSI

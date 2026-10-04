@@ -1133,6 +1133,50 @@ t_retab(Test *t)
 	text_free(e.t);
 }
 
+/* Parse an Exuberant/Universal ctags "tags" file: pseudo-tags skipped, a
+ * pattern address unescaped and de-anchored, a numeric address, and kinds. */
+static void
+t_tags(Test *t)
+{
+	char dir[] = "/tmp/vedit_tagsXXXXXX";
+	char tagspath[PATH_MAX], target[PATH_MAX];
+	Tagdb db;
+	FILE *f;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(tagspath, sizeof(tagspath), "%s/tags", dir);
+	f = fopen(tagspath, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("!_TAG_FILE_FORMAT\t2\t//\n", f);		/* pseudo-tag: skipped */
+	fputs("sock_open\tnet/sock.c\t/^int sock_open(void)$/;\"\tf\n", f);
+	fputs("MAX\tnet/sock.c\t12;\"\td\n", f);		/* numeric address */
+	fputs("Conn\tnet/sock.c\t/^struct Conn {/;\"\tkind:s\n", f);
+	fclose(f);
+
+	memset(&db, 0, sizeof(db));
+	TAP_ASSERT(t, tags_load(&db, tagspath) == 0);
+	TAP_CHECKF(t, db.n == 3, "entries %d", db.n);
+	if (db.n >= 3) {
+		TAP_CHECK(t, strcmp(db.ent[0].name, "sock_open") == 0 &&
+		    db.ent[0].kind == 'f' && db.ent[0].line == 0 &&
+		    strcmp(db.ent[0].pattern, "int sock_open(void)") == 0);
+		TAP_CHECK(t, strcmp(db.ent[1].name, "MAX") == 0 &&
+		    db.ent[1].kind == 'd' && db.ent[1].line == 12);
+		TAP_CHECK(t, strcmp(db.ent[2].name, "Conn") == 0 &&
+		    db.ent[2].kind == 's' &&
+		    strcmp(db.ent[2].pattern, "struct Conn {") == 0);
+	}
+	/* a relative tagfile resolves against the tags file's directory */
+	tag_resolve(&db, db.ent[0].file_idx, target, sizeof(target));
+	TAP_CHECKF(t, strncmp(target, dir, strlen(dir)) == 0 &&
+	    strcmp(target + strlen(target) - 10, "net/sock.c") == 0,
+	    "resolved '%s'", target);
+
+	tagdb_free(&db);
+	unlink(tagspath);
+	rmdir(dir);
+}
+
 #ifndef VEDIT_NO_TOOLS
 /* The $(...) substitution the per-language tool commands use. */
 static void
@@ -1453,6 +1497,7 @@ const Case tap_cases[] = {
 	{ "eol", t_eol },
 	{ "indent", t_indent },
 	{ "retab", t_retab },
+	{ "tags", t_tags },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_expand", t_tool_expand },
 	{ "tool_parse", t_tool_parse },

@@ -10321,7 +10321,8 @@ static const struct {
 	{ "Backspace / Del",	"Delete before / after the cursor" },
 	{ "Ctrl-F",		"Incremental find (Enter repeats the last)" },
 	{ "Ctrl-R",		"Replace, confirming each match (y/n/a/q)" },
-	{ "Ctrl-T",		"Go to a symbol defined in the buffer" },
+	{ "Ctrl-T",		"Go to a symbol (buffer, plus a tags file if any)" },
+	{ "Ctrl-]",		"Jump to the tag under the cursor (tags file)" },
 	{ "Ctrl-L",		"Go to a line number" },
 	{ "Ctrl-C / Ctrl-X",	"Copy (line if none selected) / cut" },
 	{ "Ctrl-V",		"Paste the clipboard" },
@@ -10364,6 +10365,7 @@ static const struct {
 	{ ":w  :q  :wq / :x",	"Write, quit, write and quit" },
 	{ ":q!  ZZ  ZQ",	"Quit discarding, save and quit, quit" },
 	{ ":N  :cq",		"Go to a line, quit with an error code" },
+	{ "Ctrl-]  :tag",	"Jump to a tag (under cursor / by name)" },
 	{ "F1 / F2",		"Show this help / back to modeless keys" },
 };
 
@@ -11058,22 +11060,349 @@ dlg_buffer_pick(Editor *e)
 }
 
 /****************************************************************
+ * ctags "tags" file: a parsed index of definitions across the
+ * project, feeding the symbol picker and the :tag / Ctrl-] jumps.
+ * The format is Exuberant/Universal ctags (also classic vi tags):
+ *   name <TAB> file <TAB> address[;" fields...]
+ * where address is a line number or a /pattern/ search, and the
+ * optional fields carry the kind. See https://ctags.io/ and
+ * https://ctags.sourceforge.net/.
+ ****************************************************************/
+
+/* Directory part of path (everything up to the last '/'), or "." when none. */
+static void
+path_dir(const char *path, char *out, size_t outsz)
+{
+	const char *slash = strrchr(path, '/');
+
+	if (slash) {
+		size_t n = (size_t)(slash - path);
+
+		if (n >= outsz)
+			n = outsz - 1;
+		memcpy(out, path, n);
+		out[n] = '\0';
+	} else {
+		snprintf(out, outsz, ".");
+	}
+}
+
+/* Whether a and b name the same file on disk (realpath), else a byte compare. */
+static int
+same_path(const char *a, const char *b)
+{
+	char ra[PATH_MAX], rb[PATH_MAX];
+
+	if (realpath(a, ra) && realpath(b, rb))
+		return strcmp(ra, rb) == 0;
+	return strcmp(a, b) == 0;
+}
+
+typedef struct tagent {
+	char	name[64];
+	char	kind;		/* ctags kind letter, or 0 when unknown */
+	int	file_idx;	/* index into Tagdb.files */
+	size_t	line;		/* 1-based line address, 0 when a pattern is used */
+	char	pattern[160];	/* unescaped search text, empty when line > 0 */
+} Tagent;
+
+typedef struct tagdb {
+	Tagent	*ent;
+	int	 n, cap;
+	char	**files;	/* interned file names, as written in the tags file */
+	int	 nfiles, files_cap;
+	char	 dir[PATH_MAX];	/* directory holding the tags file */
+} Tagdb;
+
+static void
+tagdb_free(Tagdb *db)
+{
+	int i;
+
+	free(db->ent);
+	for (i = 0; i < db->nfiles; i++)
+		free(db->files[i]);
+	free(db->files);
+	memset(db, 0, sizeof(*db));
+}
+
+/* Intern a file name, returning its index, or -1 on allocation failure. */
+static int
+tagdb_file_idx(Tagdb *db, const char *name)
+{
+	int i;
+	size_t len;
+	char *copy;
+
+	for (i = 0; i < db->nfiles; i++)
+		if (strcmp(db->files[i], name) == 0)
+			return i;
+	if (db->nfiles == db->files_cap) {
+		int nc = db->files_cap ? db->files_cap * 2 : 16;
+		char **nf = realloc(db->files, (size_t)nc * sizeof(*nf));
+
+		if (!nf)
+			return -1;
+		db->files = nf;
+		db->files_cap = nc;
+	}
+	len = strlen(name) + 1;
+	copy = malloc(len);
+	if (!copy)
+		return -1;
+	memcpy(copy, name, len);
+	db->files[db->nfiles] = copy;
+	return db->nfiles++;
+}
+
+/* Parse the address and extension fields of a tag line into te. The address is
+ * a line number or a /pat/ or ?pat? search ending at the ';"' field marker or
+ * the line end; the kind comes from a "kind:X" or a bare single-letter field. */
+static void
+tagdb_parse_addr(char *addr, Tagent *te)
+{
+	char *fields = NULL;
+
+	while (*addr == ' ' || *addr == '\t')
+		addr++;
+	if (isdigit((unsigned char)*addr)) {
+		te->line = (size_t)strtoul(addr, NULL, 10);
+	} else if (*addr == '/' || *addr == '?') {
+		char delim = *addr;
+		char *p = addr + 1, *out = te->pattern;
+		size_t cap = sizeof(te->pattern) - 1;
+
+		if (*p == '^')			/* drop the line-start anchor */
+			p++;
+		while (*p && *p != delim) {
+			if (*p == '\\' && p[1]) {	/* \/ \\ \t etc. */
+				p++;
+				if (out < te->pattern + cap)
+					*out++ = *p;
+				p++;
+				continue;
+			}
+			if (*p == '$' && (p[1] == delim || p[1] == '\0'))
+				break;		/* drop the line-end anchor */
+			if (out < te->pattern + cap)
+				*out++ = *p;
+			p++;
+		}
+		*out = '\0';
+	}
+	/* extension fields begin at the ';"' marker */
+	fields = strstr(addr, ";\"");
+	if (fields) {
+		char *tok;
+
+		fields += 2;
+		for (tok = strtok(fields, "\t"); tok; tok = strtok(NULL, "\t")) {
+			if (strncmp(tok, "kind:", 5) == 0 && tok[5])
+				te->kind = tok[5];
+			else if (strncmp(tok, "line:", 5) == 0)
+				te->line = (size_t)strtoul(tok + 5, NULL, 10);
+			else if (tok[0] && tok[1] == '\0' && !te->kind)
+				te->kind = tok[0];	/* bare single-letter kind */
+		}
+	}
+}
+
+/* Parse one tags-file line (modified in place) into db. */
+static int
+tagdb_parse_line(Tagdb *db, char *line)
+{
+	char *name, *file, *addr, *tab;
+	Tagent *te;
+	int fidx;
+
+	if (line[0] == '\0' || line[0] == '!')	/* blank or !_TAG_ pseudo-tag */
+		return 0;
+	name = line;
+	tab = strchr(name, '\t');
+	if (!tab)
+		return 0;
+	*tab = '\0';
+	file = tab + 1;
+	tab = strchr(file, '\t');
+	if (!tab)
+		return 0;
+	*tab = '\0';
+	addr = tab + 1;
+	if (!name[0] || !file[0])
+		return 0;
+
+	fidx = tagdb_file_idx(db, file);
+	if (fidx < 0)
+		return -1;
+	if (db->n == db->cap) {
+		int nc = db->cap ? db->cap * 2 : 256;
+		Tagent *ne = realloc(db->ent, (size_t)nc * sizeof(*ne));
+
+		if (!ne)
+			return -1;
+		db->ent = ne;
+		db->cap = nc;
+	}
+	te = &db->ent[db->n];
+	memset(te, 0, sizeof(*te));
+	snprintf(te->name, sizeof(te->name), "%s", name);
+	te->file_idx = fidx;
+	tagdb_parse_addr(addr, te);
+	db->n++;
+	return 0;
+}
+
+/* Locate the tags file: an explicit tags.file config path, else a "tags" file
+ * in the current buffer's directory. Writes the path to out; returns 0, or -1
+ * when none is readable. */
+static int
+tags_locate(Editor *e, char *out, size_t outsz)
+{
+	const char *cfg = g_cfg ? cfg_get(g_cfg, "tags.file") : NULL;
+	char dir[PATH_MAX];
+
+	if (cfg && cfg[0]) {
+		snprintf(out, outsz, "%s", cfg);
+		return access(out, R_OK) == 0 ? 0 : -1;
+	}
+	if (!e->has_name)
+		return -1;
+	path_dir(e->path, dir, sizeof(dir));
+	if (snprintf(out, outsz, "%s/tags", dir) >= (int)outsz)
+		return -1;
+	return access(out, R_OK) == 0 ? 0 : -1;
+}
+
+/* Read and parse the tags file at path into db. Returns 0, or -1 on error. */
+static int
+tags_load(Tagdb *db, const char *path)
+{
+	FILE *fp = fopen(path, "rb");
+	char *data = NULL;
+	size_t len = 0, cap = 0, start, i;
+	int c;
+
+	if (!fp)
+		return -1;
+	while ((c = fgetc(fp)) != EOF) {
+		if (len + 2 > cap) {
+			size_t nc = cap ? cap * 2 : 8192;
+			char *p = realloc(data, nc);
+
+			if (!p) {
+				free(data);
+				fclose(fp);
+				return -1;
+			}
+			data = p;
+			cap = nc;
+		}
+		data[len++] = (char)c;
+	}
+	fclose(fp);
+	if (!data)				/* empty file */
+		return 0;
+	data[len] = '\0';
+	path_dir(path, db->dir, sizeof(db->dir));
+
+	for (start = 0, i = 0; i < len; i++) {
+		if (data[i] == '\n') {
+			data[i] = '\0';
+			tagdb_parse_line(db, data + start);
+			start = i + 1;
+		}
+	}
+	if (start < len)			/* last line without a newline */
+		tagdb_parse_line(db, data + start);
+	free(data);
+	return 0;
+}
+
+/* Resolve tag file index idx against the tags-file directory. */
+static void
+tag_resolve(const Tagdb *db, int idx, char *out, size_t outsz)
+{
+	const char *rel;
+
+	if (idx < 0 || idx >= db->nfiles) {
+		out[0] = '\0';
+		return;
+	}
+	rel = db->files[idx];
+	if (rel[0] == '/')
+		snprintf(out, outsz, "%s", rel);
+	else if (snprintf(out, outsz, "%s/%s", db->dir, rel) >= (int)outsz)
+		snprintf(out, outsz, "%s", rel);
+}
+
+/* The first buffer line containing pat (a plain substring), or (size_t)-1. */
+static size_t
+buf_find_line(Editor *e, const char *pat)
+{
+	size_t n = text_lines(e->t), i, pl = strlen(pat);
+
+	if (pl == 0)
+		return (size_t)-1;
+	for (i = 0; i < n; i++) {
+		size_t len = 0, j;
+		const char *s = text_line(e->t, i, &len);
+
+		if (!s || len < pl)
+			continue;
+		for (j = 0; j + pl <= len; j++)
+			if (memcmp(s + j, pat, pl) == 0)
+				return i;
+	}
+	return (size_t)-1;
+}
+
+/* Open or switch to file and move the cursor to line (1-based; 0 means use the
+ * pattern), or to the first line matching pattern. Returns 0, or -1. */
+static int
+ed_goto_target(Editor *e, const char *file, size_t line, const char *pattern)
+{
+	if (buf_open(e, file) < 0)
+		return -1;
+	if (text_lines(e->t) == 0)
+		return -1;
+	if (line == 0 && pattern && pattern[0]) {
+		size_t ly = buf_find_line(e, pattern);
+
+		if (ly != (size_t)-1)
+			line = ly + 1;
+	}
+	e->cy = line ? line - 1 : 0;
+	if (e->cy >= text_lines(e->t))
+		e->cy = text_lines(e->t) - 1;
+	e->cx = 0;
+	e->sel_active = 0;
+	clamp_col(e);
+	return 0;
+}
+
+/****************************************************************
  * Symbol picker (a picker client)
  ****************************************************************/
 
 typedef struct sym {
-	size_t	line;		/* 0-based line the definition is on */
+	size_t	line;		/* 0-based line the definition is on (buffer) */
 	char	kind;		/* 'f' func, 's' struct/union/enum, 'c' class,
-				 * 'd' macro, 't' typedef alias */
+				 * 'd' macro, 't' typedef alias, or a ctags kind */
 	char	name[80];
+	int	tag;		/* 1 when this entry comes from the tags file */
+	int	file_idx;	/* tags: index into the picker's Tagdb; else -1 */
+	char	pattern[160];	/* tags: search pattern, empty when line is set */
 } Sym;
 
 typedef struct sympick {
 	Editor	*e;
 	Sym	*ent;
 	int	 n, cap;
-	char	 line[160];	/* reused by label() for one row */
-	size_t	 chosen;	/* target line on PICK_DONE */
+	char	 line[256];	/* reused by label() for one row */
+	int	 chosen;	/* selected row index on PICK_DONE, else -1 */
+	Tagdb	 db;		/* parsed tags file, owns the tag entries' files */
+	const char *want;	/* non-NULL: include only this exact name */
+	const char *sub;	/* non-NULL: include only names containing this */
 } Sympick;
 
 static int
@@ -11230,35 +11559,88 @@ sym_classify(const char *s, size_t len, char *name, size_t namesz)
 	return 0;
 }
 
+/* Whether name passes the picker's active filter. */
+static int
+sym_wanted(Sympick *sp, const char *name)
+{
+	if (sp->want && strcmp(name, sp->want) != 0)
+		return 0;
+	if (sp->sub && !strstr(name, sp->sub))
+		return 0;
+	return 1;
+}
+
+/* Append one entry; returns a pointer to it, or NULL on allocation failure. */
+static Sym *
+sym_add(Sympick *sp)
+{
+	if (sp->n == sp->cap) {
+		int nc = sp->cap ? sp->cap * 2 : 64;
+		Sym *ne = realloc(sp->ent, (size_t)nc * sizeof(*ne));
+
+		if (!ne)
+			return NULL;
+		sp->ent = ne;
+		sp->cap = nc;
+	}
+	memset(&sp->ent[sp->n], 0, sizeof(sp->ent[sp->n]));
+	sp->ent[sp->n].file_idx = -1;
+	return &sp->ent[sp->n++];
+}
+
+/* Scan the current buffer for definitions, then merge in the tags file (when
+ * one is found), skipping tag entries that point back into the current buffer
+ * since the live buffer scan already covers those. The want/sub filters, when
+ * set, limit which names are listed. */
 static void
 symscan(Sympick *sp)
 {
 	size_t nlines = text_lines(sp->e->t), i;
+	char tagspath[PATH_MAX];
+	int ti;
 
 	for (i = 0; i < nlines; i++) {
 		size_t len = 0;
 		const char *s = text_line(sp->e->t, i, &len);
 		char name[80], kind;
+		Sym *se;
 
 		if (!s)
 			continue;
 		kind = sym_classify(s, len, name, sizeof(name));
-		if (!kind)
+		if (!kind || !sym_wanted(sp, name))
 			continue;
-		if (sp->n == sp->cap) {
-			int nc = sp->cap ? sp->cap * 2 : 64;
-			Sym *ne = realloc(sp->ent, (size_t)nc * sizeof(*ne));
+		se = sym_add(sp);
+		if (!se)
+			return;
+		se->line = i;
+		se->kind = kind;
+		snprintf(se->name, sizeof(se->name), "%s", name);
+	}
 
-			if (!ne)
-				return;
-			sp->ent = ne;
-			sp->cap = nc;
-		}
-		sp->ent[sp->n].line = i;
-		sp->ent[sp->n].kind = kind;
-		snprintf(sp->ent[sp->n].name, sizeof(sp->ent[sp->n].name),
-		    "%s", name);
-		sp->n++;
+	if (tags_locate(sp->e, tagspath, sizeof(tagspath)) != 0)
+		return;
+	if (tags_load(&sp->db, tagspath) != 0)
+		return;
+	for (ti = 0; ti < sp->db.n; ti++) {
+		const Tagent *te = &sp->db.ent[ti];
+		char target[PATH_MAX];
+		Sym *se;
+
+		if (!sym_wanted(sp, te->name))
+			continue;
+		tag_resolve(&sp->db, te->file_idx, target, sizeof(target));
+		if (sp->e->has_name && same_path(target, sp->e->path))
+			continue;		/* the buffer scan already has it */
+		se = sym_add(sp);
+		if (!se)
+			return;
+		se->tag = 1;
+		se->kind = te->kind;
+		se->line = te->line;
+		se->file_idx = te->file_idx;
+		snprintf(se->name, sizeof(se->name), "%s", te->name);
+		snprintf(se->pattern, sizeof(se->pattern), "%s", te->pattern);
 	}
 }
 
@@ -11267,10 +11649,11 @@ sym_kindword(char kind)
 {
 	switch (kind) {
 	case 'f': return "func";
-	case 's': return "type";
+	case 's': case 'u': case 'g': case 't': return "type";
 	case 'c': return "class";
 	case 'd': return "macro";
-	case 't': return "type";
+	case 'v': return "var";
+	case 'm': return "member";
 	default:  return "";
 	}
 }
@@ -11292,12 +11675,21 @@ static const char *
 sympick_label(void *ctx, int i)
 {
 	Sympick *sp = ctx;
+	const Sym *se;
+	char where[PATH_MAX];
 
 	if (i < 0 || i >= sp->n)
 		return "";
-	snprintf(sp->line, sizeof(sp->line), "%-32s %-6s L%zu",
-	    sp->ent[i].name, sym_kindword(sp->ent[i].kind),
-	    sp->ent[i].line + 1);
+	se = &sp->ent[i];
+	if (se->tag)
+		snprintf(where, sizeof(where), "%s",
+		    se->file_idx >= 0 && se->file_idx < sp->db.nfiles ?
+		    sp->db.files[se->file_idx] : "?");
+	else
+		snprintf(where, sizeof(where), "L%zu", se->line + 1);
+	snprintf(sp->line, sizeof(sp->line), "%-8s %-28.48s %-6s %.150s",
+	    se->tag ? "[tags]" : "[buffer]", se->name,
+	    sym_kindword(se->kind), where);
 	return sp->line;
 }
 
@@ -11308,14 +11700,43 @@ sympick_choose(void *ctx, int i)
 
 	if (i < 0 || i >= sp->n)
 		return PICK_STAY;
-	sp->chosen = sp->ent[i].line;
+	sp->chosen = i;
 	return PICK_DONE;
 }
 
-/* Scan the current buffer for definitions, list them, and jump to the one
- * chosen. A list with no entry line, the picker's third client. */
+/* Jump to the chosen entry: a buffer line, or a tags entry in another file. */
 static void
-dlg_symbol_pick(Editor *e)
+sym_goto(Editor *e, Sympick *sp, int i)
+{
+	const Sym *se;
+
+	if (i < 0 || i >= sp->n)
+		return;
+	se = &sp->ent[i];
+	if (se->tag) {
+		char target[PATH_MAX];
+
+		tag_resolve(&sp->db, se->file_idx, target, sizeof(target));
+		if (ed_goto_target(e, target, se->line, se->pattern) == 0)
+			snprintf(e->status, sizeof(e->status), "%.40s  %.90s:%zu",
+			    se->name, target, e->cy + 1);
+		else
+			snprintf(e->status, sizeof(e->status),
+			    "could not open %.100s", target);
+	} else if (se->line < text_lines(e->t)) {
+		e->cy = se->line;
+		e->cx = 0;
+		e->sel_active = 0;
+		snprintf(e->status, sizeof(e->status), "line %zu", se->line + 1);
+	}
+}
+
+/* Build the merged symbol list (optionally filtered), list it, and jump to the
+ * chosen entry. When auto_single is set and exactly one entry matches, jump to
+ * it without showing the picker. The core of Ctrl-T, :tag, and Ctrl-]. */
+static void
+symbol_pick_filtered(Editor *e, const char *want, const char *sub,
+    int auto_single)
 {
 	Picksrc s = {
 		.title = sympick_title, .count = sympick_count,
@@ -11325,23 +11746,78 @@ dlg_symbol_pick(Editor *e)
 
 	memset(&sp, 0, sizeof(sp));
 	sp.e = e;
+	sp.chosen = -1;
+	sp.want = want;
+	sp.sub = sub;
 	symscan(&sp);
 	if (sp.n == 0) {
-		snprintf(e->status, sizeof(e->status), "no symbols found");
-		free(sp.ent);
-		return;
+		if (want)
+			snprintf(e->status, sizeof(e->status),
+			    "tag not found: %.60s", want);
+		else if (sub)
+			snprintf(e->status, sizeof(e->status),
+			    "no symbols match: %.60s", sub);
+		else
+			snprintf(e->status, sizeof(e->status),
+			    "no symbols found");
+		goto done;
+	}
+	if (auto_single && sp.n == 1) {
+		sym_goto(e, &sp, 0);
+		goto done;
 	}
 	s.ctx = &sp;
-	if (dlg_pick(e, &s)) {
-		if (sp.chosen < text_lines(e->t)) {
-			e->cy = sp.chosen;
-			e->cx = 0;
-			e->sel_active = 0;
-			snprintf(e->status, sizeof(e->status),
-			    "line %zu", sp.chosen + 1);
-		}
-	}
+	if (dlg_pick(e, &s))
+		sym_goto(e, &sp, sp.chosen);
+done:
 	free(sp.ent);
+	tagdb_free(&sp.db);
+}
+
+/* Scan the current buffer and the tags file for definitions, list them, and
+ * jump to the one chosen (Ctrl-T). */
+static void
+dlg_symbol_pick(Editor *e)
+{
+	symbol_pick_filtered(e, NULL, NULL, 0);
+}
+
+/* The identifier under the cursor, written to out; returns its length. */
+static size_t
+cursor_word(Editor *e, char *out, size_t outsz)
+{
+	size_t len = 0, a, b;
+	const char *s = text_line(e->t, e->cy, &len);
+
+	out[0] = '\0';
+	if (!s || e->cx > len)
+		return 0;
+	a = e->cx;
+	while (a > 0 && sym_ident((unsigned char)s[a - 1]))
+		a--;
+	b = e->cx;
+	while (b < len && sym_ident((unsigned char)s[b]))
+		b++;
+	if (b <= a)
+		return 0;
+	if (b - a >= outsz)
+		b = a + outsz - 1;
+	memcpy(out, s + a, b - a);
+	out[b - a] = '\0';
+	return b - a;
+}
+
+/* vi Ctrl-]: jump to the tag named by the identifier under the cursor. */
+static void
+ed_tag_under_cursor(Editor *e)
+{
+	char word[80];
+
+	if (cursor_word(e, word, sizeof(word)) == 0) {
+		snprintf(e->status, sizeof(e->status), "no identifier under cursor");
+		return;
+	}
+	symbol_pick_filtered(e, word, NULL, 1);
 }
 
 static void
@@ -12808,7 +13284,8 @@ usage(void)
 	    "  Ctrl-V        paste the internal clipboard\n"
 	    "  Ctrl-F        incremental find (Enter repeats the last)\n"
 	    "  Ctrl-R        replace, confirming each match (y/n/a/q)\n"
-	    "  Ctrl-T        go to a symbol defined in the buffer\n"
+	    "  Ctrl-T        go to a symbol (buffer, plus a tags file if any)\n"
+	    "  Ctrl-]        jump to the tag under the cursor\n"
 	    "  Ctrl-L        go to a line number\n"
 	    "  Ctrl-Z / Ctrl-Y  undo / redo\n"
 	    "  Ctrl-S        save (prompts for a name if the buffer has none)\n"
@@ -13455,6 +13932,15 @@ editor_loop(Editor *e)
 			}
 		}
 #endif
+
+		/* Ctrl-] jumps to the tag under the cursor, in either personality
+		 * (it arrives as ']' with the Ctrl modifier). */
+		if (seq.type == TKBD_KEY && seq.key == ']' &&
+		    (seq.mod & TKBD_MOD_CTRL) && e->mode != MODE_INSERT) {
+			ed_tag_under_cursor(e);
+			ed_render(e, e->d);
+			continue;
+		}
 
 		if (seq.type == TKBD_KEY && seq.key == TKBD_KEY_PASTE_BEGIN) {
 			if (e->mode == MODE_NORMAL)
@@ -17623,6 +18109,28 @@ vi_ex_exec(Editor *e, char *buf)
 	 * tabs to spaces when indenting with spaces, otherwise the reverse. */
 	if (strcmp(p, "retab") == 0 || strcmp(p, "retab!") == 0) {
 		ed_retab(e, e->expand_tabs);
+		return REQ_CONTINUE;
+	}
+
+	/* :tag NAME jumps to a named tag (a /pattern opens the picker filtered to
+	 * matching names); :ta is the usual abbreviation. */
+	if ((strncmp(p, "tag", 3) == 0 &&
+	    (p[3] == ' ' || p[3] == '!' || p[3] == '\0')) ||
+	    (strncmp(p, "ta", 2) == 0 &&
+	    (p[2] == ' ' || p[2] == '!' || p[2] == '\0'))) {
+		const char *arg = p + (p[1] == 'a' && p[2] == 'g' ? 3 : 2);
+
+		if (*arg == '!')
+			arg++;
+		while (*arg == ' ')
+			arg++;
+		if (*arg == '/')
+			symbol_pick_filtered(e, NULL, arg + 1, 0);
+		else if (*arg)
+			symbol_pick_filtered(e, arg, NULL, 1);
+		else
+			snprintf(e->status, sizeof(e->status),
+			    "E471: argument required");
 		return REQ_CONTINUE;
 	}
 

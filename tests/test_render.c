@@ -181,6 +181,83 @@ t_tab_key_expand(Test *t)
 	memio_free(&m);
 }
 
+/* Load a one-section config from an in-memory string (cfg_load_mem mutates its
+ * input, so it is handed a private copy). */
+static Cfg *
+cfg_from_text(const char *text)
+{
+	Cfg *c = vedit_cfg_new();
+	char *dup;
+
+	if (!c)
+		return NULL;
+	dup = cfg_dup(text);
+	if (!dup) {
+		vedit_cfg_free(c);
+		return NULL;
+	}
+	cfg_load_mem(c, dup);
+	free(dup);
+	return c;
+}
+
+/* Ctrl-] jumps to the tag under the cursor: with a tags file and one match it
+ * opens the target file and positions the cursor, driven through the loop. */
+static void
+t_tag_jump(Test *t)
+{
+	char dir[] = "/tmp/vedit_tjXXXXXX";
+	char src[PATH_MAX], tags[PATH_MAX], cfgtext[PATH_MAX + 64];
+	const char keys[] = "\x1d";		/* Ctrl-] */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Cfg *cfg;
+	FILE *f;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(src, sizeof(src), "%s/sock.c", dir);
+	snprintf(tags, sizeof(tags), "%s/tags", dir);
+
+	f = fopen(src, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("/* hdr */\nint sock_open(void)\n{\n\treturn 0;\n}\n", f);
+	fclose(f);
+
+	f = fopen(tags, "w");
+	TAP_ASSERT(t, f != NULL);
+	/* absolute file path so the resolved target is exact */
+	fprintf(f, "sock_open\t%s\t/^int sock_open(void)$/;\"\tf\n", src);
+	fclose(f);
+
+	snprintf(cfgtext, sizeof(cfgtext), "[tags]\n\tfile = %s\n", tags);
+	cfg = cfg_from_text(cfgtext);
+	TAP_ASSERT(t, cfg != NULL);
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config(v, cfg);
+	text_insert(v->e.t, 0, 0, "sock_open", 9);	/* identifier under cursor */
+	v->e.cy = 0;
+	v->e.cx = 0;
+
+	vedit_run(v);
+
+	TAP_CHECK(t, v->e.has_name &&
+	    strcmp(v->e.path + strlen(v->e.path) - 6, "sock.c") == 0);
+	TAP_CHECKF(t, v->e.cy == 1, "cursor line %zu, want 1", v->e.cy);
+
+	vedit_free(v);
+	memio_free(&m);
+	g_cfg = NULL;
+	vedit_cfg_free(cfg);
+	unlink(tags);
+	unlink(src);
+	rmdir(dir);
+}
+
 #ifndef VEDIT_NO_TOOLS
 /* A fake tool runner, so the IDE-command tests drive the whole event loop
  * (key -> dispatch -> command -> output pane) without forking a shell. */
@@ -215,26 +292,6 @@ fake_foreground(void *ctx, const char *cmd, const char *dir)
 static const struct vedit_tool_api fake_tools = {
 	NULL, fake_capture, fake_foreground,
 };
-
-/* Load a one-section config from an in-memory string (cfg_load_mem mutates its
- * input, so it is handed a private copy). */
-static Cfg *
-cfg_from_text(const char *text)
-{
-	Cfg *c = vedit_cfg_new();
-	char *dup;
-
-	if (!c)
-		return NULL;
-	dup = cfg_dup(text);
-	if (!dup) {
-		vedit_cfg_free(c);
-		return NULL;
-	}
-	cfg_load_mem(c, dup);
-	free(dup);
-	return c;
-}
 
 /* F9 (Make): the whole path end to end. The key reaches the dispatcher, the
  * per-language build command is expanded and run, the captured output is parsed
@@ -351,6 +408,7 @@ const Case tap_cases[] = {
 	{ "gutter_numbers", t_gutter_numbers },
 	{ "status_flags", t_status_flags },
 	{ "tab_key_expand", t_tab_key_expand },
+	{ "tag_jump", t_tag_jump },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_f9_make", t_tool_f9_make },
 	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },
