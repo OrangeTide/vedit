@@ -25,6 +25,8 @@
 #include "../vedit.c"
 #undef main
 
+#include "memio.h"
+
 /* ---- deterministic PRNG (xorshift64) ---- */
 
 static uint64_t rng_state = 1;
@@ -238,6 +240,92 @@ fuzz_utf8(void)
 	}
 }
 
+/* Drive the OSC 52 "copy whole file" path through a captured vedit_io: build a
+ * random buffer, copy it to the terminal clipboard, and assert the emitted
+ * OSC 52 payload is exactly the base64 of the buffer text. Also exercises the
+ * selection copy and the mirrored-clip path so the sanitizers see them. */
+static void
+fuzz_clipboard(void)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Editor *e;
+	size_t nlines = 1 + rnd_below(6), i, lastlen = 0, elen = 0;
+	char *expect;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	if (!v) {
+		memio_free(&m);
+		return;
+	}
+	e = &v->e;
+
+	/* Fill with random lines. A line never holds the newline byte, which is
+	 * the separator region_text inserts between lines. */
+	for (i = 0; i < nlines; i++) {
+		char ln[40];
+		size_t k, n = rnd_below(sizeof(ln));
+
+		for (k = 0; k < n; k++) {
+			int c;
+
+			do {
+				c = (int)(rnd() & 0xff);
+			} while (c == '\n' || c == '\0');
+			ln[k] = (char)c;
+		}
+		if (i == 0)
+			text_insert(e->t, 0, 0, ln, n);
+		else
+			lines_insert_at(e->t, i, ln, n);
+	}
+
+	/* Cover the selection copy and, with mirroring on, the clip_set path. */
+	e->clip_osc52 = (int)(rnd() & 1);
+	osc_copy_selection(e);
+	{
+		size_t ll = 0;
+		const char *s = text_line(e->t, 0, &ll);
+		char *c = malloc(ll ? ll : 1);
+
+		if (c) {
+			if (ll)
+				memcpy(c, s, ll);
+			clip_set(e, c, ll);	/* takes ownership */
+		}
+	}
+
+	/* Headline path: copy the whole file, then check what was emitted. */
+	m.outlen = 0;
+	if (m.out)
+		m.out[0] = '\0';
+	osc_copy_file(e);
+
+	nlines = text_lines(e->t);
+	text_line(e->t, nlines - 1, &lastlen);
+	expect = region_text(e, 0, 0, nlines - 1, lastlen, &elen);
+	if (expect && elen > 0 && elen <= OSC52_MAX) {
+		size_t cap = ((elen + 2) / 3) * 4 + 1;
+		char *b64 = malloc(cap);
+
+		if (b64) {
+			b64_encode((const unsigned char *)expect, elen, b64);
+			if (!m.out || strstr(m.out, b64) == NULL) {
+				fprintf(stderr, "clipboard: OSC 52 payload does "
+				    "not match the buffer (elen=%zu)\n", elen);
+				abort();
+			}
+			free(b64);
+		}
+	}
+	free(expect);
+	vedit_free(v);
+	memio_free(&m);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -257,6 +345,7 @@ main(int argc, char **argv)
 		fuzz_regex();
 		fuzz_config();
 		fuzz_utf8();
+		fuzz_clipboard();
 	}
 
 	printf("torture: %ld rounds, seed %llu, ok\n", rounds, seed);
