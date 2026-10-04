@@ -210,8 +210,12 @@ Each `rule` is `charset  target-state  [options]`:
   `underline`, `reverse`, `dim`, `italic`), e.g. `keyword = yellow bold`.
 
 The carry state between lines is the current state, so multi-line constructs
-(block comments, here-strings) work by staying in a state at end of line. A
-language whose name matches a file extension is picked up automatically; a
+(block comments, here-strings) work by staying in a state at end of line. At the
+end of each line a newline is fed to the machine (as joe does), so a state that
+should not span lines, such as a `//` line comment, returns to idle with a
+`rule = "\n" idle`; a state with only a `*` rule stays and carries on. The
+newline flush also lets a bare keyword at the very end of a line be recognized.
+A language whose name matches a file extension is picked up automatically; a
 `syntax.<ext> = <name>` line maps any other extension. The core reads no files:
 the rules are config data, loaded through `vedit_set_config()` like everything
 else. (Region markers and state includes are not in this first cut.)

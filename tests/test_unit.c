@@ -589,6 +589,71 @@ t_jsf_highlight(Test *t)
 	unlink(path);
 }
 
+static void
+t_jsf_linecomment(Test *t)
+{
+	static const char *text =
+	    "[color \"lc\"]\n"
+	    "  kw  = yellow\n"
+	    "  com = green\n"
+	    "[words \"lc.w\"]\n"
+	    "  list = if\n"
+	    "[state \"lc.idle\"]\n"
+	    "  color = text\n"
+	    "  rule = \"/\" slash\n"
+	    "  rule = \"a-z\" word buffer\n"
+	    "  rule = * idle\n"
+	    "[state \"lc.slash\"]\n"
+	    "  color = text\n"
+	    "  rule = \"/\" com recolor=2\n"
+	    "  rule = * idle noeat\n"
+	    "[state \"lc.com\"]\n"
+	    "  color = com\n"
+	    "  rule = \"\\n\" idle\n"
+	    "  rule = * com\n"
+	    "[state \"lc.word\"]\n"
+	    "  color = text\n"
+	    "  rule = \"a-z\" word\n"
+	    "  rule = * idle noeat kw=lc.w:kw\n";
+	char path[256];
+	Cfg *c = load_cfg_text(text, path, sizeof(path));
+	const Cfg *old = g_cfg;
+	const Syntax *sy;
+	uint8_t out[32];
+	uint16_t carry;
+	int lang, kw, com;
+
+	TAP_ASSERT(t, c != NULL);
+	g_cfg = c;
+	syntax_load_cfg(c);
+	lang = jsf_find("lc");
+	TAP_ASSERT(t, lang >= 0);
+	kw = jsf_class_of(lang, "kw");
+	com = jsf_class_of(lang, "com");
+	sy = syn_for_ext("lc");
+	TAP_ASSERT(t, sy && sy->fsm);
+
+	/* line 1 ends in a line comment; the virtual newline must return the
+	 * carry state to idle so the comment does not leak onto line 2 */
+	memset(out, 0, sizeof(out));
+	carry = syn_line(sy, sy->start, "a // x", 6, out);
+	TAP_CHECKF(t, out[3] == com && out[5] == com, "comment [%d %d]",
+	    out[3], out[5]);
+	TAP_CHECKF(t, carry == sy->start, "carry leaked: %u", carry);
+
+	/* line 2: a bare "if" at end of line matches the keyword via the
+	 * end-of-line token flush */
+	memset(out, 0, sizeof(out));
+	syn_line(sy, carry, "if", 2, out);
+	TAP_CHECKF(t, out[0] == kw && out[1] == kw, "eol kw [%d %d]",
+	    out[0], out[1]);
+
+	g_cfg = old;
+	syntax_load_cfg(NULL);
+	vedit_cfg_free(c);
+	unlink(path);
+}
+
 const Case tap_cases[] = {
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },
@@ -613,5 +678,6 @@ const Case tap_cases[] = {
 	{ "cfg_theme", t_cfg_theme },
 	{ "jsf_charset", t_jsf_charset },
 	{ "jsf_highlight", t_jsf_highlight },
+	{ "jsf_linecomment", t_jsf_linecomment },
 	{ NULL, NULL },
 };

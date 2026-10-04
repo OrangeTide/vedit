@@ -1008,8 +1008,12 @@ jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
 	uint16_t st = state_in < j->nstates ? state_in : j->start;
 	int buffering = 0, hops = 0;
 
-	while (i < n) {
-		unsigned char c = (unsigned char)bytes[i];
+	/* Iterate one past the line and feed a virtual '\n' there, as joe does,
+	 * so a state can end a line (a "\n" rule returns a line comment to idle)
+	 * and so a token flush at end of line matches a keyword. out[] is only
+	 * written for real bytes (i < n). */
+	while (i <= n) {
+		unsigned char c = i < n ? (unsigned char)bytes[i] : '\n';
 		const Jsfstate *S = &j->states[st];
 		const Jsfrule *R = NULL;
 		int r;
@@ -1023,7 +1027,7 @@ jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
 			}
 		}
 		if (!R) {			/* no rule: color and consume */
-			if (out)
+			if (out && i < n)
 				out[i] = S->klass;
 			i++;
 			continue;
@@ -1039,7 +1043,7 @@ jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
 				if (!jsf_group_has(j, kw->group, bytes + tok,
 				    (int)(i - tok)))
 					continue;
-				for (p = tok; p < i; p++)
+				for (p = tok; p < i && p < n; p++)
 					out[p] = kw->klass;
 				break;
 			}
@@ -1050,21 +1054,23 @@ jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
 		}
 		/* color the consumed byte with this state's class first, then
 		 * let recolor override it (and any earlier bytes) */
-		if (out && !(R->flags & JSF_F_NOEAT))
+		if (out && i < n && !(R->flags & JSF_F_NOEAT))
 			out[i] = S->klass;
 		if (R->recolor && out) {
+			size_t last = i < n ? i : (n ? n - 1 : 0);
 			size_t cnt = R->recolor;
-			size_t from = cnt > i + 1 ? 0 : (i + 1 - cnt);
+			size_t from = cnt > last + 1 ? 0 : (last + 1 - cnt);
 			uint8_t nk = j->states[R->next].klass;
 			size_t p;
 
-			for (p = from; p <= i; p++)
-				out[p] = nk;
+			if (i <= n)
+				for (p = from; p <= last && p < n; p++)
+					out[p] = nk;
 		}
 		if (R->flags & JSF_F_NOEAT) {
 			st = R->next;
 			if (++hops > 16) {	/* break a malformed noeat cycle */
-				if (out)
+				if (out && i < n)
 					out[i] = j->states[st].klass;
 				i++;
 				hops = 0;
