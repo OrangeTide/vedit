@@ -1027,6 +1027,112 @@ t_eol(Test *t)
 	text_free(tx);
 }
 
+/* Compare line y of e->t against a NUL-terminated expected string. */
+static int
+line_is(Editor *e, size_t y, const char *want)
+{
+	size_t len = 0;
+	const char *s = text_line(e->t, y, &len);
+
+	return s && len == strlen(want) && memcmp(s, want, len) == 0;
+}
+
+/* The Tab key and auto-indent: literal tabs vs spaces, and copying indent. */
+static void
+t_indent(Test *t)
+{
+	Editor e;
+
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+
+	/* Tab with expandtab off inserts a literal tab */
+	e.expand_tabs = 0;
+	e.cy = e.cx = 0;
+	ed_indent_tab(&e);
+	TAP_CHECK(t, line_is(&e, 0, "\t"));
+
+	/* Tab with expandtab on fills spaces to the next 8-column stop. The line
+	 * already holds one tab (8 columns), so this adds a full 8 spaces. */
+	e.expand_tabs = 1;
+	ed_indent_tab(&e);
+	TAP_CHECK(t, line_is(&e, 0, "\t        "));
+
+	/* a tab three columns in adds five spaces to reach column 8 */
+	text_free(e.t);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "abc", 3);
+	e.cy = 0;
+	e.cx = 3;
+	e.expand_tabs = 1;
+	ed_indent_tab(&e);
+	TAP_CHECK(t, line_is(&e, 0, "abc     "));	/* abc + 5 spaces */
+
+	/* auto-indent copies the leading whitespace onto the new line */
+	text_free(e.t);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "\t\tcode", 6);
+	e.auto_indent = 1;
+	e.cy = 0;
+	e.cx = text_line_len(e.t, 0);		/* end of line */
+	ed_newline_indent(&e);
+	TAP_CHECK(t, text_lines(e.t) == 2);
+	TAP_CHECK(t, line_is(&e, 1, "\t\t"));
+	TAP_CHECKF(t, e.cy == 1 && e.cx == 2, "cursor %zu,%zu", e.cy, e.cx);
+
+	/* with auto-indent off the new line starts empty */
+	text_free(e.t);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "\t\tcode", 6);
+	e.auto_indent = 0;
+	e.cy = 0;
+	e.cx = text_line_len(e.t, 0);
+	ed_newline_indent(&e);
+	TAP_CHECK(t, line_is(&e, 1, ""));
+
+	text_free(e.t);
+}
+
+/* Convert tabs to spaces and indentation back to tabs. */
+static void
+t_retab(Test *t)
+{
+	Editor e;
+
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+
+	/* a leading tab expands to eight spaces; a tab after content fills to the
+	 * next stop (here "ab" + a tab -> "ab" + six spaces) */
+	text_insert(e.t, 0, 0, "\tab\tc", 5);
+	TAP_CHECK(t, ed_retab_range(&e, 0, 0, 1) == 1);
+	TAP_CHECK(t, line_is(&e, 0, "        ab      c"));	/* 8 + ab + 6 + c */
+
+	/* convert indentation back to tabs: eight leading spaces -> one tab, and
+	 * spaces inside the line are left alone */
+	text_free(e.t);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "        ab c", 12);
+	TAP_CHECK(t, ed_retab_range(&e, 0, 0, 0) == 1);
+	TAP_CHECK(t, line_is(&e, 0, "\tab c"));
+
+	/* ten leading spaces -> one tab plus two spaces (8 + 2) */
+	text_free(e.t);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "          x", 11);
+	TAP_CHECK(t, ed_retab_range(&e, 0, 0, 0) == 1);
+	TAP_CHECK(t, line_is(&e, 0, "\t  x"));
+
+	text_free(e.t);
+}
+
 #ifndef VEDIT_NO_TOOLS
 /* The $(...) substitution the per-language tool commands use. */
 static void
@@ -1345,6 +1451,8 @@ const Case tap_cases[] = {
 	{ "regex_engine", t_regex_engine },
 	{ "base64", t_base64 },
 	{ "eol", t_eol },
+	{ "indent", t_indent },
+	{ "retab", t_retab },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_expand", t_tool_expand },
 	{ "tool_parse", t_tool_parse },

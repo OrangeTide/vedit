@@ -156,6 +156,31 @@ t_status_flags(Test *t)
 	memio_free(&m);
 }
 
+/* The Tab key with expandtab on inserts spaces to the next stop, driven through
+ * the event loop. */
+static void
+t_tab_key_expand(Test *t)
+{
+	const char keys[] = "\t";	/* one Tab */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	size_t len = 0;
+	const char *s;
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	v->e.expand_tabs = 1;
+	vedit_run(v);
+	s = text_line(v->e.t, 0, &len);
+	TAP_CHECKF(t, s && len == 8 && memcmp(s, "        ", 8) == 0,
+	    "expandtab produced %zu bytes", len);
+	vedit_free(v);
+	memio_free(&m);
+}
+
 #ifndef VEDIT_NO_TOOLS
 /* A fake tool runner, so the IDE-command tests drive the whole event loop
  * (key -> dispatch -> command -> output pane) without forking a shell. */
@@ -325,6 +350,7 @@ const Case tap_cases[] = {
 	{ "nowrap_truncates_tail", t_nowrap_truncates_tail },
 	{ "gutter_numbers", t_gutter_numbers },
 	{ "status_flags", t_status_flags },
+	{ "tab_key_expand", t_tab_key_expand },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_f9_make", t_tool_f9_make },
 	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },

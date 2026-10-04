@@ -4841,6 +4841,7 @@ typedef struct ebuf {
 	size_t		hl_valid;
 	int		hex_view;
 	size_t		hex_top;
+	int		expand_tabs;	/* indent with spaces in this buffer */
 	size_t		vi_mark_y[26];
 	size_t		vi_mark_x[26];
 	uint32_t	vi_marks_set;
@@ -4936,6 +4937,9 @@ typedef struct editor {
 	int		scheme;		/* chrome color scheme (SCHEME_*) */
 	int		show_lineno;	/* draw the line-number gutter */
 	int		wrap;		/* soft-wrap long lines to the window width */
+	int		show_tabs;	/* draw a guide glyph at each hard tab */
+	int		auto_indent;	/* a new line copies the previous indent */
+	int		expand_tabs;	/* Tab and auto-indent use spaces (per buffer) */
 	int		hex_view;	/* render the buffer as a hex dump */
 	size_t		hex_top;	/* first visible hex row (byte offset >> 4) */
 	int		hex_ascii;	/* editing the ascii column, not the hex */
@@ -5448,6 +5452,22 @@ int
 text_final_newline(const Text *t)
 {
 	return t->final_newline;
+}
+
+/* Whether a fresh buffer of language `lang` indents with spaces. Resolved from
+ * the config: a per-language `indent.<lang>.expand`, then a global
+ * `indent.expand`, else off (hard tabs). lang may be NULL. */
+static int
+indent_expand_default(const char *lang)
+{
+	char key[128];
+
+	if (lang && lang[0] && g_cfg) {
+		snprintf(key, sizeof(key), "indent.%s.expand", lang);
+		if (cfg_get(g_cfg, key))
+			return cfg_bool(g_cfg, key, 0);
+	}
+	return cfg_bool(g_cfg, "indent.expand", 0);
 }
 
 /* The buffer's line-ending style (enum eol). */
@@ -6794,6 +6814,8 @@ typedef enum menu_act {
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE, MA_OSC_COPY, MA_OSC_COPY_FILE,
 	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_GOTO,
 	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_HEX, MA_DRAW,
+	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS,
+	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS,
 	MA_VI_MODE,
 #ifndef VEDIT_NO_TOOLS
 	MA_COMPILE, MA_MAKE, MA_RUN, MA_VIEW_OUTPUT, MA_ERR_NEXT, MA_ERR_PREV,
@@ -6840,6 +6862,9 @@ static const Menuitem mi_edit[] = {
 	{ "",		"",		"",		MA_SEP },
 	{ "Copy to T&erminal",	 "",	"",	MA_OSC_COPY },
 	{ "Copy &File to Terminal","",	"",	MA_OSC_COPY_FILE },
+	{ "",		"",		"",		MA_SEP },
+	{ "Tabs to &Spaces",	"",	":retab",	MA_TABS_TO_SPACES },
+	{ "Spaces to &Tabs",	"",	"",	MA_SPACES_TO_TABS },
 };
 static const Menuitem mi_search[] = {
 	{ "&Find...",		"Ctrl+F",	"/",	MA_FIND },
@@ -6854,6 +6879,9 @@ static const Menuitem mi_view[] = {
 	{ "&Line Numbers",	"",	":set nu",	MA_LINENO },
 	{ "&Word Wrap",		"",	":set wrap",	MA_WRAP },
 	{ "Line &Endings",	"",	":set ff",	MA_EOL },
+	{ "Show &Tabs",		"",	":set list",	MA_SHOW_TABS },
+	{ "&Auto Indent",	"",	":set ai",	MA_AUTO_INDENT },
+	{ "&Indent with Spaces","",	":set et",	MA_EXPAND_TABS },
 	{ "&Hex Dump",		"",	"",	MA_HEX },
 };
 static const Menuitem mi_options[] = {
@@ -7325,17 +7353,22 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 /* Draw one text line clipped to the display window [left, left+width),
  * expanding tabs. Trailing space pads the field to width. Display columns in
  * [hl_start, hl_end) are shown in reverse video for the selection; pass
- * hl_start >= hl_end for no highlight. */
+ * hl_start >= hl_end for no highlight. When show_tabs is set, each hard tab's
+ * first column carries a dim guide glyph. */
 static void
 scr_line(Screen *d, int row, int col0, const char *s, size_t len,
     int left, int width, int hl_start, int hl_end, const uint8_t *sty,
     const Color *pal, const uint16_t *pal_attr, int npal,
-    Color base_fg, Color base_bg)
+    Color base_fg, Color base_bg, int show_tabs)
 {
 	const unsigned char *p = (const unsigned char *)s;
 	size_t i = 0;
 	int col = 0;		/* display column at the start of this rune */
 	int drawn = 0;		/* columns emitted into the window */
+	uint32_t tabmark = 0;	/* guide glyph for a hard tab, 0 when hidden */
+
+	if (show_tabs)
+		tabmark = (d->t->box_mode == VEDIT_BOX_UTF8) ? 0x2192 : '>';
 
 	while (i < len && drawn < width) {
 		uint32_t r;
@@ -7377,16 +7410,24 @@ scr_line(Screen *d, int row, int col0, const char *s, size_t len,
 		}
 
 		if (r == '\t' || r < 0x20 || r == 0x7f) {
-			/* render as spaces, clipped at both edges */
+			/* render as spaces, clipped at both edges; a hard tab's
+			 * first column shows the dim guide glyph when enabled */
 			int c;
 
 			for (c = 0; c < w; c++) {
+				uint32_t ch = ' ';
+				uint16_t a = attrs;
+
 				if (col + c < left)
 					continue;
 				if (drawn >= width)
 					break;
-				scr_cell(d, row, col0 + drawn, ' ', fg, base_bg,
-				    attrs);
+				if (r == '\t' && tabmark && c == 0) {
+					ch = tabmark;
+					if (!rev)
+						a |= ATTR_DIM;
+				}
+				scr_cell(d, row, col0 + drawn, ch, fg, base_bg, a);
 				drawn++;
 			}
 		} else if (col < left) {
@@ -8291,7 +8332,8 @@ render_body_wrapped(Editor *e, Screen *d, const Pal *p, int text_h,
 			render_gutter(d, e, row, gutter, idx, 0, p->content_fg,
 			    p->content_bg);
 			scr_line(d, row, col0, "", 0, 0, text_w, -1, -1, NULL,
-			    pal, pa, np, p->content_fg, p->content_bg);
+			    pal, pa, np, p->content_fg, p->content_bg,
+			    e->show_tabs);
 			if (idx == e->cy) {
 				*cur_row = i;
 				*cur_col = col0;
@@ -8308,7 +8350,8 @@ render_body_wrapped(Editor *e, Screen *d, const Pal *p, int text_h,
 			render_gutter(d, e, row, gutter, idx, 1, p->content_fg,
 			    p->content_bg);
 			scr_line(d, row, col0, "", 0, 0, text_w, hs, he, NULL,
-			    pal, pa, np, p->content_fg, p->content_bg);
+			    pal, pa, np, p->content_fg, p->content_bg,
+			    e->show_tabs);
 			if (idx == e->cy) {
 				*cur_row = i;
 				*cur_col = col0;
@@ -8332,7 +8375,8 @@ render_body_wrapped(Editor *e, Screen *d, const Pal *p, int text_h,
 			render_gutter(d, e, row, gutter, idx, seg == 0,
 			    p->content_fg, p->content_bg);
 			scr_line(d, row, col0, s, end, acol, text_w, hs, he,
-			    sty, pal, pa, np, p->content_fg, p->content_bg);
+			    sty, pal, pa, np, p->content_fg, p->content_bg,
+			    e->show_tabs);
 			if (idx == e->cy && (e->cx < next || next >= llen)) {
 				int cc = disp_cols(s, e->cx) - acol;
 
@@ -8423,11 +8467,11 @@ render_body(Editor *e, Screen *d)
 				sty = hl_line(e, idx, s, llen);
 				scr_line(d, row, col0, s, llen, (int)e->left,
 				    text_w, hs, he, sty, pal, pa, np,
-				    p->content_fg, p->content_bg);
+				    p->content_fg, p->content_bg, e->show_tabs);
 			} else {
 				scr_line(d, row, col0, "", 0, (int)e->left,
 				    text_w, hs, he, NULL, pal, pa, np,
-				    p->content_fg, p->content_bg);
+				    p->content_fg, p->content_bg, e->show_tabs);
 			}
 		}
 		cur_row = (int)(e->cy - e->top);
@@ -8972,6 +9016,171 @@ ed_newline(Editor *e)
 	}
 }
 
+/* Insert one indent step at the cursor: a hard tab, or, when the buffer indents
+ * with spaces, enough spaces to reach the next TAB_WIDTH stop. */
+static void
+ed_indent_tab(Editor *e)
+{
+	size_t llen = 0;
+	const char *s;
+	int col;
+
+	if (!e->expand_tabs) {
+		ed_insert(e, "\t", 1);
+		return;
+	}
+	s = text_line(e->t, e->cy, &llen);
+	col = s ? disp_cols(s, e->cx) : 0;
+	{
+		int n = TAB_WIDTH - (col % TAB_WIDTH);
+		char spaces[TAB_WIDTH];
+
+		memset(spaces, ' ', (size_t)n);
+		ed_insert(e, spaces, (size_t)n);
+	}
+}
+
+/* Leading whitespace (spaces and tabs) of line y, written to buf. Returns the
+ * byte count, capped at cap. */
+static size_t
+line_indent(Editor *e, size_t y, char *buf, size_t cap)
+{
+	size_t llen = 0;
+	const char *s = text_line(e->t, y, &llen);
+	size_t n = 0;
+
+	if (!s)
+		return 0;
+	while (n < llen && n < cap && (s[n] == ' ' || s[n] == '\t'))
+		n++;
+	memcpy(buf, s, n);
+	return n;
+}
+
+/* Split the line at the cursor and, when auto-indent is on, start the new line
+ * with the same leading whitespace as the line the cursor left. */
+static void
+ed_newline_indent(Editor *e)
+{
+	char indent[256];
+	size_t n = 0;
+
+	if (e->auto_indent)
+		n = line_indent(e, e->cy, indent, sizeof(indent));
+	ed_newline(e);
+	if (n)
+		ed_insert(e, indent, n);
+}
+
+/* Rewrite the whitespace of lines [lo, hi]. to_spaces expands every hard tab in
+ * the line to spaces at the TAB_WIDTH stops; otherwise the leading indent is
+ * repacked into tabs plus a spaces remainder. The whole range is one undo step.
+ * Returns the number of lines changed. */
+static int
+ed_retab_range(Editor *e, size_t lo, size_t hi, int to_spaces)
+{
+	size_t y;
+	int changed = 0;
+
+	text_undo_group_begin(e->t);
+	for (y = lo; y <= hi && y < text_lines(e->t); y++) {
+		size_t len = 0;
+		const char *s = text_line(e->t, y, &len);
+		char *out;
+		size_t olen = 0, cap;
+
+		if (!s || len == 0)
+			continue;
+		cap = len * TAB_WIDTH + 1;	/* a tab expands to at most 8 */
+		out = malloc(cap);
+		if (!out)
+			break;
+
+		if (to_spaces) {
+			size_t i = 0;
+			int col = 0;
+
+			while (i < len) {
+				uint32_t r;
+				int n = utf8_decode(&r,
+				    (const unsigned char *)s + i, len - i);
+
+				if (n <= 0)
+					n = 1;
+				if (r == '\t') {
+					int w = TAB_WIDTH - (col % TAB_WIDTH);
+
+					while (w-- > 0)
+						out[olen++] = ' ';
+					col += TAB_WIDTH - (col % TAB_WIDTH);
+				} else {
+					int rw = rune_width(r);
+
+					if (rw < 0)
+						rw = 1;
+					memcpy(out + olen, s + i, (size_t)n);
+					olen += (size_t)n;
+					col += rw;
+				}
+				i += (size_t)n;
+			}
+		} else {
+			size_t i = 0;
+			int width = 0, tabs, sp, k;
+
+			while (i < len && (s[i] == ' ' || s[i] == '\t')) {
+				if (s[i] == '\t')
+					width += TAB_WIDTH - (width % TAB_WIDTH);
+				else
+					width++;
+				i++;
+			}
+			tabs = width / TAB_WIDTH;
+			sp = width % TAB_WIDTH;
+			for (k = 0; k < tabs; k++)
+				out[olen++] = '\t';
+			for (k = 0; k < sp; k++)
+				out[olen++] = ' ';
+			memcpy(out + olen, s + i, len - i);
+			olen += len - i;
+		}
+
+		if (olen != len || memcmp(out, s, len) != 0) {
+			text_delete(e->t, y, 0, len);
+			if (olen)
+				text_insert(e->t, y, 0, out, olen);
+			hl_touch(e, y);
+			changed++;
+		}
+		free(out);
+	}
+	text_undo_group_end(e->t);
+	return changed;
+}
+
+/* Convert tabs to spaces (to_spaces) or indentation to tabs over the selection
+ * if there is one, otherwise the whole buffer. */
+static void
+ed_retab(Editor *e, int to_spaces)
+{
+	size_t lo = 0, hi = text_lines(e->t) ? text_lines(e->t) - 1 : 0;
+	int n;
+
+	if (e->sel_active) {
+		size_t y1, x1, y2, x2;
+
+		sel_bounds(e, &y1, &x1, &y2, &x2);
+		lo = y1;
+		hi = y2;
+	}
+	n = ed_retab_range(e, lo, hi, to_spaces);
+	e->cx = 0;
+	clamp_col(e);
+	snprintf(e->status, sizeof(e->status), "%s: %d line%s changed",
+	    to_spaces ? "tabs to spaces" : "spaces to tabs", n,
+	    n == 1 ? "" : "s");
+}
+
 
 /* Consume a bracketed-paste payload (PASTE_BEGIN was just read) and insert
  * it literally, so control bytes in the paste never fire editor commands.
@@ -9428,10 +9637,10 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 			ed_insert(e, (char *)buf, (size_t)n);
 		break;
 	case CMD_TAB:
-		ed_insert(e, "\t", 1);
+		ed_indent_tab(e);
 		break;
 	case CMD_NEWLINE:
-		ed_newline(e);
+		ed_newline_indent(e);
 		break;
 	case CMD_BACKSPACE:
 		ed_backspace(e);
@@ -10562,6 +10771,7 @@ buf_save(Editor *e, Buf *b)
 	b->hl_valid = e->hl_valid;
 	b->hex_view = e->hex_view;
 	b->hex_top = e->hex_top;
+	b->expand_tabs = e->expand_tabs;
 	memcpy(b->vi_mark_y, e->vi_mark_y, sizeof(b->vi_mark_y));
 	memcpy(b->vi_mark_x, e->vi_mark_x, sizeof(b->vi_mark_x));
 	b->vi_marks_set = e->vi_marks_set;
@@ -10587,6 +10797,7 @@ buf_load(Editor *e, const Buf *b)
 	e->hl_valid = b->hl_valid;
 	e->hex_view = b->hex_view;
 	e->hex_top = b->hex_top;
+	e->expand_tabs = b->expand_tabs;
 	memcpy(e->vi_mark_y, b->vi_mark_y, sizeof(e->vi_mark_y));
 	memcpy(e->vi_mark_x, b->vi_mark_x, sizeof(e->vi_mark_x));
 	e->vi_marks_set = b->vi_marks_set;
@@ -10696,6 +10907,7 @@ buf_open(Editor *e, const char *path)
 		e->has_name = 0;
 		e->syn = NULL;
 	}
+	e->expand_tabs = indent_expand_default(e->syn ? e->syn->name : NULL);
 	e->cy = e->cx = e->top = e->left = 0;
 	e->sel_active = 0;
 	e->line_state = NULL;
@@ -12291,6 +12503,27 @@ run_menu_act(Editor *e, Menuact act)
 		    eol_name(next));
 		break;
 	}
+	case MA_SHOW_TABS:
+		e->show_tabs = !e->show_tabs;
+		snprintf(e->status, sizeof(e->status), "show tabs %s",
+		    e->show_tabs ? "on" : "off");
+		break;
+	case MA_AUTO_INDENT:
+		e->auto_indent = !e->auto_indent;
+		snprintf(e->status, sizeof(e->status), "auto-indent %s",
+		    e->auto_indent ? "on" : "off");
+		break;
+	case MA_EXPAND_TABS:
+		e->expand_tabs = !e->expand_tabs;
+		snprintf(e->status, sizeof(e->status), "indent with %s",
+		    e->expand_tabs ? "spaces" : "tabs");
+		break;
+	case MA_TABS_TO_SPACES:
+		ed_retab(e, 1);
+		break;
+	case MA_SPACES_TO_TABS:
+		ed_retab(e, 0);
+		break;
 	case MA_HEX:
 		e->hex_view = !e->hex_view;
 		e->hex_top = 0;
@@ -13102,6 +13335,8 @@ editor_init(Editor *e)
 {
 	memset(e, 0, sizeof(*e));
 	e->hl_on = 1;		/* highlight when a file type is recognized */
+	e->show_tabs = 1;	/* show hard tabs by default */
+	e->auto_indent = 1;	/* copy the previous line's indent by default */
 	e->hex_pending = -1;
 	e->hex_cols = 16;
 	e->scheme = SCHEME_DOS;	/* MS-EDIT look by default; View cycles it */
@@ -13357,6 +13592,7 @@ vedit_open(struct vedit *v, const char *path)
 	if (text_load(v->e.t, v->e.path) < 0 && errno != ENOENT)
 		return -1;
 	v->e.syn = syn_for_ext(file_ext(v->e.path));
+	v->e.expand_tabs = indent_expand_default(v->e.syn ? v->e.syn->name : NULL);
 	return 0;
 }
 
@@ -13415,6 +13651,9 @@ ed_apply_config(Editor *e)
 	}
 	e->wrap = cfg_bool(g_cfg, "ui.wrap", e->wrap);
 	e->show_lineno = cfg_bool(g_cfg, "ui.number", e->show_lineno);
+	e->show_tabs = cfg_bool(g_cfg, "ui.tabs", e->show_tabs);
+	e->auto_indent = cfg_bool(g_cfg, "edit.autoindent", e->auto_indent);
+	e->expand_tabs = indent_expand_default(e->syn ? e->syn->name : NULL);
 	e->hl_on = cfg_bool(g_cfg, "syntax.enable", e->hl_on);
 	e->clip_osc52 = cfg_bool(g_cfg, "ui.clipboard", e->clip_osc52);
 	s = cfg_get(g_cfg, "edit.mode");
@@ -15160,13 +15399,20 @@ vi_enter_insert_cmd(Editor *e, uint32_t c)
 		break;
 	case 'o':
 		e->cx = text_line_len(e->t, e->cy);
-		ed_newline(e);
+		ed_newline_indent(e);		/* indent like the line above */
 		break;
-	case 'O':
+	case 'O': {
+		char indent[256];
+		size_t ind = e->auto_indent ?
+		    line_indent(e, e->cy, indent, sizeof(indent)) : 0;
+
 		e->cx = 0;
 		hl_touch(e, e->cy);
 		text_split(e->t, e->cy, 0);	/* empty line; content moves down */
+		if (ind)
+			ed_insert(e, indent, ind);	/* match the line below */
 		break;
+	}
 	}
 	enter_insert(e);
 }
@@ -16363,10 +16609,10 @@ vi_insert_key(Editor *e, const struct tkbd_seq *seq)
 		vi_clamp(e);
 		return REQ_CONTINUE;
 	case TKBD_KEY_ENTER:
-		ed_newline(e);
+		ed_newline_indent(e);
 		return REQ_CONTINUE;
 	case TKBD_KEY_TAB:
-		ed_insert(e, "\t", 1);
+		ed_indent_tab(e);
 		return REQ_CONTINUE;
 	case TKBD_KEY_BACKSPACE:
 	case TKBD_KEY_BACKSPACE2:
@@ -17300,7 +17546,44 @@ vi_ex_exec(Editor *e, char *buf)
 			e->wrap = 0;
 		else if (strcmp(arg, "wrap!") == 0 || strcmp(arg, "invwrap") == 0)
 			e->wrap = !e->wrap;
-		else if (strncmp(arg, "ff=", 3) == 0 ||
+		else if (strcmp(arg, "list") == 0 || strcmp(arg, "nolist") == 0 ||
+		    strcmp(arg, "list!") == 0 || strcmp(arg, "invlist") == 0) {
+			if (arg[0] == 'n')
+				e->show_tabs = 0;
+			else if (strchr(arg, '!') || arg[0] == 'i')
+				e->show_tabs = !e->show_tabs;
+			else
+				e->show_tabs = 1;
+			snprintf(e->status, sizeof(e->status), "show tabs %s",
+			    e->show_tabs ? "on" : "off");
+			return REQ_CONTINUE;
+		} else if (strcmp(arg, "autoindent") == 0 ||
+		    strcmp(arg, "ai") == 0 || strcmp(arg, "noautoindent") == 0 ||
+		    strcmp(arg, "noai") == 0 || strcmp(arg, "autoindent!") == 0 ||
+		    strcmp(arg, "ai!") == 0 || strcmp(arg, "invai") == 0) {
+			if (arg[0] == 'n')
+				e->auto_indent = 0;
+			else if (strchr(arg, '!') || arg[0] == 'i')
+				e->auto_indent = !e->auto_indent;
+			else
+				e->auto_indent = 1;
+			snprintf(e->status, sizeof(e->status), "auto-indent %s",
+			    e->auto_indent ? "on" : "off");
+			return REQ_CONTINUE;
+		} else if (strcmp(arg, "expandtab") == 0 ||
+		    strcmp(arg, "et") == 0 || strcmp(arg, "noexpandtab") == 0 ||
+		    strcmp(arg, "noet") == 0 || strcmp(arg, "expandtab!") == 0 ||
+		    strcmp(arg, "et!") == 0 || strcmp(arg, "invet") == 0) {
+			if (arg[0] == 'n')
+				e->expand_tabs = 0;
+			else if (strchr(arg, '!') || arg[0] == 'i')
+				e->expand_tabs = !e->expand_tabs;
+			else
+				e->expand_tabs = 1;
+			snprintf(e->status, sizeof(e->status), "indent with %s",
+			    e->expand_tabs ? "spaces" : "tabs");
+			return REQ_CONTINUE;
+		} else if (strncmp(arg, "ff=", 3) == 0 ||
 		    strncmp(arg, "fileformat=", 11) == 0) {
 			const char *val = strchr(arg, '=') + 1;
 			int eol;
@@ -17333,6 +17616,13 @@ vi_ex_exec(Editor *e, char *buf)
 		else
 			snprintf(e->status, sizeof(e->status), "line numbers %s",
 			    e->show_lineno ? "on" : "off");
+		return REQ_CONTINUE;
+	}
+
+	/* :retab rewrites whitespace following the current expandtab setting:
+	 * tabs to spaces when indenting with spaces, otherwise the reverse. */
+	if (strcmp(p, "retab") == 0 || strcmp(p, "retab!") == 0) {
+		ed_retab(e, e->expand_tabs);
 		return REQ_CONTINUE;
 	}
 

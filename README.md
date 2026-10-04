@@ -135,9 +135,14 @@ A gitconfig-style file sets the startup defaults. It is read from the first of
     colors = 256         # 256 | 16
     scroll = on          # VT100 scroll-region fast path
     clipboard = off      # also mirror every copy/yank to the terminal (OSC 52)
+    tabs   = on          # mark hard tabs with a guide glyph
 
 [edit]
     mode = vi            # vi | modeless
+    autoindent = on      # new lines copy the previous indent
+
+[indent]
+    expand = off         # off = indent with tabs, on = with spaces
 
 [syntax]
     enable = on          # highlight recognized file types
@@ -299,6 +304,43 @@ what a save writes. Changing it marks the buffer modified, since the bytes on
 disk will differ. In vi keys it is `:set ff=unix|dos|nul` (`:set fileformat=`
 also works). The current style always shows in the status bar, next to the line
 and column.
+
+### Tabs and indentation
+
+Tabs expand to 8-column stops on screen. **View > Show Tabs** (on by default)
+marks each hard tab's first column with a dim guide glyph (an arrow in UTF-8
+mode, `>` in DEC or ASCII mode), so tabs and runs of spaces are easy to tell
+apart. In vi keys it is `:set list` / `:set nolist`.
+
+**View > Auto Indent** (on by default) starts each new line with the same
+leading whitespace as the line you left, for Enter and for vi's `o` and `O`. In
+vi keys it is `:set autoindent` / `:set noautoindent` (`:set ai` / `:set noai`).
+
+**View > Indent with Spaces** controls what the Tab key and auto-indent insert:
+with it off (the default) they use a hard tab, with it on they use spaces to the
+next stop. It is per buffer. A fresh buffer's default comes from the config, by
+language, then tabs when nothing sets it (see below). In vi keys it is
+`:set expandtab` / `:set noexpandtab` (`:set et` / `:set noet`).
+
+**Edit > Tabs to Spaces** and **Edit > Spaces to Tabs** rewrite whitespace over
+the selection, or the whole buffer when there is no selection. "Tabs to Spaces"
+expands every tab in each line; "Spaces to Tabs" repacks each line's leading
+indent into tabs plus a spaces remainder. In vi keys, `:retab` does whichever
+the current `expandtab` setting implies (tabs to spaces when indenting with
+spaces, otherwise the reverse), and takes an optional line range.
+
+The config sets a fresh buffer's indent style, per language or globally:
+
+```ini
+[indent]
+    expand = off         # global default: off = tabs, on = spaces
+
+[indent "python"]
+    expand = on          # Python buffers indent with spaces
+```
+
+A per-language `[indent "<lang>"]` (the file's syntax language name) wins over
+the global `[indent] expand`, which wins over the built-in default of tabs.
 
 ### File browser
 
@@ -619,8 +661,9 @@ vedit has a text buffer with undo and redo, the modeless and vi personalities,
 the MS-EDIT chrome (menu bar, frame, scrollbars, dialogs), regex find and
 replace, selection and an internal clipboard, goto-line, multiple buffers, a hex
 view, a 2D/block draw mode, per-language build commands with a quickfix error
-list, selectable line endings (LF, CRLF, NUL), and lightweight syntax
-highlighting. It draws through a self-contained ANSI
+list, selectable line endings (LF, CRLF, NUL), tab display with auto-indent and
+tab/space conversion, and lightweight syntax highlighting. It draws through a
+self-contained ANSI
 renderer over the io vtable, and decodes the keyboard with a compact decoder that
 covers UTF-8 text, control keys, arrows, navigation keys, function keys, CSI
 modifiers, Alt+letter, and bracketed paste.
