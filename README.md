@@ -235,12 +235,11 @@ A language whose name matches a file extension is picked up automatically; a
 the rules are config data, loaded through `vedit_set_config()` like everything
 else.
 
-`docs/c.conf` is a worked example: a C highlighter (comments, strings, char and
-number literals, the preprocessor, keywords and types) that handles real C,
-including kernel source. Use it as a config directly with
-`VEDIT_CONFIG=docs/c.conf vedit file.c`, or paste its sections into your own
-config. Because it names the language `c`, it also replaces the built-in C
-highlighter.
+The built-in C and shell highlighters are themselves grammars in this format,
+compiled into the binary and loaded at startup, so they need no config file.
+Defining a language of the same name in your config replaces the matching
+built-in outright (the two are not merged), so to customize one, copy its whole
+grammar and edit it rather than setting a single color.
 
 ### Color schemes
 
@@ -413,21 +412,23 @@ a diagram into a source file.
 
 ## Syntax highlighting
 
-vedit has a small built-in highlighter, aimed at editing MUD source and scripts
-over the connection. It is not a full language engine. One generic C-family
-tokenizer covers C, C++, and LPC, and a second covers shell-style scripts. It
-colors keywords, types, strings, character and number literals, line and block
-comments (a block comment may span lines), preprocessor lines, and function calls.
+vedit highlights through a single data-driven engine, the state-machine model
+described under "Custom syntax highlighting" above. The C-family and shell
+highlighters that ship with it are grammars in that same config format, compiled
+into the binary and loaded at startup rather than written as hardcoded lexers.
+They color keywords, types, strings, character and number literals, line and
+block comments (a block comment may span lines), and preprocessor lines.
 
 The language is chosen from the file extension: `.c .h .cc .cpp .cxx .hpp .hh
-.lpc .i` use the C-family rules, and `.sh .bash` use the shell rules. Highlighting
+.lpc .i` use the C grammar, and `.sh .bash` use the shell grammar. Highlighting
 is on by default when the type is recognized, and files with no match are left
 plain. Toggle it from the View menu, or with the vi `:syntax` command: `:syntax
-off`, `:syntax on`, or `:syntax c` / `:syntax lpc` / `:syntax sh` to force a
-language. The colors stay in the 16-color range so they render on limited clients.
+off`, `:syntax on`, or `:syntax c` / `:syntax sh` to force a language. The
+built-in grammars use base-16 colors so they read the same at 16 and 256 colors
+and stay legible on the blue chrome.
 
-To add a dialect, extend the keyword and type tables and the extension map in the
-syntax section of `vedit.c`; the tokenizer itself is reused.
+To add or change a language, define a grammar in your config (see "Custom syntax
+highlighting"); a language named like a built-in replaces it.
 
 ## Embedding in a host (for example a MUD)
 
@@ -484,9 +485,8 @@ function keys, CSI modifiers, Alt+letter, and bracketed paste.
 
 It drops, as overworked for a primitive-terminal editor:
 
-- lumi's language engine (replaced by a small built-in highlighter, below),
+- lumi's language engine (replaced by the data-driven FSM highlighter, below),
 - the build / compile / make commands and the quickfix error list,
-- the config file,
 - mouse input,
 - the differential compositor and terminfo capability lookup.
 

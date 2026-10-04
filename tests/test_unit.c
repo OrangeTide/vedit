@@ -97,27 +97,46 @@ t_seg_index_of(Test *t)
 	TAP_CHECK(t, seg_index_of(s, 11, 11, 8) == 1);	/* end of line */
 }
 
+/* Class index by name for a grammar reached through its Syntax wrapper. */
+static int
+fsm_class(const Jsf *j, const char *name)
+{
+	int k;
+
+	for (k = 0; k < j->nclasses; k++)
+		if (strcmp(j->classname[k], name) == 0)
+			return k;
+	return -1;
+}
+
 static void
 t_syntax_c(Test *t)
 {
-	const Syntax *sy = syn_for_ext("c");
+	const Syntax *sy = syn_for_ext("c");	/* the built-in default grammar */
 	uint8_t out[32];
+	int type, kw, com, pre;
 
-	TAP_ASSERT(t, sy != NULL);
+	TAP_ASSERT(t, sy != NULL && sy->fsm != NULL);
+	type = fsm_class(sy->fsm, "type");
+	kw = fsm_class(sy->fsm, "keyword");
+	com = fsm_class(sy->fsm, "comment");
+	pre = fsm_class(sy->fsm, "preproc");
+	TAP_ASSERT(t, type > 0 && kw > 0 && com > 0 && pre > 0);
 
-	syn_line(sy, 0, "int", 3, out);
-	TAP_CHECK(t, out[0] == SYN_TYPE);
+	syn_line(sy, sy->start, "int", 3, out);
+	TAP_CHECKF(t, out[0] == type, "int -> %d", out[0]);
 
-	syn_line(sy, 0, "if", 2, out);
-	TAP_CHECK(t, out[0] == SYN_KEYWORD);
+	syn_line(sy, sy->start, "if", 2, out);
+	TAP_CHECKF(t, out[0] == kw, "if -> %d", out[0]);
 
-	syn_line(sy, 0, "// hi", 5, out);
-	TAP_CHECK(t, out[0] == SYN_COMMENT);
+	syn_line(sy, sy->start, "// hi", 5, out);
+	TAP_CHECKF(t, out[0] == com, "// -> %d", out[0]);
 
-	syn_line(sy, 0, "#include", 8, out);
-	TAP_CHECK(t, out[0] == SYN_PREPROC);
+	syn_line(sy, sy->start, "#include", 8, out);
+	TAP_CHECKF(t, out[0] == pre, "# -> %d", out[0]);
 
-	/* an unknown extension is not highlighted */
+	/* .sh resolves to the shell grammar, an unknown extension to nothing */
+	TAP_CHECK(t, syn_for_ext("sh") != NULL);
 	TAP_CHECK(t, syn_for_ext("xyz") == NULL);
 }
 
@@ -127,14 +146,18 @@ t_syntax_block_comment_carry(Test *t)
 	const Syntax *sy = syn_for_ext("c");
 	uint8_t out[32];
 	uint16_t st;
+	int com;
 
-	/* an unterminated block comment carries in-comment state to next line */
-	st = syn_line(sy, 0, "/* open", 7, out);
-	TAP_CHECK(t, out[0] == SYN_COMMENT);
-	TAP_CHECK(t, st == SYN_INCOMMENT);
+	TAP_ASSERT(t, sy != NULL && sy->fsm != NULL);
+	com = fsm_class(sy->fsm, "comment");
+
+	/* an unterminated block comment carries its state to the next line */
+	st = syn_line(sy, sy->start, "/* open", 7, out);
+	TAP_CHECKF(t, out[0] == com, "open -> %d", out[0]);
+	TAP_CHECKF(t, st != sy->start, "carry should be in-comment: %u", st);
 	st = syn_line(sy, st, "still */ x", 10, out);
-	TAP_CHECK(t, out[0] == SYN_COMMENT);	/* continuation still comment */
-	TAP_CHECK(t, st == 0);			/* closed on this line */
+	TAP_CHECKF(t, out[0] == com, "cont -> %d", out[0]);	/* still comment */
+	TAP_CHECK(t, st == sy->start);			/* closed on this line */
 }
 
 static void
@@ -527,8 +550,8 @@ jsf_class_of(int lang, const char *name)
 {
 	int k;
 
-	for (k = 0; k < g_jsf[lang].nclasses; k++)
-		if (strcmp(g_jsf[lang].classname[k], name) == 0)
+	for (k = 0; k < g_user.lang[lang].nclasses; k++)
+		if (strcmp(g_user.lang[lang].classname[k], name) == 0)
 			return k;
 	return -1;
 }
@@ -566,8 +589,8 @@ t_jsf_highlight(Test *t)
 
 	TAP_ASSERT(t, c != NULL);
 	g_cfg = c;
-	syntax_load_cfg(c);
-	lang = jsf_find("mini");
+	syntax_load_cfg(&g_user, c);
+	lang = jsf_find(&g_user, "mini");
 	TAP_ASSERT(t, lang >= 0);
 	kw = jsf_class_of(lang, "kw");
 	num = jsf_class_of(lang, "num");
@@ -587,7 +610,7 @@ t_jsf_highlight(Test *t)
 	TAP_CHECK(t, out[5] == txt);
 
 	g_cfg = old;
-	syntax_load_cfg(NULL);			/* clear registry for other tests */
+	syntax_load_cfg(&g_user, NULL);			/* clear registry for other tests */
 	vedit_cfg_free(c);
 	unlink(path);
 }
@@ -628,8 +651,8 @@ t_jsf_linecomment(Test *t)
 
 	TAP_ASSERT(t, c != NULL);
 	g_cfg = c;
-	syntax_load_cfg(c);
-	lang = jsf_find("lc");
+	syntax_load_cfg(&g_user, c);
+	lang = jsf_find(&g_user, "lc");
 	TAP_ASSERT(t, lang >= 0);
 	kw = jsf_class_of(lang, "kw");
 	com = jsf_class_of(lang, "com");
@@ -652,7 +675,7 @@ t_jsf_linecomment(Test *t)
 	    out[0], out[1]);
 
 	g_cfg = old;
-	syntax_load_cfg(NULL);
+	syntax_load_cfg(&g_user, NULL);
 	vedit_cfg_free(c);
 	unlink(path);
 }
@@ -686,8 +709,8 @@ t_jsf_recolormark(Test *t)
 
 	TAP_ASSERT(t, c != NULL);
 	g_cfg = c;
-	syntax_load_cfg(c);
-	lang = jsf_find("rm");
+	syntax_load_cfg(&g_user, c);
+	lang = jsf_find(&g_user, "rm");
 	TAP_ASSERT(t, lang >= 0);
 	reg = jsf_class_of(lang, "reg");
 	txt = jsf_class_of(lang, "text");
@@ -707,7 +730,7 @@ t_jsf_recolormark(Test *t)
 	    out[5], out[6]);
 
 	g_cfg = old;
-	syntax_load_cfg(NULL);
+	syntax_load_cfg(&g_user, NULL);
 	vedit_cfg_free(c);
 	unlink(path);
 }
@@ -742,8 +765,8 @@ t_jsf_include(Test *t)
 
 	TAP_ASSERT(t, c != NULL);
 	g_cfg = c;
-	syntax_load_cfg(c);
-	lang = jsf_find("inc");
+	syntax_load_cfg(&g_user, c);
+	lang = jsf_find(&g_user, "inc");
 	TAP_ASSERT(t, lang >= 0);
 	ca = jsf_class_of(lang, "a");
 	cb = jsf_class_of(lang, "b");
@@ -761,7 +784,7 @@ t_jsf_include(Test *t)
 	    out[1]);
 
 	g_cfg = old;
-	syntax_load_cfg(NULL);
+	syntax_load_cfg(&g_user, NULL);
 	vedit_cfg_free(c);
 	unlink(path);
 }

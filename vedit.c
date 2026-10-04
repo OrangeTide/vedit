@@ -196,28 +196,30 @@ cfg_make_key(char *out, size_t outsz, const char *section,
 		snprintf(out, outsz, "%s.%s", section, name);
 }
 
-/* Parse a config file into c, merging over anything already there. Returns 0
- * on success (a missing file is a failure, so the caller can ignore it), -1 on
- * a read or syntax error. */
-int
-vedit_cfg_load(Cfg *c, const char *path)
+/* Parse config text (modified in place) into c, merging over anything already
+ * there. Lines are split on '\n'; a blank or whitespace-only line is skipped.
+ * Returns 0 on success, -1 on a syntax error. Shared by the file loader and the
+ * built-in default grammars. */
+static int
+cfg_load_mem(Cfg *c, char *text)
 {
-	char buf[512], section[256], key[2048];
-	FILE *f;
-	char *subsect = NULL;
-	int line = 0, rc = 0;
+	char section[256], key[2048];
+	char *subsect = NULL, *cursor = text;
+	int rc = 0;
 
 	if (!c)
 		return -1;
-	f = fopen(path, "r");
-	if (!f)
-		return -1;
 	section[0] = '\0';
-	while (fgets(buf, (int)sizeof(buf), f)) {
-		char *base, *tmp;
+	while (*cursor) {
+		char *buf = cursor, *base, *tmp, *nl = strchr(cursor, '\n');
 
-		line++;
-		buf[strcspn(buf, "\r\n")] = '\0';	/* drop the line terminator */
+		if (nl) {
+			*nl = '\0';
+			cursor = nl + 1;
+		} else {
+			cursor += strlen(cursor);
+		}
+		buf[strcspn(buf, "\r")] = '\0';		/* drop a CR before the LF */
 		/* strip a comment, honoring quoted regions */
 		for (tmp = buf; *tmp; tmp++) {
 			if (*tmp == '#' || *tmp == ';') {
@@ -298,7 +300,41 @@ vedit_cfg_load(Cfg *c, const char *path)
 		}
 	}
 	free(subsect);
+	return rc;
+}
+
+/* Parse a config file into c, merging over anything already there. Returns 0
+ * on success (a missing file is a failure, so the caller can ignore it), -1 on
+ * a read or syntax error. */
+int
+vedit_cfg_load(Cfg *c, const char *path)
+{
+	FILE *f;
+	long sz;
+	size_t got;
+	char *buf;
+	int rc;
+
+	if (!c)
+		return -1;
+	f = fopen(path, "r");
+	if (!f)
+		return -1;
+	if (fseek(f, 0, SEEK_END) != 0 || (sz = ftell(f)) < 0) {
+		fclose(f);
+		return -1;
+	}
+	rewind(f);
+	buf = malloc((size_t)sz + 1);
+	if (!buf) {
+		fclose(f);
+		return -1;
+	}
+	got = fread(buf, 1, (size_t)sz, f);	/* text mode may read fewer */
+	buf[got] = '\0';
 	fclose(f);
+	rc = cfg_load_mem(c, buf);
+	free(buf);
 	return rc;
 }
 
@@ -767,26 +803,14 @@ enum { SCHEME_DOS, SCHEME_BLACK, SCHEME_PLAIN, SCHEME_COUNT };
  * line and returns a carry state so a block comment spans lines.
  ****************************************************************/
 
-typedef enum syn_style {
-	SYN_TEXT, SYN_COMMENT, SYN_KEYWORD, SYN_TYPE, SYN_CONSTANT,
-	SYN_STRING, SYN_OPERATOR, SYN_FUNCTION, SYN_PREPROC,
-	SYN_STYLE_COUNT,
-} SynStyle;
-
 typedef struct jsf Jsf;		/* data-driven FSM highlighter from config */
 
+/* A highlighter: just a named wrapper over an FSM grammar. */
 typedef struct syntax {
-	const char		*name;
-	uint16_t		start;		/* initial carry state / FSM state */
-	const char *const	*keywords;	/* NULL-terminated, or NULL */
-	const char *const	*types;		/* NULL-terminated, or NULL */
-	const char		*line_comment;	/* "//" or "#", or NULL */
-	unsigned char		block_comment;	/* 1: C-style slash-star */
-	unsigned char		preproc;	/* 1: line-initial '#' */
-	const Jsf		*fsm;		/* non-NULL: use the FSM instead */
+	const char	*name;
+	uint16_t	start;		/* initial FSM state */
+	const Jsf	*fsm;
 } Syntax;
-
-#define SYN_INCOMMENT 1		/* carry state: inside a block comment */
 
 /****************************************************************
  * Data-driven highlighter (joe-style FSM authored in the config file).
@@ -844,17 +868,25 @@ struct jsf {
 	uint16_t	start;
 };
 
-static Jsf	g_jsf[JSF_LANG_MAX];
-static Syntax	g_jsf_syn[JSF_LANG_MAX];	/* Syntax wrappers over g_jsf */
-static int	g_jsf_count;
+/* A registry of FSM grammars: the languages, a Syntax wrapper for each, and the
+ * count. There are two, so user grammars can override the built-in defaults
+ * without the two sets clobbering each other on a config reload. */
+typedef struct jsf_reg {
+	Jsf	lang[JSF_LANG_MAX];
+	Syntax	syn[JSF_LANG_MAX];	/* Syntax wrappers over lang[] */
+	int	count;
+} Jsfreg;
+
+static Jsfreg	g_user;		/* grammars from the user's config */
+static Jsfreg	g_def;		/* built-in default grammars (C, shell) */
 
 static int
-jsf_find(const char *name)
+jsf_find(const Jsfreg *r, const char *name)
 {
 	int i;
 
-	for (i = 0; i < g_jsf_count; i++)
-		if (strcmp(g_jsf[i].name, name) == 0)
+	for (i = 0; i < r->count; i++)
+		if (strcmp(r->lang[i].name, name) == 0)
 			return i;
 	return -1;
 }
@@ -1114,36 +1146,36 @@ jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
 }
 
 static void
-jsf_reset(void)
+jsf_reset(Jsfreg *r)
 {
 	int i;
 
-	for (i = 0; i < g_jsf_count; i++) {
-		free(g_jsf[i].rules);
-		free(g_jsf[i].kws);
-		free(g_jsf[i].words);
+	for (i = 0; i < r->count; i++) {
+		free(r->lang[i].rules);
+		free(r->lang[i].kws);
+		free(r->lang[i].words);
 	}
-	memset(g_jsf, 0, sizeof(g_jsf));
-	g_jsf_count = 0;
+	memset(r->lang, 0, sizeof(r->lang));
+	r->count = 0;
 }
 
-/* Intern a language slot by name. */
+/* Intern a language slot by name in registry r. */
 static Jsf *
-jsf_lang(const char *name)
+jsf_lang(Jsfreg *r, const char *name)
 {
-	int i = jsf_find(name);
+	int i = jsf_find(r, name);
 
 	if (i >= 0)
-		return &g_jsf[i];
-	if (g_jsf_count >= JSF_LANG_MAX)
+		return &r->lang[i];
+	if (r->count >= JSF_LANG_MAX)
 		return NULL;
-	i = g_jsf_count++;
-	snprintf(g_jsf[i].name, sizeof(g_jsf[i].name), "%s", name);
-	g_jsf[i].nclasses = 1;		/* class 0 = default */
-	g_jsf[i].classname[0][0] = '\0';
-	g_jsf[i].fg[0].type = COLOR_DEFAULT;
-	g_jsf[i].attr[0] = 0;
-	return &g_jsf[i];
+	i = r->count++;
+	snprintf(r->lang[i].name, sizeof(r->lang[i].name), "%s", name);
+	r->lang[i].nclasses = 1;		/* class 0 = default */
+	r->lang[i].classname[0][0] = '\0';
+	r->lang[i].fg[0].type = COLOR_DEFAULT;
+	r->lang[i].attr[0] = 0;
+	return &r->lang[i];
 }
 
 /* Split "a.b.c" at the first dot: head into buf, return the tail (or NULL). */
@@ -1280,15 +1312,16 @@ jsf_parse_rule(Jsf *j, int st, const char *val)
 	j->nrules++;
 }
 
-/* Build g_jsf from the config. Pass 1 interns languages, classes, groups, and
- * states; pass 2 parses rules (so forward references resolve) and the start
- * state, then builds the Syntax wrappers. */
+/* Build registry r from the config. Pass 1 interns languages, classes, groups,
+ * and states; pass 2 parses rules (so forward references resolve) and the start
+ * state, then builds the Syntax wrappers. The word slices point into c, so c
+ * must outlive r. */
 static void
-syntax_load_cfg(const Cfg *c)
+syntax_load_cfg(Jsfreg *r, const Cfg *c)
 {
 	int pass, i;
 
-	jsf_reset();
+	jsf_reset(r);
 	if (!c)
 		return;
 	for (pass = 0; pass < 2; pass++) {
@@ -1305,7 +1338,7 @@ syntax_load_cfg(const Cfg *c)
 				rest = jsf_split(key + 6, lang, sizeof(lang));
 				if (!rest)
 					continue;
-				j = jsf_lang(lang);
+				j = jsf_lang(r, lang);
 				if (j)
 					cfg_style(val,
 					    &j->fg[jsf_class(j, rest)],
@@ -1322,7 +1355,7 @@ syntax_load_cfg(const Cfg *c)
 				tail = jsf_split(rest, grp, sizeof(grp));
 				if (!tail || strcmp(tail, "list") != 0)
 					continue;
-				j = jsf_lang(lang);
+				j = jsf_lang(r, lang);
 				if (j) {
 					char full[JSF_NAME];
 
@@ -1341,7 +1374,7 @@ syntax_load_cfg(const Cfg *c)
 				tail = jsf_split(rest, sname, sizeof(sname));
 				if (!tail)
 					continue;
-				j = jsf_lang(lang);
+				j = jsf_lang(r, lang);
 				if (!j)
 					continue;
 				if (pass == 0) {
@@ -1361,292 +1394,245 @@ syntax_load_cfg(const Cfg *c)
 					continue;
 				rest = jsf_split(key + 9, lang, sizeof(lang));
 				if (rest)
-					jsf_lang(lang);
+					jsf_lang(r, lang);
 			}
 		}
 	}
 	/* resolve start states and build Syntax wrappers */
-	for (i = 0; i < g_jsf_count; i++) {
+	for (i = 0; i < r->count; i++) {
 		char sk[JSF_NAME + 24];
 		const char *sv = NULL;
 
 		if (snprintf(sk, sizeof(sk), "language.%s.start",
-		    g_jsf[i].name) < (int)sizeof(sk))
+		    r->lang[i].name) < (int)sizeof(sk))
 			sv = cfg_get(c, sk);
-		g_jsf[i].start = sv ? (uint16_t)jsf_state_idx(&g_jsf[i], sv) : 0;
-		memset(&g_jsf_syn[i], 0, sizeof(g_jsf_syn[i]));
-		g_jsf_syn[i].name = g_jsf[i].name;
-		g_jsf_syn[i].start = g_jsf[i].start;
-		g_jsf_syn[i].fsm = &g_jsf[i];
+		r->lang[i].start = sv
+		    ? (uint16_t)jsf_state_idx(&r->lang[i], sv) : 0;
+		memset(&r->syn[i], 0, sizeof(r->syn[i]));
+		r->syn[i].name = r->lang[i].name;
+		r->syn[i].start = r->lang[i].start;
+		r->syn[i].fsm = &r->lang[i];
 	}
 }
 
-/* Keyword and type sets shared by the C family (C, C++, LPC). */
-static const char *const cfam_kw[] = {
-	"if", "else", "while", "do", "for", "switch", "case", "default",
-	"break", "continue", "return", "goto", "sizeof", "typedef", "struct",
-	"union", "enum", "static", "const", "extern", "volatile", "register",
-	"inline", "auto", "restrict", "true", "false", "NULL",
-	"inherit", "nomask", "varargs", "private", "public", "protected",
-	"nosave", "new", "delete", "foreach", "catch", "efun", "in", "virtual",
-	"namespace", "class", "try", "this", "operator", "template", "using",
-	NULL,
-};
-static const char *const cfam_ty[] = {
-	"void", "char", "short", "int", "long", "float", "double", "signed",
-	"unsigned", "bool", "size_t", "ssize_t", "wchar_t", "FILE", "va_list",
-	"int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t",
-	"uint32_t", "uint64_t", "intptr_t", "uintptr_t",
-	"object", "mapping", "mixed", "string", "function", "closure",
-	"status", "buffer", "array",
-	NULL,
-};
-static const char *const sh_kw[] = {
-	"if", "then", "else", "elif", "fi", "for", "while", "until", "do",
-	"done", "case", "esac", "in", "function", "select", "return", "break",
-	"continue", "local", "export", "readonly", "declare", "set", "unset",
-	"echo", "exit", "shift", "test",
-	NULL,
-};
+/* The built-in default grammars (C family and shell), authored in the same
+ * config format a user would write, so the FSM engine is the single highlighter
+ * and there is no second hardcoded lexer. Colors are base-16 indices, which
+ * render the same at 16 and 256 colors and stay legible on the DOS blue chrome.
+ * A user config can define a language of the same name to override one. */
+static const char g_default_grammar[] =
+	"[language \"c\"]\n"
+	"	start = idle\n"
+	"[language \"sh\"]\n"
+	"	start = idle\n"
+	"\n"
+	"[syntax]\n"
+	"	h = c\n"
+	"	cc = c\n"
+	"	cpp = c\n"
+	"	cxx = c\n"
+	"	hpp = c\n"
+	"	hh = c\n"
+	"	i = c\n"
+	"	lpc = c\n"
+	"	bash = sh\n"
+	"\n"
+	"[color \"c\"]\n"
+	"	comment = 8\n"
+	"	string = 13\n"
+	"	char = 13\n"
+	"	number = 13\n"
+	"	keyword = 11\n"
+	"	type = 10\n"
+	"	preproc = 9\n"
+	"[words \"c.keywords\"]\n"
+	"	list = if else while do for switch case default break continue\n"
+	"	list = return goto sizeof typedef struct union enum static const\n"
+	"	list = extern volatile register inline auto restrict true false NULL\n"
+	"	list = inherit nomask varargs private public protected nosave new delete\n"
+	"	list = foreach catch efun in virtual namespace class try this operator\n"
+	"	list = template using\n"
+	"[words \"c.types\"]\n"
+	"	list = void char short int long float double signed unsigned bool\n"
+	"	list = size_t ssize_t wchar_t FILE va_list\n"
+	"	list = int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t\n"
+	"	list = intptr_t uintptr_t\n"
+	"	list = object mapping mixed string function closure status buffer array\n"
+	"	list = u8 u16 u32 u64 s8 s16 s32 s64 gfp_t loff_t atomic_t spinlock_t\n"
+	"[state \"c.idle\"]\n"
+	"	color = text\n"
+	"	rule = \"/\" slash\n"
+	"	rule = \"\\\"\" string recolor\n"
+	"	rule = \"'\" char recolor\n"
+	"	rule = \"0-9\" number recolor\n"
+	"	rule = \"a-zA-Z_\" ident buffer\n"
+	"	rule = \"#\" preproc recolor\n"
+	"	rule = * idle\n"
+	"[state \"c.slash\"]\n"
+	"	color = text\n"
+	"	rule = \"/\" lcomment recolor=2\n"
+	"	rule = \"*\" bcomment recolor=2\n"
+	"	rule = * idle noeat\n"
+	"[state \"c.lcomment\"]\n"
+	"	color = comment\n"
+	"	rule = \"\\n\" idle\n"
+	"	rule = * lcomment\n"
+	"[state \"c.bcomment\"]\n"
+	"	color = comment\n"
+	"	rule = \"*\" bstar\n"
+	"	rule = * bcomment\n"
+	"[state \"c.bstar\"]\n"
+	"	color = comment\n"
+	"	rule = \"/\" idle\n"
+	"	rule = \"*\" bstar\n"
+	"	rule = * bcomment\n"
+	"[state \"c.string\"]\n"
+	"	color = string\n"
+	"	rule = \"\\\\\" sesc\n"
+	"	rule = \"\\\"\" idle\n"
+	"	rule = \"\\n\" idle\n"
+	"	rule = * string\n"
+	"[state \"c.sesc\"]\n"
+	"	color = string\n"
+	"	rule = * string\n"
+	"[state \"c.char\"]\n"
+	"	color = char\n"
+	"	rule = \"\\\\\" cesc\n"
+	"	rule = \"'\" idle\n"
+	"	rule = \"\\n\" idle\n"
+	"	rule = * char\n"
+	"[state \"c.cesc\"]\n"
+	"	color = char\n"
+	"	rule = * char\n"
+	"[state \"c.number\"]\n"
+	"	color = number\n"
+	"	rule = \"0-9a-fA-F.xXuUlLeE\" number\n"
+	"	rule = * idle noeat\n"
+	"[state \"c.ident\"]\n"
+	"	color = text\n"
+	"	rule = \"a-zA-Z0-9_\" ident\n"
+	"	rule = * idle noeat kw=c.keywords:keyword kw=c.types:type\n"
+	"[state \"c.preproc\"]\n"
+	"	color = preproc\n"
+	"	rule = \"\\n\" idle\n"
+	"	rule = * preproc\n"
+	"\n"
+	"[color \"sh\"]\n"
+	"	comment = 8\n"
+	"	string = 13\n"
+	"	keyword = 11\n"
+	"	variable = 14\n"
+	"[words \"sh.keywords\"]\n"
+	"	list = if then else elif fi for while until do done case esac in\n"
+	"	list = function select return break continue local export readonly\n"
+	"	list = declare set unset echo exit shift test\n"
+	"[state \"sh.idle\"]\n"
+	"	color = text\n"
+	"	rule = \"#\" comment recolor\n"
+	"	rule = \"\\\"\" dquote recolor\n"
+	"	rule = \"'\" squote recolor\n"
+	"	rule = \"$\" var recolor\n"
+	"	rule = \"a-zA-Z_\" ident buffer\n"
+	"	rule = * idle\n"
+	"[state \"sh.comment\"]\n"
+	"	color = comment\n"
+	"	rule = \"\\n\" idle\n"
+	"	rule = * comment\n"
+	"[state \"sh.dquote\"]\n"
+	"	color = string\n"
+	"	rule = \"\\\\\" desc\n"
+	"	rule = \"\\\"\" idle\n"
+	"	rule = * dquote\n"
+	"[state \"sh.desc\"]\n"
+	"	color = string\n"
+	"	rule = * dquote\n"
+	"[state \"sh.squote\"]\n"
+	"	color = string\n"
+	"	rule = \"'\" idle\n"
+	"	rule = * squote\n"
+	"[state \"sh.var\"]\n"
+	"	color = variable\n"
+	"	rule = \"a-zA-Z0-9_\" var\n"
+	"	rule = * idle noeat\n"
+	"[state \"sh.ident\"]\n"
+	"	color = text\n"
+	"	rule = \"a-zA-Z0-9_\" ident\n"
+	"	rule = * idle noeat kw=sh.keywords:keyword\n";
 
-static const Syntax syn_c  = { "c",  0, cfam_kw, cfam_ty, "//", 1, 1, NULL };
-static const Syntax syn_sh = { "sh", 0, sh_kw,   NULL,    "#",  0, 0, NULL };
+/* The config that backs the default grammars; kept for the lifetime of the
+ * process because the grammars' word slices point into it. */
+static Cfg *g_def_cfg;
 
-static int
-syn_wstart(unsigned char c)
+/* Parse and load the built-in grammars into g_def, once. */
+static void
+syntax_load_defaults(void)
 {
-	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-	    c == '_' || c >= 0x80;
-}
-static int
-syn_wcont(unsigned char c)
-{
-	return syn_wstart(c) || (c >= '0' && c <= '9');
-}
-static int
-syn_digit(unsigned char c)
-{
-	return c >= '0' && c <= '9';
+	char *text;
+
+	if (g_def_cfg)
+		return;
+	g_def_cfg = vedit_cfg_new();
+	if (!g_def_cfg)
+		return;
+	text = cfg_dup(g_default_grammar);	/* cfg_load_mem mutates its input */
+	if (text) {
+		cfg_load_mem(g_def_cfg, text);
+		free(text);
+	}
+	syntax_load_cfg(&g_def, g_def_cfg);
 }
 
-static int
-syn_in_list(const char *const *list, const char *word, size_t len)
-{
-	size_t i;
-
-	if (!list)
-		return 0;
-	for (i = 0; list[i]; i++)
-		if (strlen(list[i]) == len && memcmp(list[i], word, len) == 0)
-			return 1;
-	return 0;
-}
-
-/* Style one line into out[0..n) (out may be NULL to only carry state).
- * Returns the state at end of line: SYN_INCOMMENT while a block comment is
- * still open, else 0. */
+/* Style one line into out[0..n) (out may be NULL to carry state only). All
+ * highlighting goes through the FSM now, so this just dispatches to it. Returns
+ * the FSM carry state at end of line (0 when there is no grammar). */
 static uint16_t
 syn_line(const Syntax *sy, uint16_t state_in, const char *bytes,
     size_t n, uint8_t *out)
 {
-	size_t i = 0;
-	uint16_t state = state_in;
-	int seen = 0;		/* a non-space byte has appeared on the line */
-#define SET(a, b, st) do { \
-	if (out) { size_t _k; for (_k = (a); _k < (b); _k++) out[_k] = (st); } \
-} while (0)
-
-	if (!sy)
+	if (!sy || !sy->fsm)
 		return 0;
-	if (sy->fsm)
-		return jsf_line(sy->fsm, state_in, bytes, n, out);
-
-	while (i < n) {
-		unsigned char c = (unsigned char)bytes[i];
-
-		if (state == SYN_INCOMMENT) {		/* close a block comment */
-			size_t j = i;
-
-			while (j < n) {
-				if (bytes[j] == '*' && j + 1 < n &&
-				    bytes[j + 1] == '/') {
-					j += 2;
-					state = 0;
-					break;
-				}
-				j++;
-			}
-			SET(i, j, SYN_COMMENT);
-			i = j;
-			continue;
-		}
-
-		if (c == ' ' || c == '\t') {
-			SET(i, i + 1, SYN_TEXT);
-			i++;
-			continue;
-		}
-
-		if (sy->preproc && c == '#' && !seen) {	/* preprocessor line */
-			SET(i, n, SYN_PREPROC);
-			break;
-		}
-		seen = 1;
-
-		if (sy->line_comment) {
-			size_t lc = strlen(sy->line_comment);
-
-			if (i + lc <= n &&
-			    memcmp(bytes + i, sy->line_comment, lc) == 0) {
-				SET(i, n, SYN_COMMENT);
-				break;
-			}
-		}
-
-		if (sy->block_comment && c == '/' && i + 1 < n &&
-		    bytes[i + 1] == '*') {
-			size_t j = i + 2;
-
-			state = SYN_INCOMMENT;
-			while (j < n) {
-				if (bytes[j] == '*' && j + 1 < n &&
-				    bytes[j + 1] == '/') {
-					j += 2;
-					state = 0;
-					break;
-				}
-				j++;
-			}
-			SET(i, j, SYN_COMMENT);
-			i = j;
-			continue;
-		}
-
-		if (c == '"' || c == '\'') {		/* string / char literal */
-			size_t j = i + 1;
-
-			while (j < n) {
-				if (bytes[j] == '\\' && j + 1 < n) {
-					j += 2;
-					continue;
-				}
-				if ((unsigned char)bytes[j] == c) {
-					j++;
-					break;
-				}
-				j++;
-			}
-			SET(i, j, SYN_STRING);
-			i = j;
-			continue;
-		}
-
-		if (syn_digit(c) || (c == '.' && i + 1 < n &&
-		    syn_digit((unsigned char)bytes[i + 1]))) {	/* number */
-			size_t j = i + 1;
-
-			while (j < n) {
-				unsigned char d = (unsigned char)bytes[j];
-
-				if (syn_wcont(d) || d == '.')
-					j++;
-				else
-					break;
-			}
-			SET(i, j, SYN_CONSTANT);
-			i = j;
-			continue;
-		}
-
-		if (syn_wstart(c)) {			/* identifier */
-			size_t j = i + 1;
-			SynStyle st;
-
-			while (j < n && syn_wcont((unsigned char)bytes[j]))
-				j++;
-			if (syn_in_list(sy->keywords, bytes + i, j - i)) {
-				st = SYN_KEYWORD;
-			} else if (syn_in_list(sy->types, bytes + i, j - i)) {
-				st = SYN_TYPE;
-			} else {
-				size_t k = j;	/* a call if '(' follows */
-
-				while (k < n && (bytes[k] == ' ' || bytes[k] == '\t'))
-					k++;
-				st = (k < n && bytes[k] == '(') ?
-				    SYN_FUNCTION : SYN_TEXT;
-			}
-			SET(i, j, st);
-			i = j;
-			continue;
-		}
-
-		SET(i, i + 1, SYN_OPERATOR);		/* punctuation */
-		i++;
-	}
-#undef SET
-	return state;
+	return jsf_line(sy->fsm, state_in, bytes, n, out);
 }
 
-static int
-syn_ieq(const char *a, const char *b)
-{
-	for (; *a && *b; a++, b++) {
-		int ca = *a, cb = *b;
-
-		if (ca >= 'A' && ca <= 'Z')
-			ca += 32;
-		if (cb >= 'A' && cb <= 'Z')
-			cb += 32;
-		if (ca != cb)
-			return 0;
-	}
-	return *a == *b;
-}
-
+/* Find a grammar named name: a user grammar first (so a user config overrides a
+ * built-in), then a default one. */
 static const Syntax *
-syn_builtin(const char *name)
+syn_reg_find(const char *name)
 {
-	static const struct { const char *e; const Syntax *s; } map[] = {
-		{ "c", &syn_c }, { "h", &syn_c }, { "cc", &syn_c },
-		{ "cpp", &syn_c }, { "cxx", &syn_c }, { "hpp", &syn_c },
-		{ "hh", &syn_c }, { "lpc", &syn_c }, { "i", &syn_c },
-		{ "sh", &syn_sh }, { "bash", &syn_sh },
-	};
-	size_t k;
+	int i = jsf_find(&g_user, name);
 
-	for (k = 0; k < sizeof(map) / sizeof(map[0]); k++)
-		if (syn_ieq(name, map[k].e))
-			return map[k].s;
+	if (i >= 0)
+		return &g_user.syn[i];
+	i = jsf_find(&g_def, name);
+	if (i >= 0)
+		return &g_def.syn[i];
 	return NULL;
 }
 
-/* Map a file extension (or a :syntax language name) to a highlighter. A config
- * FSM language is used first: by its own name (so :syntax <lang> and a matching
- * extension both work), then via a "syntax.<ext> = <lang>" mapping, and finally
- * the built-in C/sh lexers. */
+/* Map a file extension (or a :syntax language name) to a grammar. A language of
+ * that exact name wins first (so :syntax <lang> and a matching extension both
+ * work), then a "syntax.<ext> = <lang>" mapping from the user config, then the
+ * same mapping from the built-in defaults. */
 static const Syntax *
 syn_for_ext(const char *ext)
 {
 	char key[JSF_NAME + 16];
 	const char *mapped;
-	int i;
+	const Syntax *s;
 
 	if (!ext || !*ext)
 		return NULL;
-	i = jsf_find(ext);
-	if (i >= 0)
-		return &g_jsf_syn[i];
+	syntax_load_defaults();
+	s = syn_reg_find(ext);
+	if (s)
+		return s;
 	snprintf(key, sizeof(key), "syntax.%s", ext);
 	mapped = cfg_get(g_cfg, key);
-	if (mapped) {
-		i = jsf_find(mapped);
-		if (i >= 0)
-			return &g_jsf_syn[i];
-		if (syn_builtin(mapped))
-			return syn_builtin(mapped);
-	}
-	return syn_builtin(ext);
+	if (!mapped)
+		mapped = cfg_get(g_def_cfg, key);
+	if (mapped)
+		return syn_reg_find(mapped);
+	return NULL;
 }
 
 
@@ -4347,44 +4333,6 @@ rune_len_at(const char *s, size_t len, size_t cx)
  * Syntax highlighting
  ****************************************************************/
 
-/* Foreground color for each highlight style, tuned to read well on the DOS
- * blue chrome background. The values follow Vim's "darkblue" colorscheme (its
- * 256-color palette): light colors that stay legible on blue. SYN_TEXT and
- * SYN_OPERATOR fall back to the terminal default so ordinary code is left
- * alone. These are 256-color indices; a client limited to 16 colors will not
- * render them as intended. */
-#define SYN_IDX(n) { .type = COLOR_INDEXED, { .index = (n) } }
-static Color syn_color[SYN_STYLE_COUNT] = {
-	[SYN_TEXT] = { .type = COLOR_DEFAULT },
-	[SYN_COMMENT] = SYN_IDX(111),	/* light periwinkle */
-	[SYN_KEYWORD] = SYN_IDX(227),	/* light yellow */
-	[SYN_TYPE] = SYN_IDX(118),	/* bright green */
-	[SYN_CONSTANT] = SYN_IDX(217),	/* salmon */
-	[SYN_STRING] = SYN_IDX(217),	/* salmon, as darkblue groups them */
-	[SYN_OPERATOR] = { .type = COLOR_DEFAULT },
-	[SYN_FUNCTION] = SYN_IDX(123),	/* light cyan */
-	[SYN_PREPROC] = SYN_IDX(213),	/* light pink */
-};
-
-/* A separate palette for 16-color clients. The darkblue pastels above are light,
- * so mapping them to the nearest ANSI color collapses several to white; this
- * set uses punchy base-16 colors that stay distinct on the blue background.
- * Strings and numbers share a color, as darkblue groups them. */
-static Color syn_color16[SYN_STYLE_COUNT] = {
-	[SYN_TEXT] = { .type = COLOR_DEFAULT },
-	[SYN_COMMENT] = SYN_IDX(8),	/* grey */
-	[SYN_KEYWORD] = SYN_IDX(11),	/* bright yellow */
-	[SYN_TYPE] = SYN_IDX(10),	/* bright green */
-	[SYN_CONSTANT] = SYN_IDX(13),	/* bright magenta */
-	[SYN_STRING] = SYN_IDX(13),	/* bright magenta */
-	[SYN_OPERATOR] = { .type = COLOR_DEFAULT },
-	[SYN_FUNCTION] = SYN_IDX(14),	/* bright cyan */
-	[SYN_PREPROC] = SYN_IDX(9),	/* bright red */
-};
-#undef SYN_IDX
-
-
-
 /* The extension of a path (after the last '.'), or "" when there is none. */
 static const char *
 file_ext(const char *path)
@@ -6236,21 +6184,22 @@ scroll_to_cursor_wrap(Editor *e, int text_h, int W)
 	}
 }
 
-/* Resolve the syntax palette for the active language: the FSM's per-class
- * colors and attributes when one is in use, else the built-in style palette for
- * the client's color depth. */
+/* Resolve the syntax palette for the active language: the FSM's per-class colors
+ * and attributes. With no active grammar the palette is empty, and scr_line
+ * leaves every cell at the base color. */
 static void
 syn_palette(const Editor *e, const Screen *d, const Color **pal,
     const uint16_t **pa, int *np)
 {
+	(void)d;
 	if (e->hl_on && e->syn && e->syn->fsm) {
 		*pal = e->syn->fsm->fg;
 		*pa = e->syn->fsm->attr;
 		*np = e->syn->fsm->nclasses;
 	} else {
-		*pal = (d->t->colors < 256) ? syn_color16 : syn_color;
+		*pal = NULL;
 		*pa = NULL;
-		*np = SYN_STYLE_COUNT;
+		*np = 0;
 	}
 }
 
@@ -10449,7 +10398,8 @@ vedit_set_config(struct vedit *v, const struct cfg *c)
 {
 	g_cfg = c;
 	themes_load_cfg(c);		/* before ed_apply_config resolves scheme */
-	syntax_load_cfg(c);		/* register config FSM languages */
+	syntax_load_defaults();		/* built-in C and shell grammars */
+	syntax_load_cfg(&g_user, c);	/* user grammars override them */
 	if (v->e.term) {
 		v->e.term->box_mode = box_default();
 		v->e.term->colors = color_default();
