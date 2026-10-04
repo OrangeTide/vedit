@@ -309,6 +309,7 @@ dialogs, prompts, and the help screen, not just the text area.
 | Ctrl-C / Ctrl-X | copy / cut (Ctrl-C with no selection copies the line) |
 | Ctrl-V | paste the internal clipboard |
 | Ctrl-F | find (Enter repeats the last search) |
+| Ctrl-R | replace, confirming each match (y / n / a / q) |
 | Ctrl-L | go to a line number |
 | Ctrl-Z / Ctrl-Y | undo / redo |
 | Ctrl-S | save (prompts for a name if the buffer has none) |
@@ -336,8 +337,11 @@ $`, `w b e`, `gg G`, `f F t T`, `; ,`, `{ } ( )`, `% H M L |`, counts such as
 first and last line, the same as `gg` and `G`, and work in insert mode too. `ZZ`
 writes and quits, `ZQ` quits without writing. The `:` line runs
 `w q wq q! qa wqa cq`, `:N`, `:set number` / `:set nonumber`, and `:set wrap` /
-`:set nowrap`. `/` searches
-and `n` repeats.
+`:set nowrap`. `/` searches and `n` repeats. Substitution follows the usual vi
+forms: `:s/old/new/`, `:s/old/new/g` for every match on the line, a leading
+range such as `:%s/old/new/g` for the whole file, and `:g/pat/...` / `:v/pat/...`
+to run a command on matching (or non-matching) lines. In the modeless
+personality, Ctrl-R walks the matches one at a time and asks before each.
 
 ## Draw mode (ASCII art and maps)
 
@@ -432,7 +436,7 @@ push-style state machine is not provided.
 
 The lumi editor sits on about ten libraries. vedit keeps the text buffer with
 undo and redo, the modeless and vi personalities, the MS-EDIT chrome (menu bar,
-frame, scrollbars, dialogs), find, selection and an internal clipboard,
+frame, scrollbars, dialogs), find and replace, selection and an internal clipboard,
 goto-line, multiple buffers, a hex view, a 2D/block draw mode, and lightweight
 syntax highlighting. It replaces the drawing stack with
 a self-contained ANSI renderer over the io vtable, and the keyboard decoder with

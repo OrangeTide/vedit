@@ -2947,6 +2947,7 @@ typedef enum edit_mode {
 typedef enum req {
 	REQ_CONTINUE,
 	REQ_FIND,
+	REQ_REPLACE,
 	REQ_GOTO,
 	REQ_HELP,
 	REQ_SAVE,
@@ -2987,6 +2988,7 @@ typedef struct editor {
 	int		clip_block;	/* clip holds a rectangle (draw mode) */
 	int		draw_mode;	/* 2D/block draw mode: free cursor + overtype */
 	char		last_find[256];	/* last search string, for repeat */
+	char		last_replace[256]; /* last replacement string */
 	int		vi_search_dir;	/* last search direction: 1 fwd, -1 back */
 	int		vi_want_col;	/* display column j/k aim for (INT_MAX=EOL) */
 	int		vi_vert_run;	/* this command was a vertical j/k/$ move */
@@ -4209,6 +4211,7 @@ typedef enum cmd {
 	CMD_PASTE,
 	CMD_SEND,		/* send selection/line to another pane */
 	CMD_FIND,		/* prompt for a string and jump to it */
+	CMD_REPLACE,		/* prompt for a pattern and a replacement */
 	CMD_GOTO,		/* prompt for a line number and jump to it */
 	CMD_HELP,		/* show the key bindings */
 	CMD_SAVE,
@@ -4231,6 +4234,7 @@ static const Keybind keymap[] = {
 	{ TKBD_KEY_V,		1, CMD_PASTE },
 	{ TKBD_KEY_G,		1, CMD_SEND },
 	{ TKBD_KEY_F,		1, CMD_FIND },
+	{ TKBD_KEY_R,		1, CMD_REPLACE },
 	{ TKBD_KEY_L,		1, CMD_GOTO },
 	{ TKBD_KEY_F1,		0, CMD_HELP },
 	{ TKBD_KEY_LEFT,	0, CMD_LEFT },
@@ -4804,7 +4808,7 @@ typedef enum menu_act {
 	MA_NEW, MA_OPEN, MA_SAVE, MA_SAVE_AS,
 	MA_BUF_NEXT, MA_BUF_PREV, MA_BUF_LIST, MA_EXIT,
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE,
-	MA_FIND, MA_FIND_NEXT, MA_GOTO,
+	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_GOTO,
 	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_HEX, MA_DRAW, MA_VI_MODE,
 	MA_HELP, MA_ABOUT,
 } Menuact;
@@ -4849,6 +4853,7 @@ static const Menuitem mi_edit[] = {
 static const Menuitem mi_search[] = {
 	{ "&Find...",		"Ctrl+F",	"/",	MA_FIND },
 	{ "&Repeat Find",	"",		"n",	MA_FIND_NEXT },
+	{ "&Replace...",	"Ctrl+R",	":s",	MA_REPLACE },
 	{ "&Go to Line...",	"Ctrl+L",	"G",	MA_GOTO },
 };
 static const Menuitem mi_view[] = {
@@ -7372,6 +7377,8 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 		break;
 	case CMD_FIND:
 		return REQ_FIND;
+	case CMD_REPLACE:
+		return REQ_REPLACE;
 	case CMD_GOTO:
 		return REQ_GOTO;
 	case CMD_HELP:
@@ -7468,10 +7475,10 @@ ui_prompt(Editor *e, const char *q, const char *buf)
 }
 
 /* Read a line of text. buf is edited in place, so a caller may pre-fill it
- * with a default (for example the last search). Returns 1 with buf filled, or
- * 0 if cancelled or left empty. */
-int
-dlg_prompt_line(Editor *e, const char *q, char *buf, size_t bufsz)
+ * with a default. Returns 1 with buf filled, or 0 if cancelled; when
+ * allow_empty is 0 an empty line reads as a cancel, else it is accepted. */
+static int
+prompt_line(Editor *e, const char *q, char *buf, size_t bufsz, int allow_empty)
 {
 	size_t len = strlen(buf);
 
@@ -7490,7 +7497,7 @@ dlg_prompt_line(Editor *e, const char *q, char *buf, size_t bufsz)
 		if (seq.type != TKBD_KEY)
 			continue;
 		if (seq.key == TKBD_KEY_ENTER)
-			return len > 0;
+			return allow_empty ? 1 : (len > 0);
 		if (seq.key == TKBD_KEY_ESC ||
 		    ((seq.mod & TKBD_MOD_CTRL) && seq.key == TKBD_KEY_C))
 			return 0;
@@ -7516,6 +7523,139 @@ dlg_prompt_line(Editor *e, const char *q, char *buf, size_t bufsz)
 			}
 		}
 	}
+}
+
+int
+dlg_prompt_line(Editor *e, const char *q, char *buf, size_t bufsz)
+{
+	return prompt_line(e, q, buf, bufsz, 0);
+}
+
+/* Draw q on the status row and return the next character typed (lowercased),
+ * or 0 on ESC, Ctrl-C or end of input. Used for a one-key y/n/a/q prompt. */
+static int
+dlg_prompt_key(Editor *e, const char *q)
+{
+	for (;;) {
+		Event ev;
+		struct tkbd_seq seq;
+
+		ui_prompt(e, q, "");
+		if (scr_wait(e->d, &ev) == EVENT_EOF)
+			return 0;
+		if (ev.type != EVENT_KEY) {
+			scr_size(e->d, &e->rows, &e->cols);
+			continue;
+		}
+		seq = ev.key;
+		if (seq.type != TKBD_KEY)
+			continue;
+		if (seq.key == TKBD_KEY_ESC ||
+		    ((seq.mod & TKBD_MOD_CTRL) && seq.key == TKBD_KEY_C))
+			return 0;
+		if (seq.key == TKBD_KEY_ENTER)
+			return '\n';
+		if (seq.ch != TKBD_CH_NONE && seq.ch >= 0x20 && seq.ch < 0x7f)
+			return tolower((unsigned char)seq.ch);
+	}
+}
+
+/* Find the next occurrence of q at or after (fy, fx), scanning to the end of
+ * the buffer without wrapping. Matches never cross a line. Returns 1 with the
+ * position in *my, *mx, or 0 if there is none. */
+static int
+replace_next(Editor *e, const char *q, size_t fy, size_t fx,
+    size_t *my, size_t *mx)
+{
+	size_t nlines = text_lines(e->t), ln;
+
+	for (ln = fy; ln < nlines; ln++) {
+		size_t llen = 0;
+		const char *s = text_line(e->t, ln, &llen);
+		size_t from = (ln == fy) ? fx : 0;
+		const char *hit;
+
+		if (!s || from > llen)
+			continue;
+		hit = strstr(s + from, q);
+		if (hit) {
+			*my = ln;
+			*mx = (size_t)(hit - s);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* Overwrite the patlen bytes at (ln, col) with repl. The caller guarantees the
+ * match lies within the line. */
+static void
+replace_at(Editor *e, size_t ln, size_t col, size_t patlen,
+    const char *repl, size_t repllen)
+{
+	hl_touch(e, ln);
+	text_delete(e->t, ln, col, patlen);
+	if (repllen)
+		text_insert(e->t, ln, col, repl, repllen);
+}
+
+/* Prompt for a pattern and a replacement, then walk the matches from the
+ * cursor to the end of the buffer. At each one, y replaces, n skips, a replaces
+ * it and all that follow, and q (or Esc) stops. */
+static void
+replace_prompt(Editor *e)
+{
+	char pat[256], repl[256];
+	size_t patlen, repllen, y, x, my, mx, count = 0;
+	int all = 0;
+
+	snprintf(pat, sizeof(pat), "%s", e->last_find);
+	if (!prompt_line(e, "Replace: ", pat, sizeof(pat), 0)) {
+		snprintf(e->status, sizeof(e->status), "replace cancelled");
+		return;
+	}
+	snprintf(e->last_find, sizeof(e->last_find), "%s", pat);
+	snprintf(repl, sizeof(repl), "%s", e->last_replace);
+	if (!prompt_line(e, "Replace with: ", repl, sizeof(repl), 1)) {
+		snprintf(e->status, sizeof(e->status), "replace cancelled");
+		return;
+	}
+	snprintf(e->last_replace, sizeof(e->last_replace), "%s", repl);
+	patlen = strlen(pat);
+	repllen = strlen(repl);
+	if (patlen == 0)
+		return;
+
+	y = e->cy;
+	x = e->cx;
+	text_undo_group_begin(e->t);
+	while (replace_next(e, pat, y, x, &my, &mx)) {
+		e->cy = my;
+		e->cx = mx;
+		e->sel_active = 0;
+		if (!all) {
+			int k = dlg_prompt_key(e, "Replace this one? "
+			    "(y)es (n)o (a)ll (q)uit ");
+
+			if (k == 0 || k == 'q')
+				break;
+			if (k == 'a')
+				all = 1;
+			else if (k != 'y' && k != '\n') {
+				y = my;		/* skip: resume just past it */
+				x = mx + 1;
+				continue;
+			}
+		}
+		replace_at(e, my, mx, patlen, repl, repllen);
+		count++;
+		y = my;
+		x = mx + repllen;
+		e->cx = mx + repllen;
+	}
+	text_undo_group_end(e->t);
+	snprintf(e->status, sizeof(e->status), "replaced %zu occurrence%s",
+	    count, count == 1 ? "" : "s");
 }
 
 /* Save the buffer, prompting for a name if it has none. Returns 0 on a
@@ -7695,6 +7835,7 @@ static const struct {
 	{ "Enter",		"Split the line" },
 	{ "Backspace / Del",	"Delete before / after the cursor" },
 	{ "Ctrl-F",		"Find (Enter repeats the last search)" },
+	{ "Ctrl-R",		"Replace, confirming each match (y/n/a/q)" },
 	{ "Ctrl-L",		"Go to a line number" },
 	{ "Ctrl-C / Ctrl-X",	"Copy (line if none selected) / cut" },
 	{ "Ctrl-V",		"Paste the clipboard" },
@@ -8666,6 +8807,9 @@ run_menu_act(Editor *e, Menuact act)
 			snprintf(e->status, sizeof(e->status),
 			    "no previous search");
 		break;
+	case MA_REPLACE:
+		replace_prompt(e);
+		break;
 	case MA_GOTO:
 		goto_prompt(e);
 		break;
@@ -8955,6 +9099,7 @@ usage(void)
 	    "  Ctrl-C / Ctrl-X  copy / cut (Ctrl-C with no selection copies the line)\n"
 	    "  Ctrl-V        paste the internal clipboard\n"
 	    "  Ctrl-F        find (Enter repeats the last search)\n"
+	    "  Ctrl-R        replace, confirming each match (y/n/a/q)\n"
 	    "  Ctrl-L        go to a line number\n"
 	    "  Ctrl-Z / Ctrl-Y  undo / redo\n"
 	    "  Ctrl-S        save (prompts for a name if the buffer has none)\n"
@@ -8989,6 +9134,9 @@ run_req(Editor *e, Req req)
 	switch (req) {
 	case REQ_FIND:
 		find_prompt(e);
+		break;
+	case REQ_REPLACE:
+		replace_prompt(e);
 		break;
 	case REQ_GOTO:
 		goto_prompt(e);

@@ -763,6 +763,50 @@ t_jsf_include(Test *t)
 	unlink(path);
 }
 
+static void
+t_replace(Test *t)
+{
+	Editor e;
+	size_t y, x, my, mx, count, len;
+	const char *s;
+
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+
+	/* two lines, three occurrences of "foo" */
+	text_insert(e.t, 0, 0, "foo foo", 7);
+	lines_insert_at(e.t, 1, "x foo y", 7);
+
+	/* replace-all driven by the same primitives the interactive loop uses */
+	y = x = count = 0;
+	while (replace_next(&e, "foo", y, x, &my, &mx)) {
+		replace_at(&e, my, mx, 3, "BARS", 4);
+		count++;
+		y = my;
+		x = mx + 4;
+	}
+	TAP_CHECKF(t, count == 3, "count %zu", count);
+	s = text_line(e.t, 0, &len);
+	TAP_CHECKF(t, len == 9 && memcmp(s, "BARS BARS", 9) == 0,
+	    "grow line 0: '%.*s'", (int)len, s);
+	s = text_line(e.t, 1, &len);
+	TAP_CHECKF(t, len == 8 && memcmp(s, "x BARS y", 8) == 0,
+	    "grow line 1: '%.*s'", (int)len, s);
+
+	/* an empty replacement deletes the match */
+	TAP_ASSERT(t, replace_next(&e, "BARS", 1, 0, &my, &mx));
+	replace_at(&e, my, mx, 4, "", 0);
+	s = text_line(e.t, 1, &len);
+	TAP_CHECKF(t, len == 4 && memcmp(s, "x  y", 4) == 0,
+	    "delete: '%.*s'", (int)len, s);
+
+	/* no match past the end returns 0 */
+	TAP_CHECK(t, !replace_next(&e, "zzz", 0, 0, &my, &mx));
+
+	text_free(e.t);
+}
+
 const Case tap_cases[] = {
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },
@@ -790,5 +834,6 @@ const Case tap_cases[] = {
 	{ "jsf_linecomment", t_jsf_linecomment },
 	{ "jsf_recolormark", t_jsf_recolormark },
 	{ "jsf_include", t_jsf_include },
+	{ "replace", t_replace },
 	{ NULL, NULL },
 };
