@@ -4838,7 +4838,7 @@ static const Menuitem mi_file[] = {
 	{ "",		"",		"",	MA_SEP },
 	{ "Next &Buffer","F8",		":bn",	MA_BUF_NEXT },
 	{ "&Prev Buffer","Shift+F8",	":bp",	MA_BUF_PREV },
-	{ "Buffer &List","",		":ls",	MA_BUF_LIST },
+	{ "Buffer &List","",		"",	MA_BUF_LIST },
 	{ "",		"",		"",	MA_SEP },
 	{ "E&xit",	"Ctrl+Q",	":q",	MA_EXIT },
 };
@@ -8337,6 +8337,86 @@ buf_list(Editor *e)
 	}
 }
 
+/****************************************************************
+ * Buffer switcher (a picker client)
+ ****************************************************************/
+
+typedef struct bufpick {
+	Editor	*e;
+	char	 line[PATH_MAX + 64];	/* reused by label() for one row */
+	int	 chosen;		/* selected buffer index on PICK_DONE */
+} Bufpick;
+
+static const char *
+bufpick_title(void *ctx)
+{
+	(void)ctx;
+	return "Buffers";
+}
+
+static int
+bufpick_count(void *ctx)
+{
+	return ((Bufpick *)ctx)->e->nbuf;
+}
+
+static const char *
+bufpick_label(void *ctx, int i)
+{
+	Bufpick *bp = ctx;
+	Editor *e = bp->e;
+	int active = (i == e->cur);
+	const char *name, *slash;
+	const Text *t;
+
+	if (i < 0 || i >= e->nbuf)
+		return "";
+	/* The active buffer's live state is in the flat editor; a parked one's
+	 * is in its slot. Its Text pointer is shared, so dirty and line counts
+	 * read correctly from either. */
+	name = active ? (e->has_name ? e->path : "[No Name]")
+	    : (e->bufs[i].has_name ? e->bufs[i].path : "[No Name]");
+	slash = strrchr(name, '/');
+	if (slash)
+		name = slash + 1;
+	t = active ? e->t : e->bufs[i].t;
+	snprintf(bp->line, sizeof(bp->line), "%d%s  %s%s  %zuL", i + 1,
+	    active ? " *" : "", name, (t && text_dirty(t)) ? " [+]" : "",
+	    t ? text_lines(t) : 0);
+	return bp->line;
+}
+
+static int
+bufpick_choose(void *ctx, int i)
+{
+	Bufpick *bp = ctx;
+
+	if (i < 0 || i >= bp->e->nbuf)
+		return PICK_STAY;
+	bp->chosen = i;
+	return PICK_DONE;
+}
+
+/* Open a modal list of the buffers and switch to the chosen one. */
+static void
+dlg_buffer_pick(Editor *e)
+{
+	Picksrc s = {
+		.title = bufpick_title, .count = bufpick_count,
+		.label = bufpick_label, .choose = bufpick_choose,
+	};
+	Bufpick bp;
+
+	if (e->nbuf < 1)
+		return;
+	memset(&bp, 0, sizeof(bp));
+	bp.e = e;
+	bp.chosen = e->cur;
+	s.ctx = &bp;
+	if (dlg_pick(e, &s))
+		buf_switch(e, bp.chosen);
+}
+
 static void
 ed_new(Editor *e)
 {
@@ -8776,7 +8856,7 @@ run_menu_act(Editor *e, Menuact act)
 		buf_cycle(e, -1);
 		break;
 	case MA_BUF_LIST:
-		buf_list(e);
+		dlg_buffer_pick(e);
 		break;
 	case MA_EXIT:
 		if (dlg_confirm_save(e, "Save changes before exiting?"))

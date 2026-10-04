@@ -807,6 +807,57 @@ t_replace(Test *t)
 	text_free(e.t);
 }
 
+static void
+t_bufpick(Test *t)
+{
+	Editor e;
+	Buf bufs[2];
+	Bufpick bp;
+	const char *l0, *l1;
+
+	editor_init(&e);
+	memset(bufs, 0, sizeof(bufs));
+	e.bufs = bufs;
+	e.nbuf = 2;
+	e.cur = 0;
+
+	/* buffer 0: active, named, edited (so dirty) */
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "hello", 5);
+	e.has_name = 1;
+	snprintf(e.path, sizeof(e.path), "/tmp/alpha.c");
+	bufs[0].t = e.t;
+	bufs[0].has_name = 1;
+	snprintf(bufs[0].path, sizeof(bufs[0].path), "/tmp/alpha.c");
+
+	/* buffer 1: parked, unnamed, untouched */
+	bufs[1].t = text_new();
+	TAP_ASSERT(t, bufs[1].t != NULL);
+	bufs[1].has_name = 0;
+
+	memset(&bp, 0, sizeof(bp));
+	bp.e = &e;
+
+	TAP_CHECK(t, bufpick_count(&bp) == 2);
+
+	l0 = bufpick_label(&bp, 0);
+	TAP_CHECKF(t, strstr(l0, "alpha.c") && strstr(l0, "*") &&
+	    strstr(l0, "[+]"), "active label: %s", l0);
+
+	l1 = bufpick_label(&bp, 1);
+	TAP_CHECKF(t, strstr(l1, "[No Name]") && !strstr(l1, "*") &&
+	    !strstr(l1, "[+]"), "parked label: %s", l1);
+
+	/* choosing a valid row reports it; an out-of-range row stays open */
+	bp.chosen = -1;
+	TAP_CHECK(t, bufpick_choose(&bp, 1) == PICK_DONE && bp.chosen == 1);
+	TAP_CHECK(t, bufpick_choose(&bp, 9) == PICK_STAY);
+
+	text_free(bufs[0].t);
+	text_free(bufs[1].t);
+}
+
 const Case tap_cases[] = {
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },
@@ -835,5 +886,6 @@ const Case tap_cases[] = {
 	{ "jsf_recolormark", t_jsf_recolormark },
 	{ "jsf_include", t_jsf_include },
 	{ "replace", t_replace },
+	{ "bufpick", t_bufpick },
 	{ NULL, NULL },
 };

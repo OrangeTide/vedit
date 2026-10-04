@@ -279,8 +279,18 @@ over it.
 The browser is one client of a reusable list-picker control (`dlg_pick` with a
 `Picksrc` of callbacks). The control owns the box, scrolling, selection, and
 keys; a source supplies the rows and decides what choosing one means. The intent
-is to reuse it for other lists later, such as mailboxes for a mail reader or
-module and function lists for editing scripts.
+is to reuse it for other lists, such as mailboxes for a mail reader or module and
+function lists for editing scripts.
+
+### Buffer switcher
+
+**File > Buffer List** opens the same picker over the open buffers. Each row
+shows the buffer number, a `*` on the active one, the file name, a `[+]` when it
+has unsaved changes, and its line count. Move with the arrows (or type a letter
+to jump by name) and press Enter to switch to that buffer. F8 and Shift-F8 still
+cycle to the next and previous buffer without opening the list. The switcher is
+the picker's second client, a list with no entry line, where the file browser
+adds one.
 
 ### Color schemes
 
