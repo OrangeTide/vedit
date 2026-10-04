@@ -417,7 +417,10 @@ described under "Custom syntax highlighting" above. The C-family and shell
 highlighters that ship with it are grammars in that same config format, compiled
 into the binary and loaded at startup rather than written as hardcoded lexers.
 They color keywords, types, strings, character and number literals, line and
-block comments (a block comment may span lines), and preprocessor lines.
+block comments (a block comment may span lines), and preprocessor lines,
+including a string inside a `#include` or `#define` and a macro continued over a
+trailing backslash. The shell grammar also colors `$var` and `${var}`, including
+inside double-quoted strings.
 
 The language is chosen from the file extension: `.c .h .cc .cpp .cxx .hpp .hh
 .lpc .i` use the C grammar, and `.sh .bash` use the shell grammar. Highlighting

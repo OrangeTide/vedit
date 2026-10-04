@@ -161,6 +161,41 @@ t_syntax_block_comment_carry(Test *t)
 }
 
 static void
+t_syntax_refine(Test *t)
+{
+	const Syntax *c = syn_for_ext("c");
+	const Syntax *sh = syn_for_ext("sh");
+	uint8_t out[32];
+	uint16_t st;
+	int pre, str, var;
+
+	TAP_ASSERT(t, c && c->fsm && sh && sh->fsm);
+	pre = fsm_class(c->fsm, "preproc");
+	str = fsm_class(c->fsm, "string");
+
+	/* a string literal inside a preprocessor line is colored as a string */
+	syn_line(c, c->start, "#include \"x.h\"", 14, out);
+	TAP_CHECKF(t, out[0] == pre, "directive -> %d", out[0]);
+	TAP_CHECKF(t, out[9] == str && out[13] == str, "inc target [%d %d]",
+	    out[9], out[13]);
+
+	/* a trailing backslash continues the preprocessor line onto the next */
+	st = syn_line(c, c->start, "#define A \\", 11, out);
+	TAP_CHECKF(t, st != c->start, "continuation carry: %u", st);
+	syn_line(c, st, "cont", 4, out);
+	TAP_CHECKF(t, out[0] == pre, "continued line -> %d", out[0]);
+
+	/* a $var inside a double-quoted shell string is colored as a variable */
+	str = fsm_class(sh->fsm, "string");
+	var = fsm_class(sh->fsm, "variable");
+	syn_line(sh, sh->start, "\"$HOME\"", 7, out);
+	TAP_CHECKF(t, out[0] == str && out[6] == str, "quotes [%d %d]",
+	    out[0], out[6]);
+	TAP_CHECKF(t, out[1] == var && out[5] == var, "var [%d %d]",
+	    out[1], out[5]);
+}
+
+static void
 t_text_edit_undo(Test *t)
 {
 	Text *tx = text_new();
@@ -1011,6 +1046,7 @@ const Case tap_cases[] = {
 	{ "seg_index_of", t_seg_index_of },
 	{ "syntax_c", t_syntax_c },
 	{ "syntax_block_comment_carry", t_syntax_block_comment_carry },
+	{ "syntax_refine", t_syntax_refine },
 	{ "text_edit_undo", t_text_edit_undo },
 	{ "multiline_buffer", t_multiline_buffer },
 	{ "pick_fit", t_pick_fit },
