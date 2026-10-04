@@ -4832,7 +4832,6 @@ typedef struct editor {
 	int		prev_text_view;	/* the last paint was the scrollable text */
 	int		rows;
 	int		cols;
-	int		in_session;
 	Screen	*d;		/* drawing surface and input source */
 	Scrbuf *term;		/* terminal driver (box mode, resize) */
 	int		sel_active;	/* a selection is being extended */
@@ -6067,7 +6066,6 @@ typedef enum cmd {
 	CMD_COPY,
 	CMD_CUT,
 	CMD_PASTE,
-	CMD_SEND,		/* send selection/line to another pane */
 	CMD_FIND,		/* prompt for a string and jump to it */
 	CMD_REPLACE,		/* prompt for a pattern and a replacement */
 	CMD_SYMBOL,		/* pick a definition in the buffer and jump to it */
@@ -6091,7 +6089,6 @@ static const Keybind keymap[] = {
 	{ TKBD_KEY_C,		1, CMD_COPY },
 	{ TKBD_KEY_X,		1, CMD_CUT },
 	{ TKBD_KEY_V,		1, CMD_PASTE },
-	{ TKBD_KEY_G,		1, CMD_SEND },
 	{ TKBD_KEY_F,		1, CMD_FIND },
 	{ TKBD_KEY_R,		1, CMD_REPLACE },
 	{ TKBD_KEY_T,		1, CMD_SYMBOL },
@@ -7119,10 +7116,9 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 		    p->bar_fg, p->bar_bg, at);
 	}
 
-	rlen = snprintf(right, sizeof(right), "%sLine:%zu  Col:%zu%s%s",
+	rlen = snprintf(right, sizeof(right), "%sLine:%zu  Col:%zu%s",
 	    flags, e->cy + 1, (size_t)cur_col + 1,
-	    text_dirty(e->t) ? "  *" : "",
-	    e->in_session ? "  [session]" : "");
+	    text_dirty(e->t) ? "  *" : "");
 	if (rlen > 0 && rlen < e->cols - 1)
 		scr_text(e->d, row, e->cols - rlen - 1, right,
 		    p->bar_fg, p->bar_bg, at);
@@ -9012,52 +9008,6 @@ current_selection_text(Editor *e, size_t *len)
 	return region_text(e, y1, x1, y2, x2, len);
 }
 
-/* Send the selection, or the current line when nothing is selected, to
- * another window of the session as typed input. A carriage return is
- * appended so the line runs in the target shell or REPL. */
-static void
-ed_send(Editor *e)
-{
-	const char *session = getenv("LUMI_SESSION");
-	char *text = NULL, *payload;
-	size_t tlen = 0;
-
-	if (!session) {
-		snprintf(e->status, sizeof(e->status), "not in a session");
-		return;
-	}
-	if (e->sel_active) {
-		text = current_selection_text(e, &tlen);
-	} else {
-		size_t ll = 0;
-		const char *s = text_line(e->t, e->cy, &ll);
-
-		text = malloc(ll + 1);
-		if (text && ll)
-			memcpy(text, s, ll);
-		tlen = ll;
-	}
-	if (!text) {
-		snprintf(e->status, sizeof(e->status), "out of memory");
-		return;
-	}
-
-	payload = malloc(tlen + 1);
-	if (!payload) {
-		free(text);
-		snprintf(e->status, sizeof(e->status), "out of memory");
-		return;
-	}
-	memcpy(payload, text, tlen);
-	payload[tlen] = '\r';		/* submit the line in the target */
-	free(text);
-
-	/* A standalone or embedded vedit has no lumi session to send to. */
-	snprintf(e->status, sizeof(e->status), "session not found");
-	free(payload);
-	e->sel_active = 0;		/* consume the selection */
-}
-
 /* Carry out one command, returning what the main loop must do next. */
 static Req
 ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
@@ -9195,9 +9145,6 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 			e->sel_active = 0;
 		}
 		insert_clip(e);
-		break;
-	case CMD_SEND:
-		ed_send(e);
 		break;
 	case CMD_FIND:
 		return REQ_FIND;
@@ -9894,7 +9841,6 @@ static const struct {
 	{ "Ctrl-L",		"Go to a line number" },
 	{ "Ctrl-C / Ctrl-X",	"Copy (line if none selected) / cut" },
 	{ "Ctrl-V",		"Paste the clipboard" },
-	{ "Ctrl-G",		"Send selection/line to another pane" },
 	{ "Ctrl-Z / Ctrl-Y",	"Undo / redo" },
 	{ "Ctrl-S",		"Save (asks for a name if none)" },
 	{ "Ctrl-Q",		"Quit (asks if there are unsaved changes)" },
