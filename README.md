@@ -289,8 +289,22 @@ shows the buffer number, a `*` on the active one, the file name, a `[+]` when it
 has unsaved changes, and its line count. Move with the arrows (or type a letter
 to jump by name) and press Enter to switch to that buffer. F8 and Shift-F8 still
 cycle to the next and previous buffer without opening the list. The switcher is
-the picker's second client, a list with no entry line, where the file browser
+a second client of the picker, a list with no entry line, where the file browser
 adds one.
+
+### Symbol jump
+
+**Ctrl-T** (Search > Go to Symbol) scans the current buffer for definitions and
+lists them in the picker; choosing one moves the cursor to its line. Each row
+shows the name, a kind (`func`, `type`, `class`, `macro`), and the line number,
+and typing a letter jumps to the next name that starts with it. The scan is a
+set of simple line patterns rather than a parser: a top-level function (an
+identifier at column 0 right before `(`, on a line that does not end in `;`, so
+both the `name(args)` and the BSD split style are caught), a `struct` / `union`
+/ `enum` / `class` tag with an opening brace, a `} Name;` typedef alias, and a
+`#define`. It needs no tags file and no external tool, and the same patterns
+cover C, C++, LPC, and shell `name()` functions. This is the picker's third
+client and the first step toward editing larger sources.
 
 ### Color schemes
 
@@ -320,6 +334,7 @@ dialogs, prompts, and the help screen, not just the text area.
 | Ctrl-V | paste the internal clipboard |
 | Ctrl-F | find (Enter repeats the last search) |
 | Ctrl-R | replace, confirming each match (y / n / a / q) |
+| Ctrl-T | go to a symbol defined in the buffer |
 | Ctrl-L | go to a line number |
 | Ctrl-Z / Ctrl-Y | undo / redo |
 | Ctrl-S | save (prompts for a name if the buffer has none) |

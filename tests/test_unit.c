@@ -858,6 +858,91 @@ t_bufpick(Test *t)
 	text_free(bufs[1].t);
 }
 
+static char
+classify(const char *s, char *name, size_t namesz)
+{
+	name[0] = '\0';
+	return sym_classify(s, strlen(s), name, namesz);
+}
+
+static void
+t_sym_classify(Test *t)
+{
+	char nm[80];
+
+	/* functions: BSD split style (name at column 0) and same-line style */
+	TAP_CHECKF(t, classify("jsf_line(const Jsf *j,", nm, sizeof(nm)) == 'f'
+	    && strcmp(nm, "jsf_line") == 0, "bsd func: '%s'", nm);
+	TAP_CHECKF(t, classify("int main(int argc, char **argv)", nm,
+	    sizeof(nm)) == 'f' && strcmp(nm, "main") == 0, "inline func: '%s'",
+	    nm);
+	TAP_CHECKF(t, classify("foo() {", nm, sizeof(nm)) == 'f' &&
+	    strcmp(nm, "foo") == 0, "shell/paren func: '%s'", nm);
+
+	/* not functions */
+	TAP_CHECK(t, classify("static int", nm, sizeof(nm)) == 0);
+	TAP_CHECK(t, classify("int foo(void);", nm, sizeof(nm)) == 0);
+	TAP_CHECK(t, classify("\tbar(void)", nm, sizeof(nm)) == 0);
+	TAP_CHECK(t, classify("if (x) {", nm, sizeof(nm)) == 0);
+	TAP_CHECK(t, classify("while (y)", nm, sizeof(nm)) == 0);
+
+	/* macros */
+	TAP_CHECKF(t, classify("#define MAX 10", nm, sizeof(nm)) == 'd' &&
+	    strcmp(nm, "MAX") == 0, "define: '%s'", nm);
+	TAP_CHECKF(t, classify("#  define FOO(x) (x)", nm, sizeof(nm)) == 'd' &&
+	    strcmp(nm, "FOO") == 0, "define spaced: '%s'", nm);
+	TAP_CHECK(t, classify("#ifndef GUARD_H", nm, sizeof(nm)) == 0);
+
+	/* aggregates and typedef aliases */
+	TAP_CHECKF(t, classify("typedef struct jsf_rule {", nm, sizeof(nm))
+	    == 's' && strcmp(nm, "jsf_rule") == 0, "typedef struct: '%s'", nm);
+	TAP_CHECKF(t, classify("struct point {", nm, sizeof(nm)) == 's' &&
+	    strcmp(nm, "point") == 0, "struct: '%s'", nm);
+	TAP_CHECK(t, classify("struct fwd;", nm, sizeof(nm)) == 0);
+	TAP_CHECKF(t, classify("enum req {", nm, sizeof(nm)) == 's' &&
+	    strcmp(nm, "req") == 0, "enum: '%s'", nm);
+	TAP_CHECKF(t, classify("class Widget : public Base {", nm, sizeof(nm))
+	    == 'c' && strcmp(nm, "Widget") == 0, "class: '%s'", nm);
+	TAP_CHECKF(t, classify("} Jsfrule;", nm, sizeof(nm)) == 't' &&
+	    strcmp(nm, "Jsfrule") == 0, "alias: '%s'", nm);
+	TAP_CHECK(t, classify("};", nm, sizeof(nm)) == 0);
+}
+
+static void
+t_symscan(Test *t)
+{
+	Editor e;
+	Sympick sp;
+
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "#define N 3", 11);
+	lines_insert_at(e.t, 1, "struct point {", 14);
+	lines_insert_at(e.t, 2, "\tint x;", 7);
+	lines_insert_at(e.t, 3, "};", 2);
+	lines_insert_at(e.t, 4, "int add(int a, int b)", 21);
+	lines_insert_at(e.t, 5, "{", 1);
+
+	memset(&sp, 0, sizeof(sp));
+	sp.e = &e;
+	symscan(&sp);
+
+	TAP_CHECKF(t, sp.n == 3, "symbol count %d", sp.n);
+	TAP_CHECKF(t, sp.ent[0].kind == 'd' && sp.ent[0].line == 0 &&
+	    strcmp(sp.ent[0].name, "N") == 0, "sym0 %c L%zu %s",
+	    sp.ent[0].kind, sp.ent[0].line, sp.ent[0].name);
+	TAP_CHECKF(t, sp.ent[1].kind == 's' && sp.ent[1].line == 1 &&
+	    strcmp(sp.ent[1].name, "point") == 0, "sym1 %c L%zu %s",
+	    sp.ent[1].kind, sp.ent[1].line, sp.ent[1].name);
+	TAP_CHECKF(t, sp.ent[2].kind == 'f' && sp.ent[2].line == 4 &&
+	    strcmp(sp.ent[2].name, "add") == 0, "sym2 %c L%zu %s",
+	    sp.ent[2].kind, sp.ent[2].line, sp.ent[2].name);
+
+	free(sp.ent);
+	text_free(e.t);
+}
+
 const Case tap_cases[] = {
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },
@@ -887,5 +972,7 @@ const Case tap_cases[] = {
 	{ "jsf_include", t_jsf_include },
 	{ "replace", t_replace },
 	{ "bufpick", t_bufpick },
+	{ "sym_classify", t_sym_classify },
+	{ "symscan", t_symscan },
 	{ NULL, NULL },
 };

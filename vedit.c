@@ -3072,6 +3072,7 @@ int buf_cycle(Editor *e, int dir);		/* next/prev; new index */
 int buf_close(Editor *e, int i);			/* 0 ok, -1 refused */
 void buf_list(Editor *e);			/* summarize into status */
 static int dlg_save_file(Editor *e, char *out, size_t outsz);
+static void dlg_symbol_pick(Editor *e);
 void insert_clip(Editor *e);
 void insert_bytes(Editor *e, const char *bytes, size_t len);
 char *region_text(Editor *e, size_t y1, size_t x1, size_t y2, size_t x2,
@@ -4212,6 +4213,7 @@ typedef enum cmd {
 	CMD_SEND,		/* send selection/line to another pane */
 	CMD_FIND,		/* prompt for a string and jump to it */
 	CMD_REPLACE,		/* prompt for a pattern and a replacement */
+	CMD_SYMBOL,		/* pick a definition in the buffer and jump to it */
 	CMD_GOTO,		/* prompt for a line number and jump to it */
 	CMD_HELP,		/* show the key bindings */
 	CMD_SAVE,
@@ -4235,6 +4237,7 @@ static const Keybind keymap[] = {
 	{ TKBD_KEY_G,		1, CMD_SEND },
 	{ TKBD_KEY_F,		1, CMD_FIND },
 	{ TKBD_KEY_R,		1, CMD_REPLACE },
+	{ TKBD_KEY_T,		1, CMD_SYMBOL },
 	{ TKBD_KEY_L,		1, CMD_GOTO },
 	{ TKBD_KEY_F1,		0, CMD_HELP },
 	{ TKBD_KEY_LEFT,	0, CMD_LEFT },
@@ -4808,7 +4811,7 @@ typedef enum menu_act {
 	MA_NEW, MA_OPEN, MA_SAVE, MA_SAVE_AS,
 	MA_BUF_NEXT, MA_BUF_PREV, MA_BUF_LIST, MA_EXIT,
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE,
-	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_GOTO,
+	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_GOTO,
 	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_HEX, MA_DRAW, MA_VI_MODE,
 	MA_HELP, MA_ABOUT,
 } Menuact;
@@ -4854,6 +4857,7 @@ static const Menuitem mi_search[] = {
 	{ "&Find...",		"Ctrl+F",	"/",	MA_FIND },
 	{ "&Repeat Find",	"",		"n",	MA_FIND_NEXT },
 	{ "&Replace...",	"Ctrl+R",	":s",	MA_REPLACE },
+	{ "Go to S&ymbol...",	"Ctrl+T",	"",	MA_SYMBOL },
 	{ "&Go to Line...",	"Ctrl+L",	"G",	MA_GOTO },
 };
 static const Menuitem mi_view[] = {
@@ -7379,6 +7383,9 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 		return REQ_FIND;
 	case CMD_REPLACE:
 		return REQ_REPLACE;
+	case CMD_SYMBOL:
+		dlg_symbol_pick(e);
+		break;
 	case CMD_GOTO:
 		return REQ_GOTO;
 	case CMD_HELP:
@@ -7836,6 +7843,7 @@ static const struct {
 	{ "Backspace / Del",	"Delete before / after the cursor" },
 	{ "Ctrl-F",		"Find (Enter repeats the last search)" },
 	{ "Ctrl-R",		"Replace, confirming each match (y/n/a/q)" },
+	{ "Ctrl-T",		"Go to a symbol defined in the buffer" },
 	{ "Ctrl-L",		"Go to a line number" },
 	{ "Ctrl-C / Ctrl-X",	"Copy (line if none selected) / cut" },
 	{ "Ctrl-V",		"Paste the clipboard" },
@@ -8417,6 +8425,293 @@ dlg_buffer_pick(Editor *e)
 		buf_switch(e, bp.chosen);
 }
 
+/****************************************************************
+ * Symbol picker (a picker client)
+ ****************************************************************/
+
+typedef struct sym {
+	size_t	line;		/* 0-based line the definition is on */
+	char	kind;		/* 'f' func, 's' struct/union/enum, 'c' class,
+				 * 'd' macro, 't' typedef alias */
+	char	name[80];
+} Sym;
+
+typedef struct sympick {
+	Editor	*e;
+	Sym	*ent;
+	int	 n, cap;
+	char	 line[160];	/* reused by label() for one row */
+	size_t	 chosen;	/* target line on PICK_DONE */
+} Sympick;
+
+static int
+sym_ident(int c)
+{
+	return isalnum((unsigned char)c) || c == '_';
+}
+
+static int
+sym_ident_start(int c)
+{
+	return isalpha((unsigned char)c) || c == '_';
+}
+
+/* Control words that are followed by '(' but are not function definitions. */
+static int
+sym_is_kw(const char *s, size_t n)
+{
+	static const char *const kw[] = {
+		"if", "for", "while", "switch", "return", "sizeof", "do",
+		"else", "catch", "foreach", NULL,
+	};
+	int i;
+
+	for (i = 0; kw[i]; i++)
+		if (strlen(kw[i]) == n && memcmp(kw[i], s, n) == 0)
+			return 1;
+	return 0;
+}
+
+static char
+sym_copy(char *name, size_t namesz, const char *s, size_t from, size_t to,
+    char kind)
+{
+	size_t nl = to - from;
+
+	if (nl >= namesz)
+		nl = namesz - 1;
+	memcpy(name, s + from, nl);
+	name[nl] = '\0';
+	return kind;
+}
+
+/* Classify one line as a definition and extract its name. Returns the kind
+ * char (and fills name) or 0 for a line that defines nothing. The rules are
+ * deliberately simple line patterns, not a parser: a #define, a struct / union
+ * / enum / class tag with an opening brace, a "} Name;" typedef alias, or a
+ * top-level function (an identifier at column 0 right before '(', not a
+ * control keyword, on a line that does not end in ';'). */
+static char
+sym_classify(const char *s, size_t len, char *name, size_t namesz)
+{
+	size_t i, j, start, end, last = len;
+	const char *paren;
+
+	while (last > 0 && (s[last - 1] == ' ' || s[last - 1] == '\t' ||
+	    s[last - 1] == '\n' || s[last - 1] == '\r'))
+		last--;
+	if (last == 0)
+		return 0;
+
+	i = 0;
+	while (i < len && (s[i] == ' ' || s[i] == '\t'))
+		i++;
+
+	if (s[i] == '#') {			/* #define NAME */
+		j = i + 1;
+		while (j < len && (s[j] == ' ' || s[j] == '\t'))
+			j++;
+		if (len - j >= 6 && memcmp(s + j, "define", 6) == 0 &&
+		    (j + 6 >= len || !sym_ident(s[j + 6]))) {
+			j += 6;
+			while (j < len && (s[j] == ' ' || s[j] == '\t'))
+				j++;
+			start = j;
+			while (j < len && sym_ident(s[j]))
+				j++;
+			if (j > start && sym_ident_start(s[start]))
+				return sym_copy(name, namesz, s, start, j, 'd');
+		}
+		return 0;
+	}
+
+	if (s[0] == '}') {			/* } Name;  (typedef alias) */
+		j = 1;
+		while (j < len && (s[j] == ' ' || s[j] == '\t'))
+			j++;
+		start = j;
+		while (j < len && sym_ident(s[j]))
+			j++;
+		end = j;
+		while (j < len && (s[j] == ' ' || s[j] == '\t'))
+			j++;
+		if (end > start && sym_ident_start(s[start]) && j < len &&
+		    s[j] == ';')
+			return sym_copy(name, namesz, s, start, end, 't');
+		return 0;
+	}
+
+	/* struct / union / enum / class TAG, with a brace on the line */
+	{
+		static const struct { const char *w; char kind; } kws[] = {
+			{ "struct", 's' }, { "union", 's' }, { "enum", 's' },
+			{ "class", 'c' }, { NULL, 0 },
+		};
+		int k;
+
+		j = i;
+		if (len - j >= 7 && memcmp(s + j, "typedef", 7) == 0 &&
+		    (j + 7 >= len || !sym_ident(s[j + 7]))) {
+			j += 7;
+			while (j < len && (s[j] == ' ' || s[j] == '\t'))
+				j++;
+		}
+		for (k = 0; kws[k].w; k++) {
+			size_t wl = strlen(kws[k].w);
+
+			if (len - j >= wl && memcmp(s + j, kws[k].w, wl) == 0 &&
+			    j + wl < len && !sym_ident(s[j + wl])) {
+				size_t tpos = j + wl;
+
+				while (tpos < len &&
+				    (s[tpos] == ' ' || s[tpos] == '\t'))
+					tpos++;
+				start = tpos;
+				while (tpos < len && sym_ident(s[tpos]))
+					tpos++;
+				if (tpos > start && sym_ident_start(s[start]) &&
+				    memchr(s, '{', len))
+					return sym_copy(name, namesz, s, start,
+					    tpos, kws[k].kind);
+				break;
+			}
+		}
+	}
+
+	/* top-level function: a name at column 0 just before '(' */
+	if (s[0] == ' ' || s[0] == '\t')
+		return 0;
+	if (s[last - 1] == ';')
+		return 0;		/* a declaration or prototype */
+	paren = memchr(s, '(', len);
+	if (!paren)
+		return 0;
+	end = (size_t)(paren - s);
+	while (end > 0 && (s[end - 1] == ' ' || s[end - 1] == '\t'))
+		end--;
+	start = end;
+	while (start > 0 && sym_ident(s[start - 1]))
+		start--;
+	if (end > start && sym_ident_start(s[start]) &&
+	    !sym_is_kw(s + start, end - start))
+		return sym_copy(name, namesz, s, start, end, 'f');
+	return 0;
+}
+
+static void
+symscan(Sympick *sp)
+{
+	size_t nlines = text_lines(sp->e->t), i;
+
+	for (i = 0; i < nlines; i++) {
+		size_t len = 0;
+		const char *s = text_line(sp->e->t, i, &len);
+		char name[80], kind;
+
+		if (!s)
+			continue;
+		kind = sym_classify(s, len, name, sizeof(name));
+		if (!kind)
+			continue;
+		if (sp->n == sp->cap) {
+			int nc = sp->cap ? sp->cap * 2 : 64;
+			Sym *ne = realloc(sp->ent, (size_t)nc * sizeof(*ne));
+
+			if (!ne)
+				return;
+			sp->ent = ne;
+			sp->cap = nc;
+		}
+		sp->ent[sp->n].line = i;
+		sp->ent[sp->n].kind = kind;
+		snprintf(sp->ent[sp->n].name, sizeof(sp->ent[sp->n].name),
+		    "%s", name);
+		sp->n++;
+	}
+}
+
+static const char *
+sym_kindword(char kind)
+{
+	switch (kind) {
+	case 'f': return "func";
+	case 's': return "type";
+	case 'c': return "class";
+	case 'd': return "macro";
+	case 't': return "type";
+	default:  return "";
+	}
+}
+
+static const char *
+sympick_title(void *ctx)
+{
+	(void)ctx;
+	return "Symbols";
+}
+
+static int
+sympick_count(void *ctx)
+{
+	return ((Sympick *)ctx)->n;
+}
+
+static const char *
+sympick_label(void *ctx, int i)
+{
+	Sympick *sp = ctx;
+
+	if (i < 0 || i >= sp->n)
+		return "";
+	snprintf(sp->line, sizeof(sp->line), "%-32s %-6s L%zu",
+	    sp->ent[i].name, sym_kindword(sp->ent[i].kind),
+	    sp->ent[i].line + 1);
+	return sp->line;
+}
+
+static int
+sympick_choose(void *ctx, int i)
+{
+	Sympick *sp = ctx;
+
+	if (i < 0 || i >= sp->n)
+		return PICK_STAY;
+	sp->chosen = sp->ent[i].line;
+	return PICK_DONE;
+}
+
+/* Scan the current buffer for definitions, list them, and jump to the one
+ * chosen. A list with no entry line, the picker's third client. */
+static void
+dlg_symbol_pick(Editor *e)
+{
+	Picksrc s = {
+		.title = sympick_title, .count = sympick_count,
+		.label = sympick_label, .choose = sympick_choose,
+	};
+	Sympick sp;
+
+	memset(&sp, 0, sizeof(sp));
+	sp.e = e;
+	symscan(&sp);
+	if (sp.n == 0) {
+		snprintf(e->status, sizeof(e->status), "no symbols found");
+		free(sp.ent);
+		return;
+	}
+	s.ctx = &sp;
+	if (dlg_pick(e, &s)) {
+		if (sp.chosen < text_lines(e->t)) {
+			e->cy = sp.chosen;
+			e->cx = 0;
+			e->sel_active = 0;
+			snprintf(e->status, sizeof(e->status),
+			    "line %zu", sp.chosen + 1);
+		}
+	}
+	free(sp.ent);
+}
+
 static void
 ed_new(Editor *e)
 {
@@ -8890,6 +9185,9 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_REPLACE:
 		replace_prompt(e);
 		break;
+	case MA_SYMBOL:
+		dlg_symbol_pick(e);
+		break;
 	case MA_GOTO:
 		goto_prompt(e);
 		break;
@@ -9180,6 +9478,7 @@ usage(void)
 	    "  Ctrl-V        paste the internal clipboard\n"
 	    "  Ctrl-F        find (Enter repeats the last search)\n"
 	    "  Ctrl-R        replace, confirming each match (y/n/a/q)\n"
+	    "  Ctrl-T        go to a symbol defined in the buffer\n"
 	    "  Ctrl-L        go to a line number\n"
 	    "  Ctrl-Z / Ctrl-Y  undo / redo\n"
 	    "  Ctrl-S        save (prompts for a name if the buffer has none)\n"
