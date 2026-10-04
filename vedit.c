@@ -11096,7 +11096,7 @@ dlg_about(Editor *e)
 	static const char *const lines[] = {
 		"vedit",
 		"a full-screen text editor",
-		"version " VEDIT_VERSION,
+		("version " VEDIT_VERSION),
 	};
 	Aboutctx a = {
 		lines, (int)(sizeof(lines) / sizeof(lines[0])), "[ OK ]"

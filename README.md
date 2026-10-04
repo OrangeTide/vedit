@@ -28,7 +28,11 @@ dependencies.
 ## Testing
 
 ```sh
-make test
+make test               # unit and render tests through the taptest driver
+make torture            # pseudo-random fuzz of the parsers and regex engine
+make asan               # tests + torture under AddressSanitizer (with leaks)
+make ubsan              # tests + torture under UndefinedBehaviorSanitizer
+make cov                # line coverage of vedit.c from the unit tests
 ```
 
 The tests live in `tests/` and run through a vendored copy of the `taptest`
@@ -40,6 +44,19 @@ keystrokes and captures the output, so no terminal is needed. `test_unit.c`
 covers the pure helpers (UTF-8, rune width, color mapping, word-wrap layout, the
 syntax tokenizer, buffer edits and undo); `test_render.c` drives whole-editor
 behavior (cursor jumps, wrap, the gutter, status flags).
+
+`tests/torture.c` is a fuzz suite that drives the untrusted-input surfaces, the
+regex engine as search and replace use it, the config parser, and the UTF-8
+codec, with pseudo-random input and a deterministic PRNG. It is not a
+correctness oracle; it checks a few invariants and leans on the sanitizers to
+catch memory and undefined-behavior faults. Set `TORTURE_ROUNDS` to change the
+iteration count, and pass a seed as the second argument to `tests/torturet` to
+reproduce a run.
+
+CI (`.github/workflows/ci.yml`) runs the build and tests on gcc and clang, the
+two sanitizer suites, and the torture fuzz on every push and pull request. A
+single `ci-ok` job gates on all of them, so branch protection can require that
+one check.
 
 ## Running
 
