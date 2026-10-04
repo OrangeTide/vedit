@@ -258,6 +258,71 @@ t_tag_jump(Test *t)
 	rmdir(dir);
 }
 
+/* The tag stack: Ctrl-] jumps to a tag, then vi Ctrl-T pops back to where the
+ * jump started. Driven through the event loop in vi normal mode. */
+static void
+t_tag_stack(Test *t)
+{
+	char dir[] = "/tmp/vedit_tsXXXXXX";
+	char caller[PATH_MAX], target[PATH_MAX], tags[PATH_MAX];
+	char cfgtext[PATH_MAX + 64];
+	const char keys[] = "\x1d\x14";		/* Ctrl-] then Ctrl-T */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Cfg *cfg;
+	FILE *f;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(caller, sizeof(caller), "%s/caller.c", dir);
+	snprintf(target, sizeof(target), "%s/sock.c", dir);
+	snprintf(tags, sizeof(tags), "%s/tags", dir);
+
+	f = fopen(caller, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("sock_open();\n", f);
+	fclose(f);
+	f = fopen(target, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("/* hdr */\nint sock_open(void)\n{\n}\n", f);
+	fclose(f);
+	f = fopen(tags, "w");
+	TAP_ASSERT(t, f != NULL);
+	fprintf(f, "sock_open\t%s\t/^int sock_open(void)$/;\"\tf\n", target);
+	fclose(f);
+
+	snprintf(cfgtext, sizeof(cfgtext), "[tags]\n\tfile = %s\n", tags);
+	cfg = cfg_from_text(cfgtext);
+	TAP_ASSERT(t, cfg != NULL);
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config(v, cfg);
+	TAP_ASSERT(t, vedit_open(v, caller) == 0);
+	v->e.mode = MODE_NORMAL;	/* so Ctrl-T pops, not the modeless picker */
+	v->e.cy = 0;
+	v->e.cx = 0;
+
+	vedit_run(v);
+
+	/* popped back to the caller after the jump into sock.c */
+	TAP_CHECK(t, v->e.has_name &&
+	    strcmp(v->e.path + strlen(v->e.path) - 8, "caller.c") == 0);
+	TAP_CHECKF(t, v->e.cy == 0, "returned to line %zu", v->e.cy);
+	TAP_CHECKF(t, v->e.tag_sp == 0, "stack depth %d after pop", v->e.tag_sp);
+
+	vedit_free(v);
+	memio_free(&m);
+	g_cfg = NULL;
+	vedit_cfg_free(cfg);
+	unlink(caller);
+	unlink(target);
+	unlink(tags);
+	rmdir(dir);
+}
+
 #ifndef VEDIT_NO_TOOLS
 /* A fake tool runner, so the IDE-command tests drive the whole event loop
  * (key -> dispatch -> command -> output pane) without forking a shell. */
@@ -409,6 +474,7 @@ const Case tap_cases[] = {
 	{ "status_flags", t_status_flags },
 	{ "tab_key_expand", t_tab_key_expand },
 	{ "tag_jump", t_tag_jump },
+	{ "tag_stack", t_tag_stack },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_f9_make", t_tool_f9_make },
 	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },

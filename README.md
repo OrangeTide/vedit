@@ -416,8 +416,11 @@ vi users also get the familiar jumps: **Ctrl-]** jumps to the tag named by the
 identifier under the cursor, and **`:tag NAME`** (abbreviated `:ta`) jumps to a
 named tag. When a name has several matches the picker opens on just those;
 `:tag /pattern` opens the picker filtered to names containing the pattern. A
-single match jumps straight there. vedit keeps no tag stack, so there is no
-`:pop`; use the buffer switcher (F8) to return.
+single match jumps straight there. Each jump pushes where you were onto a tag
+stack, so you can return: in vi keys **Ctrl-T** or **`:pop`** (`:po`) pops back
+to the previous position, and **Search > Pop Tag** does the same in either
+personality (in the modeless keys Ctrl-T stays the symbol picker). The stack
+records named buffers only, since a pop reopens by path.
 
 [ctags]: https://ctags.io/
 [ectags]: https://ctags.sourceforge.net/

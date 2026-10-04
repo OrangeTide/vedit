@@ -4886,6 +4886,13 @@ typedef struct toolerr {
 } Toolerr;
 #endif
 
+/* One saved location on the tag stack: where a tag jump started, so a pop can
+ * return there. Only named buffers are recorded (a pop reopens by path). */
+typedef struct tagloc {
+	char	path[PATH_MAX];
+	size_t	cy, cx;
+} Tagloc;
+
 typedef struct editor {
 	Buf	*bufs;		/* open buffers; active mirrors into flat */
 	int		nbuf;		/* number of open buffers */
@@ -4940,6 +4947,8 @@ typedef struct editor {
 	int		show_tabs;	/* draw a guide glyph at each hard tab */
 	int		auto_indent;	/* a new line copies the previous indent */
 	int		expand_tabs;	/* Tab and auto-indent use spaces (per buffer) */
+	Tagloc		*tagstack;	/* positions to return to after tag jumps */
+	int		tag_sp, tag_cap;	/* stack depth and capacity */
 	int		hex_view;	/* render the buffer as a hex dump */
 	size_t		hex_top;	/* first visible hex row (byte offset >> 4) */
 	int		hex_ascii;	/* editing the ascii column, not the hex */
@@ -6812,7 +6821,7 @@ typedef enum menu_act {
 	MA_NEW, MA_OPEN, MA_SAVE, MA_SAVE_AS,
 	MA_BUF_NEXT, MA_BUF_PREV, MA_BUF_LIST, MA_EXIT,
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE, MA_OSC_COPY, MA_OSC_COPY_FILE,
-	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_GOTO,
+	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_TAG_POP, MA_GOTO,
 	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_HEX, MA_DRAW,
 	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS,
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS,
@@ -6871,6 +6880,7 @@ static const Menuitem mi_search[] = {
 	{ "&Repeat Find",	"",		"n",	MA_FIND_NEXT },
 	{ "&Replace...",	"Ctrl+R",	":s",	MA_REPLACE },
 	{ "Go to S&ymbol...",	"Ctrl+T",	"",	MA_SYMBOL },
+	{ "&Pop Tag",		"",		":pop",	MA_TAG_POP },
 	{ "&Go to Line...",	"Ctrl+L",	"G",	MA_GOTO },
 };
 static const Menuitem mi_view[] = {
@@ -10366,6 +10376,7 @@ static const struct {
 	{ ":q!  ZZ  ZQ",	"Quit discarding, save and quit, quit" },
 	{ ":N  :cq",		"Go to a line, quit with an error code" },
 	{ "Ctrl-]  :tag",	"Jump to a tag (under cursor / by name)" },
+	{ "Ctrl-T  :pop",	"Pop the tag stack back to the last jump" },
 	{ "F1 / F2",		"Show this help / back to modeless keys" },
 };
 
@@ -11704,6 +11715,53 @@ sympick_choose(void *ctx, int i)
 	return PICK_DONE;
 }
 
+/* Record the current location on the tag stack before a jump, so a later pop
+ * returns here. Unnamed buffers are not recorded (a pop reopens by path). */
+static void
+tagstack_push(Editor *e)
+{
+	Tagloc *tl;
+
+	if (!e->has_name)
+		return;
+	if (e->tag_sp == e->tag_cap) {
+		int nc = e->tag_cap ? e->tag_cap * 2 : 16;
+		Tagloc *ns = realloc(e->tagstack, (size_t)nc * sizeof(*ns));
+
+		if (!ns)
+			return;			/* out of memory: skip recording */
+		e->tagstack = ns;
+		e->tag_cap = nc;
+	}
+	tl = &e->tagstack[e->tag_sp++];
+	snprintf(tl->path, sizeof(tl->path), "%s", e->path);
+	tl->cy = e->cy;
+	tl->cx = e->cx;
+}
+
+/* Pop the most recent tag-jump origin and return to it. */
+static void
+ed_tag_pop(Editor *e)
+{
+	Tagloc tl;
+
+	if (e->tag_sp == 0) {
+		snprintf(e->status, sizeof(e->status), "tag stack empty");
+		return;
+	}
+	tl = e->tagstack[--e->tag_sp];
+	if (buf_open(e, tl.path) < 0)
+		return;				/* buf_open set the status */
+	if (text_lines(e->t) == 0)
+		return;
+	e->cy = tl.cy < text_lines(e->t) ? tl.cy : text_lines(e->t) - 1;
+	e->cx = tl.cx;
+	e->sel_active = 0;
+	clamp_col(e);
+	snprintf(e->status, sizeof(e->status), "%.100s:%zu  (%d on the tag stack)",
+	    tl.path, e->cy + 1, e->tag_sp);
+}
+
 /* Jump to the chosen entry: a buffer line, or a tags entry in another file. */
 static void
 sym_goto(Editor *e, Sympick *sp, int i)
@@ -11716,6 +11774,7 @@ sym_goto(Editor *e, Sympick *sp, int i)
 	if (se->tag) {
 		char target[PATH_MAX];
 
+		tagstack_push(e);		/* record where we jumped from */
 		tag_resolve(&sp->db, se->file_idx, target, sizeof(target));
 		if (ed_goto_target(e, target, se->line, se->pattern) == 0)
 			snprintf(e->status, sizeof(e->status), "%.40s  %.90s:%zu",
@@ -12941,6 +13000,9 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_SYMBOL:
 		dlg_symbol_pick(e);
 		break;
+	case MA_TAG_POP:
+		ed_tag_pop(e);
+		break;
 	case MA_GOTO:
 		goto_prompt(e);
 		break;
@@ -14011,6 +14073,7 @@ editor_teardown(Editor *e)
 	free(e->vi_dot.ev);
 	free(e->vi_rec.ev);
 	free(e->hl_buf);
+	free(e->tagstack);
 #ifndef VEDIT_NO_TOOLS
 	tool_free(e);
 #endif
@@ -16747,6 +16810,10 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 				vi_clamp(e);
 			}
 			break;
+		case TKBD_KEY_T:			/* pop the tag stack (vim) */
+			ed_tag_pop(e);
+			vi_clamp(e);
+			break;
 		default:
 			break;
 		}
@@ -18131,6 +18198,13 @@ vi_ex_exec(Editor *e, char *buf)
 		else
 			snprintf(e->status, sizeof(e->status),
 			    "E471: argument required");
+		return REQ_CONTINUE;
+	}
+
+	/* :pop / :po returns to the position before the last tag jump. */
+	if (strcmp(p, "pop") == 0 || strcmp(p, "po") == 0 ||
+	    strcmp(p, "pop!") == 0) {
+		ed_tag_pop(e);
 		return REQ_CONTINUE;
 	}
 
