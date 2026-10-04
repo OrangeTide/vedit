@@ -1032,6 +1032,14 @@ t_isearch(Test *t)
 	TAP_CHECK(t, !isearch_scan(&e, "zzz", 0, 0, &my, &mx));
 	TAP_CHECK(t, !isearch_scan(&e, "", 0, 0, &my, &mx));
 
+	/* backward: nearest match before the origin, then wrapping */
+	TAP_CHECKF(t, isearch_scan_dir(&e, "foo", 1, 7, -1, &my, &mx) &&
+	    my == 1 && mx == 4, "back from (1,7): L%zu C%zu", my, mx);
+	TAP_CHECKF(t, isearch_scan_dir(&e, "foo", 1, 4, -1, &my, &mx) &&
+	    my == 0 && mx == 0, "back from (1,4): L%zu C%zu", my, mx);
+	TAP_CHECKF(t, isearch_scan_dir(&e, "foo", 0, 0, -1, &my, &mx) &&
+	    my == 1 && mx == 4, "back wrap from (0,0): L%zu C%zu", my, mx);
+
 	text_free(e.t);
 }
 

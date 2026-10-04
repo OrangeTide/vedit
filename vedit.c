@@ -7802,11 +7802,51 @@ isearch_scan(Editor *e, const char *q, size_t oy, size_t ox,
 	return 0;
 }
 
+/* Direction-aware incremental scan. Forward reuses isearch_scan; backward finds
+ * the nearest match before the origin, wrapping once to the end of the buffer.
+ * Returns 1 with the position in *my, *mx. */
+static int
+isearch_scan_dir(Editor *e, const char *q, size_t oy, size_t ox, int dir,
+    size_t *my, size_t *mx)
+{
+	size_t nlines = text_lines(e->t), i;
+
+	if (dir >= 0)
+		return isearch_scan(e, q, oy, ox, my, mx);
+	if (!q[0] || nlines == 0)
+		return 0;
+	for (i = 0; i <= nlines; i++) {
+		size_t ln = (oy + 2 * nlines - i) % nlines;
+		size_t llen = 0;
+		const char *s = text_line(e->t, ln, &llen);
+		size_t lo = 0, hi;
+		const char *hit;
+
+		if (!s)
+			continue;
+		if (i == 0)
+			hi = ox;		/* strictly before the origin */
+		else if (i == nlines) {
+			lo = ox;		/* wrap: the tail of the origin line */
+			hi = llen + 1;
+		} else
+			hi = llen + 1;
+		hit = last_match(s, llen, lo, hi, q);
+		if (hit) {
+			*my = ln;
+			*mx = (size_t)(hit - s);
+			return 1;
+		}
+	}
+	return 0;
+}
+
 /* Paint the editor with the cursor already moved to the live match, then
- * overlay the query on the status row. ed_render leaves the hardware cursor at
- * the match, and ui_field does not move it, so the cursor sits on the match. */
+ * overlay the query on the status row after label. ed_render leaves the
+ * hardware cursor at the match, and ui_field does not move it, so the cursor
+ * sits on the match. */
 static void
-isearch_draw(Editor *e, const char *q, int found)
+isearch_draw(Editor *e, const char *label, const char *q, int found)
 {
 	const Pal *p = ed_chrome(e);
 	uint16_t at = (p->reverse_bars ? ATTR_REVERSE : 0) | ATTR_BOLD;
@@ -7814,18 +7854,19 @@ isearch_draw(Editor *e, const char *q, int found)
 	int status_row = (e->rows > 0 ? e->rows : 24) - 1;
 
 	ed_render(e, e->d);
-	snprintf(line, sizeof(line), "%sISearch: %s",
-	    found ? "" : "(failing) ", q);
+	snprintf(line, sizeof(line), "%s%s%s",
+	    found ? "" : "(failing) ", label, q);
 	ui_field(e->d, status_row, 0, e->cols, line, p->bar_fg, p->bar_bg, at);
 	scr_present(e->d);
 }
 
-/* Incremental search: the cursor follows the first match from the starting
- * position as the query is typed. Enter accepts (and stores the query for
- * Repeat Find); on an empty query Enter repeats the last search. Esc or Ctrl-C
- * cancels and restores the starting view. */
+/* Incremental search in direction dir (1 forward, -1 backward). The cursor
+ * follows the first match from the starting position as the query is typed.
+ * Enter accepts (storing the query and direction for repeats); an empty query
+ * repeats the last search. Esc or Ctrl-C cancels and restores the start. label
+ * is the status-line prompt ("/" or "?" for vi, "ISearch: " for modeless). */
 static void
-find_prompt(Editor *e)
+incsearch(Editor *e, int dir, const char *label)
 {
 	size_t oy = e->cy, ox = e->cx, otop = e->top, oleft = e->left;
 	char q[256];
@@ -7838,7 +7879,8 @@ find_prompt(Editor *e)
 		struct tkbd_seq seq;
 		size_t my = oy, mx = ox;
 
-		if (len > 0 && (found = isearch_scan(e, q, oy, ox, &my, &mx))) {
+		if (len > 0 &&
+		    (found = isearch_scan_dir(e, q, oy, ox, dir, &my, &mx))) {
 			e->cy = my;
 			e->cx = mx;
 			e->sel_active = 0;
@@ -7850,7 +7892,7 @@ find_prompt(Editor *e)
 			if (len == 0)
 				found = 1;
 		}
-		isearch_draw(e, q, found);
+		isearch_draw(e, label, q, found);
 
 		if (scr_wait(e->d, &ev) == EVENT_EOF) {
 			e->cy = oy, e->cx = ox, e->top = otop, e->left = oleft;
@@ -7866,10 +7908,11 @@ find_prompt(Editor *e)
 		if (seq.key == TKBD_KEY_ENTER) {
 			if (len == 0) {
 				if (e->last_find[0])
-					ed_find(e, e->last_find);
+					ed_find_dir(e, e->last_find, dir);
 				return;
 			}
 			snprintf(e->last_find, sizeof(e->last_find), "%s", q);
+			e->vi_search_dir = dir;
 			if (found)
 				snprintf(e->status, sizeof(e->status),
 				    "found '%.80s'", q);
@@ -7906,6 +7949,13 @@ find_prompt(Editor *e)
 			}
 		}
 	}
+}
+
+/* Modeless find: forward incremental search. */
+static void
+find_prompt(Editor *e)
+{
+	incsearch(e, 1, "ISearch: ");
 }
 
 /* Prompt for a 1-based line number and move the cursor to that line. A number
@@ -14393,19 +14443,13 @@ vi_colon(Editor *e)
 	return vi_ex_exec(e, buf);
 }
 
-/* Read a vi '/' search pattern and jump to the next match. */
+/* Vi '/' (forward) and '?' (backward) incremental search. The direction was
+ * stashed in vi_search_dir by the key that requested it. */
 void
 vi_search(Editor *e)
 {
 	int dir = e->vi_search_dir < 0 ? -1 : 1;
-	char q[256];
 
-	q[0] = '\0';
-	if (!dlg_prompt_line(e, dir < 0 ? "?" : "/", q, sizeof(q))) {
-		snprintf(e->status, sizeof(e->status), "search cancelled");
-		return;
-	}
-	snprintf(e->last_find, sizeof(e->last_find), "%s", q);
-	ed_find_dir(e, q, dir);
+	incsearch(e, dir, dir < 0 ? "?" : "/");
 }
 

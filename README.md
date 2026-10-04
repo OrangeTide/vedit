@@ -375,7 +375,9 @@ $`, `w b e`, `gg G`, `f F t T`, `; ,`, `{ } ( )`, `% H M L |`, counts such as
 first and last line, the same as `gg` and `G`, and work in insert mode too. `ZZ`
 writes and quits, `ZQ` quits without writing. The `:` line runs
 `w q wq q! qa wqa cq`, `:N`, `:set number` / `:set nonumber`, and `:set wrap` /
-`:set nowrap`. `/` searches and `n` repeats. Substitution follows the usual vi
+`:set nowrap`. `/` and `?` search incrementally (forward and backward, the
+cursor following the first match as you type, Esc restoring the start) and `n` /
+`N` repeat. Substitution follows the usual vi
 forms: `:s/old/new/`, `:s/old/new/g` for every match on the line, a leading
 range such as `:%s/old/new/g` for the whole file, and `:g/pat/...` / `:v/pat/...`
 to run a command on matching (or non-matching) lines. In the modeless
