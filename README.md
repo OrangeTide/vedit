@@ -235,6 +235,13 @@ A language whose name matches a file extension is picked up automatically; a
 the rules are config data, loaded through `vedit_set_config()` like everything
 else.
 
+`docs/c.conf` is a worked example: a C highlighter (comments, strings, char and
+number literals, the preprocessor, keywords and types) that handles real C,
+including kernel source. Use it as a config directly with
+`VEDIT_CONFIG=docs/c.conf vedit file.c`, or paste its sections into your own
+config. Because it names the language `c`, it also replaces the built-in C
+highlighter.
+
 ### Color schemes
 
 ### Line numbers
