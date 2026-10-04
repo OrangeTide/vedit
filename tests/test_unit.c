@@ -828,8 +828,9 @@ static void
 t_replace(Test *t)
 {
 	Editor e;
-	size_t y, x, my, mx, count, len;
+	size_t y, x, my, mx, mlen, count, len;
 	const char *s;
+	rx_t *re;
 
 	editor_init(&e);
 	e.t = text_new();
@@ -840,13 +841,16 @@ t_replace(Test *t)
 	lines_insert_at(e.t, 1, "x foo y", 7);
 
 	/* replace-all driven by the same primitives the interactive loop uses */
+	re = rx_compile("foo", 0, NULL);
+	TAP_ASSERT(t, re != NULL);
 	y = x = count = 0;
-	while (replace_next(&e, "foo", y, x, &my, &mx)) {
-		replace_at(&e, my, mx, 3, "BARS", 4);
+	while (replace_next(&e, re, y, x, &my, &mx, &mlen)) {
+		replace_at(&e, my, mx, mlen, "BARS", 4);
 		count++;
 		y = my;
 		x = mx + 4;
 	}
+	rx_free(re);
 	TAP_CHECKF(t, count == 3, "count %zu", count);
 	s = text_line(e.t, 0, &len);
 	TAP_CHECKF(t, len == 9 && memcmp(s, "BARS BARS", 9) == 0,
@@ -856,16 +860,51 @@ t_replace(Test *t)
 	    "grow line 1: '%.*s'", (int)len, s);
 
 	/* an empty replacement deletes the match */
-	TAP_ASSERT(t, replace_next(&e, "BARS", 1, 0, &my, &mx));
-	replace_at(&e, my, mx, 4, "", 0);
+	re = rx_compile("BARS", 0, NULL);
+	TAP_ASSERT(t, re != NULL);
+	TAP_ASSERT(t, replace_next(&e, re, 1, 0, &my, &mx, &mlen));
+	replace_at(&e, my, mx, mlen, "", 0);
+	rx_free(re);
 	s = text_line(e.t, 1, &len);
 	TAP_CHECKF(t, len == 4 && memcmp(s, "x  y", 4) == 0,
 	    "delete: '%.*s'", (int)len, s);
 
 	/* no match past the end returns 0 */
-	TAP_CHECK(t, !replace_next(&e, "zzz", 0, 0, &my, &mx));
+	re = rx_compile("zzz", 0, NULL);
+	TAP_ASSERT(t, re != NULL);
+	TAP_CHECK(t, !replace_next(&e, re, 0, 0, &my, &mx, &mlen));
+	rx_free(re);
 
 	text_free(e.t);
+}
+
+/* The vendored rx engine, as the editor drives it: a regex match with a
+ * variable-width span, and a replacement template with a backreference. */
+static void
+t_regex_engine(Test *t)
+{
+	rx_t *re;
+	const char *s = "size_t n = 0;";
+	rx_match m[3];
+	char *out;
+
+	re = rx_compile("([a-z_]+)_t", 0, NULL);
+	TAP_ASSERT(t, re != NULL);
+	TAP_CHECKF(t, rx_exec(re, s, strlen(s), 0, m, 3) == 1 &&
+	    m[0].so == 0 && m[0].eo == 6, "match span %ld..%ld",
+	    m[0].so, m[0].eo);
+	TAP_CHECKF(t, m[1].so == 0 && m[1].eo == 4, "group1 %ld..%ld",
+	    m[1].so, m[1].eo);
+	rx_free(re);
+
+	/* backreference and the whole-match & in a replacement template */
+	re = rx_compile("(\\w+)@(\\w+)", 0, NULL);
+	TAP_ASSERT(t, re != NULL);
+	out = rx_replace(re, "user@host", 9, "\\2.\\1", 0);
+	TAP_ASSERT(t, out != NULL);
+	TAP_CHECKF(t, strcmp(out, "host.user") == 0, "swap: '%s'", out);
+	free(out);
+	rx_free(re);
 }
 
 static void
@@ -1017,20 +1056,28 @@ t_isearch(Test *t)
 	lines_insert_at(e.t, 1, "baz foo", 7);
 
 	/* from the very start, the first match is in place */
-	TAP_CHECK(t, isearch_scan(&e, "foo", 0, 0, &my, &mx) &&
+	TAP_CHECK(t, isearch_scan_dir(&e, "foo", 0, 0, 1, &my, &mx) &&
 	    my == 0 && mx == 0);
 
 	/* past the first match, the next is on line 2 */
-	TAP_CHECKF(t, isearch_scan(&e, "foo", 0, 1, &my, &mx) &&
+	TAP_CHECKF(t, isearch_scan_dir(&e, "foo", 0, 1, 1, &my, &mx) &&
 	    my == 1 && mx == 4, "forward: L%zu C%zu", my, mx);
 
 	/* past the last match, it wraps back to the first */
-	TAP_CHECKF(t, isearch_scan(&e, "foo", 1, 5, &my, &mx) &&
+	TAP_CHECKF(t, isearch_scan_dir(&e, "foo", 1, 5, 1, &my, &mx) &&
 	    my == 0 && mx == 0, "wrap: L%zu C%zu", my, mx);
 
 	/* a miss and an empty query both report nothing */
-	TAP_CHECK(t, !isearch_scan(&e, "zzz", 0, 0, &my, &mx));
-	TAP_CHECK(t, !isearch_scan(&e, "", 0, 0, &my, &mx));
+	TAP_CHECK(t, !isearch_scan_dir(&e, "zzz", 0, 0, 1, &my, &mx));
+	TAP_CHECK(t, !isearch_scan_dir(&e, "", 0, 0, 1, &my, &mx));
+
+	/* the pattern is a regex: anchors and classes work */
+	TAP_CHECKF(t, isearch_scan_dir(&e, "^baz", 0, 0, 1, &my, &mx) &&
+	    my == 1 && mx == 0, "anchor: L%zu C%zu", my, mx);
+	TAP_CHECKF(t, isearch_scan_dir(&e, "b.r", 0, 0, 1, &my, &mx) &&
+	    my == 0 && mx == 4, "class: L%zu C%zu", my, mx);
+	/* a half-typed, invalid pattern matches nothing rather than erroring */
+	TAP_CHECK(t, !isearch_scan_dir(&e, "(", 0, 0, 1, &my, &mx));
 
 	/* backward: nearest match before the origin, then wrapping */
 	TAP_CHECKF(t, isearch_scan_dir(&e, "foo", 1, 7, -1, &my, &mx) &&
@@ -1072,6 +1119,7 @@ const Case tap_cases[] = {
 	{ "jsf_recolormark", t_jsf_recolormark },
 	{ "jsf_include", t_jsf_include },
 	{ "replace", t_replace },
+	{ "regex_engine", t_regex_engine },
 	{ "bufpick", t_bufpick },
 	{ "sym_classify", t_sym_classify },
 	{ "symscan", t_symscan },

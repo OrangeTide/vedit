@@ -338,8 +338,8 @@ dialogs, prompts, and the help screen, not just the text area.
 | Shift-arrows | extend a selection |
 | Ctrl-C / Ctrl-X | copy / cut (Ctrl-C with no selection copies the line) |
 | Ctrl-V | paste the internal clipboard |
-| Ctrl-F | incremental find (Enter repeats the last search) |
-| Ctrl-R | replace, confirming each match (y / n / a / q) |
+| Ctrl-F | incremental find, by regular expression (Enter repeats the last search) |
+| Ctrl-R | replace by regular expression, confirming each match (y / n / a / q) |
 | Ctrl-T | go to a symbol defined in the buffer |
 | Ctrl-L | go to a line number |
 | Ctrl-Z / Ctrl-Y | undo / redo |
@@ -357,7 +357,13 @@ you started as you type, the status line shows the query (marked `(failing)`
 when nothing matches), and the view scrolls to keep the match in sight. Enter
 accepts and leaves the cursor on the match, storing the query so Repeat Find and
 a later empty-query Ctrl-F jump to the next one. Esc cancels and restores the
-starting position.
+starting position. The query is a regular expression, so a half-typed pattern
+that is not yet valid simply matches nothing until it is.
+
+Ctrl-R replaces by regular expression. It asks for a pattern and a replacement
+template, then walks the matches from the cursor to the end of the buffer and
+confirms each one. The template understands `&` and `\1`..`\9` for the whole
+match and captured groups, and `\U \L \u \l \E` to change case.
 
 The menu bar works the MS-EDIT way. Press F10 to activate it, then press a
 menu's highlighted letter (F, E, S, B, V, O, H) to open it, or use the arrow
@@ -377,11 +383,28 @@ writes and quits, `ZQ` quits without writing. The `:` line runs
 `w q wq q! qa wqa cq`, `:N`, `:set number` / `:set nonumber`, and `:set wrap` /
 `:set nowrap`. `/` and `?` search incrementally (forward and backward, the
 cursor following the first match as you type, Esc restoring the start) and `n` /
-`N` repeat. Substitution follows the usual vi
-forms: `:s/old/new/`, `:s/old/new/g` for every match on the line, a leading
-range such as `:%s/old/new/g` for the whole file, and `:g/pat/...` / `:v/pat/...`
-to run a command on matching (or non-matching) lines. In the modeless
-personality, Ctrl-R walks the matches one at a time and asks before each.
+`N` repeat. Searches and substitutions take regular expressions. Substitution
+follows the usual vi forms: `:s/old/new/`, `:s/old/new/g` for every match on the
+line, a leading range such as `:%s/old/new/g` for the whole file, and
+`:g/pat/...` / `:v/pat/...` to run a command on matching (or non-matching) lines.
+The replacement supports `&` and `\1`..`\9` and the `\U \L \u \l \E` case
+escapes. In the modeless personality, Ctrl-R walks the matches one at a time and
+asks before each.
+
+### Regular expressions
+
+Search and replace are driven by a small vendored regex engine, [rx][rx]. The
+pattern language is POSIX extended regular expressions with the common vi, sed,
+and PCRE conveniences on top: `.`, `*` `+` `?` and their lazy `*?` `+?` `??`
+forms, counted repetition `{n,m}`, bracket classes `[...]` with ranges,
+`[:class:]`, and `\d \w \s`, the anchors `^` `$` and the word boundaries `\b \B`
+`\< \>`, groups `(...)` and `(?:...)`, alternation `|`, and backreferences
+`\1`..`\9`. Matching is byte oriented and runs one line at a time, so a pattern
+matches within a single line. The engine lives in `vedit.c` between the
+`Vendored: rx` banners and can be refreshed from upstream by replacing that
+block.
+
+[rx]: https://github.com/OrangeTide/rx
 
 ## Draw mode (ASCII art and maps)
 
@@ -481,7 +504,7 @@ push-style state machine is not provided.
 
 The lumi editor sits on about ten libraries. vedit keeps the text buffer with
 undo and redo, the modeless and vi personalities, the MS-EDIT chrome (menu bar,
-frame, scrollbars, dialogs), find and replace, selection and an internal clipboard,
+frame, scrollbars, dialogs), regex find and replace, selection and an internal clipboard,
 goto-line, multiple buffers, a hex view, a 2D/block draw mode, and lightweight
 syntax highlighting. It replaces the drawing stack with
 a self-contained ANSI renderer over the io vtable, and the keyboard decoder with
