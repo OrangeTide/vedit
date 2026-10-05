@@ -30,7 +30,7 @@ TORTURE_ROUNDS ?= 20000
 # Shared flags for the sanitizer builds of the tests and the torture suite.
 SANCFLAGS = -std=gnu11 -Wall -Wextra -g -O1 -fno-omit-frame-pointer
 
-.PHONY: all clean install uninstall test torture asan ubsan cov
+.PHONY: all clean install uninstall test torture asan ubsan cov screenshots
 
 all: $(PROG)
 
@@ -98,6 +98,11 @@ cov:
 	    testmain.c -o test_unit-cov && ./test_unit-cov >/dev/null && \
 	    gcov test_unit-cov-test_unit.gcda >/dev/null 2>&1 || true
 	@echo "see $(TESTDIR)/vedit.c.gcov for per-line counts"
+
+# Regenerate the README screenshots (docs/shot-*.png) from the built binary.
+# Needs Xvfb, xterm, xdotool, and ImageMagick's import on PATH.
+screenshots: $(PROG)
+	docs/screenshots.sh ./$(PROG)
 
 clean:
 	rm -f $(PROG) $(TESTDIR)/taptest $(TESTBINS) $(TESTDIR)/torturet \
