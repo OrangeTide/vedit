@@ -10908,6 +10908,22 @@ buf_cycle(Editor *e, int dir)
 	return e->cur;
 }
 
+/* Whether a and b name the same file for buffer de-duplication. When both exist
+ * on disk, they match by device and inode, so a symlink, a "./" or "../" detour,
+ * and a hard link all resolve to one buffer. A plain byte comparison is the
+ * fallback, covering a name that is not on disk yet (a new file). */
+static int
+buf_same_file(const char *a, const char *b)
+{
+	struct stat sa, sb;
+
+	if (strcmp(a, b) == 0)
+		return 1;
+	if (stat(a, &sa) == 0 && stat(b, &sb) == 0)
+		return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+	return 0;
+}
+
 int
 buf_open(Editor *e, const char *path)
 {
@@ -10921,7 +10937,7 @@ buf_open(Editor *e, const char *path)
 			int named = (i == e->cur) ? e->has_name :
 			    e->bufs[i].has_name;
 
-			if (named && strcmp(bp, path) == 0) {
+			if (named && buf_same_file(bp, path)) {
 				buf_switch(e, i);
 				return i;
 			}

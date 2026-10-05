@@ -389,6 +389,59 @@ t_gf_header(Test *t)
 	rmdir(dir);
 }
 
+/* Opening the same file by a second spelling (here a symlink) switches to the
+ * open buffer instead of making a duplicate; a distinct file still adds one. */
+static void
+t_buf_dedup(Test *t)
+{
+	char dir[] = "/tmp/vedit_dedupXXXXXX";
+	char a[PATH_MAX], b[PATH_MAX], sym[PATH_MAX];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	FILE *f;
+	int n0;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(a, sizeof(a), "%s/a.c", dir);
+	snprintf(b, sizeof(b), "%s/b.c", dir);
+	snprintf(sym, sizeof(sym), "%s/link.c", dir);
+	f = fopen(a, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("a\n", f);
+	fclose(f);
+	f = fopen(b, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("b\n", f);
+	fclose(f);
+	TAP_ASSERT(t, symlink(a, sym) == 0);
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, a) == 0);
+	vedit_run(v);			/* registers the initial buffer */
+	n0 = v->e.nbuf;
+	TAP_CHECKF(t, n0 == 1, "initial buffer count %d", n0);
+
+	/* the symlink resolves to the open buffer: no new buffer */
+	TAP_CHECK(t, buf_open(&v->e, sym) >= 0);
+	TAP_CHECKF(t, v->e.nbuf == n0, "symlink added a buffer: %d", v->e.nbuf);
+
+	/* a genuinely different file does add one */
+	TAP_CHECK(t, buf_open(&v->e, b) >= 0);
+	TAP_CHECKF(t, v->e.nbuf == n0 + 1, "distinct file not added: %d",
+	    v->e.nbuf);
+
+	vedit_free(v);
+	memio_free(&m);
+	unlink(sym);
+	unlink(b);
+	unlink(a);
+	rmdir(dir);
+}
+
 #ifndef VEDIT_NO_TOOLS
 /* A fake tool runner, so the IDE-command tests drive the whole event loop
  * (key -> dispatch -> command -> output pane) without forking a shell. */
@@ -550,6 +603,7 @@ const Case tap_cases[] = {
 	{ "tag_jump", t_tag_jump },
 	{ "tag_stack", t_tag_stack },
 	{ "gf_header", t_gf_header },
+	{ "buf_dedup", t_buf_dedup },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_f9_make", t_tool_f9_make },
 	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },

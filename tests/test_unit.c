@@ -1822,6 +1822,54 @@ t_tool_nav(Test *t)
 }
 #endif /* VEDIT_NO_TOOLS */
 
+/* Buffer de-duplication identity: the same file reached by a different spelling,
+ * a symlink, or a hard link is one file; distinct or not-yet-saved names are not. */
+static void
+t_buf_same_file(Test *t)
+{
+	char dir[] = "/tmp/vedit_bufXXXXXX";
+	char a[PATH_MAX], b[PATH_MAX], dot[PATH_MAX], sym[PATH_MAX], hard[PATH_MAX];
+	FILE *f;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(a, sizeof(a), "%s/a.c", dir);
+	snprintf(b, sizeof(b), "%s/b.c", dir);
+	snprintf(dot, sizeof(dot), "%s/./a.c", dir);
+	snprintf(sym, sizeof(sym), "%s/link.c", dir);
+	snprintf(hard, sizeof(hard), "%s/hard.c", dir);
+
+	f = fopen(a, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("x\n", f);
+	fclose(f);
+	f = fopen(b, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("y\n", f);
+	fclose(f);
+	TAP_ASSERT(t, symlink(a, sym) == 0);
+	TAP_ASSERT(t, link(a, hard) == 0);
+
+	/* identical strings match without needing the disk */
+	TAP_CHECK(t, buf_same_file(a, a) == 1);
+	TAP_CHECK(t, buf_same_file("/no/such/x", "/no/such/x") == 1);
+
+	/* different spellings of one file match by device + inode */
+	TAP_CHECK(t, buf_same_file(a, dot) == 1);	/* a "./" detour */
+	TAP_CHECK(t, buf_same_file(a, sym) == 1);	/* a symlink */
+	TAP_CHECK(t, buf_same_file(a, hard) == 1);	/* a hard link */
+
+	/* distinct files, or names not on disk, do not match */
+	TAP_CHECK(t, buf_same_file(a, b) == 0);
+	TAP_CHECK(t, buf_same_file(a, "/no/such/y") == 0);
+	TAP_CHECK(t, buf_same_file("/no/such/x", "/no/such/y") == 0);
+
+	unlink(hard);
+	unlink(sym);
+	unlink(b);
+	unlink(a);
+	rmdir(dir);
+}
+
 static void
 t_bufpick(Test *t)
 {
@@ -2057,6 +2105,7 @@ const Case tap_cases[] = {
 	{ "tool_pattern", t_tool_pattern },
 	{ "tool_run", t_tool_run },
 #endif
+	{ "buf_same_file", t_buf_same_file },
 	{ "bufpick", t_bufpick },
 	{ "sym_classify", t_sym_classify },
 	{ "symscan", t_symscan },

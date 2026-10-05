@@ -66,8 +66,10 @@ one check.
 vedit [file]
 ```
 
-A missing file opens as a new, named buffer. vedit requires a terminal on both
-stdin and stdout when run from the command line.
+A missing file opens as a new, named buffer. Opening a file that is already open,
+even by a different spelling (a symlink, a `./` or `../` detour, or a hard link),
+switches to the existing buffer rather than loading a second copy. vedit requires
+a terminal on both stdin and stdout when run from the command line.
 
 ### Box-drawing mode
 
