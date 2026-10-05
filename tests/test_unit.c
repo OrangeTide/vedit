@@ -1373,6 +1373,7 @@ t_ex_abbrev(Test *t)
 		{ "y", EX_YANK }, { "g", EX_GLOBAL }, { "v", EX_VGLOBAL },
 		{ "r", EX_READ }, { "re", EX_READ }, { "read", EX_READ },
 		{ "ret", EX_RETAB }, { "retab", EX_RETAB },
+		{ "rel", EX_RELOAD }, { "reload", EX_RELOAD },
 		{ "b", EX_BUFFER }, { "bu", EX_BUFFER }, { "buffer", EX_BUFFER },
 		{ "buffers", EX_LS }, { "ls", EX_LS }, { "files", EX_LS },
 		{ "bn", EX_BNEXT }, { "bp", EX_BPREV }, { "bN", EX_BPREV },

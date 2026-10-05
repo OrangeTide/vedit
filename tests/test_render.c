@@ -442,6 +442,68 @@ t_buf_dedup(Test *t)
 	rmdir(dir);
 }
 
+/* Runtime config reload: re-reading the file picks up a changed setting, keeps a
+ * valid syntax pointer, and reports no config when none backs the session. */
+static void
+t_reload_config(Test *t)
+{
+	char dir[] = "/tmp/vedit_rlXXXXXX";
+	char cfgp[PATH_MAX], src[PATH_MAX];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	FILE *f;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(cfgp, sizeof(cfgp), "%s/config", dir);
+	snprintf(src, sizeof(src), "%s/a.c", dir);
+	f = fopen(src, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("int x;\n", f);
+	fclose(f);
+	f = fopen(cfgp, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("[ui]\nwrap = on\n", f);
+	fclose(f);
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, src) == 0);
+	vedit_run(v);				/* register the buffer */
+
+	/* a .c buffer has a syntax; it must survive a grammar reload */
+	TAP_CHECK(t, v->e.syn != NULL);
+
+	/* no path recorded yet: reload is a reported no-op */
+	ed_reload_config(&v->e);
+	TAP_CHECKF(t, strstr(v->e.status, "no config") != NULL,
+	    "status: %s", v->e.status);
+
+	/* record the path, reload, and the file's wrap = on takes effect */
+	vedit_set_config_path(v, cfgp);
+	ed_reload_config(&v->e);
+	TAP_CHECK(t, v->e.wrap == 1);
+	TAP_CHECK(t, v->e.syn != NULL);		/* re-pointed, not dangling */
+	TAP_CHECKF(t, strstr(v->e.status, "reloaded") != NULL,
+	    "status: %s", v->e.status);
+
+	/* edit the file and reload again: the new value wins */
+	f = fopen(cfgp, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("[ui]\nwrap = off\n", f);
+	fclose(f);
+	ed_reload_config(&v->e);
+	TAP_CHECK(t, v->e.wrap == 0);
+
+	vedit_free(v);
+	memio_free(&m);
+	unlink(cfgp);
+	unlink(src);
+	rmdir(dir);
+}
+
 #ifndef VEDIT_NO_TOOLS
 /* A fake tool runner, so the IDE-command tests drive the whole event loop
  * (key -> dispatch -> command -> output pane) without forking a shell. */
@@ -604,6 +666,7 @@ const Case tap_cases[] = {
 	{ "tag_stack", t_tag_stack },
 	{ "gf_header", t_gf_header },
 	{ "buf_dedup", t_buf_dedup },
+	{ "reload_config", t_reload_config },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_f9_make", t_tool_f9_make },
 	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },

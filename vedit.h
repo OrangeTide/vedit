@@ -113,6 +113,12 @@ int vedit_cfg_load(struct cfg *c, const char *path);
 void vedit_cfg_free(struct cfg *c);
 void vedit_set_config(struct vedit *v, const struct cfg *c);
 
+/* Record the path the config was read from, so the user can re-read it during a
+ * session with the ":reload" ex command or Options > Reload Config. The reloaded
+ * config is owned by the editor. Without this, reload reports there is no config
+ * file. Pass NULL to clear. */
+void vedit_set_config_path(struct vedit *v, const char *path);
+
 #ifndef VEDIT_NO_TOOLS
 /*
  * External tool commands (compile / make / run), the "primitive IDE" layer.

@@ -5031,6 +5031,10 @@ typedef struct editor {
 	char		vi_last_fT;	/* last f/F/t/T, for ; and , */
 	uint32_t	vi_last_fT_ch;	/* the target char it searched for */
 	int		vi_zpending;	/* a leading 'Z' is awaiting its pair */
+
+	/* runtime config reload (set by the standalone CLI) */
+	char		cfg_path[PATH_MAX];	/* config file to re-read, or "" */
+	Cfg		*cfg_owned;	/* a config this editor reloaded and owns */
 } Editor;
 
 /* Core helpers the vi personality relies on, defined in edit.c. */
@@ -6859,7 +6863,7 @@ typedef enum menu_act {
 	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_HEX, MA_DRAW,
 	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS,
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS,
-	MA_VI_MODE,
+	MA_VI_MODE, MA_RELOAD_CONFIG,
 #ifndef VEDIT_NO_TOOLS
 	MA_COMPILE, MA_MAKE, MA_RUN, MA_VIEW_OUTPUT, MA_ERR_NEXT, MA_ERR_PREV,
 #endif
@@ -6868,6 +6872,7 @@ typedef enum menu_act {
 
 /* draw mode toggle, defined with the draw-mode module further down */
 static void draw_toggle(Editor *e);
+static void ed_reload_config(Editor *e);
 
 typedef struct menu_item {
 	const char	*label;
@@ -6930,8 +6935,9 @@ static const Menuitem mi_view[] = {
 	{ "&Hex Dump",		"",	"",	MA_HEX },
 };
 static const Menuitem mi_options[] = {
-	{ "&Draw Mode",	"Ins",	"",	MA_DRAW },
-	{ "&Vi Keys",	"F2",	"",	MA_VI_MODE },
+	{ "&Draw Mode",		"Ins",	"",		MA_DRAW },
+	{ "&Vi Keys",		"F2",	"",		MA_VI_MODE },
+	{ "&Reload Config",	"",	":reload",	MA_RELOAD_CONFIG },
 };
 #ifndef VEDIT_NO_TOOLS
 static const Menuitem mi_compile[] = {
@@ -10413,6 +10419,7 @@ static const struct {
 	{ "Ctrl-]  :tag",	"Jump to a tag (under cursor / by name)" },
 	{ "Ctrl-T  :pop",	"Pop the tag stack back to the last jump" },
 	{ "gf",			"Open the header or file named under the cursor" },
+	{ ":reload",		"Re-read the config file (also Options menu)" },
 	{ "F1 / F2",		"Show this help / back to modeless keys" },
 };
 
@@ -13879,6 +13886,9 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_VI_MODE:
 		toggle_vi(e);
 		break;
+	case MA_RELOAD_CONFIG:
+		ed_reload_config(e);
+		break;
 #ifndef VEDIT_NO_TOOLS
 	case MA_COMPILE:
 		run_tool_cmd(e, CMD_COMPILE);
@@ -14875,6 +14885,9 @@ editor_teardown(Editor *e)
 	free(e->vi_rec.ev);
 	free(e->hl_buf);
 	free(e->tagstack);
+	if (g_cfg == e->cfg_owned)	/* don't leave the global dangling */
+		g_cfg = NULL;
+	vedit_cfg_free(e->cfg_owned);
 #ifndef VEDIT_NO_TOOLS
 	tool_free(e);
 #endif
@@ -15015,6 +15028,65 @@ ed_apply_config(Editor *e)
 	}
 }
 
+/* Reloading the grammars rebuilds the Syntax registries, so every buffer's cached
+ * syn pointer is recomputed from its path, and its highlight cache invalidated. */
+static void
+ed_refresh_syntax(Editor *e)
+{
+	int i;
+
+	e->syn = e->has_name ? syn_for_ext(file_ext(e->path)) : NULL;
+	e->hl_valid = 0;
+	for (i = 0; i < e->nbuf; i++) {
+		if (i == e->cur)
+			continue;	/* the active buffer lives in the flat fields */
+		e->bufs[i].syn = e->bufs[i].has_name
+		    ? syn_for_ext(file_ext(e->bufs[i].path)) : NULL;
+		e->bufs[i].hl_valid = 0;
+	}
+}
+
+/* Re-read the config file named at startup and apply it to the running editor:
+ * the scheme and themes, box mode and colors, syntax grammars, and the editor
+ * toggles, with a repaint on return. Env variables still rank above the file, as
+ * at startup. A no-op with a message when no config file backs this session (an
+ * embedding host, --no-config, or built-in defaults only). */
+static void
+ed_reload_config(Editor *e)
+{
+	Cfg *nc;
+
+	if (e->cfg_path[0] == '\0') {
+		snprintf(e->status, sizeof(e->status), "no config file to reload");
+		return;
+	}
+	nc = vedit_cfg_new();
+	if (!nc) {
+		snprintf(e->status, sizeof(e->status), "out of memory");
+		return;
+	}
+	if (vedit_cfg_load(nc, e->cfg_path) != 0) {
+		vedit_cfg_free(nc);
+		snprintf(e->status, sizeof(e->status), "cannot read config: %.80s",
+		    e->cfg_path);
+		return;
+	}
+	g_cfg = nc;
+	themes_load_cfg(nc);		/* before ed_apply_config resolves scheme */
+	syntax_load_defaults();		/* built-in C and shell grammars */
+	syntax_load_cfg(&g_user, nc);	/* user grammars override them */
+	ed_refresh_syntax(e);		/* re-point syn before ed_apply_config reads it */
+	if (e->term) {
+		e->term->box_mode = box_default();
+		e->term->colors = color_default();
+		e->term->scroll = scroll_default();
+	}
+	ed_apply_config(e);
+	vedit_cfg_free(e->cfg_owned);	/* free the previous reload, if any */
+	e->cfg_owned = nc;
+	snprintf(e->status, sizeof(e->status), "config reloaded");
+}
+
 /* Hand the editor a parsed configuration (see vedit_cfg_load). It is borrowed,
  * not copied, so it must outlive the editor; pass NULL to clear it. Call before
  * vedit_run(). The startup knobs (box mode, colors, scroll) are re-resolved so
@@ -15033,6 +15105,15 @@ vedit_set_config(struct vedit *v, const struct cfg *c)
 		v->e.term->scroll = scroll_default();
 	}
 	ed_apply_config(&v->e);
+}
+
+/* Record the path the config was read from, so the editor can re-read it at the
+ * user's request (the ":reload" ex command and Options > Reload Config). Without
+ * it, those report that there is no config file to reload. Pass NULL to clear. */
+void
+vedit_set_config_path(struct vedit *v, const char *path)
+{
+	snprintf(v->e.cfg_path, sizeof(v->e.cfg_path), "%s", path ? path : "");
 }
 
 #ifndef VEDIT_NO_TOOLS
@@ -15467,6 +15548,7 @@ main(int argc, char **argv)
 		cfg = vedit_cfg_new();
 		if (cfg && vedit_cfg_load(cfg, cfg_path) == 0) {
 			vedit_set_config(v, cfg);
+			vedit_set_config_path(v, cfg_path);	/* enable :reload */
 		} else {
 			if (cfg_opt)		/* an explicit path should exist */
 				fprintf(stderr, "%s: %s: cannot read config\n",
@@ -18868,7 +18950,7 @@ enum excmd {
 	EX_NONE, EX_SUBST, EX_GLOBAL, EX_VGLOBAL, EX_DELETE, EX_YANK, EX_READ,
 	EX_EDIT, EX_ENEW, EX_WRITE, EX_WQ, EX_XIT, EX_QUIT, EX_QALL, EX_WQALL,
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
-	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW,
+	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD,
 };
 
 static const struct excmd_name {
@@ -18908,6 +18990,7 @@ static const struct excmd_name {
 	{ "pop",	2, EX_POP },
 	{ "retab",	3, EX_RETAB },
 	{ "draw",	2, EX_DRAW },
+	{ "reload",	3, EX_RELOAD },
 };
 
 /* Copy the leading run of ASCII letters of *pp into word[], advancing *pp past
@@ -19184,6 +19267,9 @@ vi_ex_exec(Editor *e, char *buf)
 		return REQ_CONTINUE;
 	case EX_DRAW:
 		draw_toggle(e);
+		return REQ_CONTINUE;
+	case EX_RELOAD:
+		ed_reload_config(e);
 		return REQ_CONTINUE;
 	default:
 		break;

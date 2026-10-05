@@ -180,6 +180,13 @@ and a set, non-empty value wins over the config file:
 Only these per-project keys read the environment; editor preferences such as the
 theme or key mode stay in the config file.
 
+After editing the config file, reload it without restarting: the `:reload` ex
+command, or Options > Reload Config. It re-reads the file named at startup and
+re-applies everything (the scheme and themes, box mode and colors, syntax
+grammars, and the editor toggles). A session started with `--no-config`, or one
+embedded in a host that supplies its own config, has no file to reload and says
+so.
+
 A `[theme "name"]` section defines a custom color scheme that `ui.scheme = name`
 then selects, alongside the three built-ins:
 
