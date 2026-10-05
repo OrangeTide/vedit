@@ -323,6 +323,72 @@ t_tag_stack(Test *t)
 	rmdir(dir);
 }
 
+/* gf: on an #include line, open the header found through a compile_commands.json
+ * include path. Driven through the event loop in vi normal mode. */
+static void
+t_gf_header(Test *t)
+{
+	char dir[] = "/tmp/vedit_gfXXXXXX";
+	char src[PATH_MAX], inc[PATH_MAX], hdr[PATH_MAX], db[PATH_MAX];
+	char cfgtext[PATH_MAX + 64];
+	const char keys[] = "gf";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Cfg *cfg;
+	FILE *f;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(inc, sizeof(inc), "%s/inc", dir);
+	TAP_ASSERT(t, mkdir(inc, 0700) == 0);
+	snprintf(src, sizeof(src), "%s/foo.c", dir);
+	snprintf(hdr, sizeof(hdr), "%s/inc/bar.h", dir);	/* only under inc/ */
+	snprintf(db, sizeof(db), "%s/compile_commands.json", dir);
+
+	f = fopen(src, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("#include \"bar.h\"\n", f);
+	fclose(f);
+	f = fopen(hdr, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("#define BAR 1\n", f);
+	fclose(f);
+	f = fopen(db, "w");
+	TAP_ASSERT(t, f != NULL);
+	fprintf(f, "[{\"directory\":\"%s\",\"file\":\"foo.c\","
+	    "\"arguments\":[\"cc\",\"-I\",\"inc\",\"-c\",\"foo.c\"]}]\n", dir);
+	fclose(f);
+
+	snprintf(cfgtext, sizeof(cfgtext), "[cc]\n\tfile = %s\n", db);
+	cfg = cfg_from_text(cfgtext);
+	TAP_ASSERT(t, cfg != NULL);
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config(v, cfg);
+	TAP_ASSERT(t, vedit_open(v, src) == 0);
+	v->e.mode = MODE_NORMAL;	/* gf is a vi normal-mode command */
+	v->e.cy = 0;
+	v->e.cx = 0;
+
+	vedit_run(v);
+
+	TAP_CHECK(t, v->e.has_name &&
+	    strcmp(v->e.path + strlen(v->e.path) - 5, "bar.h") == 0);
+
+	vedit_free(v);
+	memio_free(&m);
+	g_cfg = NULL;
+	vedit_cfg_free(cfg);
+	unlink(db);
+	unlink(hdr);
+	unlink(src);
+	rmdir(inc);
+	rmdir(dir);
+}
+
 #ifndef VEDIT_NO_TOOLS
 /* A fake tool runner, so the IDE-command tests drive the whole event loop
  * (key -> dispatch -> command -> output pane) without forking a shell. */
@@ -475,6 +541,7 @@ const Case tap_cases[] = {
 	{ "tab_key_expand", t_tab_key_expand },
 	{ "tag_jump", t_tag_jump },
 	{ "tag_stack", t_tag_stack },
+	{ "gf_header", t_gf_header },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_f9_make", t_tool_f9_make },
 	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },

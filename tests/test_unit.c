@@ -1243,6 +1243,113 @@ t_ex_subst(Test *t)
 	text_free(e.t);
 }
 
+/* The #include target parser: "name" / <name>, spaces, and non-matches. */
+static void
+t_include_target(Test *t)
+{
+	char out[PATH_MAX];
+	int angle;
+
+	TAP_CHECK(t, include_target("#include \"foo.h\"", 16, out,
+	    sizeof(out), &angle) == 5 && angle == 0 &&
+	    strcmp(out, "foo.h") == 0);
+	TAP_CHECK(t, include_target("#include <a/b.h>", 16, out,
+	    sizeof(out), &angle) == 5 && angle == 1 &&
+	    strcmp(out, "a/b.h") == 0);
+	TAP_CHECK(t, include_target("   #  include   \"x.h\"", 21, out,
+	    sizeof(out), &angle) == 3 && strcmp(out, "x.h") == 0);
+	TAP_CHECK(t, include_target("int x;", 6, out, sizeof(out),
+	    &angle) == 0);
+	TAP_CHECK(t, include_target("#include foo", 12, out, sizeof(out),
+	    &angle) == 0);
+	TAP_CHECK(t, include_target("#include \"bad", 13, out, sizeof(out),
+	    &angle) == 0);
+}
+
+/* The shell-style splitter for a "command" string: quotes and escapes. */
+static void
+t_cc_split(Test *t)
+{
+	char cmd[] = "cc -I /a \"b c\" -DX=\\\"y\\\" foo.c";
+	int argc = 0;
+	char **argv = cc_split(cmd, &argc);
+
+	TAP_ASSERT(t, argv != NULL);
+	TAP_CHECKF(t, argc == 6, "argc %d", argc);
+	TAP_CHECK(t, strcmp(argv[0], "cc") == 0);
+	TAP_CHECK(t, strcmp(argv[1], "-I") == 0);
+	TAP_CHECK(t, strcmp(argv[2], "/a") == 0);
+	TAP_CHECK(t, strcmp(argv[3], "b c") == 0);
+	TAP_CHECK(t, strcmp(argv[4], "-DX=\"y\"") == 0);
+	TAP_CHECK(t, strcmp(argv[5], "foo.c") == 0);
+	free(argv);
+}
+
+/* End to end: cc_resolve finds the current file's entry in a temp
+ * compile_commands.json and resolves its -I dir relative to directory. */
+static void
+t_cc_db(Test *t)
+{
+	char tmpl[] = "/tmp/vedit_ccXXXXXX";
+	char *dir = mkdtemp(tmpl);
+	char src[PATH_MAX], inc[PATH_MAX], hdr[PATH_MAX];
+	char db[PATH_MAX], cfgpath[PATH_MAX], json[1024], cfgtext[PATH_MAX + 32];
+	char cand[PATH_MAX];
+	Cfg *c;
+	Editor e;
+	CcIncludes ci;
+
+	TAP_ASSERT(t, dir != NULL);
+	snprintf(inc, sizeof(inc), "%s/inc", dir);
+	TAP_ASSERT(t, mkdir(inc, 0700) == 0);
+	snprintf(src, sizeof(src), "%s/foo.c", dir);
+	TAP_ASSERT(t, fclose(fopen(src, "w")) == 0);
+	snprintf(hdr, sizeof(hdr), "%s/bar.h", inc);
+	TAP_ASSERT(t, fclose(fopen(hdr, "w")) == 0);
+
+	/* An entry with a relative file and a relative -I, plus a decoy. */
+	snprintf(json, sizeof(json),
+	    "[\n"
+	    " { \"directory\": \"%s\", \"file\": \"other.c\",\n"
+	    "   \"arguments\": [\"cc\", \"-Iwrong\", \"-c\", \"other.c\"] },\n"
+	    " { \"directory\": \"%s\", \"file\": \"foo.c\",\n"
+	    "   \"arguments\": [\"cc\", \"-I\", \"inc\", \"-c\", \"foo.c\"] }\n"
+	    "]\n", dir, dir);
+	snprintf(db, sizeof(db), "%s/compile_commands.json", dir);
+	{
+		FILE *f = fopen(db, "w");
+
+		TAP_ASSERT(t, f != NULL);
+		fputs(json, f);
+		fclose(f);
+	}
+
+	snprintf(cfgtext, sizeof(cfgtext), "[cc]\nfile = %s\n", db);
+	c = load_cfg_text(cfgtext, cfgpath, sizeof(cfgpath));
+	TAP_ASSERT(t, c != NULL);
+
+	memset(&e, 0, sizeof(e));
+	e.has_name = 1;
+	snprintf(e.path, sizeof(e.path), "%s", src);
+
+	g_cfg = c;
+	TAP_CHECK(t, cc_resolve(&e, &ci) == 0);
+	TAP_CHECKF(t, ci.found && ci.ninc == 1, "found %d ninc %d",
+	    ci.found, ci.ninc);
+	/* the resolved -I dir holds bar.h */
+	snprintf(cand, sizeof(cand), "%s/bar.h", ci.inc[0]);
+	TAP_CHECK(t, access(cand, R_OK) == 0);
+	g_cfg = NULL;
+	vedit_cfg_free(c);
+
+	unlink(db);
+	unlink(hdr);
+	unlink(src);
+	rmdir(inc);
+	rmdir(dir);
+	unlink(cfgpath);
+}
+
 #ifndef VEDIT_NO_TOOLS
 /* The $(...) substitution the per-language tool commands use. */
 static void
@@ -1566,6 +1673,9 @@ const Case tap_cases[] = {
 	{ "tags", t_tags },
 	{ "ex_abbrev", t_ex_abbrev },
 	{ "ex_subst", t_ex_subst },
+	{ "include_target", t_include_target },
+	{ "cc_split", t_cc_split },
+	{ "cc_db", t_cc_db },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_expand", t_tool_expand },
 	{ "tool_parse", t_tool_parse },

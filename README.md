@@ -147,6 +147,9 @@ A gitconfig-style file sets the startup defaults. It is read from the first of
 [tags]
     file = /path/to/tags # ctags index; else a "tags" file beside the buffer
 
+[cc]
+    file = /path/to/compile_commands.json # include paths for gf / Open Header
+
 [syntax]
     enable = on          # highlight recognized file types
 ```
@@ -589,13 +592,26 @@ opens or switches to that file. A command marked with a sibling
 that reads input or draws its own screen. vedit leaves the alternate screen while
 it runs and returns when it exits.
 
-Finding headers across a large project would need to read a
-`compile_commands.json` database. vedit has no JSON parser, so it does not do
-this today. Point the commands at a `Makefile` or a wrapper script when the build
-needs include paths or flags that a single command line cannot carry.
+### Opening headers
 
-The whole subsystem is compiled in by default and can be dropped by building with
+Press `gf` in vi keys, or Search > Open Header, to open the header named on an
+`#include` line. The name under the cursor works too when the cursor is not on an
+`#include`. vedit looks for the file in this order: an absolute or
+current-directory path as written, then for the `"..."` form the current file's
+own directory, then the include search directories of the current file.
+
+Those search directories come from a clang compilation database. Point the
+`cc.file` config key at a `compile_commands.json` and vedit reads the `-I`,
+`-isystem`, and `-iquote` flags from the entry whose `file` matches the buffer.
+The reader understands just that one schema, not arbitrary JSON, and relative
+directories are resolved against the entry's `directory`. Without `cc.file`,
+`gf` still searches the current and buffer directories, which covers a small
+project. A build whose include paths a single command line cannot carry can
+still point the Compile and Make commands at a `Makefile` or a wrapper script.
+
+The build commands are compiled in by default and can be dropped by building with
 `-DVEDIT_NO_TOOLS`, which removes the commands, the menus, and the output pane.
+Header navigation (`gf` and the `cc.file` reader) is separate and stays available.
 An embedding host supplies its own command runner (or none) through
 `vedit_set_tools`; see [Embedding in a host](#embedding-in-a-host-for-example-a-mud).
 

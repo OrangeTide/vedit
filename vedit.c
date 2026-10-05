@@ -6821,7 +6821,8 @@ typedef enum menu_act {
 	MA_NEW, MA_OPEN, MA_SAVE, MA_SAVE_AS,
 	MA_BUF_NEXT, MA_BUF_PREV, MA_BUF_LIST, MA_EXIT,
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE, MA_OSC_COPY, MA_OSC_COPY_FILE,
-	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_TAG_POP, MA_GOTO,
+	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_TAG_POP, MA_OPEN_HEADER,
+	MA_GOTO,
 	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_HEX, MA_DRAW,
 	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS,
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS,
@@ -6881,6 +6882,7 @@ static const Menuitem mi_search[] = {
 	{ "&Replace...",	"Ctrl+R",	":s",	MA_REPLACE },
 	{ "Go to S&ymbol...",	"Ctrl+T",	"",	MA_SYMBOL },
 	{ "&Pop Tag",		"",		":pop",	MA_TAG_POP },
+	{ "Open &Header",	"",		"gf",	MA_OPEN_HEADER },
 	{ "&Go to Line...",	"Ctrl+L",	"G",	MA_GOTO },
 };
 static const Menuitem mi_view[] = {
@@ -10377,6 +10379,7 @@ static const struct {
 	{ ":N  :cq",		"Go to a line, quit with an error code" },
 	{ "Ctrl-]  :tag",	"Jump to a tag (under cursor / by name)" },
 	{ "Ctrl-T  :pop",	"Pop the tag stack back to the last jump" },
+	{ "gf",			"Open the header or file named under the cursor" },
 	{ "F1 / F2",		"Show this help / back to modeless keys" },
 };
 
@@ -11389,6 +11392,508 @@ ed_goto_target(Editor *e, const char *file, size_t line, const char *pattern)
 	e->sel_active = 0;
 	clamp_col(e);
 	return 0;
+}
+
+/****************************************************************
+ * Header navigation (compile_commands.json include paths)
+ *
+ * A clang compilation database is a JSON array of objects, each with
+ * "directory", "file", and either a "command" string or an "arguments"
+ * array. vedit reads only the include search directories from the entry
+ * that matches the current file, so an #include line can open its header.
+ * This parses just that shape; it is not a general JSON reader.
+ ****************************************************************/
+
+#define CC_MAX_INC 64
+
+typedef struct ccincludes {
+	char	dir[PATH_MAX];			/* the entry's compile directory */
+	char	inc[CC_MAX_INC][PATH_MAX];	/* -I / -isystem search dirs */
+	char	quote[CC_MAX_INC][PATH_MAX];	/* -iquote dirs (for "" form) */
+	int	ninc;
+	int	nquote;
+	int	found;
+} CcIncludes;
+
+static char *
+cc_skip_ws(char *p)
+{
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+	return p;
+}
+
+static int
+cc_hex4(const char *p)
+{
+	int v = 0, i;
+
+	for (i = 0; i < 4; i++) {
+		char c = p[i];
+
+		v <<= 4;
+		if (c >= '0' && c <= '9')
+			v |= c - '0';
+		else if (c >= 'a' && c <= 'f')
+			v |= c - 'a' + 10;
+		else if (c >= 'A' && c <= 'F')
+			v |= c - 'A' + 10;
+		else
+			return -1;
+	}
+	return v;
+}
+
+/* Unescape a JSON string in place and advance *pp past the closing quote.
+ * Returns the (nul-terminated) start, or NULL when *pp is not a string. */
+static char *
+cc_string(char **pp)
+{
+	char *p = *pp, *start, *dst;
+
+	if (*p != '"')
+		return NULL;
+	p++;
+	start = dst = p;
+	while (*p && *p != '"') {
+		if (*p != '\\') {
+			*dst++ = *p++;
+			continue;
+		}
+		p++;
+		switch (*p) {
+		case 'b': *dst++ = '\b'; p++; break;
+		case 'f': *dst++ = '\f'; p++; break;
+		case 'n': *dst++ = '\n'; p++; break;
+		case 'r': *dst++ = '\r'; p++; break;
+		case 't': *dst++ = '\t'; p++; break;
+		case 'u': {
+			int cp = cc_hex4(p + 1);
+
+			if (cp < 0) {
+				*dst++ = *p++;
+				break;
+			}
+			p += 5;
+			if (cp <= 0x7f) {
+				*dst++ = (char)cp;
+			} else if (cp <= 0x7ff) {
+				*dst++ = (char)(0xc0 | (cp >> 6));
+				*dst++ = (char)(0x80 | (cp & 0x3f));
+			} else {
+				*dst++ = (char)(0xe0 | (cp >> 12));
+				*dst++ = (char)(0x80 | ((cp >> 6) & 0x3f));
+				*dst++ = (char)(0x80 | (cp & 0x3f));
+			}
+			break;
+		}
+		case '\0': break;
+		default: *dst++ = *p++; break;
+		}
+	}
+	if (*p == '"')
+		p++;
+	*dst = '\0';
+	*pp = p;
+	return start;
+}
+
+/* Skip one JSON value (string, array, object, or primitive), advancing *pp. */
+static void
+cc_skip_value(char **pp)
+{
+	char *p = cc_skip_ws(*pp);
+
+	if (*p == '"') {
+		cc_string(&p);
+	} else if (*p == '[' || *p == '{') {
+		char open = *p, close = open == '[' ? ']' : '}';
+		int depth = 0;
+
+		do {
+			if (*p == '"') {		/* skip strings whole */
+				cc_string(&p);
+				continue;
+			}
+			if (*p == open)
+				depth++;
+			else if (*p == close)
+				depth--;
+			p++;
+		} while (*p && depth > 0);
+	} else {
+		while (*p && *p != ',' && *p != '}' && *p != ']')
+			p++;
+	}
+	*pp = p;
+}
+
+/* Append a search dir, resolving a relative one against the compile dir. */
+static void
+cc_add_dir(char arr[][PATH_MAX], int *n, const char *base, const char *d)
+{
+	if (*n >= CC_MAX_INC || !d || !d[0])
+		return;
+	if (d[0] == '/')
+		snprintf(arr[*n], PATH_MAX, "%s", d);
+	else
+		snprintf(arr[*n], PATH_MAX, "%.2040s/%.2040s", base, d);
+	(*n)++;
+}
+
+/* Pull -I / -isystem / -iquote dirs from one entry's argument list. */
+static void
+cc_extract(CcIncludes *out, const char *dir, char **argv, int argc)
+{
+	int i;
+
+	snprintf(out->dir, sizeof(out->dir), "%s", dir);
+	for (i = 0; i < argc; i++) {
+		const char *a = argv[i];
+
+		if (a[0] == '-' && a[1] == 'I') {
+			if (a[2])
+				cc_add_dir(out->inc, &out->ninc, dir, a + 2);
+			else if (i + 1 < argc)
+				cc_add_dir(out->inc, &out->ninc, dir, argv[++i]);
+		} else if (strcmp(a, "-isystem") == 0 && i + 1 < argc) {
+			cc_add_dir(out->inc, &out->ninc, dir, argv[++i]);
+		} else if (strcmp(a, "-iquote") == 0 && i + 1 < argc) {
+			cc_add_dir(out->quote, &out->nquote, dir, argv[++i]);
+		}
+	}
+	out->found = 1;
+}
+
+/* Split a shell-style "command" string in place into argv (pointers into s).
+ * Handles double/single quotes and backslash escapes well enough to carry a
+ * path with spaces. Returns a malloc'd, NULL-terminated array, or NULL. */
+static char **
+cc_split(char *s, int *argc_out)
+{
+	char **argv = NULL;
+	int argc = 0, cap = 0;
+	char *p = s;
+
+	for (;;) {
+		char *dst, *arg;
+
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (!*p)
+			break;
+		arg = dst = p;
+		while (*p && *p != ' ' && *p != '\t') {
+			if (*p == '"' || *p == '\'') {
+				char q = *p++;
+
+				while (*p && *p != q) {
+					if (q == '"' && *p == '\\' && p[1])
+						p++;
+					*dst++ = *p++;
+				}
+				if (*p == q)
+					p++;
+			} else if (*p == '\\' && p[1]) {
+				p++;
+				*dst++ = *p++;
+			} else {
+				*dst++ = *p++;
+			}
+		}
+		if (*p)
+			p++;		/* step over the separator before nul */
+		*dst = '\0';
+		if (argc + 1 >= cap) {
+			int nc = cap ? cap * 2 : 16;
+			char **na = realloc(argv, sizeof(*na) * nc);
+
+			if (!na) {
+				free(argv);
+				return NULL;
+			}
+			argv = na;
+			cap = nc;
+		}
+		argv[argc++] = arg;
+	}
+	if (argv)
+		argv[argc] = NULL;
+	*argc_out = argc;
+	return argv;
+}
+
+/* Parse one object (*pp at '{'); if its file matches e->path, fill out and set
+ * out->found. Advances *pp past the closing '}'. */
+static void
+cc_object(Editor *e, char **pp, CcIncludes *out)
+{
+	char *p = *pp + 1;			/* past '{' */
+	char *dir = NULL, *file = NULL, *command = NULL;
+	char **args = NULL;
+	int nargs = 0;
+
+	while (*p && *p != '}') {
+		char *key;
+
+		p = cc_skip_ws(p);
+		if (*p == ',') { p++; continue; }
+		if (*p != '"')
+			break;
+		key = cc_string(&p);
+		p = cc_skip_ws(p);
+		if (*p != ':')
+			break;
+		p++;
+		p = cc_skip_ws(p);
+		if (key && strcmp(key, "directory") == 0)
+			dir = cc_string(&p);
+		else if (key && strcmp(key, "file") == 0)
+			file = cc_string(&p);
+		else if (key && strcmp(key, "command") == 0)
+			command = cc_string(&p);
+		else if (key && strcmp(key, "arguments") == 0 && *p == '[') {
+			int cap = 0;
+
+			p++;
+			while (*p && *p != ']') {
+				p = cc_skip_ws(p);
+				if (*p == ',') { p++; continue; }
+				if (*p != '"') { cc_skip_value(&p); continue; }
+				if (nargs + 1 >= cap) {
+					int nc = cap ? cap * 2 : 16;
+					char **na = realloc(args,
+					    sizeof(*na) * nc);
+
+					if (!na)
+						break;
+					args = na;
+					cap = nc;
+				}
+				args[nargs++] = cc_string(&p);
+			}
+			if (*p == ']')
+				p++;
+		} else {
+			cc_skip_value(&p);
+		}
+	}
+	if (*p == '}')
+		p++;
+	*pp = p;
+
+	if (file && file[0]) {			/* does this entry name our file? */
+		char full[PATH_MAX];
+
+		if (file[0] == '/')
+			snprintf(full, sizeof(full), "%s", file);
+		else if (dir)
+			snprintf(full, sizeof(full), "%.2040s/%.2040s",
+			    dir, file);
+		else
+			full[0] = '\0';
+		if (full[0] && same_path(full, e->path)) {
+			if (!args && command)
+				args = cc_split(command, &nargs);
+			cc_extract(out, dir ? dir : ".", args, nargs);
+		}
+	}
+	free(args);
+}
+
+/* Resolve the current file's include search dirs from the compile database
+ * named by the cc.file config key. Returns 0 on a match, -1 otherwise. */
+static int
+cc_resolve(Editor *e, CcIncludes *out)
+{
+	const char *cfg = g_cfg ? cfg_get(g_cfg, "cc.file") : NULL;
+	char *json = NULL, *p;
+	size_t len = 0, cap = 0;
+	FILE *fp;
+	int c;
+
+	out->found = 0;
+	out->ninc = out->nquote = 0;
+	out->dir[0] = '\0';
+	if (!cfg || !cfg[0] || !e->has_name)
+		return -1;
+	fp = fopen(cfg, "rb");
+	if (!fp)
+		return -1;
+	while ((c = fgetc(fp)) != EOF) {
+		if (len + 2 > cap) {
+			size_t nc = cap ? cap * 2 : 8192;
+			char *np = realloc(json, nc);
+
+			if (!np) {
+				free(json);
+				fclose(fp);
+				return -1;
+			}
+			json = np;
+			cap = nc;
+		}
+		json[len++] = (char)c;
+	}
+	fclose(fp);
+	if (!json)
+		return -1;
+	json[len] = '\0';
+
+	p = cc_skip_ws(json);
+	if (*p != '[') {
+		free(json);
+		return -1;
+	}
+	p++;
+	while (*p && *p != ']') {
+		p = cc_skip_ws(p);
+		if (*p == ',') { p++; continue; }
+		if (*p != '{')
+			break;
+		cc_object(e, &p, out);
+		if (out->found)
+			break;
+	}
+	free(json);
+	return out->found ? 0 : -1;
+}
+
+/* Characters that make up a filename path word under the cursor. */
+static int
+cc_path_ch(int c)
+{
+	return isalnum((unsigned char)c) || c == '.' || c == '_' ||
+	    c == '-' || c == '/' || c == '+';
+}
+
+/* The path-like word under the cursor, for a bare filename (not #include). */
+static int
+cursor_path(Editor *e, char *out, size_t outsz)
+{
+	size_t len = 0, a, b;
+	const char *s = text_line(e->t, e->cy, &len);
+
+	out[0] = '\0';
+	if (!s || e->cx > len)
+		return 0;
+	a = e->cx;
+	while (a > 0 && cc_path_ch((unsigned char)s[a - 1]))
+		a--;
+	b = e->cx;
+	while (b < len && cc_path_ch((unsigned char)s[b]))
+		b++;
+	if (b <= a || b - a >= outsz)
+		return 0;
+	memcpy(out, s + a, b - a);
+	out[b - a] = '\0';
+	return b - a;
+}
+
+/* Extract the header named on an #include line: "name" or <name>. Sets *angle
+ * for the <...> form. Returns the length, or 0 when the line is not #include. */
+static size_t
+include_target(const char *s, size_t len, char *out, size_t outsz, int *angle)
+{
+	size_t i = 0, start, n;
+	char close;
+
+	out[0] = '\0';
+	*angle = 0;
+	while (i < len && (s[i] == ' ' || s[i] == '\t'))
+		i++;
+	if (i >= len || s[i] != '#')
+		return 0;
+	i++;
+	while (i < len && (s[i] == ' ' || s[i] == '\t'))
+		i++;
+	if (len - i < 7 || memcmp(s + i, "include", 7) != 0)
+		return 0;
+	i += 7;
+	while (i < len && (s[i] == ' ' || s[i] == '\t'))
+		i++;
+	if (i < len && s[i] == '"')
+		close = '"';
+	else if (i < len && s[i] == '<') {
+		close = '>';
+		*angle = 1;
+	} else {
+		return 0;
+	}
+	i++;
+	start = i;
+	while (i < len && s[i] != close)
+		i++;
+	if (i >= len)
+		return 0;
+	n = i - start;
+	if (n == 0 || n >= outsz)
+		return 0;
+	memcpy(out, s + start, n);
+	out[n] = '\0';
+	return n;
+}
+
+/* Open path if it is readable, placing the cursor at its top. 0 on success. */
+static int
+cc_try_open(Editor *e, const char *path)
+{
+	if (access(path, R_OK) != 0)
+		return -1;
+	if (ed_goto_target(e, path, 0, NULL) != 0)
+		return -1;
+	snprintf(e->status, sizeof(e->status), "opened %.100s", path);
+	return 0;
+}
+
+/* gf: open the header named on an #include line, or the filename under the
+ * cursor, searching the compile database's include dirs. */
+static void
+ed_open_header(Editor *e)
+{
+	size_t len = 0;
+	const char *line = text_line(e->t, e->cy, &len);
+	char name[PATH_MAX], cand[PATH_MAX], dir[PATH_MAX];
+	int angle = 0, i;
+	CcIncludes cc;
+
+	if (!line)
+		return;
+	if (include_target(line, len, name, sizeof(name), &angle) == 0 &&
+	    cursor_path(e, name, sizeof(name)) == 0) {
+		snprintf(e->status, sizeof(e->status),
+		    "no include or filename under cursor");
+		return;
+	}
+	if (cc_try_open(e, name) == 0)		/* absolute or cwd-relative */
+		return;
+
+	cc_resolve(e, &cc);			/* -1 just leaves cc empty */
+
+	if (!angle && e->has_name) {		/* "": the file's own dir first */
+		path_dir(e->path, dir, sizeof(dir));
+		snprintf(cand, sizeof(cand), "%.2040s/%.2040s", dir, name);
+		if (cc_try_open(e, cand) == 0)
+			return;
+	}
+	if (!angle)
+		for (i = 0; i < cc.nquote; i++) {
+			snprintf(cand, sizeof(cand), "%.2040s/%.2040s",
+			    cc.quote[i], name);
+			if (cc_try_open(e, cand) == 0)
+				return;
+		}
+	for (i = 0; i < cc.ninc; i++) {
+		snprintf(cand, sizeof(cand), "%.2040s/%.2040s", cc.inc[i], name);
+		if (cc_try_open(e, cand) == 0)
+			return;
+	}
+	if (cc.found) {				/* last resort: the compile dir */
+		snprintf(cand, sizeof(cand), "%.2040s/%.2040s", cc.dir, name);
+		if (cc_try_open(e, cand) == 0)
+			return;
+	}
+	snprintf(e->status, sizeof(e->status), "file not found: %.80s", name);
 }
 
 /****************************************************************
@@ -13002,6 +13507,9 @@ run_menu_act(Editor *e, Menuact act)
 		break;
 	case MA_TAG_POP:
 		ed_tag_pop(e);
+		break;
+	case MA_OPEN_HEADER:
+		ed_open_header(e);
 		break;
 	case MA_GOTO:
 		goto_prompt(e);
@@ -16871,6 +17379,11 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 		e->vi_gpending = 0;
 		if (c == 'g')
 			return vi_do_motion(e, 'g');
+		if (c == 'f') {
+			ed_open_header(e);
+			vi_reset_pending(e);
+			return REQ_CONTINUE;
+		}
 		vi_reset_pending(e);
 		return REQ_CONTINUE;
 	}
