@@ -19,6 +19,9 @@ if [ ! -x "$vedit" ]; then
 	echo "screenshots: no vedit binary at $vedit (run make first)" >&2
 	exit 1
 fi
+# Resolve to an absolute path: the render step runs xterm from a temp dir, so a
+# relative binary path would no longer point at the editor.
+vedit=$(CDPATH= cd -- "$(dirname -- "$vedit")" && pwd)/$(basename -- "$vedit")
 for tool in Xvfb xterm xdotool import; do
 	command -v "$tool" >/dev/null 2>&1 || {
 		echo "screenshots: missing required tool: $tool" >&2
@@ -102,6 +105,7 @@ render() {
 	    -xrm 'xterm*internalBorder: 2' \
 	    -xrm 'XTerm*allowSendEvents: true' \
 	    -xrm 'XTerm*metaSendsEscape: true' \
+	    -xrm 'XTerm*cursorBlink: false' \
 	    -e "$vedit" "$(basename "$file")" &
 	xterm_pid=$!
 	sleep 2
