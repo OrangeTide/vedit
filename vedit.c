@@ -11702,11 +11702,24 @@ cc_object(Editor *e, char **pp, CcIncludes *out)
 }
 
 /* Resolve the current file's include search dirs from the compile database
- * named by the cc.file config key. Returns 0 on a match, -1 otherwise. */
+ * named by the cc.file config key. Returns 0 on a match, -1 otherwise.
+ *
+ * The result (hit or miss) is cached for one file, so repeated gf on the same
+ * buffer does not re-read and re-parse the whole database. The cache is keyed
+ * by the buffer path and the database path, and invalidated when the database's
+ * size or mtime changes, so an edited database is picked up. */
 static int
 cc_resolve(Editor *e, CcIncludes *out)
 {
+	static CcIncludes cache;
+	static char cache_key[PATH_MAX];	/* buffer path */
+	static char cache_db[PATH_MAX];		/* cc.file path */
+	static time_t cache_mtime;
+	static off_t cache_size;
+	static int cache_valid;
+
 	const char *cfg = g_cfg ? cfg_get(g_cfg, "cc.file") : NULL;
+	struct stat st;
 	char *json = NULL, *p;
 	size_t len = 0, cap = 0;
 	FILE *fp;
@@ -11717,6 +11730,16 @@ cc_resolve(Editor *e, CcIncludes *out)
 	out->dir[0] = '\0';
 	if (!cfg || !cfg[0] || !e->has_name)
 		return -1;
+	if (stat(cfg, &st) != 0)
+		return -1;
+
+	if (cache_valid && cache_mtime == st.st_mtime &&
+	    cache_size == st.st_size && strcmp(cache_key, e->path) == 0 &&
+	    strcmp(cache_db, cfg) == 0) {
+		*out = cache;
+		return out->found ? 0 : -1;
+	}
+
 	fp = fopen(cfg, "rb");
 	if (!fp)
 		return -1;
@@ -11728,7 +11751,7 @@ cc_resolve(Editor *e, CcIncludes *out)
 			if (!np) {
 				free(json);
 				fclose(fp);
-				return -1;
+				return -1;	/* allocation failure: do not cache */
 			}
 			json = np;
 			cap = nc;
@@ -11736,26 +11759,31 @@ cc_resolve(Editor *e, CcIncludes *out)
 		json[len++] = (char)c;
 	}
 	fclose(fp);
-	if (!json)
-		return -1;
-	json[len] = '\0';
 
-	p = cc_skip_ws(json);
-	if (*p != '[') {
+	if (json) {
+		json[len] = '\0';
+		p = cc_skip_ws(json);
+		if (*p == '[') {
+			p++;
+			while (*p && *p != ']') {
+				p = cc_skip_ws(p);
+				if (*p == ',') { p++; continue; }
+				if (*p != '{')
+					break;
+				cc_object(e, &p, out);
+				if (out->found)
+					break;
+			}
+		}
 		free(json);
-		return -1;
 	}
-	p++;
-	while (*p && *p != ']') {
-		p = cc_skip_ws(p);
-		if (*p == ',') { p++; continue; }
-		if (*p != '{')
-			break;
-		cc_object(e, &p, out);
-		if (out->found)
-			break;
-	}
-	free(json);
+
+	cache = *out;				/* remember this outcome */
+	snprintf(cache_key, sizeof(cache_key), "%s", e->path);
+	snprintf(cache_db, sizeof(cache_db), "%s", cfg);
+	cache_mtime = st.st_mtime;
+	cache_size = st.st_size;
+	cache_valid = 1;
 	return out->found ? 0 : -1;
 }
 

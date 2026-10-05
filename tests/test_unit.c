@@ -4,6 +4,7 @@
  * functions are reachable directly.
  */
 #include "test.h"
+#include <utime.h>
 
 #define main test_main
 #include "../vedit.c"
@@ -1304,7 +1305,7 @@ t_cc_db(Test *t)
 	TAP_ASSERT(t, mkdir(inc, 0700) == 0);
 	snprintf(src, sizeof(src), "%s/foo.c", dir);
 	TAP_ASSERT(t, fclose(fopen(src, "w")) == 0);
-	snprintf(hdr, sizeof(hdr), "%s/bar.h", inc);
+	snprintf(hdr, sizeof(hdr), "%s/inc/bar.h", dir);
 	TAP_ASSERT(t, fclose(fopen(hdr, "w")) == 0);
 
 	/* An entry with a relative file and a relative -I, plus a decoy. */
@@ -1337,7 +1338,7 @@ t_cc_db(Test *t)
 	TAP_CHECKF(t, ci.found && ci.ninc == 1, "found %d ninc %d",
 	    ci.found, ci.ninc);
 	/* the resolved -I dir holds bar.h */
-	snprintf(cand, sizeof(cand), "%s/bar.h", ci.inc[0]);
+	snprintf(cand, sizeof(cand), "%.4000s/bar.h", ci.inc[0]);
 	TAP_CHECK(t, access(cand, R_OK) == 0);
 	g_cfg = NULL;
 	vedit_cfg_free(c);
@@ -1346,6 +1347,82 @@ t_cc_db(Test *t)
 	unlink(hdr);
 	unlink(src);
 	rmdir(inc);
+	rmdir(dir);
+	unlink(cfgpath);
+}
+
+/* cc_resolve caches one result: rewriting the database with equal-length but
+ * different content while holding its mtime fixed is not re-read (the stale
+ * result stands), and bumping the mtime invalidates the cache. */
+static void
+t_cc_cache(Test *t)
+{
+	char tmpl[] = "/tmp/vedit_cccXXXXXX";
+	char *dir = mkdtemp(tmpl);
+	char src[PATH_MAX], db[PATH_MAX], cfgpath[PATH_MAX];
+	char cfgtext[PATH_MAX + 32], j1[512], j2[512];
+	struct stat st0;
+	struct utimbuf ut;
+	Cfg *c;
+	Editor e;
+	CcIncludes ci;
+	FILE *f;
+	size_t n;
+
+	TAP_ASSERT(t, dir != NULL);
+	snprintf(src, sizeof(src), "%s/foo.c", dir);
+	TAP_ASSERT(t, fclose(fopen(src, "w")) == 0);
+	snprintf(db, sizeof(db), "%s/compile_commands.json", dir);
+
+	/* j1 and j2 differ only inc <-> oth, so their byte length is identical. */
+	snprintf(j1, sizeof(j1), "[{\"directory\":\"%s\",\"file\":\"foo.c\","
+	    "\"arguments\":[\"cc\",\"-Iinc\",\"-c\",\"foo.c\"]}]\n", dir);
+	snprintf(j2, sizeof(j2), "[{\"directory\":\"%s\",\"file\":\"foo.c\","
+	    "\"arguments\":[\"cc\",\"-Ioth\",\"-c\",\"foo.c\"]}]\n", dir);
+	f = fopen(db, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs(j1, f);
+	fclose(f);
+
+	snprintf(cfgtext, sizeof(cfgtext), "[cc]\nfile = %s\n", db);
+	c = load_cfg_text(cfgtext, cfgpath, sizeof(cfgpath));
+	TAP_ASSERT(t, c != NULL);
+	g_cfg = c;
+
+	memset(&e, 0, sizeof(e));
+	e.has_name = 1;
+	snprintf(e.path, sizeof(e.path), "%s", src);
+
+	TAP_CHECK(t, cc_resolve(&e, &ci) == 0 && ci.ninc == 1);
+	n = strlen(ci.inc[0]);
+	TAP_CHECK(t, n >= 4 && strcmp(ci.inc[0] + n - 4, "/inc") == 0);
+	TAP_ASSERT(t, stat(db, &st0) == 0);
+
+	/* rewrite with the other dir but restore the mtime: a cache hit */
+	f = fopen(db, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs(j2, f);
+	fclose(f);
+	ut.actime = st0.st_atime;
+	ut.modtime = st0.st_mtime;
+	TAP_ASSERT(t, utime(db, &ut) == 0);
+	TAP_CHECK(t, cc_resolve(&e, &ci) == 0 && ci.ninc == 1);
+	n = strlen(ci.inc[0]);
+	TAP_CHECKF(t, n >= 4 && strcmp(ci.inc[0] + n - 4, "/inc") == 0,
+	    "cache hit should keep stale '%s'", ci.inc[0]);
+
+	/* bump the mtime: the cache is now stale and the new content is read */
+	ut.modtime = st0.st_mtime + 5;
+	TAP_ASSERT(t, utime(db, &ut) == 0);
+	TAP_CHECK(t, cc_resolve(&e, &ci) == 0 && ci.ninc == 1);
+	n = strlen(ci.inc[0]);
+	TAP_CHECKF(t, n >= 4 && strcmp(ci.inc[0] + n - 4, "/oth") == 0,
+	    "mtime bump should reparse to '%s'", ci.inc[0]);
+
+	g_cfg = NULL;
+	vedit_cfg_free(c);
+	unlink(db);
+	unlink(src);
 	rmdir(dir);
 	unlink(cfgpath);
 }
@@ -1676,6 +1753,7 @@ const Case tap_cases[] = {
 	{ "include_target", t_include_target },
 	{ "cc_split", t_cc_split },
 	{ "cc_db", t_cc_db },
+	{ "cc_cache", t_cc_cache },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_expand", t_tool_expand },
 	{ "tool_parse", t_tool_parse },
