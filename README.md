@@ -531,7 +531,7 @@ terminal emulators capture Alt+letter for their own menus, so F10 then a letter
 is the reliable path. Inside an open menu, each item's highlighted letter runs
 it.
 
-![The Edit menu open, with the terminal-clipboard commands](docs/shot-menu.png)
+![The Edit menu open, with the terminal-clipboard and retab commands](docs/shot-menu.png)
 
 ### vi keys
 
