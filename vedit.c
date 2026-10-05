@@ -11118,6 +11118,74 @@ same_path(const char *a, const char *b)
 	return strcmp(a, b) == 0;
 }
 
+/* Collapse ".", ".." and duplicate slashes in a path, lexically: no disk
+ * access and no symlink resolution, so it works on paths that do not exist and
+ * never blocks. A leading '/' is kept, and an empty result becomes ".". 0 on
+ * success, -1 if the result would not fit or the path has too many segments
+ * (the caller then falls back to the raw path). */
+static int
+path_normalize(const char *in, char *out, size_t outsz)
+{
+	int starts[256];		/* out-offset where each kept segment begins */
+	int nseg = 0, absolute = (in[0] == '/');
+	const char *p = in;
+	size_t o = 0, base;
+
+	if (outsz == 0)
+		return -1;
+	if (absolute)
+		out[o++] = '/';
+	base = o;
+	while (*p) {
+		const char *s;
+		size_t n;
+
+		while (*p == '/')
+			p++;
+		s = p;
+		while (*p && *p != '/')
+			p++;
+		n = (size_t)(p - s);
+		if (n == 0)
+			break;			/* trailing slash */
+		if (n == 1 && s[0] == '.')
+			continue;		/* "." : drop */
+		if (n == 2 && s[0] == '.' && s[1] == '.') {
+			if (nseg > 0) {
+				size_t ls = (size_t)starts[nseg - 1];
+
+				if (!(o - ls == 2 && out[ls] == '.' &&
+				    out[ls + 1] == '.')) {
+					nseg--;		/* pop a real segment */
+					o = ls;
+					if (o > base)
+						o--;	/* and its separator */
+					continue;
+				}
+			}
+			if (absolute)
+				continue;	/* ".." above root: drop */
+			/* relative with nothing to pop: keep ".." literally */
+		}
+		if (nseg >= (int)(sizeof(starts) / sizeof(starts[0])))
+			return -1;
+		if (o > base) {			/* separator before a non-first seg */
+			if (o + 1 >= outsz)
+				return -1;
+			out[o++] = '/';
+		}
+		starts[nseg++] = (int)o;
+		if (o + n >= outsz)
+			return -1;
+		memcpy(out + o, s, n);
+		o += n;
+	}
+	if (o == 0)
+		out[o++] = '.';
+	out[o] = '\0';
+	return 0;
+}
+
 typedef struct tagent {
 	char	name[64];
 	char	kind;		/* ctags kind letter, or 0 when unknown */
@@ -11872,11 +11940,15 @@ include_target(const char *s, size_t len, char *out, size_t outsz, int *angle)
 static int
 cc_try_open(Editor *e, const char *path)
 {
-	if (access(path, R_OK) != 0)
+	char norm[PATH_MAX];
+
+	if (path_normalize(path, norm, sizeof(norm)) != 0)
+		snprintf(norm, sizeof(norm), "%.4094s", path);	/* fall back */
+	if (access(norm, R_OK) != 0)
 		return -1;
-	if (ed_goto_target(e, path, 0, NULL) != 0)
+	if (ed_goto_target(e, norm, 0, NULL) != 0)
 		return -1;
-	snprintf(e->status, sizeof(e->status), "opened %.100s", path);
+	snprintf(e->status, sizeof(e->status), "opened %.100s", norm);
 	return 0;
 }
 

@@ -609,7 +609,10 @@ Press `gf` in vi keys, or Search > Open Header, to open the header named on an
 `#include` line. The name under the cursor works too when the cursor is not on an
 `#include`. vedit looks for the file in this order: an absolute or
 current-directory path as written, then for the `"..."` form the current file's
-own directory, then the include search directories of the current file.
+own directory, then the include search directories of the current file. The
+resolved path is tidied (`.`, `..`, and doubled slashes are collapsed) before the
+file opens, so the status line stays readable and the same header is not opened
+twice under two spellings.
 
 Those search directories come from a clang compilation database. Point the
 `cc.file` config key at a `compile_commands.json` and vedit reads the `-I`,

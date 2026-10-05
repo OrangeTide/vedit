@@ -1244,6 +1244,36 @@ t_ex_subst(Test *t)
 	text_free(e.t);
 }
 
+/* The lexical path normalizer: ".", "..", and duplicate slashes. */
+static void
+t_path_normalize(Test *t)
+{
+	char out[PATH_MAX];
+
+	TAP_CHECK(t, path_normalize("inc/../bar.h", out, sizeof(out)) == 0 &&
+	    strcmp(out, "bar.h") == 0);
+	TAP_CHECK(t, path_normalize("a//b///c", out, sizeof(out)) == 0 &&
+	    strcmp(out, "a/b/c") == 0);
+	TAP_CHECK(t, path_normalize("./a/./b", out, sizeof(out)) == 0 &&
+	    strcmp(out, "a/b") == 0);
+	TAP_CHECK(t, path_normalize("a/b/../../c", out, sizeof(out)) == 0 &&
+	    strcmp(out, "c") == 0);
+	TAP_CHECK(t, path_normalize("/a/../b", out, sizeof(out)) == 0 &&
+	    strcmp(out, "/b") == 0);
+	TAP_CHECK(t, path_normalize("/a/../..", out, sizeof(out)) == 0 &&
+	    strcmp(out, "/") == 0);	/* ".." cannot climb above root */
+	TAP_CHECK(t, path_normalize("../x", out, sizeof(out)) == 0 &&
+	    strcmp(out, "../x") == 0);	/* relative ".." is kept */
+	TAP_CHECK(t, path_normalize("a/../../x", out, sizeof(out)) == 0 &&
+	    strcmp(out, "../x") == 0);
+	TAP_CHECK(t, path_normalize(".", out, sizeof(out)) == 0 &&
+	    strcmp(out, ".") == 0);
+	TAP_CHECK(t, path_normalize("a/b/", out, sizeof(out)) == 0 &&
+	    strcmp(out, "a/b") == 0);	/* trailing slash dropped */
+	TAP_CHECK(t, path_normalize("/", out, sizeof(out)) == 0 &&
+	    strcmp(out, "/") == 0);
+}
+
 /* The #include target parser: "name" / <name>, spaces, and non-matches. */
 static void
 t_include_target(Test *t)
@@ -1794,6 +1824,7 @@ const Case tap_cases[] = {
 	{ "tags", t_tags },
 	{ "ex_abbrev", t_ex_abbrev },
 	{ "ex_subst", t_ex_subst },
+	{ "path_normalize", t_path_normalize },
 	{ "include_target", t_include_target },
 	{ "cc_split", t_cc_split },
 	{ "cc_db", t_cc_db },
