@@ -150,6 +150,9 @@ A gitconfig-style file sets the startup defaults. It is read from the first of
 [cc]
     file = /path/to/compile_commands.json # include paths for gf / Open Header
 
+[error]
+    pattern = ^([^(]+)\(([0-9]+),([0-9]+)\):  # extra build-error format
+
 [syntax]
     enable = on          # highlight recognized file types
 ```
@@ -588,6 +591,15 @@ looks like a gcc, clang, or MSVC diagnostic (`file:line:col: ...` or
 `file:line: ...`) becomes a jump target: press Enter on it in the pane, or use
 `F4` and `Shift+F4` from the editor to step through them. A diagnostic in another
 file opens or switches to that file.
+
+Toolchains with a different format are handled by adding `error.pattern` keys
+under `[error]`. Each value is a regular expression where capture group 1 is the
+file, group 2 the line, and an optional group 3 the column. The patterns are
+tried before the built-ins, and the first match on a line wins, so a key can both
+parse a new format and override the default reading of a line. Set as many as you
+need; they accumulate in file order. A pattern that contains `#` or `;`, or that
+ends in a space, must be wrapped in double quotes so the config reader keeps it
+whole.
 
 The severity word after the location (`error`, `warning`, `note`) is read and
 used. The pane colors errors red, warnings yellow, and notes cyan, and the pane

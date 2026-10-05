@@ -13180,60 +13180,87 @@ tool_group_num(const char *s, const rx_match *m)
 	return (size_t)strtoul(buf, NULL, 10);
 }
 
-/* Record a diagnostic if line s matches a gcc/clang "file:line[:col]:" form. */
+/* How many user "error.pattern" regexes are honored, beyond the built-ins. */
+#define TOOL_MAX_PAT 16
+
+/* Record a diagnostic if line s matches one of the patterns. Patterns are
+ * tried in order and the first match wins. Capture group 1 is the file, group 2
+ * the line, and the optional group 3 the column. Severity is read from the text
+ * after the match, as gcc, clang, and MSVC all name it there. */
 static void
-tool_parse_line(Editor *e, rx_t *re_col, rx_t *re_nocol, const char *s,
-    int outline)
+tool_parse_line(Editor *e, rx_t **pats, int npat, const char *s, int outline)
 {
 	rx_match m[4];
 	char file[PATH_MAX];
 	size_t n;
+	int i;
 
-	if (re_col && rx_exec(re_col, s, strlen(s), 0, m, 4) == 1) {
+	for (i = 0; i < npat; i++) {
+		if (!pats[i] || rx_exec(pats[i], s, strlen(s), 0, m, 4) != 1)
+			continue;
+		if (m[1].so < 0)		/* no file capture: not a hit */
+			return;
 		n = (size_t)(m[1].eo - m[1].so);
 		if (n >= sizeof(file))
 			n = sizeof(file) - 1;
 		memcpy(file, s + m[1].so, n);
 		file[n] = '\0';
-		tool_add_err(e, file, tool_group_num(s, &m[2]),
-		    tool_group_num(s, &m[3]), outline, tool_sev(s + m[0].eo));
-	} else if (re_nocol && rx_exec(re_nocol, s, strlen(s), 0, m, 3) == 1) {
-		n = (size_t)(m[1].eo - m[1].so);
-		if (n >= sizeof(file))
-			n = sizeof(file) - 1;
-		memcpy(file, s + m[1].so, n);
-		file[n] = '\0';
-		tool_add_err(e, file, tool_group_num(s, &m[2]), 0, outline,
-		    tool_sev(s + m[0].eo));
+		tool_add_err(e, file,
+		    m[2].so >= 0 ? tool_group_num(s, &m[2]) : 0,
+		    m[3].so >= 0 ? tool_group_num(s, &m[3]) : 0,
+		    outline, tool_sev(s + m[0].eo));
+		return;
 	}
+}
+
+/* Build the pattern list: any user "error.pattern" regexes first, so they can
+ * override the built-in gcc/clang/MSVC shapes, then the two built-ins. Returns
+ * the count and fills pats (which must hold TOOL_MAX_PAT + 2 entries). */
+static int
+tool_patterns(rx_t **pats)
+{
+	int npat = 0, i;
+
+	for (i = 0; g_cfg && i < g_cfg->count && npat < TOOL_MAX_PAT; i++) {
+		rx_t *re;
+
+		if (strcmp(g_cfg->entries[i].key, "error.pattern") != 0)
+			continue;
+		re = rx_compile(g_cfg->entries[i].value, 0, NULL);
+		if (re)
+			pats[npat++] = re;	/* bad regexes are skipped */
+	}
+	pats[npat++] = rx_compile("^([^:]+):([0-9]+):([0-9]+): ", 0, NULL);
+	pats[npat++] = rx_compile("^([^:]+):([0-9]+): ", 0, NULL);
+	return npat;
 }
 
 /* Split the captured bytes into lines and build the diagnostic list. */
 static void
 tool_parse_output(Editor *e)
 {
-	rx_t *re_col = rx_compile("^([^:]+):([0-9]+):([0-9]+): ", 0, NULL);
-	rx_t *re_nocol = rx_compile("^([^:]+):([0-9]+): ", 0, NULL);
-	size_t i, start = 0;
+	rx_t *pats[TOOL_MAX_PAT + 2];
+	int npat = tool_patterns(pats), i;
+	size_t start = 0, k;
 
-	for (i = 0; e->tool_raw && i < e->tool_rawlen; i++) {
-		if (e->tool_raw[i] != '\n')
+	for (k = 0; e->tool_raw && k < e->tool_rawlen; k++) {
+		if (e->tool_raw[k] != '\n')
 			continue;
-		if (tool_add_line(e, e->tool_raw + start, i - start) == 0)
-			tool_parse_line(e, re_col, re_nocol,
+		if (tool_add_line(e, e->tool_raw + start, k - start) == 0)
+			tool_parse_line(e, pats, npat,
 			    e->tool_lines[e->tool_nlines - 1],
 			    e->tool_nlines - 1);
-		start = i + 1;
+		start = k + 1;
 	}
 	if (e->tool_raw && start < e->tool_rawlen) {	/* final partial line */
 		if (tool_add_line(e, e->tool_raw + start,
 		    e->tool_rawlen - start) == 0)
-			tool_parse_line(e, re_col, re_nocol,
+			tool_parse_line(e, pats, npat,
 			    e->tool_lines[e->tool_nlines - 1],
 			    e->tool_nlines - 1);
 	}
-	rx_free(re_col);
-	rx_free(re_nocol);
+	for (i = 0; i < npat; i++)
+		rx_free(pats[i]);
 }
 
 /* ---- jumping to a diagnostic ---- */

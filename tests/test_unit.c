@@ -1521,6 +1521,45 @@ t_tool_parse(Test *t)
 	}
 	tool_free(&e);
 }
+
+/* User error.pattern regexes augment the built-ins and are tried first, so they
+ * can parse formats gcc/clang do not. Group 1 = file, 2 = line, 3 = column. */
+static void
+t_tool_pattern(Test *t)
+{
+	static const char *cfgtext =
+	    "[error]\n"
+	    "pattern = ^([^(]+)\\(([0-9]+),([0-9]+)\\): \n"	/* MSVC/TS form */
+	    "pattern = File \"([^\"]+)\", line ([0-9]+)\n";	/* no column */
+	char cfgpath[256];
+	Cfg *c = load_cfg_text(cfgtext, cfgpath, sizeof(cfgpath));
+	const Cfg *old = g_cfg;
+	Editor e;
+	const char *out =
+	    "main.c:10:5: error: boom\n"		/* still the built-in */
+	    "widget.ts(12,5): error TS2322: bad\n"	/* config, with column */
+	    "  File \"app.py\", line 42\n";		/* config, no column */
+
+	TAP_ASSERT(t, c != NULL);
+	g_cfg = c;
+	editor_init(&e);
+	sb_append(&e.tool_raw, &e.tool_rawlen, &e.tool_rawcap, out, strlen(out));
+	tool_parse_output(&e);
+
+	TAP_CHECKF(t, e.tool_nerr == 3, "errors %d", e.tool_nerr);
+	if (e.tool_nerr == 3) {
+		TAP_CHECK(t, strcmp(e.tool_errs[0].file, "main.c") == 0 &&
+		    e.tool_errs[0].line == 10 && e.tool_errs[0].col == 5);
+		TAP_CHECK(t, strcmp(e.tool_errs[1].file, "widget.ts") == 0 &&
+		    e.tool_errs[1].line == 12 && e.tool_errs[1].col == 5);
+		TAP_CHECK(t, strcmp(e.tool_errs[2].file, "app.py") == 0 &&
+		    e.tool_errs[2].line == 42 && e.tool_errs[2].col == 0);
+	}
+	tool_free(&e);
+	g_cfg = old;
+	vedit_cfg_free(c);
+	unlink(cfgpath);
+}
 /* The standalone binary's shell spawner: capture stdout, and the exit status. */
 struct capbuf { char data[256]; size_t len; };
 
@@ -1834,6 +1873,7 @@ const Case tap_cases[] = {
 	{ "tool_nav", t_tool_nav },
 	{ "tool_expand", t_tool_expand },
 	{ "tool_parse", t_tool_parse },
+	{ "tool_pattern", t_tool_pattern },
 	{ "tool_run", t_tool_run },
 #endif
 	{ "bufpick", t_bufpick },
