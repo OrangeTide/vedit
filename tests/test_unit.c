@@ -1177,6 +1177,72 @@ t_tags(Test *t)
 	rmdir(dir);
 }
 
+/* ex command names resolve by the vi abbreviation rule: any prefix of the full
+ * name at least `min` long, with the standard minimums not colliding. */
+static void
+t_ex_abbrev(Test *t)
+{
+	static const struct { const char *w; int id; } v[] = {
+		{ "s", EX_SUBST }, { "su", EX_SUBST }, { "substitute", EX_SUBST },
+		{ "se", EX_SET }, { "set", EX_SET },
+		{ "sy", EX_SYNTAX }, { "syntax", EX_SYNTAX },
+		{ "e", EX_EDIT }, { "ed", EX_EDIT }, { "edit", EX_EDIT },
+		{ "en", EX_NONE }, { "ene", EX_ENEW }, { "enew", EX_ENEW },
+		{ "w", EX_WRITE }, { "write", EX_WRITE },
+		{ "wq", EX_WQ }, { "wqa", EX_WQALL }, { "wqall", EX_WQALL },
+		{ "x", EX_XIT }, { "ex", EX_XIT }, { "exit", EX_XIT },
+		{ "xa", EX_WQALL }, { "xall", EX_WQALL },
+		{ "q", EX_QUIT }, { "quit", EX_QUIT },
+		{ "qa", EX_QALL }, { "qall", EX_QALL }, { "quitall", EX_QALL },
+		{ "cq", EX_CQUIT }, { "cquit", EX_CQUIT },
+		{ "d", EX_DELETE }, { "delete", EX_DELETE },
+		{ "y", EX_YANK }, { "g", EX_GLOBAL }, { "v", EX_VGLOBAL },
+		{ "r", EX_READ }, { "re", EX_READ }, { "read", EX_READ },
+		{ "ret", EX_RETAB }, { "retab", EX_RETAB },
+		{ "b", EX_BUFFER }, { "bu", EX_BUFFER }, { "buffer", EX_BUFFER },
+		{ "buffers", EX_LS }, { "ls", EX_LS }, { "files", EX_LS },
+		{ "bn", EX_BNEXT }, { "bp", EX_BPREV }, { "bN", EX_BPREV },
+		{ "bd", EX_BDELETE },
+		{ "ta", EX_TAG }, { "tag", EX_TAG },
+		{ "po", EX_POP }, { "pop", EX_POP },
+		{ "dr", EX_DRAW }, { "draw", EX_DRAW },
+		{ "zzz", EX_NONE }, { "", EX_NONE },
+	};
+	size_t k;
+
+	for (k = 0; k < sizeof(v) / sizeof(v[0]); k++)
+		TAP_CHECKF(t, ex_lookup(v[k].w) == v[k].id,
+		    "lookup '%s' = %d (want %d)", v[k].w, ex_lookup(v[k].w),
+		    v[k].id);
+}
+
+/* A substitute works spelled short (:s) or in full (:substitute), proving the
+ * delimiter is read from after the command word, not a fixed offset. */
+static void
+t_ex_subst(Test *t)
+{
+	Editor e;
+	char cmd[64];
+
+	editor_init(&e);
+	e.rows = 24;
+	e.cols = 80;
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "foo foo", 7);
+	e.cy = e.cx = 0;
+
+	snprintf(cmd, sizeof(cmd), "s/foo/bar/");
+	vi_ex_exec(&e, cmd);
+	TAP_CHECK(t, line_is(&e, 0, "bar foo"));
+
+	snprintf(cmd, sizeof(cmd), "%%substitute/foo/baz/g");
+	vi_ex_exec(&e, cmd);
+	TAP_CHECK(t, line_is(&e, 0, "bar baz"));
+
+	text_free(e.t);
+}
+
 #ifndef VEDIT_NO_TOOLS
 /* The $(...) substitution the per-language tool commands use. */
 static void
@@ -1498,6 +1564,8 @@ const Case tap_cases[] = {
 	{ "indent", t_indent },
 	{ "retab", t_retab },
 	{ "tags", t_tags },
+	{ "ex_abbrev", t_ex_abbrev },
+	{ "ex_subst", t_ex_subst },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_expand", t_tool_expand },
 	{ "tool_parse", t_tool_parse },

@@ -17516,16 +17516,6 @@ vi_dispatch(Editor *e, const struct tkbd_seq *seq)
 	return r;
 }
 
-/* True when p equals any of the NULL-terminated list of names. */
-static int
-vi_ex_match(const char *p, const char *const *names)
-{
-	for (; *names; names++)
-		if (strcmp(p, *names) == 0)
-			return 1;
-	return 0;
-}
-
 /* A delimiter is a printable non-space, non-alphanumeric character, so that a
  * word command like ':syntax' is not mistaken for ':s/.../'. */
 static int
@@ -17535,24 +17525,6 @@ is_ex_delim(char d)
 		return 0;
 	return !((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z') ||
 	    (d >= '0' && d <= '9'));
-}
-
-/* A ':s' is a substitute only when the character after the s is a delimiter. */
-static int
-vi_ex_is_subst(const char *cmd)
-{
-	return is_ex_delim(cmd[1]);
-}
-
-/* A ':g' or ':v' (or ':g!') is global only when a delimiter follows. */
-static int
-vi_ex_is_global(const char *cmd)
-{
-	const char *p = cmd + 1;
-
-	if (*cmd == 'g' && *p == '!')
-		p++;
-	return is_ex_delim(*p);
 }
 
 /* Count the matches of re on line s[0, len): all of them, or just the first
@@ -17608,18 +17580,23 @@ vi_ex_subst_line(Editor *e, size_t y, rx_t *re, const char *rep, int global)
 	return matches;
 }
 
-/* Run a :[range]s/pat/rep/[g] over lines [lo,hi]. The delimiter is the char
- * after the s; an empty pattern reuses the last search string. */
+/* Run a :[range]s/pat/rep/[g] over lines [lo,hi]. `args` begins at the
+ * delimiter (so args[0] is the '/' or other separator); an empty pattern
+ * reuses the last search string. */
 static Req
-vi_ex_substitute(Editor *e, size_t lo, size_t hi, const char *cmd)
+vi_ex_substitute(Editor *e, size_t lo, size_t hi, const char *args)
 {
-	char delim = cmd[1];
+	char delim = args[0];
 	char pat[256], rep[256];
-	const char *p = cmd + 2, *use, *err;
+	const char *p = args + 1, *use, *err;
 	size_t n = 0, y;
 	int global = 0, subs = 0, lines = 0;
 	rx_t *re;
 
+	if (!is_ex_delim(delim)) {
+		snprintf(e->status, sizeof(e->status), "E146: missing separator");
+		return REQ_CONTINUE;
+	}
 	while (*p && *p != delim) {			/* pattern */
 		if (n < sizeof(pat) - 1)
 			pat[n++] = *p;
@@ -17689,17 +17666,13 @@ vi_ex_substitute(Editor *e, size_t lo, size_t hi, const char *cmd)
  * collected first so the command can shift line numbers safely. */
 static Req
 vi_ex_global(Editor *e, size_t lo, size_t hi, int had_range,
-    const char *cmd, int invert)
+    const char *args, int invert)
 {
-	const char *p = cmd + 1, *sub, *use, *err;
+	const char *p = args, *sub, *use, *err;
 	char delim, pat[256];
 	size_t n = 0, y, *rows, nrows = 0, i;
 	rx_t *re;
 
-	if (*cmd == 'g' && *p == '!') {
-		invert = 1;
-		p++;
-	}
 	delim = *p;
 	if (!is_ex_delim(delim)) {
 		snprintf(e->status, sizeof(e->status), "E146: missing pattern");
@@ -17759,9 +17732,9 @@ vi_ex_global(Editor *e, size_t lo, size_t hi, int had_range,
 	if (sub[0] == 'd' && (sub[1] == '\0' || sub[1] == ' ')) {
 		for (i = nrows; i > 0; i--)	/* delete bottom-up */
 			vi_delete_lines(e, rows[i - 1], rows[i - 1]);
-	} else if (sub[0] == 's' && vi_ex_is_subst(sub)) {
+	} else if (sub[0] == 's' && is_ex_delim(sub[1])) {
 		for (i = 0; i < nrows; i++)	/* substitute keeps line count */
-			vi_ex_substitute(e, rows[i], rows[i], sub);
+			vi_ex_substitute(e, rows[i], rows[i], sub + 1);
 	} else {
 		text_undo_group_end(e->t);
 		free(rows);
@@ -17892,21 +17865,16 @@ vi_ex_parse_range(Editor *e, char **pp, size_t *lo, size_t *hi)
 	return 1;
 }
 
-/* Read the file named in cmd (":r path" or ":read path") into the buffer,
- * inserting its contents on the line below line "at". The cursor lands on
- * the first inserted line, matching vi's :r. */
+/* Read the file named by fn into the buffer, inserting its contents on the line
+ * below line "at". The cursor lands on the first inserted line, matching vi's
+ * :r. fn is the argument already past the command word. */
 static Req
-vi_ex_read_file(Editor *e, size_t at, const char *cmd)
+vi_ex_read_file(Editor *e, size_t at, const char *fn)
 {
-	const char *fn = cmd;
 	Text *nt;
 	char *bytes;
 	size_t nlines, i, total, off;
 
-	while (*fn && *fn != ' ')		/* skip the command word */
-		fn++;
-	while (*fn == ' ')
-		fn++;
 	if (*fn == '\0') {
 		snprintf(e->status, sizeof(e->status), "E32: no file name");
 		return REQ_CONTINUE;
@@ -17970,308 +17938,421 @@ vi_ex_read_file(Editor *e, size_t at, const char *cmd)
 	return REQ_CONTINUE;
 }
 
+/* Apply a :set option (arg is past the "set" word and any spaces). vedit
+ * accepts the vim abbreviations and the no/inv prefixes and ! suffix. */
+static Req
+ex_set(Editor *e, const char *arg)
+{
+	if (strcmp(arg, "number") == 0 || strcmp(arg, "nu") == 0)
+		e->show_lineno = 1;
+	else if (strcmp(arg, "nonumber") == 0 || strcmp(arg, "nonu") == 0)
+		e->show_lineno = 0;
+	else if (strcmp(arg, "number!") == 0 || strcmp(arg, "nu!") == 0 ||
+	    strcmp(arg, "invnumber") == 0)
+		e->show_lineno = !e->show_lineno;
+	else if (strcmp(arg, "wrap") == 0)
+		e->wrap = 1;
+	else if (strcmp(arg, "nowrap") == 0)
+		e->wrap = 0;
+	else if (strcmp(arg, "wrap!") == 0 || strcmp(arg, "invwrap") == 0)
+		e->wrap = !e->wrap;
+	else if (strcmp(arg, "list") == 0 || strcmp(arg, "nolist") == 0 ||
+	    strcmp(arg, "list!") == 0 || strcmp(arg, "invlist") == 0) {
+		if (arg[0] == 'n')
+			e->show_tabs = 0;
+		else if (strchr(arg, '!') || arg[0] == 'i')
+			e->show_tabs = !e->show_tabs;
+		else
+			e->show_tabs = 1;
+		snprintf(e->status, sizeof(e->status), "show tabs %s",
+		    e->show_tabs ? "on" : "off");
+		return REQ_CONTINUE;
+	} else if (strcmp(arg, "autoindent") == 0 || strcmp(arg, "ai") == 0 ||
+	    strcmp(arg, "noautoindent") == 0 || strcmp(arg, "noai") == 0 ||
+	    strcmp(arg, "autoindent!") == 0 || strcmp(arg, "ai!") == 0 ||
+	    strcmp(arg, "invai") == 0) {
+		if (arg[0] == 'n')
+			e->auto_indent = 0;
+		else if (strchr(arg, '!') || arg[0] == 'i')
+			e->auto_indent = !e->auto_indent;
+		else
+			e->auto_indent = 1;
+		snprintf(e->status, sizeof(e->status), "auto-indent %s",
+		    e->auto_indent ? "on" : "off");
+		return REQ_CONTINUE;
+	} else if (strcmp(arg, "expandtab") == 0 || strcmp(arg, "et") == 0 ||
+	    strcmp(arg, "noexpandtab") == 0 || strcmp(arg, "noet") == 0 ||
+	    strcmp(arg, "expandtab!") == 0 || strcmp(arg, "et!") == 0 ||
+	    strcmp(arg, "invet") == 0) {
+		if (arg[0] == 'n')
+			e->expand_tabs = 0;
+		else if (strchr(arg, '!') || arg[0] == 'i')
+			e->expand_tabs = !e->expand_tabs;
+		else
+			e->expand_tabs = 1;
+		snprintf(e->status, sizeof(e->status), "indent with %s",
+		    e->expand_tabs ? "spaces" : "tabs");
+		return REQ_CONTINUE;
+	} else if (strncmp(arg, "ff=", 3) == 0 ||
+	    strncmp(arg, "fileformat=", 11) == 0) {
+		const char *val = strchr(arg, '=') + 1;
+		int eol;
+
+		if (strcmp(val, "unix") == 0 || strcmp(val, "lf") == 0)
+			eol = EOL_LF;
+		else if (strcmp(val, "dos") == 0 || strcmp(val, "crlf") == 0)
+			eol = EOL_CRLF;
+		else if (strcmp(val, "nul") == 0)
+			eol = EOL_NUL;
+		else {
+			snprintf(e->status, sizeof(e->status),
+			    "E474: invalid fileformat: %.20s", val);
+			return REQ_CONTINUE;
+		}
+		text_set_eol(e->t, eol);
+		snprintf(e->status, sizeof(e->status), "fileformat=%s",
+		    eol_name(eol));
+		return REQ_CONTINUE;
+	} else {
+		snprintf(e->status, sizeof(e->status),
+		    "E518: unknown option: %.40s", arg);
+		return REQ_CONTINUE;
+	}
+	if (e->wrap)
+		e->left = 0;
+	if (strstr(arg, "wrap"))
+		snprintf(e->status, sizeof(e->status), "word wrap %s",
+		    e->wrap ? "on" : "off");
+	else
+		snprintf(e->status, sizeof(e->status), "line numbers %s",
+		    e->show_lineno ? "on" : "off");
+	return REQ_CONTINUE;
+}
+
+/* Apply :syntax on|off|<name> (arg is past the "syntax" word and any spaces). */
+static Req
+ex_syntax(Editor *e, const char *arg)
+{
+	if (strcmp(arg, "off") == 0) {
+		e->hl_on = 0;
+	} else if (*arg == '\0' || strcmp(arg, "on") == 0) {
+		e->hl_on = 1;
+		e->hl_valid = 0;		/* recolor from the top */
+	} else {
+		const Syntax *sy = syn_for_ext(arg);
+
+		if (!sy) {
+			snprintf(e->status, sizeof(e->status),
+			    "no syntax for '%.40s'", arg);
+			return REQ_CONTINUE;
+		}
+		e->syn = sy;
+		e->hl_on = 1;
+		e->hl_valid = 0;
+	}
+	return REQ_CONTINUE;
+}
+
+/* The ex command set. Each ex command may be abbreviated to any prefix of its
+ * full name that is at least `min` characters long, the de-facto vi/ex rule
+ * (so :s, :su .. :substitute all work, and :e .. :edit, :w .. :write). The
+ * table is scanned in order and the first match wins; the `min` values are
+ * chosen so the standard abbreviations never collide. */
+enum excmd {
+	EX_NONE, EX_SUBST, EX_GLOBAL, EX_VGLOBAL, EX_DELETE, EX_YANK, EX_READ,
+	EX_EDIT, EX_ENEW, EX_WRITE, EX_WQ, EX_XIT, EX_QUIT, EX_QALL, EX_WQALL,
+	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
+	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW,
+};
+
+static const struct excmd_name {
+	const char	*name;
+	int		 min;
+	int		 id;
+} ex_cmds[] = {
+	{ "substitute",	1, EX_SUBST },
+	{ "global",	1, EX_GLOBAL },
+	{ "vglobal",	1, EX_VGLOBAL },
+	{ "delete",	1, EX_DELETE },
+	{ "yank",	1, EX_YANK },
+	{ "read",	1, EX_READ },
+	{ "edit",	1, EX_EDIT },
+	{ "enew",	3, EX_ENEW },
+	{ "write",	1, EX_WRITE },
+	{ "wq",		2, EX_WQ },
+	{ "wqall",	3, EX_WQALL },
+	{ "xall",	2, EX_WQALL },
+	{ "xit",	1, EX_XIT },
+	{ "exit",	2, EX_XIT },
+	{ "quit",	1, EX_QUIT },
+	{ "qall",	2, EX_QALL },
+	{ "quitall",	5, EX_QALL },
+	{ "cquit",	2, EX_CQUIT },
+	{ "set",	2, EX_SET },
+	{ "syntax",	2, EX_SYNTAX },
+	{ "buffers",	7, EX_LS },
+	{ "files",	3, EX_LS },
+	{ "ls",		2, EX_LS },
+	{ "buffer",	1, EX_BUFFER },
+	{ "bnext",	2, EX_BNEXT },
+	{ "bprevious",	2, EX_BPREV },
+	{ "bNext",	2, EX_BPREV },
+	{ "bdelete",	2, EX_BDELETE },
+	{ "tag",	2, EX_TAG },
+	{ "pop",	2, EX_POP },
+	{ "retab",	3, EX_RETAB },
+	{ "draw",	2, EX_DRAW },
+};
+
+/* Copy the leading run of ASCII letters of *pp into word[], advancing *pp past
+ * them. Returns the stored length. */
+static size_t
+ex_word(const char **pp, char *word, size_t wsz)
+{
+	const char *p = *pp;
+	size_t n = 0;
+
+	while ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')) {
+		if (n < wsz - 1)
+			word[n++] = *p;
+		p++;
+	}
+	word[n] = '\0';
+	*pp = p;
+	return n;
+}
+
+/* Resolve a command word to its id by the prefix-abbreviation rule. */
+static int
+ex_lookup(const char *word)
+{
+	size_t wl = strlen(word), i;
+
+	if (wl == 0)
+		return EX_NONE;
+	for (i = 0; i < sizeof(ex_cmds) / sizeof(ex_cmds[0]); i++) {
+		size_t nl = strlen(ex_cmds[i].name);
+
+		if (wl >= (size_t)ex_cmds[i].min && wl <= nl &&
+		    strncmp(word, ex_cmds[i].name, wl) == 0)
+			return ex_cmds[i].id;
+	}
+	return EX_NONE;
+}
+
+/* Save the current buffer to e->path. Returns -1 and sets the status on error,
+ * or 0 on success. */
+static int
+ex_write_current(Editor *e)
+{
+	if (!e->has_name) {
+		snprintf(e->status, sizeof(e->status), "E32: no file name");
+		return -1;
+	}
+	if (text_save(e->t, e->path) < 0) {
+		snprintf(e->status, sizeof(e->status), "save failed: %s",
+		    strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
 /* Run an already-entered ex command line. Returns REQ_FORCE_QUIT when the
- * command asks to leave, otherwise REQ_CONTINUE. The "all" variants (:qa,
- * :wqa, :xa) behave like their single forms. Split from vi_colon so it can run
- * without the interactive prompt. */
+ * command asks to leave, otherwise REQ_CONTINUE. Command names follow the
+ * vi/ex abbreviation rule (see ex_cmds); a trailing '!' forces. Split from
+ * vi_colon so it can run without the interactive prompt. */
 static Req
 vi_ex_exec(Editor *e, char *buf)
 {
-	char *p;
+	char *p = buf, *after;
+	size_t lo = 0, hi = 0;
+	int rr, had_range, id, bang = 0, invert = 0;
+	char word[32];
+	const char *rest, *wp;
 
-	p = buf;
 	while (*p == ' ')
 		p++;
 
-	/* An optional leading line range, then a range-aware command. */
-	{
-		char *after = p;
-		size_t lo = 0, hi = 0;
-		int rr = vi_ex_parse_range(e, &after, &lo, &hi);
+	/* An optional leading line range. */
+	after = p;
+	rr = vi_ex_parse_range(e, &after, &lo, &hi);
+	if (rr < 0) {
+		snprintf(e->status, sizeof(e->status), "E16: invalid range");
+		return REQ_CONTINUE;
+	}
+	while (*after == ' ')
+		after++;
+	had_range = rr > 0;
 
-		if (rr < 0) {
+	if (had_range && *after == '\0') {		/* :N -- go to line */
+		e->cy = hi;
+		e->cx = first_nonblank(e, e->cy);
+		vi_clamp(e);
+		return REQ_CONTINUE;
+	}
+	if (!had_range)					/* default: current line */
+		lo = hi = e->cy;
+
+	if (*after == '\0')				/* a bare ':' does nothing */
+		return REQ_CONTINUE;
+
+	/* The non-word line-shift commands. */
+	if (*after == '>' || *after == '<') {
+		vi_shift_lines(e, lo, hi, *after == '>' ? 1 : -1);
+		return REQ_CONTINUE;
+	}
+
+	/* The command word, then look it up by the abbreviation rule. */
+	wp = after;
+	ex_word(&wp, word, sizeof(word));
+	rest = wp;
+	id = ex_lookup(word);
+
+	/* Substitute and global read their own delimiter, so the leading '!' of
+	 * :g! is theirs, not the generic force flag. */
+	if (id == EX_SUBST) {
+		if (!is_ex_delim(*rest))
+			goto unknown;
+		return vi_ex_substitute(e, lo, hi, rest);
+	}
+	if (id == EX_GLOBAL || id == EX_VGLOBAL) {
+		invert = (id == EX_VGLOBAL);
+		if (id == EX_GLOBAL && *rest == '!') {
+			invert = 1;
+			rest++;
+		}
+		if (!is_ex_delim(*rest)) {
 			snprintf(e->status, sizeof(e->status),
-			    "E16: invalid range");
+			    "E146: missing pattern");
 			return REQ_CONTINUE;
 		}
-		while (*after == ' ')
-			after++;
-		if (rr > 0 && *after == '\0') {		/* :N -- go to line */
-			e->cy = hi;
-			e->cx = first_nonblank(e, e->cy);
-			vi_clamp(e);
+		return vi_ex_global(e, lo, hi, had_range, rest, invert);
+	}
+
+	/* A trailing '!' forces; then skip to the argument. */
+	if (*rest == '!') {
+		bang = 1;
+		rest++;
+	}
+	while (*rest == ' ')
+		rest++;
+
+	switch (id) {
+	case EX_DELETE:
+		vi_yank_lines(e, lo, hi);
+		vi_delete_lines(e, lo, hi);
+		e->cy = lo < text_lines(e->t) ? lo : text_lines(e->t) - 1;
+		e->cx = first_nonblank(e, e->cy);
+		vi_clamp(e);
+		return REQ_CONTINUE;
+	case EX_YANK:
+		vi_yank_lines(e, lo, hi);
+		e->cy = lo;
+		vi_clamp(e);
+		return REQ_CONTINUE;
+	case EX_READ:
+		return vi_ex_read_file(e, hi, rest);
+	case EX_EDIT:
+		if (*rest) {			/* :e file -- open or switch */
+			buf_open(e, rest);
 			return REQ_CONTINUE;
 		}
-		if (rr == 0)				/* default: the current line */
-			lo = hi = e->cy;
-
-		switch (*after) {
-		case 's':				/* :s -- substitute */
-			if (vi_ex_is_subst(after))
-				return vi_ex_substitute(e, lo, hi, after);
-			break;			/* :syntax etc.: fall through */
-		case 'g':				/* :g / :g! -- global */
-		case 'v':				/* :v -- inverse global */
-			if (vi_ex_is_global(after))
-				return vi_ex_global(e, lo, hi, rr > 0, after,
-				    *after == 'v');
-			break;
-		case 'd':				/* :d -- delete lines */
-			if (after[1] == '\0' || after[1] == ' ') {
-				vi_yank_lines(e, lo, hi);
-				vi_delete_lines(e, lo, hi);
-				e->cy = lo < text_lines(e->t) ? lo :
-				    text_lines(e->t) - 1;
-				e->cx = first_nonblank(e, e->cy);
-				vi_clamp(e);
-				return REQ_CONTINUE;
-			}
-			break;
-		case 'y':				/* :y -- yank lines */
-			if (after[1] == '\0' || after[1] == ' ') {
-				vi_yank_lines(e, lo, hi);
-				e->cy = lo;
-				vi_clamp(e);
-				return REQ_CONTINUE;
-			}
-			break;
-		case '>':
-		case '<':				/* :> / :< -- shift lines */
-			vi_shift_lines(e, lo, hi, *after == '>' ? 1 : -1);
-			return REQ_CONTINUE;
-		case 'r':				/* :[N]r file -- read below */
-			if (after[1] == ' ' || after[1] == '\0' ||
-			    strncmp(after, "read", 4) == 0)
-				return vi_ex_read_file(e, hi, after);
-			break;
-		default:
-			break;
-		}
-		if (rr > 0) {			/* a range but not a line command */
-			snprintf(e->status, sizeof(e->status),
-			    "E492: not an editor command: %.60s", after);
-			return REQ_CONTINUE;
-		}
-	}
-
-	if (strncmp(p, "syn", 3) == 0) {	/* :syntax on|off|<name> */
-		const char *arg = p;
-
-		while (*arg && *arg != ' ')
-			arg++;
-		while (*arg == ' ')
-			arg++;
-		if (strcmp(arg, "off") == 0) {
-			e->hl_on = 0;
-		} else if (*arg == '\0' || strcmp(arg, "on") == 0) {
-			e->hl_on = 1;
-			e->hl_valid = 0;	/* recolor from the top */
-		} else {
-			const Syntax *sy = syn_for_ext(arg);
-
-			if (!sy) {
-				snprintf(e->status, sizeof(e->status),
-				    "no syntax for '%.40s'", arg);
-				return REQ_CONTINUE;
-			}
-			e->syn = sy;
-			e->hl_on = 1;
-			e->hl_valid = 0;
-		}
-		return REQ_CONTINUE;
-	}
-
-	if (strncmp(p, "set", 3) == 0 && (p[3] == ' ' || p[3] == '\0')) {
-		const char *arg = p + 3;	/* :set number|nonumber|nu|nonu */
-
-		while (*arg == ' ')
-			arg++;
-		if (strcmp(arg, "number") == 0 || strcmp(arg, "nu") == 0)
-			e->show_lineno = 1;
-		else if (strcmp(arg, "nonumber") == 0 || strcmp(arg, "nonu") == 0)
-			e->show_lineno = 0;
-		else if (strcmp(arg, "number!") == 0 || strcmp(arg, "nu!") == 0 ||
-		    strcmp(arg, "invnumber") == 0)
-			e->show_lineno = !e->show_lineno;
-		else if (strcmp(arg, "wrap") == 0)
-			e->wrap = 1;
-		else if (strcmp(arg, "nowrap") == 0)
-			e->wrap = 0;
-		else if (strcmp(arg, "wrap!") == 0 || strcmp(arg, "invwrap") == 0)
-			e->wrap = !e->wrap;
-		else if (strcmp(arg, "list") == 0 || strcmp(arg, "nolist") == 0 ||
-		    strcmp(arg, "list!") == 0 || strcmp(arg, "invlist") == 0) {
-			if (arg[0] == 'n')
-				e->show_tabs = 0;
-			else if (strchr(arg, '!') || arg[0] == 'i')
-				e->show_tabs = !e->show_tabs;
-			else
-				e->show_tabs = 1;
-			snprintf(e->status, sizeof(e->status), "show tabs %s",
-			    e->show_tabs ? "on" : "off");
-			return REQ_CONTINUE;
-		} else if (strcmp(arg, "autoindent") == 0 ||
-		    strcmp(arg, "ai") == 0 || strcmp(arg, "noautoindent") == 0 ||
-		    strcmp(arg, "noai") == 0 || strcmp(arg, "autoindent!") == 0 ||
-		    strcmp(arg, "ai!") == 0 || strcmp(arg, "invai") == 0) {
-			if (arg[0] == 'n')
-				e->auto_indent = 0;
-			else if (strchr(arg, '!') || arg[0] == 'i')
-				e->auto_indent = !e->auto_indent;
-			else
-				e->auto_indent = 1;
-			snprintf(e->status, sizeof(e->status), "auto-indent %s",
-			    e->auto_indent ? "on" : "off");
-			return REQ_CONTINUE;
-		} else if (strcmp(arg, "expandtab") == 0 ||
-		    strcmp(arg, "et") == 0 || strcmp(arg, "noexpandtab") == 0 ||
-		    strcmp(arg, "noet") == 0 || strcmp(arg, "expandtab!") == 0 ||
-		    strcmp(arg, "et!") == 0 || strcmp(arg, "invet") == 0) {
-			if (arg[0] == 'n')
-				e->expand_tabs = 0;
-			else if (strchr(arg, '!') || arg[0] == 'i')
-				e->expand_tabs = !e->expand_tabs;
-			else
-				e->expand_tabs = 1;
-			snprintf(e->status, sizeof(e->status), "indent with %s",
-			    e->expand_tabs ? "spaces" : "tabs");
-			return REQ_CONTINUE;
-		} else if (strncmp(arg, "ff=", 3) == 0 ||
-		    strncmp(arg, "fileformat=", 11) == 0) {
-			const char *val = strchr(arg, '=') + 1;
-			int eol;
-
-			if (strcmp(val, "unix") == 0 || strcmp(val, "lf") == 0)
-				eol = EOL_LF;
-			else if (strcmp(val, "dos") == 0 || strcmp(val, "crlf") == 0)
-				eol = EOL_CRLF;
-			else if (strcmp(val, "nul") == 0)
-				eol = EOL_NUL;
-			else {
-				snprintf(e->status, sizeof(e->status),
-				    "E474: invalid fileformat: %.20s", val);
-				return REQ_CONTINUE;
-			}
-			text_set_eol(e->t, eol);
-			snprintf(e->status, sizeof(e->status),
-			    "fileformat=%s", eol_name(eol));
-			return REQ_CONTINUE;
-		} else {
-			snprintf(e->status, sizeof(e->status),
-			    "E518: unknown option: %.40s", arg);
-			return REQ_CONTINUE;
-		}
-		if (e->wrap)
-			e->left = 0;
-		if (strstr(arg, "wrap"))
-			snprintf(e->status, sizeof(e->status), "word wrap %s",
-			    e->wrap ? "on" : "off");
-		else
-			snprintf(e->status, sizeof(e->status), "line numbers %s",
-			    e->show_lineno ? "on" : "off");
-		return REQ_CONTINUE;
-	}
-
-	/* :retab rewrites whitespace following the current expandtab setting:
-	 * tabs to spaces when indenting with spaces, otherwise the reverse. */
-	if (strcmp(p, "retab") == 0 || strcmp(p, "retab!") == 0) {
-		ed_retab(e, e->expand_tabs);
-		return REQ_CONTINUE;
-	}
-
-	/* :tag NAME jumps to a named tag (a /pattern opens the picker filtered to
-	 * matching names); :ta is the usual abbreviation. */
-	if ((strncmp(p, "tag", 3) == 0 &&
-	    (p[3] == ' ' || p[3] == '!' || p[3] == '\0')) ||
-	    (strncmp(p, "ta", 2) == 0 &&
-	    (p[2] == ' ' || p[2] == '!' || p[2] == '\0'))) {
-		const char *arg = p + (p[1] == 'a' && p[2] == 'g' ? 3 : 2);
-
-		if (*arg == '!')
-			arg++;
-		while (*arg == ' ')
-			arg++;
-		if (*arg == '/')
-			symbol_pick_filtered(e, NULL, arg + 1, 0);
-		else if (*arg)
-			symbol_pick_filtered(e, arg, NULL, 1);
-		else
-			snprintf(e->status, sizeof(e->status),
-			    "E471: argument required");
-		return REQ_CONTINUE;
-	}
-
-	/* :pop / :po returns to the position before the last tag jump. */
-	if (strcmp(p, "pop") == 0 || strcmp(p, "po") == 0 ||
-	    strcmp(p, "pop!") == 0) {
-		ed_tag_pop(e);
-		return REQ_CONTINUE;
-	}
-
-	/* Buffer commands. :e opens a file (or reloads the current one), :ls
-	 * lists, :bn/:bp cycle, :b N switches, :bd closes. */
-	if (strncmp(p, "e ", 2) == 0 || strncmp(p, "edit ", 5) == 0) {
-		const char *fn = p + (p[1] == ' ' ? 1 : 4);
-
-		while (*fn == ' ')
-			fn++;
-		buf_open(e, fn);
-		return REQ_CONTINUE;
-	}
-	if (strcmp(p, "e") == 0 || strcmp(p, "e!") == 0 ||
-	    strcmp(p, "edit") == 0 || strcmp(p, "edit!") == 0) {
-		Text *nt;
-
-		if (!e->has_name) {
+		if (!e->has_name) {		/* :e -- reload the current file */
 			snprintf(e->status, sizeof(e->status),
 			    "E32: no file name");
 			return REQ_CONTINUE;
 		}
-		nt = text_new();
-		if (!nt) {
-			snprintf(e->status, sizeof(e->status), "out of memory");
-			return REQ_CONTINUE;
+		{
+			Text *nt = text_new();
+
+			if (!nt) {
+				snprintf(e->status, sizeof(e->status),
+				    "out of memory");
+				return REQ_CONTINUE;
+			}
+			if (text_load(nt, e->path) < 0) {
+				snprintf(e->status, sizeof(e->status),
+				    "reload failed: %s", strerror(errno));
+				text_free(nt);
+				return REQ_CONTINUE;
+			}
+			text_free(e->t);
+			e->t = nt;
+			e->cy = e->cx = e->top = e->left = 0;
+			e->sel_active = 0;
+			e->hl_valid = 0;
+			snprintf(e->status, sizeof(e->status), "reloaded %.100s",
+			    e->path);
 		}
-		if (text_load(nt, e->path) < 0) {
-			snprintf(e->status, sizeof(e->status),
-			    "reload failed: %s", strerror(errno));
-			text_free(nt);
-			return REQ_CONTINUE;
-		}
-		text_free(e->t);
-		e->t = nt;
-		e->cy = e->cx = e->top = e->left = 0;
-		e->sel_active = 0;
-		e->hl_valid = 0;
-		snprintf(e->status, sizeof(e->status), "reloaded %.100s",
-		    e->path);
 		return REQ_CONTINUE;
-	}
-	if (strcmp(p, "enew") == 0) {
+	case EX_ENEW:
 		buf_open(e, NULL);
 		return REQ_CONTINUE;
-	}
-	if (strcmp(p, "ls") == 0 || strcmp(p, "buffers") == 0 ||
-	    strcmp(p, "files") == 0) {
+	case EX_WRITE:
+		if (*rest) {			/* :w file -- set the name */
+			snprintf(e->path, sizeof(e->path), "%s", rest);
+			e->has_name = 1;
+		}
+		if (ex_write_current(e) == 0)
+			snprintf(e->status, sizeof(e->status), "wrote %.120s",
+			    e->path);
+		return REQ_CONTINUE;
+	case EX_WQ:
+	case EX_XIT:
+		if (ex_write_current(e) != 0)
+			return REQ_CONTINUE;
+		return REQ_FORCE_QUIT;
+	case EX_QUIT:
+		if (!bang && text_dirty(e->t)) {
+			snprintf(e->status, sizeof(e->status),
+			    "E37: no write since last change (:q! overrides)");
+			return REQ_CONTINUE;
+		}
+		return REQ_FORCE_QUIT;
+	case EX_QALL:
+		if (!bang && text_dirty(e->t)) {
+			snprintf(e->status, sizeof(e->status),
+			    "E37: no write since last change (add ! to override)");
+			return REQ_CONTINUE;
+		}
+		return REQ_FORCE_QUIT;
+	case EX_WQALL:
+		if (ex_write_current(e) != 0)
+			return REQ_CONTINUE;
+		return REQ_FORCE_QUIT;
+	case EX_CQUIT:
+		return REQ_QUIT_ERR;		/* exit with a nonzero code */
+	case EX_SET:
+		return ex_set(e, rest);
+	case EX_SYNTAX:
+		return ex_syntax(e, rest);
+	case EX_LS:
 		buf_list(e);
 		return REQ_CONTINUE;
+	case EX_BUFFER: {
+		long n;
+
+		if (*rest < '0' || *rest > '9') {
+			snprintf(e->status, sizeof(e->status),
+			    "E471: argument required");
+			return REQ_CONTINUE;
+		}
+		n = strtol(rest, NULL, 10);
+		if (n < 1 || n > e->nbuf)
+			snprintf(e->status, sizeof(e->status),
+			    "E86: no buffer %ld", n);
+		else
+			buf_switch(e, (int)(n - 1));
+		return REQ_CONTINUE;
 	}
-	if (strcmp(p, "bn") == 0 || strcmp(p, "bnext") == 0) {
+	case EX_BNEXT:
 		buf_cycle(e, 1);
 		return REQ_CONTINUE;
-	}
-	if (strcmp(p, "bp") == 0 || strcmp(p, "bprev") == 0 ||
-	    strcmp(p, "bprevious") == 0 || strcmp(p, "bN") == 0 ||
-	    strcmp(p, "bNext") == 0) {
+	case EX_BPREV:
 		buf_cycle(e, -1);
 		return REQ_CONTINUE;
-	}
-	if (strcmp(p, "bd") == 0 || strcmp(p, "bd!") == 0 ||
-	    strcmp(p, "bdelete") == 0 || strcmp(p, "bdelete!") == 0) {
-		size_t bl = strlen(p);
-		int force = bl > 0 && p[bl - 1] == '!';
-
-		if (!force && text_dirty(e->t)) {
+	case EX_BDELETE:
+		if (!bang && text_dirty(e->t)) {
 			snprintf(e->status, sizeof(e->status),
 			    "E89: no write since last change (add ! to override)");
 			return REQ_CONTINUE;
@@ -18280,128 +18361,31 @@ vi_ex_exec(Editor *e, char *buf)
 			snprintf(e->status, sizeof(e->status),
 			    "cannot close the last buffer");
 		return REQ_CONTINUE;
-	}
-	if ((strncmp(p, "b ", 2) == 0 || strncmp(p, "buffer ", 7) == 0 ||
-	    (p[0] == 'b' && p[1] >= '0' && p[1] <= '9'))) {
-		const char *np = p + 1;
-		long n;
-
-		while (*np && (*np < '0' || *np > '9'))
-			np++;
-		n = strtol(np, NULL, 10);
-		if (n < 1 || n > e->nbuf)
-			snprintf(e->status, sizeof(e->status),
-			    "E86: no buffer %ld", n);
+	case EX_TAG:
+		if (*rest == '/')
+			symbol_pick_filtered(e, NULL, rest + 1, 0);
+		else if (*rest)
+			symbol_pick_filtered(e, rest, NULL, 1);
 		else
-			buf_switch(e, (int)(n - 1));
-		return REQ_CONTINUE;
-	}
-
-	if (strcmp(p, "q") == 0) {
-		if (text_dirty(e->t)) {
 			snprintf(e->status, sizeof(e->status),
-			    "E37: no write since last change (:q! overrides)");
-			return REQ_CONTINUE;
-		}
-		return REQ_FORCE_QUIT;
-	}
-	if (strcmp(p, "q!") == 0)
-		return REQ_FORCE_QUIT;
-	if (strcmp(p, "draw") == 0) {		/* toggle 2D/block draw mode */
+			    "E471: argument required");
+		return REQ_CONTINUE;
+	case EX_POP:
+		ed_tag_pop(e);
+		return REQ_CONTINUE;
+	case EX_RETAB:
+		ed_retab(e, e->expand_tabs);
+		return REQ_CONTINUE;
+	case EX_DRAW:
 		draw_toggle(e);
 		return REQ_CONTINUE;
-	}
-	if (strcmp(p, "w") == 0 || strcmp(p, "w!") == 0 ||
-	    strncmp(p, "w ", 2) == 0) {
-		const char *fn = p + 1;
-
-		while (*fn == ' ' || *fn == '!')
-			fn++;
-		if (*fn) {
-			snprintf(e->path, sizeof(e->path), "%s", fn);
-			e->has_name = 1;
-		}
-		if (!e->has_name) {
-			snprintf(e->status, sizeof(e->status),
-			    "E32: no file name");
-			return REQ_CONTINUE;
-		}
-		if (text_save(e->t, e->path) < 0)
-			snprintf(e->status, sizeof(e->status),
-			    "save failed: %s", strerror(errno));
-		else
-			snprintf(e->status, sizeof(e->status), "wrote %.120s",
-			    e->path);
-		return REQ_CONTINUE;
-	}
-	if (strcmp(p, "wq") == 0 || strcmp(p, "wq!") == 0 ||
-	    strcmp(p, "x") == 0 || strcmp(p, "x!") == 0) {
-		if (!e->has_name) {
-			snprintf(e->status, sizeof(e->status),
-			    "E32: no file name");
-			return REQ_CONTINUE;
-		}
-		if (text_save(e->t, e->path) < 0) {
-			snprintf(e->status, sizeof(e->status),
-			    "save failed: %s", strerror(errno));
-			return REQ_CONTINUE;
-		}
-		return REQ_FORCE_QUIT;
+	default:
+		break;
 	}
 
-	/* The quit-all, write-all-and-quit, and quit-with-error families. A
-	 * trailing '!' forces past unsaved changes. */
-	{
-		static const char *const qall[] = {
-			"qa", "qall", "quita", "quitall", NULL,
-		};
-		static const char *const wqall[] = {
-			"wqa", "wqall", "xa", "xall", NULL,
-		};
-		static const char *const cquit[] = {
-			"cq", "cquit", NULL,
-		};
-		char base[32];
-		int force = 0;
-		size_t bl = strlen(p);
-
-		if (bl > 0 && p[bl - 1] == '!') {
-			force = 1;
-			bl--;
-		}
-		if (bl < sizeof(base)) {
-			memcpy(base, p, bl);
-			base[bl] = '\0';
-
-			if (vi_ex_match(base, cquit))
-				return REQ_QUIT_ERR;	/* exit nonzero */
-			if (vi_ex_match(base, qall)) {
-				if (!force && text_dirty(e->t)) {
-					snprintf(e->status, sizeof(e->status),
-					    "E37: no write since last change"
-					    " (add ! to override)");
-					return REQ_CONTINUE;
-				}
-				return REQ_FORCE_QUIT;
-			}
-			if (vi_ex_match(base, wqall)) {
-				if (!e->has_name) {
-					snprintf(e->status, sizeof(e->status),
-					    "E32: no file name");
-					return REQ_CONTINUE;
-				}
-				if (text_save(e->t, e->path) < 0) {
-					snprintf(e->status, sizeof(e->status),
-					    "save failed: %s",
-					    strerror(errno));
-					return REQ_CONTINUE;
-				}
-				return REQ_FORCE_QUIT;
-			}
-		}
-	}
-
-	snprintf(e->status, sizeof(e->status), "E492: not a command: %.80s", p);
+unknown:
+	snprintf(e->status, sizeof(e->status), "E492: not an editor command: "
+	    "%.80s", after);
 	return REQ_CONTINUE;
 }
 

@@ -509,9 +509,14 @@ $`, `w b e`, `gg G`, `f F t T`, `; ,`, `{ } ( )`, `% H M L |`, counts such as
 `3j`, the operators `d c y` with motions (`dw`, `d$`, `dt`), `cc dd yy`, `x`,
 `p`, `u`, and `i a A I o O` to insert. `Ctrl-Home` and `Ctrl-End` jump to the
 first and last line, the same as `gg` and `G`, and work in insert mode too. `ZZ`
-writes and quits, `ZQ` quits without writing. The `:` line runs
-`w q wq q! qa wqa cq`, `:N`, `:set number` / `:set nonumber`, and `:set wrap` /
-`:set nowrap`. `/` and `?` search incrementally (forward and backward, the
+writes and quits, `ZQ` quits without writing. The `:` line runs `write`, `quit`,
+`wq`, `xit`, `qall`, `wqall`, `cquit`, `edit`, `enew`, `read`, `buffer`,
+`bnext`, `bprevious`, `bdelete`, `buffers`, `tag`, `pop`, `retab`, `:N`,
+`:set number` / `:set nonumber`, and `:set wrap` / `:set nowrap`. Command names
+follow the usual vi abbreviation rule: any leading prefix of the full name down
+to its standard short form works, so `:s` is `:substitute`, `:e` is `:edit`,
+`:w` is `:write`, `:bn` is `:bnext`, while `:se` stays `:set` and `:sy` is
+`:syntax`. `/` and `?` search incrementally (forward and backward, the
 cursor following the first match as you type, Esc restoring the start) and `n` /
 `N` repeat. Searches and substitutions take regular expressions. Substitution
 follows the usual vi forms: `:s/old/new/`, `:s/old/new/g` for every match on the
