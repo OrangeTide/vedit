@@ -326,6 +326,256 @@ fuzz_clipboard(void)
 	memio_free(&m);
 }
 
+/* ---- editing: a differential model with full undo/redo replay ---- */
+
+/* A flat reference document: the buffer content as one byte string, lines
+ * joined by '\n'. It is the oracle the Text buffer is checked against. */
+struct doc {
+	char	*b;
+	size_t	 len;
+	size_t	 cap;
+};
+
+static int
+doc_reserve(struct doc *d, size_t need)
+{
+	size_t nc;
+	char *nb;
+
+	if (need <= d->cap)
+		return 0;
+	nc = d->cap ? d->cap : 32;
+	while (nc < need)
+		nc *= 2;
+	nb = realloc(d->b, nc);
+	if (!nb)
+		return -1;
+	d->b = nb;
+	d->cap = nc;
+	return 0;
+}
+
+/* Count lines: one more than the number of newlines. */
+static size_t
+doc_nlines(const struct doc *d)
+{
+	size_t i, n = 1;
+
+	for (i = 0; i < d->len; i++)
+		if (d->b[i] == '\n')
+			n++;
+	return n;
+}
+
+/* Byte offset where line begins and its length (to the next '\n' or the end). */
+static void
+doc_lineinfo(const struct doc *d, size_t line, size_t *start, size_t *llen)
+{
+	size_t i, ln = 0, s = 0;
+
+	for (i = 0; i < d->len; i++) {
+		if (d->b[i] == '\n') {
+			if (ln == line) {
+				*start = s;
+				*llen = i - s;
+				return;
+			}
+			ln++;
+			s = i + 1;
+		}
+	}
+	*start = s;				/* the last line */
+	*llen = d->len - s;
+}
+
+/* Remove del bytes at off and insert nins bytes there, mirroring an edit. */
+static int
+doc_splice(struct doc *d, size_t off, size_t del, const char *ins, size_t nins)
+{
+	if (doc_reserve(d, d->len - del + nins + 1) != 0)
+		return -1;
+	memmove(d->b + off + nins, d->b + off + del, d->len - off - del);
+	if (nins)
+		memcpy(d->b + off, ins, nins);
+	d->len = d->len - del + nins;
+	return 0;
+}
+
+/* Serialize the Text buffer the way doc stores it; caller frees. */
+static char *
+text_serialize(Text *t, size_t *lenout)
+{
+	size_t n = text_lines(t), i, len = 0, cap = 64;
+	char *s = malloc(cap);
+
+	if (!s)
+		return NULL;
+	for (i = 0; i < n; i++) {
+		size_t ll = 0;
+		const char *l = text_line(t, i, &ll);
+
+		while (len + ll + 2 > cap) {
+			char *ns = realloc(s, cap *= 2);
+
+			if (!ns) {
+				free(s);
+				return NULL;
+			}
+			s = ns;
+		}
+		if (ll)
+			memcpy(s + len, l, ll);
+		len += ll;
+		if (i + 1 < n)
+			s[len++] = '\n';
+	}
+	*lenout = len;
+	return s;
+}
+
+/* Abort if the Text buffer and the model have diverged. */
+static void
+edit_check(Text *t, const struct doc *d, const char *where)
+{
+	size_t tl = 0;
+	char *ts = text_serialize(t, &tl);
+
+	if (!ts)
+		return;				/* out of memory: skip the check */
+	if (tl != d->len || (tl && memcmp(ts, d->b, tl) != 0)) {
+		fprintf(stderr, "edit: %s: buffer diverged from model "
+		    "(buffer %zu bytes, model %zu)\n", where, tl, d->len);
+		abort();
+	}
+	free(ts);
+}
+
+/* Drive a random run of primitive edits against both the Text buffer and the
+ * flat model, checking they agree after every edit, then undo the whole run and
+ * redo it, checking the buffer against a snapshot of every intermediate state.
+ * This is the core data-integrity fuzzer: an editor must never drop or corrupt
+ * a byte, and every edit must be exactly reversible. */
+static void
+fuzz_edit(void)
+{
+	enum { MAXSNAP = 64 };
+	Text *t = text_new();
+	struct doc d = { NULL, 0, 0 };
+	char *snap[MAXSNAP];
+	size_t snaplen[MAXSNAP];
+	int nsnap = 0, j;
+	size_t nops = 1 + rnd_below(40), i;
+
+	if (!t)
+		return;
+	snap[nsnap] = malloc(1);		/* the initial empty state */
+	if (!snap[nsnap]) {
+		text_free(t);
+		return;
+	}
+	snaplen[nsnap++] = 0;
+
+	for (i = 0; i < nops && nsnap < MAXSNAP; i++) {
+		size_t nlines = doc_nlines(&d);
+		size_t line = rnd_below(nlines);
+		size_t start = 0, llen = 0, col;
+		int did = 0;
+
+		doc_lineinfo(&d, line, &start, &llen);
+		col = rnd_below(llen + 1);
+
+		switch (rnd_below(4)) {
+		case 0: {				/* insert */
+			char ins[8];
+			size_t k, n = 1 + rnd_below(sizeof(ins));
+
+			for (k = 0; k < n; k++) {
+				int c;
+
+				do {
+					c = (int)(rnd() & 0x7f);
+				} while (c == '\n' || c == '\0');
+				ins[k] = (char)c;
+			}
+			if (text_insert(t, line, col, ins, n) == OK)
+				did = doc_splice(&d, start + col, 0, ins, n) == 0;
+			break;
+		}
+		case 1:					/* delete within the line */
+			if (llen - col >= 1) {
+				size_t avail = llen - col;
+				size_t n = 1 + rnd_below(avail + 2); /* may over-ask */
+				size_t eff = n > avail ? avail : n;  /* clamp like the op */
+
+				if (text_delete(t, line, col, n) == OK)
+					did = doc_splice(&d, start + col, eff,
+					    NULL, 0) == 0;
+			}
+			break;
+		case 2:					/* split the line */
+			if (text_split(t, line, col) == OK)
+				did = doc_splice(&d, start + col, 0, "\n", 1) == 0;
+			break;
+		case 3:					/* join with the next line */
+			if (line + 1 < nlines && text_join(t, line) == OK)
+				did = doc_splice(&d, start + llen, 1, NULL, 0) == 0;
+			break;
+		}
+
+		if (!did)
+			continue;
+		edit_check(t, &d, "forward");
+		text_undo_boundary(t);			/* keep undo steps 1:1 */
+		snap[nsnap] = malloc(d.len ? d.len : 1);
+		if (!snap[nsnap])
+			break;
+		if (d.len)
+			memcpy(snap[nsnap], d.b, d.len);
+		snaplen[nsnap++] = d.len;
+	}
+
+	/* Undo every recorded edit, checking the buffer against each prior state. */
+	for (j = nsnap - 1; j > 0; j--) {
+		size_t ln = 0, cl = 0, tl = 0;
+		char *ts;
+
+		if (text_undo(t, &ln, &cl) != OK) {
+			fprintf(stderr, "edit: undo exhausted early at step %d\n", j);
+			abort();
+		}
+		ts = text_serialize(t, &tl);
+		if (ts && (tl != snaplen[j - 1] ||
+		    (tl && memcmp(ts, snap[j - 1], tl) != 0))) {
+			fprintf(stderr, "edit: undo to state %d mismatch\n", j - 1);
+			abort();
+		}
+		free(ts);
+	}
+
+	/* Redo it all, checking the buffer against each forward state again. */
+	for (j = 1; j < nsnap; j++) {
+		size_t ln = 0, cl = 0, tl = 0;
+		char *ts;
+
+		if (text_redo(t, &ln, &cl) != OK) {
+			fprintf(stderr, "edit: redo exhausted early at step %d\n", j);
+			abort();
+		}
+		ts = text_serialize(t, &tl);
+		if (ts && (tl != snaplen[j] ||
+		    (tl && memcmp(ts, snap[j], tl) != 0))) {
+			fprintf(stderr, "edit: redo to state %d mismatch\n", j);
+			abort();
+		}
+		free(ts);
+	}
+
+	for (j = 0; j < nsnap; j++)
+		free(snap[j]);
+	free(d.b);
+	text_free(t);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -346,6 +596,7 @@ main(int argc, char **argv)
 		fuzz_config();
 		fuzz_utf8();
 		fuzz_clipboard();
+		fuzz_edit();
 	}
 
 	printf("torture: %ld rounds, seed %llu, ok\n", rounds, seed);

@@ -196,6 +196,53 @@ t_syntax_refine(Test *t)
 	    out[1], out[5]);
 }
 
+/* Serialize the whole buffer the way the file on disk would read: each line's
+ * bytes in order, joined by '\n', with no trailing newline. Caller frees. */
+static char *
+text_dump(Text *tx, size_t *lenout)
+{
+	size_t n = text_lines(tx), i, len = 0, cap = 64;
+	char *s = malloc(cap);
+
+	if (!s)
+		return NULL;
+	for (i = 0; i < n; i++) {
+		size_t ll = 0;
+		const char *l = text_line(tx, i, &ll);
+
+		while (len + ll + 2 > cap) {
+			char *ns = realloc(s, cap *= 2);
+
+			if (!ns) {
+				free(s);
+				return NULL;
+			}
+			s = ns;
+		}
+		if (ll)
+			memcpy(s + len, l, ll);
+		len += ll;
+		if (i + 1 < n)
+			s[len++] = '\n';
+	}
+	s[len] = '\0';
+	if (lenout)
+		*lenout = len;
+	return s;
+}
+
+/* True when the buffer serializes to exactly want (a NUL-free string). */
+static int
+dump_is(Text *tx, const char *want)
+{
+	size_t len = 0;
+	char *s = text_dump(tx, &len);
+	int ok = s && len == strlen(want) && memcmp(s, want, len) == 0;
+
+	free(s);
+	return ok;
+}
+
 static void
 t_text_edit_undo(Test *t)
 {
@@ -224,6 +271,85 @@ t_text_edit_undo(Test *t)
 	TAP_CHECK(t, len == 4 && memcmp(s, "ello", 4) == 0);
 
 	text_free(tx);
+}
+
+/* A long editing session exercising insert, delete, split, join, grouped undo,
+ * a full undo/redo sweep, and a save/reload round-trip, checking byte-exact
+ * content at every milestone. This is the data-integrity guard for the editor:
+ * nothing it does should silently drop or corrupt a byte. */
+static void
+t_edit_roundtrip(Test *t)
+{
+	Text *tx = text_new(), *re = NULL;
+	size_t line = 0, col = 0, len = 0;
+	char path[64];
+	char *final = NULL, *reloaded = NULL;
+
+	TAP_ASSERT(t, tx != NULL);
+
+	/* Build three lines from nothing with inserts and splits. */
+	TAP_CHECK(t, text_insert(tx, 0, 0, "The quick", 9) == OK);
+	TAP_CHECK(t, text_split(tx, 0, 9) == OK);	/* open line 1 */
+	TAP_CHECK(t, text_insert(tx, 1, 0, "brown fox", 9) == OK);
+	TAP_CHECK(t, text_split(tx, 1, 9) == OK);	/* open line 2 */
+	TAP_CHECK(t, text_insert(tx, 2, 0, "jumps over", 10) == OK);
+	TAP_CHECK(t, dump_is(tx, "The quick\nbrown fox\njumps over"));
+
+	/* Insert inside a line, then delete part of another. */
+	TAP_CHECK(t, text_insert(tx, 0, 3, " very", 5) == OK);	/* "The very quick" */
+	TAP_CHECK(t, dump_is(tx, "The very quick\nbrown fox\njumps over"));
+	TAP_CHECK(t, text_delete(tx, 2, 5, 5) == OK);		/* drop " over" */
+	TAP_CHECK(t, dump_is(tx, "The very quick\nbrown fox\njumps"));
+
+	/* Join line 1 onto line 0, splitting the three lines down to two. */
+	TAP_CHECK(t, text_join(tx, 1) == OK);
+	TAP_CHECK(t, dump_is(tx, "The very quick\nbrown foxjumps"));
+
+	/* A grouped edit must undo and redo as a single unit. */
+	text_undo_group_begin(tx);
+	TAP_CHECK(t, text_insert(tx, 0, 0, "[", 1) == OK);
+	TAP_CHECK(t, text_insert(tx, 0, 1, "]", 1) == OK);
+	text_undo_group_end(tx);
+	TAP_CHECK(t, dump_is(tx, "[]The very quick\nbrown foxjumps"));
+	TAP_CHECK(t, text_undo(tx, &line, &col) == OK);		/* both inserts */
+	TAP_CHECK(t, dump_is(tx, "The very quick\nbrown foxjumps"));
+	TAP_CHECK(t, text_redo(tx, &line, &col) == OK);
+	TAP_CHECK(t, dump_is(tx, "[]The very quick\nbrown foxjumps"));
+
+	final = text_dump(tx, &len);
+	TAP_ASSERT(t, final != NULL);
+
+	/* Undo everything: the buffer must return to a single empty line. */
+	while (text_undo(tx, &line, &col) == OK)
+		;
+	TAP_CHECK(t, text_lines(tx) == 1 && dump_is(tx, ""));
+
+	/* Redo everything: byte-identical to the state before the undo sweep. */
+	while (text_redo(tx, &line, &col) == OK)
+		;
+	TAP_CHECK(t, dump_is(tx, final));
+
+	/* Save and reload: the bytes must survive a disk round-trip intact. */
+	snprintf(path, sizeof(path), "/tmp/vedit_rtXXXXXX");
+	{
+		int fd = mkstemp(path);
+
+		TAP_ASSERT(t, fd >= 0);
+		close(fd);
+	}
+	TAP_ASSERT(t, text_save(tx, path) == OK);
+	re = text_new();
+	TAP_ASSERT(t, re != NULL && text_load(re, path) == OK);
+	reloaded = text_dump(re, &len);
+	TAP_ASSERT(t, reloaded != NULL);
+	TAP_CHECKF(t, strcmp(final, reloaded) == 0,
+	    "reload mismatch:\n  saved=[%s]\n  read =[%s]", final, reloaded);
+
+	remove(path);
+	free(final);
+	free(reloaded);
+	text_free(tx);
+	text_free(re);
 }
 
 static void
@@ -1839,6 +1965,7 @@ const Case tap_cases[] = {
 	{ "syntax_block_comment_carry", t_syntax_block_comment_carry },
 	{ "syntax_refine", t_syntax_refine },
 	{ "text_edit_undo", t_text_edit_undo },
+	{ "edit_roundtrip", t_edit_roundtrip },
 	{ "multiline_buffer", t_multiline_buffer },
 	{ "pick_fit", t_pick_fit },
 	{ "filepick_cmp", t_filepick_cmp },
