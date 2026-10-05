@@ -4887,6 +4887,10 @@ typedef enum edit_mode {
 	MODE_INSERT,		/* vi insert mode */
 } Mode;
 
+/* Marker stored in e->vi_visual for a Ctrl-V block selection (the control code
+ * Ctrl-V itself), alongside 'v' charwise and 'V' linewise. */
+#define VI_VBLOCK 0x16
+
 /* What the main loop must do after a command; save and quit may prompt, so
  * they are carried out there where the input stream is available. */
 typedef enum req {
@@ -5031,6 +5035,12 @@ typedef struct editor {
 	char		vi_last_fT;	/* last f/F/t/T, for ; and , */
 	uint32_t	vi_last_fT_ch;	/* the target char it searched for */
 	int		vi_zpending;	/* a leading 'Z' is awaiting its pair */
+	/* visual-block (Ctrl-V) insert/append in progress */
+	int		vi_block_insert;	/* a block I/A insert is active */
+	int		vi_bi_append;	/* that insert appends (A) vs inserts (I) */
+	size_t		vi_bi_col;	/* block column the lower rows receive */
+	size_t		vi_bi_start;	/* column the top-row insert began at */
+	size_t		vi_bi_y1, vi_bi_y2;	/* block row range to replicate over */
 
 	/* runtime config reload (set by the standalone CLI) */
 	char		cfg_path[PATH_MAX];	/* config file to re-read, or "" */
@@ -7380,6 +7390,8 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 			mode = "-- VISUAL --  ";
 		else if (e->vi_visual == 'V')
 			mode = "-- VISUAL LINE --  ";
+		else if (e->vi_visual == VI_VBLOCK)
+			mode = "-- VISUAL BLOCK --  ";
 		else if (e->mode == MODE_NORMAL)
 			mode = "-- NORMAL --  ";
 		else if (e->mode == MODE_INSERT)
@@ -9442,6 +9454,7 @@ clip_set(Editor *e, char *bytes, size_t len)
 	free(e->clip);
 	e->clip = bytes;
 	e->clip_len = len;
+	e->clip_block = 0;	/* a plain copy; block copies set this themselves */
 	/* Mirror to the terminal's clipboard via OSC 52 only when the config
 	 * opted in; by default a copy stays in the internal clipboard so the
 	 * common case never depends on OSC 52 working. */
@@ -10410,6 +10423,8 @@ static const struct {
 	{ "i a o I A O",	"Enter insert mode (Esc returns to normal)" },
 	{ "x  dd cc yy",	"Delete char, cut / change / yank a line" },
 	{ "d c y + motion",	"Operate over a motion" },
+	{ "v  V  Ctrl-V",	"Visual char / line / block select" },
+	{ "block: d y I A",	"Delete, yank, insert at left, append at right" },
 	{ "p / P",		"Paste after / before the cursor" },
 	{ "u / Ctrl-R",		"Undo / redo" },
 	{ "/ text  n",		"Search forward, repeat the last search" },
@@ -16706,6 +16721,173 @@ vi_apply_operator(Editor *e, char op, Motion m)
 
 /* Put the register after (or before) the cursor: linewise as new lines,
  * charwise inline. */
+/* Insert n spaces at the end of line y so its length reaches col. */
+static void
+vi_pad_to_col(Editor *e, size_t y, size_t col)
+{
+	size_t len = text_line_len(e->t, y), off = len, need;
+	char sp[128];
+
+	if (len >= col)
+		return;
+	need = col - len;
+	memset(sp, ' ', sizeof(sp));
+	while (need) {
+		size_t chunk = need < sizeof(sp) ? need : sizeof(sp);
+
+		text_insert(e->t, y, off, sp, chunk);
+		off += chunk;
+		need -= chunk;
+	}
+}
+
+/* Visual-block delete: copy the rectangle to the register (blockwise), then
+ * remove those columns from each row so the text closes up. One undo step. */
+static void
+vi_block_delete(Editor *e)
+{
+	size_t y1, y2, x1, x2, y;
+
+	if (!e->sel_active)
+		return;
+	draw_block_bounds(e, &y1, &y2, &x1, &x2);
+	draw_block_copy(e);			/* fills the register, clip_block=1 */
+	text_undo_group_begin(e->t);
+	for (y = y1; y <= y2 && y < text_lines(e->t); y++) {
+		size_t len = text_line_len(e->t, y);
+		size_t a = x1 < len ? x1 : len;
+		size_t b = (x2 + 1) < len ? x2 + 1 : len;
+
+		if (b > a)
+			text_delete(e->t, y, a, b - a);
+		hl_touch(e, y);
+	}
+	text_undo_group_end(e->t);
+	e->cy = y1;
+	e->cx = x1;
+	vi_clamp(e);
+	snprintf(e->status, sizeof(e->status), "deleted %zux%zu block",
+	    x2 - x1 + 1, y2 - y1 + 1);
+}
+
+/* Visual-block yank: copy the rectangle blockwise, cursor to its top-left. */
+static void
+vi_block_yank(Editor *e)
+{
+	size_t y1, y2, x1, x2;
+
+	if (!e->sel_active)
+		return;
+	draw_block_bounds(e, &y1, &y2, &x1, &x2);
+	draw_block_copy(e);
+	e->cy = y1;
+	e->cx = x1;
+	vi_clamp(e);
+}
+
+/* Enter insert mode for a block I (left edge) or A (right edge). The typed text
+ * is replicated down the other rows by vi_block_insert_finish on Esc. The whole
+ * session is one undo step, opened here and closed by the insert-mode Esc. */
+static void
+vi_block_insert_enter(Editor *e, int append)
+{
+	size_t y1, y2, x1, x2, col, len;
+
+	draw_block_bounds(e, &y1, &y2, &x1, &x2);
+	col = append ? x2 + 1 : x1;
+	e->vi_visual = 0;
+	e->sel_active = 0;
+	e->sel_block = 0;
+	vi_reset_pending(e);
+	text_undo_group_begin(e->t);
+	e->cy = y1;
+	if (append)
+		vi_pad_to_col(e, y1, col);	/* A reaches col even on a short top row */
+	len = text_line_len(e->t, y1);
+	e->cx = col < len ? col : len;
+	e->vi_block_insert = 1;
+	e->vi_bi_append = append;
+	e->vi_bi_col = col;
+	e->vi_bi_start = e->cx;
+	e->vi_bi_y1 = y1;
+	e->vi_bi_y2 = y2;
+	enter_insert(e);
+}
+
+/* On leaving a block insert, copy what was typed on the top row and apply it to
+ * the lower rows at the block column. Called while the undo group is still open.
+ * I skips rows too short to reach the column; A pads them first. */
+static void
+vi_block_insert_finish(Editor *e)
+{
+	size_t y, col = e->vi_bi_col, start = e->vi_bi_start, len, tlen;
+	const char *s;
+	char *text;
+
+	e->vi_block_insert = 0;
+	if (e->cy != e->vi_bi_y1 || e->cx <= start)
+		return;				/* nothing usable was typed */
+	s = text_line(e->t, e->vi_bi_y1, &len);
+	tlen = e->cx - start;
+	text = malloc(tlen);
+	if (!text)
+		return;
+	memcpy(text, s + start, tlen);
+	for (y = e->vi_bi_y1 + 1; y <= e->vi_bi_y2 && y < text_lines(e->t); y++) {
+		len = text_line_len(e->t, y);
+		if (e->vi_bi_append)
+			vi_pad_to_col(e, y, col);
+		else if (len < col)
+			continue;		/* I leaves short lines alone */
+		text_insert(e->t, y, col, text, tlen);
+		hl_touch(e, y);
+	}
+	free(text);
+}
+
+/* Paste a block-yanked register: insert each row's columns at the paste column
+ * on consecutive lines, padding short lines and creating lines past the end so
+ * the rectangle lands intact. One undo step. */
+static void
+vi_block_put(Editor *e, int after)
+{
+	const char *clip = e->clip;
+	size_t clip_len = e->clip_len, i = 0, col, y, len = 0;
+	const char *s;
+
+	col = e->cx;
+	if (after) {
+		s = text_line(e->t, e->cy, &len);
+		col = (e->cx < len) ? e->cx + rune_len_at(s, len, e->cx) : len;
+	}
+	text_undo_group_begin(e->t);
+	y = e->cy;
+	for (;;) {
+		size_t j = i, rlen;
+
+		while (j < clip_len && clip[j] != '\n')
+			j++;
+		rlen = j - i;
+		while (y >= text_lines(e->t)) {		/* grow the buffer downward */
+			size_t last = text_lines(e->t) - 1;
+
+			text_split(e->t, last, text_line_len(e->t, last));
+		}
+		vi_pad_to_col(e, y, col);
+		if (rlen)
+			text_insert(e->t, y, col, clip + i, rlen);
+		hl_touch(e, y);
+		y++;
+		if (j >= clip_len)
+			break;
+		i = j + 1;
+	}
+	text_undo_group_end(e->t);
+	e->cx = col;
+	vi_clamp(e);
+	snprintf(e->status, sizeof(e->status), "pasted block");
+}
+
 static void
 vi_put(Editor *e, int after)
 {
@@ -16716,6 +16898,11 @@ vi_put(Editor *e, int after)
 	vi_reg_get(e, &clip, &clip_len, &linewise);
 	if (!clip || clip_len == 0) {
 		snprintf(e->status, sizeof(e->status), "clipboard is empty");
+		e->vi_reg = 0;
+		return;
+	}
+	if (e->clip_block && clip == e->clip) {	/* a block-yanked rectangle */
+		vi_block_put(e, after);
 		e->vi_reg = 0;
 		return;
 	}
@@ -17697,6 +17884,13 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 			ed_tag_pop(e);
 			vi_clamp(e);
 			break;
+		case TKBD_KEY_V:			/* Ctrl-V: visual block select */
+			e->vi_visual = VI_VBLOCK;
+			e->sel_active = 1;
+			e->sel_block = 1;
+			e->ay = e->cy;
+			e->ax = e->cx;
+			break;
 		default:
 			break;
 		}
@@ -18040,6 +18234,8 @@ vi_insert_key(Editor *e, const struct tkbd_seq *seq)
 	case TKBD_KEY_ESC:
 		e->mode = MODE_NORMAL;
 		e->vi_overtype = 0;
+		if (e->vi_block_insert)		/* replicate within the open group */
+			vi_block_insert_finish(e);
 		text_undo_group_end(e->t);	/* close the insert session */
 		if (e->cx > 0) {
 			size_t len = 0;
@@ -18118,6 +18314,7 @@ vi_leave_visual(Editor *e)
 {
 	e->vi_visual = 0;
 	e->sel_active = 0;
+	e->sel_block = 0;
 	vi_reset_pending(e);
 }
 
@@ -18185,7 +18382,57 @@ vi_visual_key(Editor *e, const struct tkbd_seq *seq)
 	if (ctrl && seq->type == TKBD_KEY) {
 		if (seq->key == TKBD_KEY_R)	/* no redo while selecting */
 			return REQ_CONTINUE;
+		if (seq->key == TKBD_KEY_V) {	/* Ctrl-V toggles / switches to block */
+			if (e->vi_visual == VI_VBLOCK) {
+				vi_leave_visual(e);
+			} else {
+				e->vi_visual = VI_VBLOCK;
+				e->sel_block = 1;
+			}
+			return REQ_CONTINUE;
+		}
 		return vi_normal_key(e, seq);	/* Ctrl-D/U/F/B scroll */
+	}
+
+	/* Block mode has its own operators; motions and o/O/>/< fall through. */
+	if (e->vi_visual == VI_VBLOCK) {
+		switch (c) {
+		case 'd':
+		case 'x':
+			vi_block_delete(e);
+			vi_leave_visual(e);
+			return REQ_CONTINUE;
+		case 'y':
+			vi_block_yank(e);
+			vi_leave_visual(e);
+			return REQ_CONTINUE;
+		case 'I':
+			vi_block_insert_enter(e, 0);
+			return REQ_CONTINUE;
+		case 'A':
+			vi_block_insert_enter(e, 1);
+			return REQ_CONTINUE;
+		case 'v':
+		case 'V':
+			e->vi_visual = (char)c;	/* switch to charwise / linewise */
+			e->sel_block = 0;
+			return REQ_CONTINUE;
+		/* no block form yet: swallow so they don't act charwise */
+		case 'c':
+		case 's':
+		case 'C':
+		case 'S':
+		case 'r':
+		case 'p':
+		case 'P':
+		case 'i':
+		case 'a':
+		case '~':
+		case 'J':
+			return REQ_CONTINUE;
+		default:
+			break;			/* o/O, >/<, and motions below */
+		}
 	}
 
 	switch (c) {

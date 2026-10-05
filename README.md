@@ -538,7 +538,13 @@ it.
 Press F2 to switch to the vi personality. NORMAL mode supports `h j k l`, `0 ^
 $`, `w b e`, `gg G`, `f F t T`, `; ,`, `{ } ( )`, `% H M L |`, counts such as
 `3j`, the operators `d c y` with motions (`dw`, `d$`, `dt`), `cc dd yy`, `x`,
-`p`, `u`, and `i a A I o O` to insert. `Ctrl-Home` and `Ctrl-End` jump to the
+`p`, `u`, and `i a A I o O` to insert. Visual mode selects text: `v` charwise,
+`V` linewise, and `Ctrl-V` blockwise, after which an operator acts on the
+selection. A blockwise selection (a column rectangle) supports `d`/`x` to delete
+the columns, `y` to yank them, and `I` / `A` to insert at the left edge or append
+past the right edge, replicating the typed text down every row when you press
+Esc; a block yanked or deleted this way pastes back as a rectangle with `p`.
+`Ctrl-Home` and `Ctrl-End` jump to the
 first and last line, the same as `gg` and `G`, and work in insert mode too. `ZZ`
 writes and quits, `ZQ` quits without writing. The `:` line runs `write`, `quit`,
 `wq`, `xit`, `qall`, `wqall`, `cquit`, `edit`, `enew`, `read`, `buffer`,

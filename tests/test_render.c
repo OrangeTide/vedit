@@ -504,6 +504,128 @@ t_reload_config(Test *t)
 	rmdir(dir);
 }
 
+/* True when line y of the buffer equals the NUL-terminated want. */
+static int
+vline_is(struct vedit *v, size_t y, const char *want)
+{
+	size_t len = 0;
+	const char *s = text_line(v->e.t, y, &len);
+
+	return s && len == strlen(want) && memcmp(s, want, len) == 0;
+}
+
+/* Ctrl-V block delete removes the column range from every spanned row. */
+static void
+t_vblock_delete(Test *t)
+{
+	static const char *const L[] = { "abcdef", "ghijkl", "mnopqr" };
+	const char keys[] = "\x16jjld";	/* Ctrl-V, down, down, right, delete */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 3);
+	v->e.mode = MODE_NORMAL;
+	vedit_run(v);
+
+	TAP_CHECK(t, vline_is(v, 0, "cdef"));	/* columns 0-1 removed */
+	TAP_CHECK(t, vline_is(v, 1, "ijkl"));
+	TAP_CHECK(t, vline_is(v, 2, "opqr"));
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* Ctrl-V then I inserts typed text down the whole block; A appends past it. */
+static void
+t_vblock_insert(Test *t)
+{
+	static const char *const L[] = { "abcdef", "ghijkl", "mnopqr" };
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	/* I at the left edge: "X" prepended to all three rows */
+	{
+		const char keys[] = "\x16jjIX\x1b";	/* block, down x2, I, 'X', Esc */
+
+		memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+		memio_bind(&io, &m);
+		v = vedit_new(&io);
+		TAP_ASSERT(t, v != NULL);
+		fill_lines(v->e.t, L, 3);
+		v->e.mode = MODE_NORMAL;
+		vedit_run(v);
+		TAP_CHECK(t, vline_is(v, 0, "Xabcdef"));
+		TAP_CHECK(t, vline_is(v, 1, "Xghijkl"));
+		TAP_CHECK(t, vline_is(v, 2, "Xmnopqr"));
+		vedit_free(v);
+		memio_free(&m);
+	}
+
+	/* A past the right edge of a 3-wide block (cols 0-2): "Z" at column 3 */
+	{
+		const char keys[] = "\x16jjllAZ\x1b";
+
+		memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+		memio_bind(&io, &m);
+		v = vedit_new(&io);
+		TAP_ASSERT(t, v != NULL);
+		fill_lines(v->e.t, L, 3);
+		v->e.mode = MODE_NORMAL;
+		vedit_run(v);
+		TAP_CHECK(t, vline_is(v, 0, "abcZdef"));
+		TAP_CHECK(t, vline_is(v, 1, "ghiZjkl"));
+		TAP_CHECK(t, vline_is(v, 2, "mnoZpqr"));
+		vedit_free(v);
+		memio_free(&m);
+	}
+}
+
+/* Block yank fills a blockwise register; block put inserts the rectangle. */
+static void
+t_vblock_yank_put(Test *t)
+{
+	static const char *const L[] = { "abcdef", "ghijkl", "mnopqr" };
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 3);
+
+	/* select columns 1-2 over all three rows and yank */
+	v->e.ay = 0;
+	v->e.ax = 1;
+	v->e.cy = 2;
+	v->e.cx = 2;
+	v->e.sel_active = 1;
+	v->e.sel_block = 1;
+	vi_block_yank(&v->e);
+	TAP_CHECK(t, v->e.clip_block == 1);
+	TAP_CHECKF(t, v->e.clip_len == 8 &&
+	    memcmp(v->e.clip, "bc\nhi\nno", 8) == 0, "clip '%.*s'",
+	    (int)v->e.clip_len, v->e.clip);
+
+	/* put it inserted at column 0 of the top row, spreading down */
+	v->e.cy = 0;
+	v->e.cx = 0;
+	vi_block_put(&v->e, 0);
+	TAP_CHECK(t, vline_is(v, 0, "bcabcdef"));
+	TAP_CHECK(t, vline_is(v, 1, "highijkl"));
+	TAP_CHECK(t, vline_is(v, 2, "nomnopqr"));
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 #ifndef VEDIT_NO_TOOLS
 /* A fake tool runner, so the IDE-command tests drive the whole event loop
  * (key -> dispatch -> command -> output pane) without forking a shell. */
@@ -667,6 +789,9 @@ const Case tap_cases[] = {
 	{ "gf_header", t_gf_header },
 	{ "buf_dedup", t_buf_dedup },
 	{ "reload_config", t_reload_config },
+	{ "vblock_delete", t_vblock_delete },
+	{ "vblock_insert", t_vblock_insert },
+	{ "vblock_yank_put", t_vblock_yank_put },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_f9_make", t_tool_f9_make },
 	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },
