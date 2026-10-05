@@ -1528,6 +1528,50 @@ t_tool_run(Test *t)
 	rc = cli_run_capture(NULL, "exit 3", ".", cap_emit, &c);
 	TAP_CHECKF(t, rc == 3, "exit-status %d", rc);
 }
+
+/* Diagnostic severity is read from the word after "file:line:col: ". */
+static void
+t_tool_sev(Test *t)
+{
+	TAP_CHECK(t, tool_sev("error: 'x' undeclared") == TSEV_ERROR);
+	TAP_CHECK(t, tool_sev("warning: unused") == TSEV_WARN);
+	TAP_CHECK(t, tool_sev("note: expanded from") == TSEV_NOTE);
+	TAP_CHECK(t, tool_sev("fatal error: no such file") == TSEV_ERROR);
+	TAP_CHECK(t, tool_sev("  WARNING: C4244") == TSEV_WARN);	/* ci + ws */
+	TAP_CHECK(t, tool_sev("undefined reference to foo") == TSEV_ERROR);
+	TAP_CHECK(t, strcmp(tool_sev_name(TSEV_ERROR), "error") == 0);
+	TAP_CHECK(t, strcmp(tool_sev_name(TSEV_WARN), "warning") == 0);
+	TAP_CHECK(t, strcmp(tool_sev_name(TSEV_NOTE), "note") == 0);
+}
+
+/* The count, first-error, and nav-floor helpers over a diagnostics list. */
+static void
+t_tool_nav(Test *t)
+{
+	Editor e;
+	Toolerr errs[3];
+	int ne, nw;
+
+	memset(&e, 0, sizeof(e));
+	memset(errs, 0, sizeof(errs));
+	errs[0].sev = TSEV_WARN;
+	errs[1].sev = TSEV_ERROR;
+	errs[2].sev = TSEV_NOTE;
+	e.tool_errs = errs;
+	e.tool_nerr = 3;
+
+	tool_counts(&e, &ne, &nw);
+	TAP_CHECKF(t, ne == 1 && nw == 1, "counts %d/%d", ne, nw);
+	TAP_CHECKF(t, tool_first_error(&e) == 1, "first %d",
+	    tool_first_error(&e));
+	/* an error is present, so stepping floors at errors */
+	TAP_CHECK(t, tool_nav_floor(&e) == TSEV_ERROR);
+
+	/* with no errors, the floor drops to warnings */
+	errs[1].sev = TSEV_WARN;
+	TAP_CHECK(t, tool_first_error(&e) == -1);
+	TAP_CHECK(t, tool_nav_floor(&e) == TSEV_WARN);
+}
 #endif /* VEDIT_NO_TOOLS */
 
 static void
@@ -1755,6 +1799,8 @@ const Case tap_cases[] = {
 	{ "cc_db", t_cc_db },
 	{ "cc_cache", t_cc_cache },
 #ifndef VEDIT_NO_TOOLS
+	{ "tool_sev", t_tool_sev },
+	{ "tool_nav", t_tool_nav },
 	{ "tool_expand", t_tool_expand },
 	{ "tool_parse", t_tool_parse },
 	{ "tool_run", t_tool_run },

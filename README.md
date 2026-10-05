@@ -584,10 +584,21 @@ you want. For example:
 ```
 
 Compile and Make capture the command's output into a scrollable pane. Output that
-looks like a gcc or clang diagnostic (`file:line:col: ...` or `file:line: ...`)
-becomes a jump target: press Enter on it in the pane, or use `F4` and `Shift+F4`
-from the editor to step through the diagnostics. A diagnostic in another file
-opens or switches to that file. A command marked with a sibling
+looks like a gcc, clang, or MSVC diagnostic (`file:line:col: ...` or
+`file:line: ...`) becomes a jump target: press Enter on it in the pane, or use
+`F4` and `Shift+F4` from the editor to step through them. A diagnostic in another
+file opens or switches to that file.
+
+The severity word after the location (`error`, `warning`, `note`) is read and
+used. The pane colors errors red, warnings yellow, and notes cyan, and the pane
+title and the post-build status line count the errors and warnings separately.
+After a build the cursor lands on the first error, so it is in place the moment
+the pane closes. `F4` and `Shift+F4` step through the errors, skipping warnings
+and notes, and wrap around at the ends. When a build has no errors, they step
+through its warnings instead. Anything that matches the location form but carries
+no recognized severity word, such as a linker line, counts as an error.
+
+A command marked with a sibling
 `<command>.interactive = on` key runs on the real terminal instead, for a program
 that reads input or draws its own screen. vedit leaves the alternate screen while
 it runs and returns when it exits.

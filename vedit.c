@@ -4877,12 +4877,18 @@ typedef enum req {
 } Req;
 
 #ifndef VEDIT_NO_TOOLS
+/* Diagnostic severity, ascending so a higher value is more severe. An
+ * unlabeled "file:line: msg" (a linker line, a custom tool) counts as an
+ * error, so it is still a navigation stop. */
+enum toolsev { TSEV_NOTE, TSEV_WARN, TSEV_ERROR };
+
 /* A parsed compiler diagnostic: where it points, and which captured output
  * line it came from (so the pane can highlight that line). */
 typedef struct toolerr {
 	char	file[PATH_MAX];
 	size_t	line, col;		/* 1-based; col is 0 when absent */
 	int	outline;		/* index into the captured output lines */
+	int	sev;			/* enum toolsev */
 } Toolerr;
 #endif
 
@@ -10347,7 +10353,7 @@ static const struct {
 #ifndef VEDIT_NO_TOOLS
 	{ "Alt+F9 / F9",	"Compile the file / make the project" },
 	{ "Ctrl+F9 / Alt+F5",	"Run the program / view the last output" },
-	{ "F4 / Shift+F4",	"Next / previous build diagnostic" },
+	{ "F4 / Shift+F4",	"Next / previous build error (wraps around)" },
 #endif
 };
 
@@ -13034,7 +13040,8 @@ tool_add_line(Editor *e, const char *s, size_t n)
 }
 
 static void
-tool_add_err(Editor *e, const char *file, size_t line, size_t col, int outline)
+tool_add_err(Editor *e, const char *file, size_t line, size_t col, int outline,
+    int sev)
 {
 	Toolerr *te;
 
@@ -13052,6 +13059,39 @@ tool_add_err(Editor *e, const char *file, size_t line, size_t col, int outline)
 	te->line = line;
 	te->col = col;
 	te->outline = outline;
+	te->sev = sev;
+}
+
+/* Case-insensitive test of whether s begins with the lowercase word pfx. */
+static int
+tool_ci_prefix(const char *s, const char *pfx)
+{
+	for (; *pfx; s++, pfx++)
+		if (tolower((unsigned char)*s) != (unsigned char)*pfx)
+			return 0;
+	return 1;
+}
+
+/* Classify the severity word that follows a diagnostic's "file:line:col: ".
+ * gcc, clang, and MSVC all name it; anything unrecognized counts as an error. */
+static int
+tool_sev(const char *p)
+{
+	while (*p == ' ' || *p == '\t')
+		p++;
+	if (tool_ci_prefix(p, "warning"))
+		return TSEV_WARN;
+	if (tool_ci_prefix(p, "note") || tool_ci_prefix(p, "remark"))
+		return TSEV_NOTE;
+	return TSEV_ERROR;		/* error, fatal error, or unlabeled */
+}
+
+/* The display name for a severity. */
+static const char *
+tool_sev_name(int sev)
+{
+	return sev == TSEV_ERROR ? "error" :
+	    sev == TSEV_WARN ? "warning" : "note";
 }
 
 /* The decimal value of capture group m within s. */
@@ -13084,14 +13124,15 @@ tool_parse_line(Editor *e, rx_t *re_col, rx_t *re_nocol, const char *s,
 		memcpy(file, s + m[1].so, n);
 		file[n] = '\0';
 		tool_add_err(e, file, tool_group_num(s, &m[2]),
-		    tool_group_num(s, &m[3]), outline);
+		    tool_group_num(s, &m[3]), outline, tool_sev(s + m[0].eo));
 	} else if (re_nocol && rx_exec(re_nocol, s, strlen(s), 0, m, 3) == 1) {
 		n = (size_t)(m[1].eo - m[1].so);
 		if (n >= sizeof(file))
 			n = sizeof(file) - 1;
 		memcpy(file, s + m[1].so, n);
 		file[n] = '\0';
-		tool_add_err(e, file, tool_group_num(s, &m[2]), 0, outline);
+		tool_add_err(e, file, tool_group_num(s, &m[2]), 0, outline,
+		    tool_sev(s + m[0].eo));
 	}
 }
 
@@ -13170,27 +13211,86 @@ tool_goto_err(Editor *e, int ei)
 	e->sel_active = 0;
 	clamp_col(e);
 	e->tool_curerr = ei;
-	snprintf(e->status, sizeof(e->status), "error %d/%d: %.120s:%zu",
-	    ei + 1, e->tool_nerr, te->file, te->line);
+	snprintf(e->status, sizeof(e->status), "%s %d/%d: %.120s:%zu",
+	    tool_sev_name(te->sev), ei + 1, e->tool_nerr, te->file, te->line);
 	return 0;
 }
 
-/* F4 / Shift+F4: jump to the next or previous diagnostic. */
+/* Count the errors and warnings among the parsed diagnostics. */
+static void
+tool_counts(Editor *e, int *nerr, int *nwarn)
+{
+	int i;
+
+	*nerr = *nwarn = 0;
+	for (i = 0; i < e->tool_nerr; i++) {
+		if (e->tool_errs[i].sev == TSEV_ERROR)
+			(*nerr)++;
+		else if (e->tool_errs[i].sev == TSEV_WARN)
+			(*nwarn)++;
+	}
+}
+
+/* The first error (not warning or note), or -1 when there is none. */
+static int
+tool_first_error(Editor *e)
+{
+	int i;
+
+	for (i = 0; i < e->tool_nerr; i++)
+		if (e->tool_errs[i].sev == TSEV_ERROR)
+			return i;
+	return -1;
+}
+
+/* The highest severity present. Stepping visits only that tier, so with any
+ * error present F4 walks errors and skips warnings and notes; a build with only
+ * warnings still steps through them. */
+static int
+tool_nav_floor(Editor *e)
+{
+	int i, floor = TSEV_NOTE;
+
+	for (i = 0; i < e->tool_nerr; i++)
+		if (e->tool_errs[i].sev > floor)
+			floor = e->tool_errs[i].sev;
+	return floor;
+}
+
+/* F4 / Shift+F4: step to the next or previous diagnostic of the top severity
+ * present, wrapping around at the ends. */
 static void
 ed_err_step(Editor *e, int dir)
 {
-	int next;
+	int floor, start, idx, i, wrapped = 0;
 
 	if (e->tool_nerr == 0) {
 		snprintf(e->status, sizeof(e->status), "no diagnostics");
 		return;
 	}
-	next = e->tool_curerr + dir;
-	if (next < 0)
-		next = 0;
-	if (next >= e->tool_nerr)
-		next = e->tool_nerr - 1;
-	tool_goto_err(e, next);
+	floor = tool_nav_floor(e);
+	start = e->tool_curerr;
+	idx = start;
+	for (i = 0; i < e->tool_nerr; i++) {
+		idx += dir;
+		if (idx < 0) {
+			idx = e->tool_nerr - 1;
+			wrapped = 1;
+		} else if (idx >= e->tool_nerr) {
+			idx = 0;
+			wrapped = 1;
+		}
+		if (e->tool_errs[idx].sev >= floor) {
+			tool_goto_err(e, idx);
+			if (wrapped && start >= 0) {
+				size_t n = strlen(e->status);
+
+				snprintf(e->status + n, sizeof(e->status) - n,
+				    " (wrapped)");
+			}
+			return;
+		}
+	}
 }
 
 /* The diagnostic shown on output line `outline`, or -1. */
@@ -13233,8 +13333,14 @@ dlg_tool_output(Editor *e)
 	}
 	if (e->tool_nerr > 0)
 		cur = e->tool_errs[0].outline;
-	snprintf(hdr, sizeof(hdr), " Output: %s  (%d diagnostic%s)",
-	    e->tool_title, e->tool_nerr, e->tool_nerr == 1 ? "" : "s");
+	{
+		int ne, nw;
+
+		tool_counts(e, &ne, &nw);
+		snprintf(hdr, sizeof(hdr),
+		    " Output: %s  (%d error%s, %d warning%s)", e->tool_title,
+		    ne, ne == 1 ? "" : "s", nw, nw == 1 ? "" : "s");
+	}
 
 	for (;;) {
 		Screen *d = e->d;
@@ -13262,9 +13368,16 @@ dlg_tool_output(Editor *e)
 			    e->tool_lines[idx] : "";
 			Color fg = p->content_fg;
 			uint16_t at = 0;
+			int ei = (idx < e->tool_nlines) ?
+			    tool_err_at(e, idx) : -1;
 
-			if (idx < e->tool_nlines && tool_err_at(e, idx) >= 0)
-				fg = tool_color(9);	/* diagnostic: red */
+			if (ei >= 0) {
+				switch (e->tool_errs[ei].sev) {
+				case TSEV_ERROR: fg = tool_color(9); break;
+				case TSEV_WARN:  fg = tool_color(11); break;
+				default:	 fg = tool_color(14); break;
+				}
+			}
 			if (idx == cur)
 				at = ATTR_REVERSE;
 			ui_field(d, row, 0, e->cols, s, fg, p->content_bg, at);
@@ -13394,20 +13507,26 @@ ed_tool_run(Editor *e, const char *which, const char *label)
 			snprintf(e->status, sizeof(e->status),
 			    "%s finished (exit %d)", label, rc);
 	} else if (e->tools->run_capture) {
+		int fe, ne, nw;
+
 		tool_clear_output(e);
 		snprintf(e->tool_title, sizeof(e->tool_title), "%s", label);
 		rc = e->tools->run_capture(e->tools->ctx, cmd, dir, tool_emit,
 		    e);
 		tool_parse_output(e);
 		e->tool_curerr = -1;
+		fe = tool_first_error(e);
+		if (fe >= 0)			/* land on the first error */
+			tool_goto_err(e, fe);
+		dlg_tool_output(e);
+		tool_counts(e, &ne, &nw);
 		if (rc < 0)
 			snprintf(e->status, sizeof(e->status),
 			    "could not run: %.80s", cmd);
 		else
 			snprintf(e->status, sizeof(e->status),
-			    "%s exited %d, %d diagnostic%s", label, rc,
-			    e->tool_nerr, e->tool_nerr == 1 ? "" : "s");
-		dlg_tool_output(e);
+			    "%s exited %d, %d error%s, %d warning%s", label, rc,
+			    ne, ne == 1 ? "" : "s", nw, nw == 1 ? "" : "s");
 	} else {
 		snprintf(e->status, sizeof(e->status),
 		    "this command is interactive but no tty runner is set");

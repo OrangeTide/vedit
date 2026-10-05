@@ -474,7 +474,15 @@ t_tool_f9_make(Test *t)
 		    v->e.tool_errs[1].line == 7 && v->e.tool_errs[1].col == 0,
 		    "err1 %s:%zu:%zu", v->e.tool_errs[1].file,
 		    v->e.tool_errs[1].line, v->e.tool_errs[1].col);
+		/* severity was classified from the "error:" / "warning:" word */
+		TAP_CHECK(t, v->e.tool_errs[0].sev == TSEV_ERROR &&
+		    v->e.tool_errs[1].sev == TSEV_WARN);
 	}
+
+	/* the build landed on the first error, and the summary counts both */
+	TAP_CHECKF(t, v->e.tool_curerr == 0, "curerr %d", v->e.tool_curerr);
+	TAP_CHECKF(t, strstr(v->e.status, "1 error") != NULL &&
+	    strstr(v->e.status, "1 warning") != NULL, "status '%s'", v->e.status);
 
 	/* the output pane rendered the captured text */
 	TAP_CHECK(t, m.out && strstr(m.out, "undeclared") != NULL);
