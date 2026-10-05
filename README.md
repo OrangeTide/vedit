@@ -630,7 +630,9 @@ Those search directories come from a clang compilation database. Point the
 `cc.file` config key at a `compile_commands.json` and vedit reads the `-I`,
 `-isystem`, and `-iquote` flags from the entry whose `file` matches the buffer.
 The reader understands just that one schema, not arbitrary JSON, and relative
-directories are resolved against the entry's `directory`. Without `cc.file`,
+directories are resolved against the entry's `directory`. Only the include flags
+are read; the compile command itself is never executed, so opening a project does
+not run commands from a file in that project. Without `cc.file`,
 `gf` still searches the current and buffer directories, which covers a small
 project. A build whose include paths a single command line cannot carry can
 still point the Compile and Make commands at a `Makefile` or a wrapper script.
