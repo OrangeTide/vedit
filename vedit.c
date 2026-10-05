@@ -2528,6 +2528,33 @@ static const BoxDef box_tab[BG_COUNT] = {
  * resolvers consult it below the environment and above auto-detection. */
 static const Cfg *g_cfg;
 
+/* Look up a per-project config key, letting an environment variable override the
+ * config file. The variable name is VEDIT_ followed by the key uppercased with
+ * every '.' turned into '_', so tags.file is VEDIT_TAGS_FILE and command.c.build
+ * is VEDIT_COMMAND_C_BUILD. A set, non-empty variable wins over the config;
+ * otherwise the config value is used. Returns NULL when neither is set. This is
+ * reserved for keys that genuinely vary per project (an include or tags path, a
+ * build command), not for editor preferences. */
+static const char *
+cfg_proj_get(const char *key)
+{
+	char env[160];
+	char *p;
+	const char *v;
+	int n;
+
+	n = snprintf(env, sizeof(env), "VEDIT_%s", key);
+	if (n > 0 && (size_t)n < sizeof(env)) {
+		for (p = env + 6; *p; p++)
+			*p = (*p == '.') ? '_'
+			    : (char)toupper((unsigned char)*p);
+		v = getenv(env);
+		if (v && v[0])
+			return v;
+	}
+	return g_cfg ? cfg_get(g_cfg, key) : NULL;
+}
+
 /* A forced mode set from the command line, or -1 for "decide from the
  * environment". box_default() resolves it. */
 static int g_box_force = -1;
@@ -11346,7 +11373,7 @@ tagdb_parse_line(Tagdb *db, char *line)
 static int
 tags_locate(Editor *e, char *out, size_t outsz)
 {
-	const char *cfg = g_cfg ? cfg_get(g_cfg, "tags.file") : NULL;
+	const char *cfg = cfg_proj_get("tags.file");
 	char dir[PATH_MAX];
 
 	if (cfg && cfg[0]) {
@@ -11792,7 +11819,7 @@ cc_resolve(Editor *e, CcIncludes *out)
 	static off_t cache_size;
 	static int cache_valid;
 
-	const char *cfg = g_cfg ? cfg_get(g_cfg, "cc.file") : NULL;
+	const char *cfg = cfg_proj_get("cc.file");
 	struct stat st;
 	char *json = NULL, *p;
 	size_t len = 0, cap = 0;
@@ -12927,10 +12954,10 @@ tool_template(Editor *e, const char *which)
 	const char *lang = tool_lang(e);
 	char key[128];
 
-	if (!lang || !g_cfg)
+	if (!lang)
 		return NULL;
 	snprintf(key, sizeof(key), "command.%s.%s", lang, which);
-	return cfg_get(g_cfg, key);
+	return cfg_proj_get(key);
 }
 
 /* Whether command.<lang>.<which>.interactive is set. */
@@ -13230,8 +13257,12 @@ tool_patterns(rx_t **pats)
 		if (re)
 			pats[npat++] = re;	/* bad regexes are skipped */
 	}
-	pats[npat++] = rx_compile("^([^:]+):([0-9]+):([0-9]+): ", 0, NULL);
-	pats[npat++] = rx_compile("^([^:]+):([0-9]+): ", 0, NULL);
+	/* The file group allows an optional leading drive letter, so a Windows
+	 * path like C:\src\foo.c is not cut off at the drive colon. The
+	 * alternation adds no capture group, so file/line/col stay 1/2/3. */
+	pats[npat++] = rx_compile(
+	    "^([A-Za-z]:[^:]+|[^:]+):([0-9]+):([0-9]+): ", 0, NULL);
+	pats[npat++] = rx_compile("^([A-Za-z]:[^:]+|[^:]+):([0-9]+): ", 0, NULL);
 	return npat;
 }
 

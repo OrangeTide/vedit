@@ -162,6 +162,22 @@ Booleans accept `on`/`off`, `yes`/`no`, `true`/`false`, or `1`/`0`. A missing or
 unreadable file is ignored (an explicit `--config` path that cannot be read
 prints a warning and the editor still starts).
 
+The keys that usually differ from one project to the next can be overridden by an
+environment variable, which is handy in a per-project shell or an `.envrc`. The
+variable is `VEDIT_` followed by the key uppercased with each `.` turned into `_`,
+and a set, non-empty value wins over the config file:
+
+| Config key                 | Environment variable       |
+| -------------------------- | -------------------------- |
+| `tags.file`                | `VEDIT_TAGS_FILE`          |
+| `cc.file`                  | `VEDIT_CC_FILE`            |
+| `command.<lang>.compile`   | `VEDIT_COMMAND_<LANG>_COMPILE` |
+| `command.<lang>.build`     | `VEDIT_COMMAND_<LANG>_BUILD`   |
+| `command.<lang>.run`       | `VEDIT_COMMAND_<LANG>_RUN`     |
+
+Only these per-project keys read the environment; editor preferences such as the
+theme or key mode stay in the config file.
+
 A `[theme "name"]` section defines a custom color scheme that `ui.scheme = name`
 then selects, alongside the three built-ins:
 
@@ -588,9 +604,10 @@ you want. For example:
 
 Compile and Make capture the command's output into a scrollable pane. Output that
 looks like a gcc, clang, or MSVC diagnostic (`file:line:col: ...` or
-`file:line: ...`) becomes a jump target: press Enter on it in the pane, or use
-`F4` and `Shift+F4` from the editor to step through them. A diagnostic in another
-file opens or switches to that file.
+`file:line: ...`, including a Windows `C:\path` with a drive letter) becomes a
+jump target: press Enter on it in the pane, or use `F4` and `Shift+F4` from the
+editor to step through them. A diagnostic in another file opens or switches to
+that file.
 
 Toolchains with a different format are handled by adding `error.pattern` keys
 under `[error]`. Each value is a regular expression where capture group 1 is the

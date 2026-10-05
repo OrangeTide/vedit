@@ -634,6 +634,53 @@ t_cfg_resolve(Test *t)
 	unlink(path);
 }
 
+/* Per-project keys may be overridden by VEDIT_<KEY> environment variables:
+ * env wins over the config, an empty var is treated as unset, and the key's dots
+ * map to underscores with the whole name uppercased. */
+static void
+t_cfg_env(Test *t)
+{
+	static const char *text = "[tags]\nfile = from_config\n";
+	char path[256];
+	Cfg *c = load_cfg_text(text, path, sizeof(path));
+	const Cfg *old = g_cfg;
+
+	TAP_ASSERT(t, c != NULL);
+	g_cfg = c;
+	unsetenv("VEDIT_TAGS_FILE");
+
+	/* config value when no env var is set */
+	TAP_CHECK(t, cfg_proj_get("tags.file") &&
+	    strcmp(cfg_proj_get("tags.file"), "from_config") == 0);
+
+	/* the env var wins over the config */
+	setenv("VEDIT_TAGS_FILE", "from_env", 1);
+	TAP_CHECK(t, strcmp(cfg_proj_get("tags.file"), "from_env") == 0);
+
+	/* a dotted key maps '.' -> '_' and uppercases: command.c.build */
+	setenv("VEDIT_COMMAND_C_BUILD", "make -j", 1);
+	TAP_CHECK(t, cfg_proj_get("command.c.build") &&
+	    strcmp(cfg_proj_get("command.c.build"), "make -j") == 0);
+	unsetenv("VEDIT_COMMAND_C_BUILD");
+
+	/* an empty variable is treated as unset: the config value shows again */
+	setenv("VEDIT_TAGS_FILE", "", 1);
+	TAP_CHECK(t, strcmp(cfg_proj_get("tags.file"), "from_config") == 0);
+	unsetenv("VEDIT_TAGS_FILE");
+
+	/* the override works even with no config loaded at all */
+	g_cfg = NULL;
+	setenv("VEDIT_CC_FILE", "/tmp/cc.json", 1);
+	TAP_CHECK(t, cfg_proj_get("cc.file") &&
+	    strcmp(cfg_proj_get("cc.file"), "/tmp/cc.json") == 0);
+	unsetenv("VEDIT_CC_FILE");
+	TAP_CHECK(t, cfg_proj_get("cc.file") == NULL);	/* neither set */
+
+	g_cfg = old;
+	vedit_cfg_free(c);
+	unlink(path);
+}
+
 static void
 t_cfg_color(Test *t)
 {
@@ -1625,15 +1672,16 @@ t_tool_parse(Test *t)
 	    "gcc -c main.c\n"
 	    "main.c:10:5: error: 'x' undeclared\n"
 	    "util.h:3: warning: unused\n"
+	    "C:\\src\\foo.c:12:7: error: oops\n"	/* a Windows drive path */
 	    "make: *** [all] Error 1\n";
 
 	editor_init(&e);
 	sb_append(&e.tool_raw, &e.tool_rawlen, &e.tool_rawcap, out, strlen(out));
 	tool_parse_output(&e);
 
-	TAP_CHECKF(t, e.tool_nlines == 4, "lines %d", e.tool_nlines);
-	TAP_CHECKF(t, e.tool_nerr == 2, "errors %d", e.tool_nerr);
-	if (e.tool_nerr == 2) {
+	TAP_CHECKF(t, e.tool_nlines == 5, "lines %d", e.tool_nlines);
+	TAP_CHECKF(t, e.tool_nerr == 3, "errors %d", e.tool_nerr);
+	if (e.tool_nerr == 3) {
 		TAP_CHECKF(t, strcmp(e.tool_errs[0].file, "main.c") == 0 &&
 		    e.tool_errs[0].line == 10 && e.tool_errs[0].col == 5 &&
 		    e.tool_errs[0].outline == 1, "err0 %s:%zu:%zu@%d",
@@ -1644,6 +1692,11 @@ t_tool_parse(Test *t)
 		    e.tool_errs[1].outline == 2, "err1 %s:%zu:%zu@%d",
 		    e.tool_errs[1].file, e.tool_errs[1].line,
 		    e.tool_errs[1].col, e.tool_errs[1].outline);
+		TAP_CHECKF(t, strcmp(e.tool_errs[2].file, "C:\\src\\foo.c") == 0 &&
+		    e.tool_errs[2].line == 12 && e.tool_errs[2].col == 7 &&
+		    e.tool_errs[2].outline == 3, "err2 %s:%zu:%zu@%d",
+		    e.tool_errs[2].file, e.tool_errs[2].line,
+		    e.tool_errs[2].col, e.tool_errs[2].outline);
 	}
 	tool_free(&e);
 }
@@ -1974,6 +2027,7 @@ const Case tap_cases[] = {
 	{ "filepick_start_dir", t_filepick_start_dir },
 	{ "cfg_parse", t_cfg_parse },
 	{ "cfg_resolve", t_cfg_resolve },
+	{ "cfg_env", t_cfg_env },
 	{ "cfg_color", t_cfg_color },
 	{ "cfg_theme", t_cfg_theme },
 	{ "jsf_charset", t_jsf_charset },
