@@ -5380,6 +5380,7 @@ struct term {
 	int		dead;		/* child has exited */
 	int		exit_status;
 	int		tool;		/* runs a build command: output is also captured */
+	int		pane;		/* shown in the pane under the text buffer */
 	char		tool_label[TOOLTITLE_MAX];	/* frame label for a tool terminal */
 	int		rows, cols;	/* grid size (matches the text area) */
 	struct vt_state	*vt;
@@ -5518,6 +5519,7 @@ typedef struct editor {
 	char	tool_title[TOOLTITLE_MAX];	/* label of the last command, for the pane */
 	char	tool_dir[PATH_MAX];	/* directory the last command ran in */
 	int		tool_in_term;		/* run build commands in a terminal buffer */
+	int		tool_in_pane;		/* ... shown in the pane under the text */
 	int		tool_done_pending;	/* a tool terminal exited; parse on the next tick */
 	char	tool_result[STATUS_MAX];	/* "Make exited 0, ..." for the frame */
 #endif
@@ -5626,6 +5628,7 @@ typedef struct editor {
 	Term		*vterm;		/* active buffer's terminal session, or NULL */
 	int		term_dirty;	/* active terminal output pending a render */
 	int		term_prefix;	/* 1 = Ctrl-W seen, awaiting a command key */
+	int		pane_focus;	/* keys go to the pane's terminal, not the text */
 } Editor;
 
 #ifdef VEDIT_TERM
@@ -5639,7 +5642,17 @@ static int term_loop_step(Editor *e);		/* one wait/input/render tick */
 static void term_resize_all(Editor *e);		/* match ptys to the text area */
 static void term_buf_free(Buf *b);		/* reap child, free a term buffer */
 static int term_open_argv(Editor *e, char *const argv[], const char *dir,
-    const char *label);			/* spawn argv in a new terminal buffer */
+    const char *label, int rows);		/* spawn argv in a new terminal buffer */
+static Term *term_focus(Editor *e);		/* terminal the keys go to, or NULL */
+static int pane_open(Editor *e, char *const argv[], const char *dir,
+    const char *label);			/* spawn argv in the bottom pane */
+static void pane_run(Editor *e, const char *cmd);	/* :split [cmd] */
+static void pane_close(Editor *e);		/* close the pane's terminal */
+static void pane_key(Editor *e);		/* Ctrl-W from a text buffer */
+static int pane_shown(const Editor *e);		/* the pane is on screen */
+static Term *pane_term(const Editor *e, int *idx);	/* the pane's terminal */
+static void pane_render(Editor *e, Screen *d);	/* draw the pane under the text */
+static const char *term_title(const Term *t);	/* OSC title, label, or "terminal" */
 #ifndef VEDIT_NO_TOOLS
 static Term *tool_term_find(const Editor *e, int *idx);	/* the build terminal */
 static int tool_poll_done(Editor *e);		/* finish an exited build */
@@ -7470,12 +7483,83 @@ ed_chrome(const Editor *e)
 	}
 }
 
-/* Height of the framed text area (rows minus menu, two borders, status). */
-int
-text_height(const Editor *e)
+/* Height of the whole framed text area (rows minus menu, two borders,
+ * status), before any bottom pane is taken out of it. */
+static int
+text_height_full(const Editor *e)
 {
 	int h = e->rows - CHROME_TOP - CHROME_BOTTOM;
 
+	return h < 1 ? 1 : h;
+}
+
+#ifdef VEDIT_TERM
+/* ---- the bottom pane ---------------------------------------------------- *
+ * One terminal buffer can be shown in a pane under the current text buffer:
+ * the build output, a shell, a log. The pane is the simplest split that pays
+ * off: the text keeps the editor's one set of cursor and scroll state, and a
+ * terminal carries its own grid, so drawing it below costs nothing extra. The
+ * pane's terminal is marked by a flag on the Term, never by a stored index,
+ * so closing it as a buffer leaves nothing dangling. */
+
+#define PANE_MIN_TOTAL	8	/* full text rows needed before a pane is shown */
+#define PANE_MIN_ROWS	3	/* smallest pane */
+
+/* The terminal flagged for the pane, or NULL; its buffer index to *idx. */
+static Term *
+pane_term(const Editor *e, int *idx)
+{
+	int i;
+
+	for (i = 0; i < e->nbuf; i++) {
+		Term *t = (i == e->cur)
+		    ? (e->kind == BUF_TERM ? e->vterm : NULL)
+		    : (e->bufs[i].kind == BUF_TERM ? e->bufs[i].vterm : NULL);
+
+		if (t && t->pane) {
+			if (idx)
+				*idx = i;
+			return t;
+		}
+	}
+	return NULL;
+}
+
+/* Rows the pane takes: a third of the text area, within its limits. */
+static int
+pane_height(const Editor *e)
+{
+	int full = text_height_full(e);
+	int h = full / 3;
+
+	if (h < PANE_MIN_ROWS)
+		h = PANE_MIN_ROWS;
+	if (h > full - 4)
+		h = full - 4;
+	return h < 1 ? 1 : h;
+}
+
+/* Whether the pane is on screen: it has a terminal, a text buffer is current
+ * (a terminal buffer takes the whole area), and the window is tall enough. */
+static int
+pane_shown(const Editor *e)
+{
+	return e->kind == BUF_TEXT && text_height_full(e) >= PANE_MIN_TOTAL &&
+	    pane_term(e, NULL) != NULL;
+}
+#endif /* VEDIT_TERM */
+
+/* Height of the text area the current buffer draws in: the frame minus the
+ * pane and its separator row when the pane is shown. */
+int
+text_height(const Editor *e)
+{
+	int h = text_height_full(e);
+
+#ifdef VEDIT_TERM
+	if (pane_shown(e))
+		h -= pane_height(e) + 1;
+#endif
 	return h < 1 ? 1 : h;
 }
 
@@ -7600,7 +7684,7 @@ typedef enum menu_act {
 	MA_COMPILE, MA_MAKE, MA_RUN, MA_VIEW_OUTPUT, MA_ERR_NEXT, MA_ERR_PREV,
 #endif
 #ifdef VEDIT_TERM
-	MA_TERM_NEW, MA_TERM_CLOSE,
+	MA_TERM_NEW, MA_TERM_CLOSE, MA_TERM_SPLIT, MA_PANE_CLOSE,
 #endif
 	MA_HELP, MA_TUTORIAL, MA_ABOUT,
 } Menuact;
@@ -7692,8 +7776,11 @@ static const Menuitem mi_run[] = {
 #endif
 #ifdef VEDIT_TERM
 static const Menuitem mi_term[] = {
-	{ "&New Terminal",	"",	"",	MA_TERM_NEW },
-	{ "&Close Terminal",	"",	"",	MA_TERM_CLOSE },
+	{ "&New Terminal",	"",	":terminal",	MA_TERM_NEW },
+	{ "&Close Terminal",	"",	"",		MA_TERM_CLOSE },
+	{ "",			"",	"",		MA_SEP },
+	{ "&Split Terminal",	"Ctrl-W s",	":split",	MA_TERM_SPLIT },
+	{ "Close &Pane",	"Ctrl-W c",	"",		MA_PANE_CLOSE },
 };
 #endif
 static const Menuitem mi_help[] = {
@@ -8032,6 +8119,10 @@ menu_item_enabled(const Editor *e, Menuact act)
 		return e->d->t->io.poll_fds != NULL;
 	case MA_TERM_CLOSE:
 		return term_is_active(e);
+	case MA_TERM_SPLIT:
+		return e->d->t->io.poll_fds != NULL && e->kind == BUF_TEXT;
+	case MA_PANE_CLOSE:
+		return pane_term(e, NULL) != NULL;
 #endif
 	default:
 		return 1;
@@ -9479,6 +9570,10 @@ render_body(Editor *e, Screen *d)
 
 	scr_cursor_vis(d, 1);		/* a menu overlay may have hidden it */
 	scr_cursor(d, CHROME_TOP + cur_row, cur_scol);
+#ifdef VEDIT_TERM
+	if (pane_shown(e))
+		pane_render(e, d);	/* may move the cursor into the pane */
+#endif
 
 	e->prev_top = e->top;		/* for the next frame's scroll decision */
 	e->prev_left = e->left;
@@ -9488,6 +9583,9 @@ render_body(Editor *e, Screen *d)
 static void
 ed_render(Editor *e, Screen *d)
 {
+#ifdef VEDIT_TERM
+	term_resize_all(e);	/* the pane may have appeared or gone */
+#endif
 	render_body(e, d);
 	scr_present(d);
 }
@@ -11748,6 +11846,7 @@ static const struct {
 	{ "F2",			"Toggle vi keys (modal editing)" },
 	{ "F8 / Shift+F8",	"Next / previous open buffer" },
 #ifdef VEDIT_TERM
+	{ "Ctrl-W s / w / c",	"Shell in a pane below / focus the pane / close it" },
 	{ "Ctrl-W m",		"In a terminal buffer: open the menu (F1 for the rest)" },
 #endif
 #ifndef VEDIT_NO_TOOLS
@@ -11804,6 +11903,8 @@ static const struct {
 #endif
 #ifdef VEDIT_TERM
 	{ ":terminal [cmd]",	"Open a terminal buffer (keys go to the program)" },
+	{ ":split [cmd]",	"Run a shell or cmd in a pane under the text" },
+	{ "Ctrl-W s / w / c",	"Shell in the pane / focus the pane / close it" },
 	{ "Ctrl-W m / w / c",	"In a terminal: menu / next buffer / close" },
 #endif
 	{ ":reload",		"Re-read the config file (also Options menu)" },
@@ -11934,9 +12035,23 @@ static const char *const tut_term[] = {
 	"  - When the program exits, the buffer stays so you can read its",
 	"    last output. Close it with Ctrl-W q.",
 	"  - Make, Compile, and Run (F9, Alt+F9, Ctrl+F9) open a terminal",
-	"    buffer of their own, labelled with the command. A build that",
-	"    ends with errors lands you on the first one; Alt+F5 switches",
-	"    back to its output, and the next build replaces the buffer.",
+	"    buffer of their own, labelled with the command, in the pane",
+	"    below. A build that ends with errors lands you on the first",
+	"    one; Alt+F5 focuses its output; the next build replaces it.",
+	"",
+	"The pane",
+	"",
+	"  One terminal can be shown in a pane under the text, so a build,",
+	"  a shell, or a log stays in view while you edit. From the text:",
+	"",
+	"      Ctrl-W s        open a shell in the pane (or focus it)",
+	"      Ctrl-W w        move the focus into the pane",
+	"      Ctrl-W c        close the pane's terminal",
+	"      :split [cmd]    run cmd (default: a shell) in the pane",
+	"",
+	"  In the pane, Ctrl-W w returns to the text and the other Ctrl-W",
+	"  keys below apply. The pane's title is reversed while it has",
+	"  the focus.",
 	"",
 	"Control keys",
 	"",
@@ -15753,7 +15868,8 @@ tool_term_start(Editor *e, const char *cmd, const char *dir, const char *label)
 	argv[1] = "-c";
 	argv[2] = (char *)cmd;
 	argv[3] = NULL;
-	if (term_open_argv(e, argv, dir, label) < 0)
+	if ((e->tool_in_pane ? pane_open(e, argv, dir, label)
+	    : term_open_argv(e, argv, dir, label, 0)) < 0)
 		return -1;
 	if (old) {				/* drop the finished predecessor */
 		for (i = 0; i < e->nbuf; i++)
@@ -15763,8 +15879,12 @@ tool_term_start(Editor *e, const char *cmd, const char *dir, const char *label)
 				break;
 			}
 	}
-	set_status(e, "%s: running in a terminal buffer (Ctrl-W w returns to the file)",
-	    label);
+	if (pane_shown(e))
+		set_status(e, "%s: running in the pane below (Ctrl-W w focuses it)",
+		    label);
+	else
+		set_status(e, "%s: running in a terminal buffer (Ctrl-W w returns to the file)",
+		    label);
 	return 0;
 }
 
@@ -15795,8 +15915,12 @@ tool_poll_done(Editor *e)
 		    "%s exited %d, %d error%s, %d warning%s", e->tool_title, rc,
 		    ne, ne == 1 ? "" : "s", nw, nw == 1 ? "" : "s");
 	fe = tool_first_error(e);
-	if (fe >= 0)				/* land on the first error */
+	if (fe >= 0) {				/* land on the first error */
 		tool_goto_err(e, fe);
+#ifdef VEDIT_TERM
+		e->pane_focus = 0;		/* typing goes to the fix */
+#endif
+	}
 	set_status(e, "%s", e->tool_result);
 	return 1;
 }
@@ -15812,6 +15936,11 @@ tool_view_output(Editor *e)
 	int idx;
 
 	if (tool_term_find(e, &idx) && idx != e->cur) {
+		if (pane_shown(e) && e->bufs[idx].vterm->pane) {
+			e->pane_focus = 1;	/* it is right below: focus it */
+			set_status(e, "pane: keys go to the terminal; Ctrl-W w returns to the file");
+			return;
+		}
 		buf_switch(e, idx);
 		return;
 	}
@@ -16192,6 +16321,12 @@ run_menu_act(Editor *e, Menuact act)
 		else
 			set_status(e, "cannot close the last buffer");
 		break;
+	case MA_TERM_SPLIT:
+		pane_run(e, NULL);
+		break;
+	case MA_PANE_CLOSE:
+		pane_close(e);
+		break;
 #endif
 	case MA_HELP:
 		dlg_help(e);
@@ -16479,6 +16614,7 @@ usage(void)
 	    "  F8 / Shift+F8 next / previous open buffer\n"
 	    "  F10 or Alt+letter  open the menu bar\n"
 	    "  Ctrl-W m      open the menu bar from inside a terminal buffer\n"
+	    "  Ctrl-W s/w/c  a shell in a pane below the text / focus it / close it\n"
 	    "  F1            show the key bindings\n"
 	    "  F2            toggle vi keys (modal editing)\n"
 	    "\n"
@@ -17006,6 +17142,7 @@ editor_init(Editor *e)
 	e->format_on_save = 0;	/* do not reformat on save unless asked */
 #ifndef VEDIT_NO_TOOLS
 	e->tool_in_term = 1;	/* build in a terminal buffer when one is possible */
+	e->tool_in_pane = 1;	/* ... in the pane under the text */
 #endif
 	e->hex_pending = -1;
 	e->hex_cols = 16;
@@ -17031,7 +17168,7 @@ editor_loop(Editor *e)
 #ifdef VEDIT_TERM
 		/* A terminal buffer takes over input (raw passthrough) and
 		 * rendering until the user switches away or closes it. */
-		if (term_is_active(e)) {
+		if (term_focus(e)) {
 			switch (term_loop_step(e)) {
 			case TERM_QUIT:
 				return 0;
@@ -17050,13 +17187,19 @@ editor_loop(Editor *e)
 		case EVENT_RESIZE:
 		case EVENT_RESUME:
 			scr_size(e->d, &e->rows, &e->cols);
-			ed_render(e, e->d);
+			ed_render(e, e->d);	/* resizes the terminals too */
 			continue;
 		case EVENT_KEY:
 			seq = ev.key;
 			break;
 		case EVENT_IDLE:
 			swap_maybe_write(e);	/* snapshot a dirty buffer */
+#ifdef VEDIT_TERM
+			if (e->term_dirty) {	/* the pane's program wrote */
+				ed_render(e, e->d);
+				e->term_dirty = 0;
+			}
+#endif
 			continue;
 		default:
 			continue;
@@ -17137,6 +17280,17 @@ editor_loop(Editor *e)
 			ed_render(e, e->d);
 			continue;
 		}
+
+#ifdef VEDIT_TERM
+		/* Ctrl-W is the pane prefix in a text buffer too: s opens a
+		 * shell below, w moves the focus there, c closes it. */
+		if (seq.type == TKBD_KEY && seq.key == TKBD_KEY_W &&
+		    (seq.mod & TKBD_MOD_CTRL) && e->mode != MODE_INSERT) {
+			pane_key(e);
+			ed_render(e, e->d);
+			continue;
+		}
+#endif
 
 #ifndef VEDIT_NO_TOOLS
 		/* The IDE keys (Compile, Make, Run, error stepping) work in both
@@ -17386,6 +17540,7 @@ ed_apply_config(Editor *e)
 	e->format_on_save = cfg_bool(g_cfg, "edit.formatonsave", e->format_on_save);
 #ifndef VEDIT_NO_TOOLS
 	e->tool_in_term = cfg_bool(g_cfg, "command.terminal", e->tool_in_term);
+	e->tool_in_pane = cfg_bool(g_cfg, "command.split", e->tool_in_pane);
 #endif
 	e->search_icase = cfg_bool(g_cfg, "edit.ignorecase", e->search_icase);
 	s = cfg_get(g_cfg, "edit.shiftwidth");
@@ -20823,16 +20978,9 @@ term_is_active(const Editor *e)
 static const char *
 term_label(const Editor *e)
 {
-	const char *title;
-
 	if (e->kind != BUF_TERM || !e->vterm)
 		return "terminal";
-	title = vt_state_title(e->vterm->vt);
-	if (title && title[0])
-		return title;
-	if (e->vterm->tool && e->vterm->tool_label[0])
-		return e->vterm->tool_label;
-	return "terminal";
+	return term_title(e->vterm);
 }
 
 /* Hang up and reap the child, free the emulator. No-op on a text buffer. */
@@ -20937,7 +21085,7 @@ term_drain(void *ctx, int fd)
 
 	if (!t || t->master_fd < 0)
 		return;
-	active = (t == e->vterm);
+	active = (t == e->vterm) || t->pane;	/* on screen: repaint */
 	for (;;) {
 		char buf[4096];
 		ssize_t r = read(fd, buf, sizeof(buf));
@@ -21032,19 +21180,282 @@ term_render(Editor *e, Screen *d)
 	return 1;
 }
 
+/* ---- the bottom pane: drawing, focus, opening ---- */
+
+/* The title a terminal shows on its frame: the OSC title the child set, else
+ * the build command it runs, else "terminal". */
+static const char *
+term_title(const Term *t)
+{
+	const char *title = vt_state_title(t->vt);
+
+	if (title && title[0])
+		return title;
+	if (t->tool && t->tool_label[0])
+		return t->tool_label;
+	return "terminal";
+}
+
+/* Draw the separator row and the pane's grid under the text area. The frame
+ * above stops at the text area, so the border columns here are ours too. With
+ * the focus in the pane, the hardware cursor is moved into it. */
+static void
+pane_render(Editor *e, Screen *d)
+{
+	const Pal *p = ed_chrome(e);
+	Term *t = pane_term(e, NULL);
+	int top_h = text_height(e), ph = pane_height(e);
+	int sep = CHROME_TOP + top_h, row0 = sep + 1;
+	int sb = e->cols - chrome_right(e), text_w = text_width(e);
+	Color fg = p->frame_fg, bg = p->frame_bg;
+	char title[80];
+	int tlen, tstart, r, c;
+
+	if (!t)
+		return;
+	scr_fill(d, sep, 0, e->cols, GL_H, fg, bg, 0);
+	if (t->dead)
+		tlen = snprintf(title, sizeof(title), " %s (exited %d) ",
+		    term_title(t), t->exit_status);
+	else
+		tlen = snprintf(title, sizeof(title), " %s ", term_title(t));
+	if (tlen > e->cols - 4)
+		tlen = e->cols - 4;
+	if (tlen > 0) {
+		tstart = (e->cols - tlen) / 2;
+		if (tstart < 1)
+			tstart = 1;
+		ui_field(d, sep, tstart, tlen, title, p->title_fg, bg,
+		    e->pane_focus ? (ATTR_BOLD | ATTR_REVERSE) : ATTR_BOLD);
+	}
+	for (r = 0; r < ph; r++) {
+		int row = row0 + r;
+
+		scr_cell(d, row, 0, GL_V, fg, bg, 0);
+		scr_cell(d, row, sb, GL_V, fg, bg, 0);
+		for (c = 0; c < text_w; c++) {
+			struct vt_cell *cell = (r < t->rows && c < t->cols)
+			    ? vt_buf_cell(t->vt->buf, r, c) : NULL;
+
+			if (cell)
+				scr_cell(d, row, CHROME_LEFT + c, cell->codepoint,
+				    cell->fg, cell->bg, cell->attrs);
+			else
+				scr_cell(d, row, CHROME_LEFT + c, ' ',
+				    p->content_fg, p->content_bg, 0);
+		}
+	}
+	if (e->pane_focus) {
+		if (t->dead) {
+			scr_cursor_vis(d, 0);
+		} else {
+			int cr = t->vt->cursor_row, cc = t->vt->cursor_col;
+
+			if (cr < 0)
+				cr = 0;
+			else if (cr >= ph)
+				cr = ph - 1;
+			if (cc < 0)
+				cc = 0;
+			else if (cc >= text_w)
+				cc = text_w - 1;
+			scr_cursor_shape(d, CURSOR_DEFAULT);
+			scr_cursor_vis(d,
+			    (t->vt->modes & VT_MODE_CURSOR_VIS) ? 1 : 0);
+			scr_cursor(d, row0 + cr, CHROME_LEFT + cc);
+		}
+	}
+}
+
+/* The terminal keystrokes go to: the current buffer when it is a terminal,
+ * else the pane's when the focus is there. A focus left on a pane that has
+ * gone (closed, or hidden by a small window) is dropped. */
+static Term *
+term_focus(Editor *e)
+{
+	if (term_is_active(e))
+		return e->vterm;
+	if (e->pane_focus) {
+		if (pane_shown(e))
+			return pane_term(e, NULL);
+		e->pane_focus = 0;
+	}
+	return NULL;
+}
+
+/* Whether a command could open in the pane now: a text buffer is current and
+ * the window is tall enough. The fd multiplexer is checked by term_open_argv. */
+static int
+pane_possible(const Editor *e)
+{
+	return e->kind == BUF_TEXT && text_height_full(e) >= PANE_MIN_TOTAL;
+}
+
+/* Open argv in a new terminal buffer shown in the pane, keeping the current
+ * text buffer current. The previous pane terminal, if any, gives up the pane:
+ * closed when its program has exited, else left as a plain terminal buffer.
+ * Returns the new buffer's index, or -1 with the status set. */
+static int
+pane_open(Editor *e, char *const argv[], const char *dir, const char *label)
+{
+	Term *old = pane_term(e, NULL), *t;
+	int prev = e->cur, i;
+
+	if (!pane_possible(e))
+		return term_open_argv(e, argv, dir, label, 0);
+	i = term_open_argv(e, argv, dir, label, pane_height(e));
+	if (i < 0)
+		return -1;
+	t = e->vterm;
+	t->pane = 1;
+	buf_switch(e, prev);			/* back to the text */
+	if (old) {
+		old->pane = 0;
+		if (old->dead)
+			for (i = 0; i < e->nbuf; i++)
+				if (i != e->cur && e->bufs[i].kind == BUF_TERM &&
+				    e->bufs[i].vterm == old) {
+					buf_close(e, i);
+					break;
+				}
+	}
+	e->pane_focus = 0;
+	return pane_term(e, &i) ? i : -1;
+}
+
+/* Split cmd (NULL = the login shell) on whitespace into an argv, as :terminal
+ * does. *cmdbuf gets the backing copy to free; words must hold max + 1. */
+static char *const *
+term_argv(const char *cmd, char **cmdbuf, char *words[], int max)
+{
+	int nw = 0;
+	char *save = NULL, *s;
+
+	*cmdbuf = NULL;
+	if (!cmd || !cmd[0])
+		return NULL;
+	*cmdbuf = strdup(cmd);
+	if (!*cmdbuf)
+		return NULL;
+	for (s = strtok_r(*cmdbuf, " \t", &save); s && nw < max;
+	    s = strtok_r(NULL, " \t", &save))
+		words[nw++] = s;
+	words[nw] = NULL;
+	return nw > 0 ? words : NULL;
+}
+
+/* :split [cmd], Ctrl-W s, Terminal > Split Terminal: run cmd (NULL = a shell)
+ * in the pane. A bare split with a live pane terminal just focuses it; a bare
+ * split takes the focus, a command leaves it on the text. */
+static void
+pane_run(Editor *e, const char *cmd)
+{
+	Term *t = pane_term(e, NULL);
+	char *cmdbuf, *words[64];
+	char *const *argv;
+
+	if (!pane_possible(e)) {
+		set_status(e, "no room for a pane here");
+		return;
+	}
+	if (!cmd && t && !t->dead) {
+		e->pane_focus = 1;
+		set_status(e, "pane: keys go to the terminal; Ctrl-W w returns to the file");
+		return;
+	}
+	argv = term_argv(cmd, &cmdbuf, words, 63);
+	if (pane_open(e, argv, NULL, NULL) >= 0) {
+		e->pane_focus = (cmd == NULL);
+		set_status(e, cmd ? "pane: %.60s (Ctrl-W w focuses it, Ctrl-W c closes it)"
+		    : "pane: keys go to the terminal; Ctrl-W w returns to the file",
+		    cmd ? cmd : "");
+	}
+	free(cmdbuf);
+}
+
+/* Close the pane's terminal buffer (hangs up its program). */
+static void
+pane_close(Editor *e)
+{
+	int idx;
+
+	e->pane_focus = 0;
+	if (!pane_term(e, &idx)) {
+		set_status(e, "no pane to close");
+		return;
+	}
+	if (buf_close(e, idx) < 0)
+		set_status(e, "cannot close the last buffer");
+	else
+		set_status(e, "pane closed");
+}
+
+/* Ctrl-W from a text buffer: one more key picks the pane action. */
+static void
+pane_key(Editor *e)
+{
+	Event ev;
+	uint32_t ch;
+
+	set_status(e, "Ctrl-W: (s)plit a shell below, (w) focus the pane, (c)lose it");
+	ed_render(e, e->d);
+	for (;;) {
+		switch (scr_wait(e->d, &ev)) {
+		case EVENT_EOF:
+			return;
+		case EVENT_RESIZE:
+		case EVENT_RESUME:
+			scr_size(e->d, &e->rows, &e->cols);
+			continue;
+		case EVENT_KEY:
+			break;
+		default:
+			continue;
+		}
+		break;
+	}
+	e->status[0] = '\0';
+	if (ev.key.type != TKBD_KEY || ev.key.ch == TKBD_CH_NONE)
+		return;
+	ch = ev.key.ch;
+	if (ch == 'w' || ch == 'W' || ch == 'p' || ch == 'j') {
+		if (pane_shown(e)) {
+			e->pane_focus = 1;
+			set_status(e, "pane: keys go to the terminal; Ctrl-W w returns to the file");
+		} else {
+			set_status(e, "no pane (Ctrl-W s opens a shell in one)");
+		}
+	} else if (ch == 's' || ch == 'S') {
+		pane_run(e, NULL);
+	} else if (ch == 'c' || ch == 'q') {
+		pane_close(e);
+	}
+}
+
 /* Match every live terminal's PTY and grid to the current text-area size. */
 static void
 term_resize_all(Editor *e)
 {
-	int rows = text_height(e), cols = text_width(e);  /* each clamps to >= 1 */
+	int cols = text_width(e);		/* clamps to >= 1 */
+	int shown = pane_shown(e), ph = shown ? pane_height(e) : 0;
 	int i;
 
 	for (i = 0; i < e->nbuf; i++) {
 		Term *t = (i == e->cur)
 		    ? (e->kind == BUF_TERM ? e->vterm : NULL)
 		    : (e->bufs[i].kind == BUF_TERM ? e->bufs[i].vterm : NULL);
+		int rows;
 
 		if (!t || t->dead || t->master_fd < 0)
+			continue;
+		/* only what is on screen: the current terminal fills the
+		 * area, the pane's gets the pane; a background one keeps its
+		 * size rather than being bounced with SIGWINCH */
+		if (i == e->cur)
+			rows = text_height(e);
+		else if (shown && t->pane)
+			rows = ph;
+		else
 			continue;
 		if (t->rows == rows && t->cols == cols)
 			continue;
@@ -21161,19 +21572,22 @@ term_install(Editor *e, Term *t)
 /* Open a new terminal buffer running argv (NULL = the login shell) in dir
  * (NULL = the editor's cwd). label, when set, marks it as a tool terminal:
  * its output is also captured for the diagnostic parser and the frame shows
- * the label. Returns the buffer index, or -1. */
+ * the label. rows sizes the grid (0 = the text area), so a pane terminal is
+ * born at its size rather than resized at the first paint. Returns the
+ * buffer index, or -1. */
 static int
 term_open_argv(Editor *e, char *const argv[], const char *dir,
-    const char *label)
+    const char *label, int rows)
 {
 	Term *t;
-	int i, rows, cols;
+	int i, cols;
 
 	if (!e->d->t->io.poll_fds) {
 		set_status(e, "terminal needs a host that multiplexes fds");
 		return -1;
 	}
-	rows = text_height(e);		/* both already clamp to >= 1 */
+	if (rows < 1)
+		rows = text_height(e);		/* both already clamp to >= 1 */
 	cols = text_width(e);
 
 	t = term_make(rows, cols);
@@ -21209,25 +21623,11 @@ term_open_argv(Editor *e, char *const argv[], const char *dir,
 static int
 term_open(Editor *e, const char *cmd)
 {
-	char *cmdbuf = NULL, *words[64];
-	char *const *argv = NULL;
+	char *cmdbuf, *words[64];
+	char *const *argv = term_argv(cmd, &cmdbuf, words, 63);
 	int i;
 
-	if (cmd && cmd[0]) {			/* split on whitespace */
-		int nw = 0;
-		char *save = NULL, *s;
-
-		cmdbuf = strdup(cmd);
-		if (cmdbuf) {
-			for (s = strtok_r(cmdbuf, " \t", &save);
-			    s && nw < 63; s = strtok_r(NULL, " \t", &save))
-				words[nw++] = s;
-			words[nw] = NULL;
-			if (nw > 0)
-				argv = words;
-		}
-	}
-	i = term_open_argv(e, argv, NULL, NULL);
+	i = term_open_argv(e, argv, NULL, NULL, 0);
 	free(cmdbuf);
 	return i;
 }
@@ -21267,7 +21667,11 @@ term_loop_step(Editor *e)
 	unsigned char raw[512];
 	char out[512];
 	int rc, n, i, outn = 0;
-	Term *t = e->vterm;
+	Term *t = term_focus(e);
+	int in_pane = !term_is_active(e);	/* the pane has the focus */
+
+	if (!t)
+		return TERM_CONT;
 
 	if (g_winch || sb->want_resize) {
 		int from_signal = g_winch;
@@ -21339,13 +21743,13 @@ term_loop_step(Editor *e)
 			term_write(t, &lit, 1);
 			continue;
 		}
-		if (b == 'w') {
-			buf_cycle(e, 1);
-			ed_render(e, e->d);
-			return TERM_CONT;
-		}
-		if (b == 'W' || b == 'p') {
-			buf_cycle(e, -1);
+		if (b == 'w' || b == 'W' || b == 'p') {
+			if (in_pane) {		/* back to the text above */
+				e->pane_focus = 0;
+				e->status[0] = '\0';
+			} else {
+				buf_cycle(e, b == 'w' ? 1 : -1);
+			}
 			ed_render(e, e->d);
 			return TERM_CONT;
 		}
@@ -21355,6 +21759,11 @@ term_loop_step(Editor *e)
 			return TERM_CONT;
 		}
 		if (b == 'c' || b == 'q') {
+			if (in_pane) {
+				pane_close(e);
+				ed_render(e, e->d);
+				return TERM_CONT;
+			}
 			if (e->nbuf > 1) {
 				buf_close(e, e->cur);
 				ed_render(e, e->d);
@@ -25875,7 +26284,7 @@ enum excmd {
 	EX_EDIT, EX_ENEW, EX_WRITE, EX_WQ, EX_XIT, EX_QUIT, EX_QALL, EX_WQALL,
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
 	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD,
-	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_FORMAT,
+	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_FORMAT,
 };
 
 static const struct excmd_name {
@@ -25924,6 +26333,7 @@ static const struct excmd_name {
 #endif
 #ifdef VEDIT_TERM
 	{ "terminal",	4, EX_TERM },
+	{ "split",	2, EX_SPLIT },
 #endif
 };
 
@@ -26198,6 +26608,9 @@ vi_ex_exec(Editor *e, char *buf)
 #ifdef VEDIT_TERM
 	case EX_TERM:
 		term_open(e, *rest ? rest : NULL);
+		return REQ_CONTINUE;
+	case EX_SPLIT:
+		pane_run(e, *rest ? rest : NULL);
 		return REQ_CONTINUE;
 #endif
 	case EX_BDELETE:

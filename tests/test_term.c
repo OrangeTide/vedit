@@ -730,7 +730,7 @@ t_tool_term_start(Test *t)
 	Memio m;
 	struct vedit_io io;
 	struct vedit *v;
-	Term *old;
+	Term *old, *pt;
 	int tries, idx = -1;
 
 	TAP_ASSERT(t, mkdtemp(dir) != NULL);
@@ -762,19 +762,23 @@ t_tool_term_start(Test *t)
 	TAP_CHECK(t, old != NULL && old->dead && old->exit_status == 3);
 	TAP_CHECKF(t, v->e.nbuf == 2, "nbuf %d", v->e.nbuf);	/* term, b.c */
 
-	/* a second build replaces the finished terminal */
+	/* a second build replaces the finished terminal; with a text buffer
+	 * current it opens in the pane below and the text keeps the focus */
 	TAP_CHECK(t, tool_term_start(&v->e, "exit 0", dir, "Make") == 0);
 	TAP_CHECKF(t, v->e.nbuf == 2, "nbuf %d after restart", v->e.nbuf);
-	TAP_CHECK(t, tool_term_find(&v->e, NULL) == v->e.vterm && v->e.vterm != old);
+	pt = tool_term_find(&v->e, NULL);
+	TAP_CHECK(t, pt != NULL && pt != old && pt->pane);
+	TAP_CHECK(t, v->e.kind == BUF_TEXT && pane_shown(&v->e) && !v->e.pane_focus);
 	TAP_CHECK(t, v->e.tool_nerr == 0);	/* the capture was cleared */
-	for (tries = 0; tries < 200 && !v->e.vterm->dead; tries++)
+	v->e.pane_focus = 1;			/* so the loop step pumps it */
+	for (tries = 0; tries < 200 && !pt->dead; tries++)
 		if (term_loop_step(&v->e) != TERM_CONT)
 			break;
 	for (tries = 0; tries < 5 && v->e.tool_done_pending; tries++)
 		term_loop_step(&v->e);
 	TAP_CHECKF(t, strcmp(v->e.tool_result, "Make exited 0") == 0,
 	    "result '%s'", v->e.tool_result);
-	TAP_CHECK(t, term_is_active(&v->e));	/* no error: stays on the output */
+	TAP_CHECK(t, v->e.kind == BUF_TEXT && pane_shown(&v->e));	/* output stays below */
 
 	/* a running build refuses a second start */
 	TAP_CHECK(t, tool_term_start(&v->e, "sleep 5", dir, "Make") == 0);
@@ -819,6 +823,79 @@ t_tool_term_shell(Test *t)
 	TAP_CHECK(t, term_is_active(&v->e));	/* no error: stays on the output */
 	TAP_CHECK(t, v->e.tool_nlines == 1 &&
 	    strcmp(v->e.tool_lines[0], "nothing to see") == 0);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* ---- the bottom pane ---- */
+
+/* A command opened with :split runs in a pane under the text buffer, which
+ * keeps the keys until Ctrl-W w moves the focus; the pane's output lands in
+ * the rows under the separator; Ctrl-W w from the pane returns to the text
+ * and pane_close removes it. Skipped when a pty cannot be opened. */
+static void
+t_pane_split(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Term *pt;
+	Scrbuf *sb;
+	int idx = -1, full, ph, tries, row;
+
+	v = term_editor_in(&m, &io, "w", 1, 1);	/* "w" answers Ctrl-W */
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, buf_open(&v->e, NULL) == 0);	/* a text buffer */
+	TAP_CHECK(t, v->e.kind == BUF_TEXT && !pane_shown(&v->e));
+	full = text_height_full(&v->e);
+	TAP_CHECKF(t, text_height(&v->e) == full, "no pane: %d of %d",
+	    text_height(&v->e), full);
+
+	pane_run(&v->e, "cat");
+	pt = pane_term(&v->e, &idx);
+	if (!pt) {
+		vedit_free(v);			/* no pty here: skip */
+		memio_free(&m);
+		return;
+	}
+	TAP_CHECK(t, v->e.kind == BUF_TEXT && idx != v->e.cur);
+	TAP_CHECK(t, pane_shown(&v->e) && !v->e.pane_focus);
+	ph = pane_height(&v->e);
+	TAP_CHECKF(t, text_height(&v->e) == full - ph - 1,
+	    "text %d, full %d, pane %d", text_height(&v->e), full, ph);
+	TAP_CHECKF(t, pt->rows == ph, "pane grid %d rows, want %d", pt->rows, ph);
+
+	/* Ctrl-W then the scripted "w" focuses the pane */
+	pane_key(&v->e);
+	TAP_CHECK(t, v->e.pane_focus == 1 && term_focus(&v->e) == pt);
+
+	/* what cat echoes shows up in the pane rows */
+	term_write(pt, "hi\r", 3);
+	for (tries = 0; tries < 50; tries++) {
+		TAP_ASSERT(t, term_loop_step(&v->e) == TERM_CONT);
+		if (vt_buf_cell(pt->vt->buf, 1, 0) &&
+		    vt_buf_cell(pt->vt->buf, 1, 0)->codepoint == 'h')
+			break;
+	}
+	ed_render(&v->e, v->e.d);
+	sb = v->e.d->t;
+	row = CHROME_TOP + text_height(&v->e) + 1 + 1;	/* separator, echo, output */
+	TAP_CHECKF(t, sb->cur[(size_t)row * sb->cols + CHROME_LEFT].codepoint == 'h',
+	    "pane row %d col 1 is U+%04X", row,
+	    sb->cur[(size_t)row * sb->cols + CHROME_LEFT].codepoint);
+	TAP_CHECK(t, sb->cur[(size_t)(row - 2) * sb->cols + 0].codepoint == GL_H);
+
+	/* Ctrl-W w from the pane: focus returns to the text */
+	scr_raw_unread(v->e.d, (const unsigned char *)"\027w", 2);
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_CONT);
+	TAP_CHECK(t, v->e.pane_focus == 0 && term_focus(&v->e) == NULL);
+
+	pane_close(&v->e);
+	TAP_CHECK(t, pane_term(&v->e, NULL) == NULL && v->e.nbuf == 1);
+	TAP_CHECK(t, text_height(&v->e) == full);
+	TAP_CHECK(t, strcmp(v->e.status, "pane closed") == 0);
 
 	vedit_free(v);
 	memio_free(&m);
@@ -949,7 +1026,9 @@ t_term_cursor_clamp(Test *t)
 
 	TAP_ASSERT(t, write(child, "\033[40;40H", 8) == 8);
 	term_drain(&v->e, v->e.vterm->master_fd);
-	ed_render(&v->e, v->e.d);		/* must not place the cursor off-area */
+	/* render_body, not ed_render: the latter first resizes the grid to
+	 * the area, which would remove the case being tested */
+	render_body(&v->e, v->e.d);		/* must not place the cursor off-area */
 	TAP_CHECK(t, v->e.vterm->vt->cursor_row >= text_height(&v->e));
 
 	close(child);
@@ -1121,6 +1200,7 @@ const Case tap_cases[] = {
 	{ "tool_term_capture", t_tool_term_capture },
 	{ "tool_term_start", t_tool_term_start },
 	{ "tool_term_shell", t_tool_term_shell },
+	{ "pane_split", t_pane_split },
 	{ "term_poll_fallback", t_term_poll_fallback },
 	{ "term_discard", t_term_discard },
 	{ "term_open_nomux", t_term_open_nomux },

@@ -210,6 +210,7 @@ A gitconfig-style file sets the startup defaults. It is read from the first of
 
 [command]
     terminal = on        # run Compile / Make / Run in a terminal buffer
+    split = on           # ... shown in a pane under the file
 
 [error]
     pattern = ^([^(]+)\(([0-9]+),([0-9]+)\):  # extra build-error format
@@ -760,11 +761,13 @@ you want. For example:
 Compile, Make, and Run start the command in a terminal buffer (see
 [Terminal buffers](#terminal-buffers)), labelled with the command name, so its
 output shows live, in color, and a program that prompts can be answered. The
-buffer stays after the command exits, with the exit status and, when any were
-parsed, the diagnostic counts on its status line, and the next build replaces
-it. `Ctrl-W w` returns
-to the file while a command runs; `Alt+F5` (Run > View Output) switches back to
-the build terminal. The output is also captured for the parser below: it is the
+buffer opens in [the pane](#the-pane) under the file, so the output stays in view
+while you fix what it reports; set `command.split = off` to have it fill the
+frame instead. The buffer stays after the command exits, with the exit status
+and, when any were parsed, the diagnostic counts on the status line, and the
+next build replaces it. `Ctrl-W w` moves the focus between the file and the
+pane; `Alt+F5` (Run > View Output) focuses the build terminal, or switches to it
+when it is not in the pane. The output is also captured for the parser below: it is the
 same capture that feeds the output pane, which is what the command falls back to
 when a terminal buffer is not possible, either because the host cannot multiplex
 file descriptors, the editor was built with `VEDIT_NO_TERM`, or `command.terminal`
@@ -901,8 +904,33 @@ the menu bar, and from there to every editor command; when the menu closes,
 focus returns to the terminal.
 
 The build commands (F9, Alt+F9, Ctrl+F9) open a terminal buffer of their own,
-labelled with the command name, described under
-[Build commands](#build-commands-a-primitive-ide).
+labelled with the command name and shown in the pane described next, as covered
+under [Build commands](#build-commands-a-primitive-ide).
+
+### The pane
+
+One terminal buffer can be shown in a pane under the text, a third of the text
+area high, so a build's output, a shell, or a log stays in view while you edit.
+This is the simplest split that pays off: the text keeps the editor's one cursor
+and scroll state, and a terminal carries its own grid, so drawing it below costs
+nothing. Open a shell there with `Ctrl-W s`, Terminal > Split Terminal, or the vi
+command `:split`; `:split cmd` runs `cmd` in the pane instead, as `:terminal cmd`
+would (`tail -f build.log`, say). The build commands put their output there by
+default.
+
+| Key                       | What it does                                     |
+|---------------------------|--------------------------------------------------|
+| `Ctrl-W s`                | open a shell in the pane, or focus the one there |
+| `Ctrl-W w`                | move the focus into the pane, or back out of it  |
+| `Ctrl-W c`                | close the pane's terminal                        |
+
+The pane's title is drawn reversed while the focus is there; keys then go to its
+program, with `Ctrl-W` as the prefix just as in a full terminal buffer. The pane
+holds one terminal: opening another there hands the previous one back as a plain
+terminal buffer, or closes it when its program had exited. F8 still reaches the
+pane's buffer, which fills the frame like any terminal while it is current, and
+the pane returns when a text buffer is. A window with fewer than eight text rows
+hides the pane rather than squeeze it.
 
 When the child exits, the buffer shows `[process exited N]` and waits for
 `Ctrl-W q` to close.
