@@ -19951,16 +19951,12 @@ term_render(Editor *e, Screen *d)
 {
 	const Pal *p = ed_chrome(e);
 	Term *t = e->vterm;
-	int text_h = text_height(e);
+	int text_h = text_height(e);	/* both already clamp to >= 1 */
 	int text_w = text_width(e);
 	int r, c;
 
 	if (!t)
 		return 0;
-	if (text_h < 1)
-		text_h = 1;
-	if (text_w < 1)
-		text_w = 1;
 
 	scr_clear(d);
 	for (r = 0; r < text_h && r < t->rows; r++) {
@@ -20007,13 +20003,9 @@ term_render(Editor *e, Screen *d)
 static void
 term_resize_all(Editor *e)
 {
-	int rows = text_height(e), cols = text_width(e);
+	int rows = text_height(e), cols = text_width(e);  /* each clamps to >= 1 */
 	int i;
 
-	if (rows < 1)
-		rows = 1;
-	if (cols < 1)
-		cols = 1;
 	for (i = 0; i < e->nbuf; i++) {
 		Term *t = (i == e->cur)
 		    ? (e->kind == BUF_TERM ? e->vterm : NULL)
@@ -20147,12 +20139,8 @@ term_open(Editor *e, const char *cmd)
 		set_status(e, "terminal needs a host that multiplexes fds");
 		return -1;
 	}
-	rows = text_height(e);
+	rows = text_height(e);		/* both already clamp to >= 1 */
 	cols = text_width(e);
-	if (rows < 1)
-		rows = 1;
-	if (cols < 1)
-		cols = 1;
 
 	t = term_make(rows, cols);
 	if (!t) {
@@ -20204,6 +20192,8 @@ term_attach(Editor *e, int fd, int rows, int cols)
 {
 	Term *t;
 
+	/* rows/cols come straight from the caller (a test), not from
+	 * text_height/text_width, so this clamp is still needed. */
 	if (rows < 1)
 		rows = 1;
 	if (cols < 1)
