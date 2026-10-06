@@ -14,24 +14,59 @@
 #include "memio.h"
 
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
-/* Build an editor over memio (no terminal) and drop the empty initial text, so
- * a terminal buffer created with term_attach/term_open is the only buffer and
- * nothing leaks at teardown. */
+/* Build an editor over memio with keys as the scripted keyboard input. Drops
+ * the empty initial text so a terminal buffer is the only buffer and nothing
+ * leaks at teardown. With mux set, memio also offers poll_fds, which the input
+ * loop (scr_pump -> in_refill) needs. */
 static struct vedit *
-term_editor(Memio *m, struct vedit_io *io)
+term_editor_in(Memio *m, struct vedit_io *io, const char *keys, size_t klen,
+    int mux)
 {
 	struct vedit *v;
 
-	memio_init(m, "", 0, 24, 80);
+	memio_init(m, keys, klen, 24, 80);
 	memio_bind(io, m);
+	if (mux)
+		memio_enable_fds(io);
 	v = vedit_new(io);
 	if (v) {
 		text_free(v->e.t);	/* replaced by the terminal's own text */
 		v->e.t = NULL;
 	}
 	return v;
+}
+
+static struct vedit *
+term_editor(Memio *m, struct vedit_io *io)
+{
+	return term_editor_in(m, io, "", 0, 0);
+}
+
+/* Attach a terminal to one end of a socketpair and hand the test the other end
+ * (the "child"). A socketpair is bidirectional, so the loop can both forward
+ * keystrokes to the child and read what the child writes back. The editor owns
+ * its end (freed at teardown); the caller closes *child. Returns -1 on error. */
+static int
+term_pair(struct vedit *v, int *child, int rows, int cols)
+{
+	int sv[2], fl;
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
+		return -1;
+	fl = fcntl(sv[0], F_GETFL);
+	fcntl(sv[0], F_SETFL, fl | O_NONBLOCK);
+	fl = fcntl(sv[1], F_GETFL);
+	fcntl(sv[1], F_SETFL, fl | O_NONBLOCK);
+	if (term_attach(&v->e, sv[0], rows, cols) < 0) {
+		close(sv[0]);
+		close(sv[1]);
+		return -1;
+	}
+	*child = sv[1];
+	return 0;
 }
 
 /* Attach a pipe as a terminal, feed it an escape stream, and check the grid,
@@ -223,11 +258,522 @@ t_term_fork_smoke(Test *t)
 	memio_free(&m);
 }
 
+/* Drain everything currently readable from a non-blocking fd. */
+static int
+read_all(int fd, char *buf, int max)
+{
+	int n = 0;
+	ssize_t r;
+
+	while (n < max && (r = read(fd, buf + n, (size_t)(max - n))) > 0)
+		n += (int)r;
+	return n;
+}
+
+/* The input loop forwards raw keystrokes to the child. */
+static void
+t_term_loop_input(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child, n;
+	char buf[64];
+
+	v = term_editor_in(&m, &io, "hello", 5, 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_CONT);
+	n = read_all(child, buf, sizeof(buf));
+	TAP_CHECKF(t, n == 5 && memcmp(buf, "hello", 5) == 0,
+	    "child got %d bytes", n);
+
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* Ctrl-W Ctrl-W sends one literal Ctrl-W to the child. */
+static void
+t_term_loop_literal(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child, n;
+	char buf[8];
+
+	v = term_editor_in(&m, &io, "\027\027", 2, 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_CONT);
+	n = read_all(child, buf, sizeof(buf));
+	TAP_CHECKF(t, n == 1 && buf[0] == 0x17, "child got %d bytes", n);
+
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* Ctrl-W w is a window command (buffer cycle); it does not reach the child. */
+static void
+t_term_loop_cmd(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child, n;
+	char buf[8];
+
+	v = term_editor_in(&m, &io, "\027w", 2, 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_CONT);
+	n = read_all(child, buf, sizeof(buf));
+	TAP_CHECKF(t, n == 0, "window command leaked %d bytes to child", n);
+
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* Ctrl-W q on the only buffer asks the editor to quit. */
+static void
+t_term_loop_quit(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child;
+
+	v = term_editor_in(&m, &io, "\027q", 2, 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_QUIT);
+
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* With no keystrokes, the loop drains child output through the multiplexer and
+ * updates the grid (the idle path). */
+static void
+t_term_loop_output(Test *t)
+{
+	static const char out[] = "\033[32mGRID\033[0m";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child;
+	struct vt_cell *cell;
+
+	v = term_editor_in(&m, &io, "", 0, 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+
+	TAP_ASSERT(t, write(child, out, sizeof(out) - 1) == (ssize_t)(sizeof(out) - 1));
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_CONT);
+
+	cell = vt_buf_cell(v->e.vterm->vt->buf, 0, 0);
+	TAP_ASSERT(t, cell != NULL);
+	TAP_CHECKF(t, cell->codepoint == 'G', "grid cp=%u", cell->codepoint);
+	TAP_CHECK(t, cell->fg.type == COLOR_INDEXED && cell->fg.index == 2);
+
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* A pending resize is handled by the terminal loop (resizes the PTY + grid). */
+static void
+t_term_loop_resize(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child;
+
+	v = term_editor_in(&m, &io, "", 0, 1);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+
+	g_winch = 1;				/* a window-change arrived */
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_CONT);
+	TAP_CHECK(t, g_winch == 0);		/* the handler consumed it */
+	TAP_CHECK(t, v->e.vterm->rows == text_height(&v->e));
+
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* The native poll_fds binding reports the keyboard and the extra PTY fds. */
+static void
+t_tty_poll_fds(Test *t)
+{
+	Ttyio tt;
+	int a[2], b[2], extra[1], ready[VEDIT_TERM_MAX], nready, r;
+
+	TAP_ASSERT(t, pipe(a) == 0);
+	TAP_ASSERT(t, pipe(b) == 0);
+	memset(&tt, 0, sizeof(tt));
+	tt.in_fd = a[0];			/* stands in for the keyboard */
+	extra[0] = b[0];			/* stands in for a PTY master */
+
+	r = tty_poll_fds(&tt, 0, extra, 1, ready, &nready);
+	TAP_CHECKF(t, r == 0 && nready == 0, "idle: r=%d nready=%d", r, nready);
+
+	TAP_ASSERT(t, write(b[1], "x", 1) == 1);	/* PTY readable */
+	r = tty_poll_fds(&tt, 0, extra, 1, ready, &nready);
+	TAP_CHECKF(t, r == 0 && nready == 1 && ready[0] == b[0],
+	    "pty: r=%d nready=%d", r, nready);
+
+	TAP_ASSERT(t, write(a[1], "k", 1) == 1);	/* keyboard readable */
+	r = tty_poll_fds(&tt, 0, extra, 1, ready, &nready);
+	TAP_CHECKF(t, r == 1, "kbd: r=%d", r);
+
+	close(a[0]);
+	close(a[1]);
+	close(b[0]);
+	close(b[1]);
+}
+
+/* With no title set, the label falls back to a generic name. */
+static void
+t_term_label_default(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child;
+
+	v = term_editor(&m, &io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+	TAP_CHECK(t, strcmp(term_label(&v->e), "terminal") == 0);
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* Two terminals: collect reports both, and a background one is found by fd. */
+static void
+t_term_two_bg(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int c0, c1, fds[VEDIT_TERM_MAX], n;
+	struct vt_cell *cell;
+
+	v = term_editor(&m, &io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, term_pair(v, &c0, 10, 40) == 0);		/* buffer 0 */
+	TAP_ASSERT(t, term_pair(v, &c1, 10, 40) == 0);		/* buffer 1 (active) */
+
+	n = term_collect(&v->e, fds, VEDIT_TERM_MAX);
+	TAP_CHECKF(t, n == 2, "collect returned %d", n);
+
+	/* feed the background buffer; term_drain must find it by fd */
+	TAP_ASSERT(t, write(c0, "\033[33mBG\033[0m", 10) == 10);
+	term_drain(&v->e, v->e.bufs[0].vterm->master_fd);
+	cell = vt_buf_cell(v->e.bufs[0].vterm->vt->buf, 0, 0);
+	TAP_ASSERT(t, cell != NULL);
+	TAP_CHECK(t, cell->codepoint == 'B');
+
+	close(c0);
+	close(c1);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* Ctrl-W W switches to the previous buffer. */
+static void
+t_term_loop_prev(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int c0, c1;
+
+	v = term_editor_in(&m, &io, "\027W", 2, 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, term_pair(v, &c0, 10, 40) == 0);
+	TAP_ASSERT(t, term_pair(v, &c1, 10, 40) == 0);
+	TAP_CHECK(t, v->e.cur == 1);
+
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_CONT);
+	TAP_CHECKF(t, v->e.cur == 0, "prev left cur at %d", v->e.cur);
+
+	close(c0);
+	close(c1);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* Ctrl-W c closes the active terminal when another buffer remains. */
+static void
+t_term_loop_close(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int c0, c1;
+
+	v = term_editor_in(&m, &io, "\027c", 2, 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, term_pair(v, &c0, 10, 40) == 0);
+	TAP_ASSERT(t, term_pair(v, &c1, 10, 40) == 0);
+
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_CONT);
+	TAP_CHECKF(t, v->e.nbuf == 1, "close left nbuf at %d", v->e.nbuf);
+
+	close(c0);			/* the closed buffer's end */
+	close(c1);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* Ctrl-W <digit> switches to that buffer by number. */
+static void
+t_term_loop_digit(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int c0, c1;
+
+	v = term_editor_in(&m, &io, "\0271", 2, 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, term_pair(v, &c0, 10, 40) == 0);
+	TAP_ASSERT(t, term_pair(v, &c1, 10, 40) == 0);
+
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_CONT);
+	TAP_CHECKF(t, v->e.cur == 0, "digit left cur at %d", v->e.cur);
+
+	close(c0);
+	close(c1);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* Bytes typed before Ctrl-W are flushed to the child before the command. */
+static void
+t_term_loop_flush(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child, n;
+	char buf[8];
+
+	v = term_editor_in(&m, &io, "ab\027\027", 4, 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_CONT);
+	n = read_all(child, buf, sizeof(buf));
+	TAP_CHECKF(t, n == 3 && buf[0] == 'a' && buf[1] == 'b' && buf[2] == 0x17,
+	    "child got %d bytes", n);
+
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* Without a multiplexing host, in_refill uses the plain poll fallback. */
+static void
+t_term_poll_fallback(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child;
+
+	v = term_editor(&m, &io);		/* no memio_enable_fds: poll only */
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+	TAP_CHECK(t, v->e.d->t->io.poll_fds == NULL);
+
+	/* memio has no input, so the fallback path reads EOF */
+	TAP_CHECK(t, scr_pump(v->e.d, 0) < 0);
+
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* term_discard frees a handle that was never installed on a buffer. */
+static void
+t_term_discard(Test *t)
+{
+	Term *h = term_make(10, 40);
+	int p[2];
+
+	TAP_ASSERT(t, h != NULL);
+	TAP_ASSERT(t, pipe(p) == 0);
+	h->master_fd = p[1];		/* a real fd to close; no child to reap */
+	term_discard(h);		/* closes the fd, frees vt/parser/handle */
+	close(p[0]);
+}
+
+/* term_open refuses without a multiplexing host. */
+static void
+t_term_open_nomux(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	v = term_editor(&m, &io);		/* no memio_enable_fds */
+	TAP_ASSERT(t, v != NULL);
+	v->e.t = text_new();			/* term_open refuses before using it */
+	TAP_CHECK(t, term_open(&v->e, NULL) < 0);
+	TAP_CHECK(t, v->e.kind != BUF_TERM);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* Ctrl-W n opens a second terminal (a forked child). */
+static void
+t_term_loop_newwin(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child, before;
+
+	v = term_editor_in(&m, &io, "\027n", 2, 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+	before = v->e.nbuf;
+
+	if (term_loop_step(&v->e) != TERM_CONT) {
+		close(child);
+		vedit_free(v);
+		memio_free(&m);
+		return;
+	}
+	/* a new terminal buffer appears (unless the spawn failed) */
+	TAP_CHECK(t, v->e.nbuf >= before);
+
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* A resize to a different size resizes the PTY and grid through the loop. */
+static void
+t_term_loop_resize_grow(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child;
+
+	v = term_editor_in(&m, &io, "", 0, 1);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+
+	m.rows = 40;				/* getsize now reports a new size */
+	m.cols = 100;
+	g_winch = 1;
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_CONT);
+	TAP_CHECK(t, v->e.rows == 40 && v->e.cols == 100);
+	TAP_CHECK(t, v->e.vterm->rows == text_height(&v->e));
+
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* A cursor reported past the visible area is clamped into it. */
+static void
+t_term_cursor_clamp(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child;
+
+	v = term_editor(&m, &io);
+	TAP_ASSERT(t, v != NULL);
+	/* grid taller than the text area so the child can park the cursor
+	 * below the last visible row, forcing the clamp */
+	TAP_ASSERT(t, term_pair(v, &child, 40, 40) == 0);
+
+	TAP_ASSERT(t, write(child, "\033[40;40H", 8) == 8);
+	term_drain(&v->e, v->e.vterm->master_fd);
+	ed_render(&v->e, v->e.d);		/* must not place the cursor off-area */
+	TAP_CHECK(t, v->e.vterm->vt->cursor_row >= text_height(&v->e));
+
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* Freeing a buffer whose child is still alive hangs it up and reaps it. */
+static void
+t_term_kill(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	v = term_editor_in(&m, &io, "", 0, 1);
+	TAP_ASSERT(t, v != NULL);
+	if (term_open(&v->e, "sleep 30") < 0) {
+		vedit_free(v);			/* spawn unavailable: skip */
+		memio_free(&m);
+		return;
+	}
+	TAP_CHECK(t, v->e.vterm->child_pid > 0);
+	TAP_CHECK(t, !v->e.vterm->dead);
+	vedit_free(v);				/* term_buf_free: SIGHUP + reap */
+	memio_free(&m);
+}
+
 const Case tap_cases[] = {
 	{ "term_attach_render", t_term_attach_render },
 	{ "term_collect", t_term_collect },
 	{ "term_resize", t_term_resize },
 	{ "term_title_cursor", t_term_title_cursor },
 	{ "term_fork_smoke", t_term_fork_smoke },
+	{ "term_loop_input", t_term_loop_input },
+	{ "term_loop_literal", t_term_loop_literal },
+	{ "term_loop_cmd", t_term_loop_cmd },
+	{ "term_loop_quit", t_term_loop_quit },
+	{ "term_loop_output", t_term_loop_output },
+	{ "term_loop_resize", t_term_loop_resize },
+	{ "tty_poll_fds", t_tty_poll_fds },
+	{ "term_label_default", t_term_label_default },
+	{ "term_two_bg", t_term_two_bg },
+	{ "term_loop_prev", t_term_loop_prev },
+	{ "term_loop_close", t_term_loop_close },
+	{ "term_loop_digit", t_term_loop_digit },
+	{ "term_loop_flush", t_term_loop_flush },
+	{ "term_poll_fallback", t_term_poll_fallback },
+	{ "term_discard", t_term_discard },
+	{ "term_open_nomux", t_term_open_nomux },
+	{ "term_loop_newwin", t_term_loop_newwin },
+	{ "term_loop_resize_grow", t_term_loop_resize_grow },
+	{ "term_cursor_clamp", t_term_cursor_clamp },
+	{ "term_kill", t_term_kill },
 	{ NULL, NULL },
 };
