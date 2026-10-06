@@ -772,7 +772,7 @@ t_tool_term_start(Test *t)
 			break;
 	for (tries = 0; tries < 5 && v->e.tool_done_pending; tries++)
 		term_loop_step(&v->e);
-	TAP_CHECKF(t, strcmp(v->e.tool_result, "Make exited 0, 0 errors, 0 warnings") == 0,
+	TAP_CHECKF(t, strcmp(v->e.tool_result, "Make exited 0") == 0,
 	    "result '%s'", v->e.tool_result);
 	TAP_CHECK(t, term_is_active(&v->e));	/* no error: stays on the output */
 
@@ -785,6 +785,43 @@ t_tool_term_start(Test *t)
 	memio_free(&m);
 	remove_file(dir, "b.c");
 	rmdir(dir);
+}
+
+/* :!cmd runs in a tool terminal labelled with the command, and its output is
+ * parsed like a build's. Skipped when a pty cannot be opened. */
+static void
+t_tool_term_shell(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int tries;
+
+	v = term_editor_in(&m, &io, "", 0, 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	v->e.tools = &cli_tools;
+	ed_shell_cmd(&v->e, "printf 'nothing to see\\n'; exit 4");
+	if (!term_is_active(&v->e)) {
+		vedit_free(v);			/* no pty here: skip */
+		memio_free(&m);
+		return;
+	}
+	TAP_CHECKF(t, strcmp(term_label(&v->e), "! printf 'nothing to see\\n'; exit 4") == 0,
+	    "label '%s'", term_label(&v->e));
+	for (tries = 0; tries < 200 && !v->e.vterm->dead; tries++)
+		if (term_loop_step(&v->e) != TERM_CONT)
+			break;
+	for (tries = 0; tries < 5 && v->e.tool_done_pending; tries++)
+		term_loop_step(&v->e);
+	TAP_CHECKF(t, strcmp(v->e.tool_result, "! printf 'nothing to see\\n'; exit 4 exited 4") == 0,
+	    "result '%s'", v->e.tool_result);
+	TAP_CHECK(t, term_is_active(&v->e));	/* no error: stays on the output */
+	TAP_CHECK(t, v->e.tool_nlines == 1 &&
+	    strcmp(v->e.tool_lines[0], "nothing to see") == 0);
+
+	vedit_free(v);
+	memio_free(&m);
 }
 
 /* Without a multiplexing host, in_refill uses the plain poll fallback. */
@@ -1083,6 +1120,7 @@ const Case tap_cases[] = {
 	{ "term_loop_menu", t_term_loop_menu },
 	{ "tool_term_capture", t_tool_term_capture },
 	{ "tool_term_start", t_tool_term_start },
+	{ "tool_term_shell", t_tool_term_shell },
 	{ "term_poll_fallback", t_term_poll_fallback },
 	{ "term_discard", t_term_discard },
 	{ "term_open_nomux", t_term_open_nomux },

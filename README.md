@@ -676,8 +676,10 @@ writes and quits, `ZQ` quits without writing. The `:` line runs `write`, `quit`,
 `bnext`, `bprevious`, `bdelete`, `buffers`, `tag`, `pop`, `retab`, `marks`,
 `delmarks`, `jumps`, `:N`,
 `:set number` / `:set nonumber`, and `:set wrap` / `:set nowrap`. `:!cmd` runs a
-shell command and shows its output in the build pane (through the host's command
-runner, so it is unavailable when none is installed). `:terminal [cmd]` opens a
+shell command the way the build commands run: in a terminal buffer labelled
+with the command, or in the output pane when a terminal buffer is not possible
+(through the host's command runner, so it is unavailable when none is
+installed). `:terminal [cmd]` opens a
 terminal buffer, described under
 [Terminal buffers](#terminal-buffers). Command names
 follow the usual vi abbreviation rule: any leading prefix of the full name down
@@ -758,8 +760,9 @@ you want. For example:
 Compile, Make, and Run start the command in a terminal buffer (see
 [Terminal buffers](#terminal-buffers)), labelled with the command name, so its
 output shows live, in color, and a program that prompts can be answered. The
-buffer stays after the command exits, with the exit status and the diagnostic
-counts on its status line, and the next build replaces it. `Ctrl-W w` returns
+buffer stays after the command exits, with the exit status and, when any were
+parsed, the diagnostic counts on its status line, and the next build replaces
+it. `Ctrl-W w` returns
 to the file while a command runs; `Alt+F5` (Run > View Output) switches back to
 the build terminal. The output is also captured for the parser below: it is the
 same capture that feeds the output pane, which is what the command falls back to

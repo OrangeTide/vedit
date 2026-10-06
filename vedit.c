@@ -15787,9 +15787,13 @@ tool_poll_done(Editor *e)
 	tool_parse_output(e);
 	e->tool_curerr = -1;
 	tool_counts(e, &ne, &nw);
-	snprintf(e->tool_result, sizeof(e->tool_result),
-	    "%s exited %d, %d error%s, %d warning%s", e->tool_title, rc,
-	    ne, ne == 1 ? "" : "s", nw, nw == 1 ? "" : "s");
+	if (e->tool_nerr == 0)		/* nothing parsed: keep it short */
+		snprintf(e->tool_result, sizeof(e->tool_result),
+		    "%s exited %d", e->tool_title, rc);
+	else
+		snprintf(e->tool_result, sizeof(e->tool_result),
+		    "%s exited %d, %d error%s, %d warning%s", e->tool_title, rc,
+		    ne, ne == 1 ? "" : "s", nw, nw == 1 ? "" : "s");
 	fe = tool_first_error(e);
 	if (fe >= 0)				/* land on the first error */
 		tool_goto_err(e, fe);
@@ -15904,9 +15908,10 @@ ed_tool_run(Editor *e, const char *which, const char *label)
 	free(cmd);
 }
 
-/* Run an arbitrary shell command (vi :!cmd), capturing its output into the
- * tool pane. Goes through the host's tool runner, so an embedding host that
- * installs no runner (or none with capture) simply has no shell access. */
+/* Run an arbitrary shell command (vi :!cmd): in a tool terminal buffer when
+ * one is possible, else capturing its output into the tool pane. Both go
+ * through the host's tool runner, so an embedding host that installs no
+ * runner simply has no shell access. */
 static void
 ed_shell_cmd(Editor *e, const char *cmd)
 {
@@ -15917,12 +15922,25 @@ ed_shell_cmd(Editor *e, const char *cmd)
 		set_status(e, "usage: :!command");
 		return;
 	}
-	if (!e->tools || !e->tools->run_capture) {
+	if (!e->tools) {
 		set_status(e, "shell commands are not available");
 		return;
 	}
 	tool_build_dir(e, dir, sizeof(dir));
 	snprintf(e->tool_dir, sizeof(e->tool_dir), "%s", dir);
+#ifdef VEDIT_TERM
+	if (tool_use_term(e)) {
+		char label[TOOLTITLE_MAX];
+
+		snprintf(label, sizeof(label), "! %.40s", cmd);
+		tool_term_start(e, cmd, dir, label);
+		return;
+	}
+#endif
+	if (!e->tools->run_capture) {
+		set_status(e, "shell commands are not available");
+		return;
+	}
 	tool_clear_output(e);
 	snprintf(e->tool_title, sizeof(e->tool_title), "! %.40s", cmd);
 	rc = e->tools->run_capture(e->tools->ctx, cmd, dir, tool_emit, e);
