@@ -114,7 +114,7 @@ static void
 t_syntax_c(Test *t)
 {
 	const Syntax *sy = syn_for_ext("c");	/* the built-in default grammar */
-	uint8_t out[32];
+	uint16_t out[32];
 	int type, kw, com, pre;
 
 	TAP_ASSERT(t, sy != NULL && sy->fsm != NULL);
@@ -145,8 +145,8 @@ static void
 t_syntax_block_comment_carry(Test *t)
 {
 	const Syntax *sy = syn_for_ext("c");
-	uint8_t out[32];
-	uint16_t st;
+	uint16_t out[32];
+	uint32_t st;
 	int com;
 
 	TAP_ASSERT(t, sy != NULL && sy->fsm != NULL);
@@ -166,8 +166,8 @@ t_syntax_refine(Test *t)
 {
 	const Syntax *c = syn_for_ext("c");
 	const Syntax *sh = syn_for_ext("sh");
-	uint8_t out[32];
-	uint16_t st;
+	uint16_t out[32];
+	uint32_t st;
 	int pre, str, var;
 
 	TAP_ASSERT(t, c && c->fsm && sh && sh->fsm);
@@ -200,8 +200,8 @@ static void
 t_syntax_md(Test *t)
 {
 	const Syntax *md = syn_for_ext("md");
-	uint8_t out[64];
-	uint16_t st;
+	uint16_t out[64];
+	uint32_t st;
 	int head, bold, ital, code, cb, quote, link, url, lm, txt;
 
 	TAP_ASSERT(t, md != NULL && md->fsm != NULL);
@@ -270,8 +270,9 @@ t_syntax_md(Test *t)
 	syn_line(md, md->start, "-x", 2, out);
 	TAP_CHECKF(t, out[0] == txt, "lone dash %d", out[0]);
 
-	/* a fenced code block carries across lines until the closing fence */
-	st = syn_line(md, md->start, "```c", 4, out);
+	/* a fenced code block carries across lines until the closing fence (a
+	 * language the editor knows is styled by its grammar: t_syntax_md_embed) */
+	st = syn_line(md, md->start, "```nosuch", 9, out);
 	TAP_CHECKF(t, out[0] == code && out[3] == code, "fence open [%d %d]",
 	    out[0], out[3]);
 	TAP_CHECKF(t, st != md->start, "fence carries state %u", st);
@@ -281,6 +282,66 @@ t_syntax_md(Test *t)
 	st = syn_line(md, st, "```", 3, out);
 	TAP_CHECKF(t, out[0] == cb, "fence close %d", out[0]);
 	TAP_CHECK(t, st == md->start);		/* block closed on this line */
+}
+
+/* A fenced block whose info string names a known language is styled by that
+ * language's grammar, tagged with its id, and the carry state packs both
+ * grammars until the closing fence returns the line to Markdown. An unknown
+ * language keeps the block in Markdown's own codeblock color. */
+static void
+t_syntax_md_embed(Test *t)
+{
+	const Syntax *md = syn_for_ext("md");
+	const Syntax *c = syn_for_ext("c");
+	uint16_t out[32];
+	uint32_t st;
+	int cb, type, kw, gid;
+
+	TAP_ASSERT(t, md && md->fsm && c && c->fsm);
+	cb = fsm_class(md->fsm, "codeblock");
+	type = fsm_class(c->fsm, "type");
+	kw = fsm_class(c->fsm, "keyword");
+	gid = syn_gid(c);
+	TAP_ASSERT(t, cb > 0 && type > 0 && kw > 0 && gid > 0);
+
+	st = syn_line(md, md->start, "```c", 4, out);
+	TAP_CHECKF(t, SYN_GID(st) == gid && SYN_INNER(st) == c->start,
+	    "after the fence: gid %d inner %u", SYN_GID(st), SYN_INNER(st));
+	st = syn_line(md, st, "int x; return", 13, out);
+	TAP_CHECKF(t, out[0] == ((gid << 8) | type), "int -> %#x", out[0]);
+	TAP_CHECKF(t, out[7] == ((gid << 8) | kw), "return -> %#x", out[7]);
+	TAP_CHECK(t, SYN_GID(st) == gid);
+	/* a C block comment left open carries the inner state across lines */
+	st = syn_line(md, st, "/* open", 7, out);
+	TAP_CHECK(t, SYN_GID(st) == gid && SYN_INNER(st) != c->start);
+	st = syn_line(md, st, "still", 5, out);
+	TAP_CHECKF(t, (out[0] >> 8) == gid && (out[0] & 0xff) ==
+	    fsm_class(c->fsm, "comment"), "comment carry -> %#x", out[0]);
+	/* the closing fence, even indented, ends the region in Markdown's color */
+	st = syn_line(md, st, "  ```", 5, out);
+	TAP_CHECKF(t, out[2] == cb, "fence close -> %#x", out[2]);
+	TAP_CHECKF(t, st == SYN_PACK(md->start, 0, 0), "closed: %#x", st);
+
+	/* the info string's first word picks the language; extras are ignored */
+	st = syn_line(md, md->start, "```sh title=x", 13, out);
+	TAP_CHECKF(t, SYN_GID(st) == syn_gid(syn_for_ext("sh")),
+	    "sh fence gid %d", SYN_GID(st));
+	st = syn_line(md, st, "```", 3, out);
+	TAP_CHECK(t, st == SYN_PACK(md->start, 0, 0));
+
+	/* an unknown language: plain codeblock, no inner grammar */
+	st = syn_line(md, md->start, "```nosuch", 9, out);
+	TAP_CHECKF(t, SYN_GID(st) == 0, "unknown gid %d", SYN_GID(st));
+	st = syn_line(md, st, "int x;", 6, out);
+	TAP_CHECKF(t, out[0] == cb && out[5] == cb, "plain body [%#x %#x]",
+	    out[0], out[5]);
+	st = syn_line(md, st, "```", 3, out);
+	TAP_CHECK(t, st == SYN_PACK(md->start, 0, 0));
+
+	/* a bare fence too */
+	st = syn_line(md, md->start, "```", 3, out);
+	st = syn_line(md, st, "x", 1, out);
+	TAP_CHECK(t, out[0] == cb && SYN_GID(st) == 0);
 }
 
 /* Serialize the whole buffer the way the file on disk would read: each line's
@@ -1233,7 +1294,7 @@ t_jsf_highlight(Test *t)
 	const Cfg *old = g_cfg;
 	const Syntax *sy;
 	const char *line = "if 42x";
-	uint8_t out[16];
+	uint16_t out[16];
 	int lang, kw, num, txt;
 
 	TAP_ASSERT(t, c != NULL);
@@ -1263,6 +1324,75 @@ t_jsf_highlight(Test *t)
 	vedit_cfg_free(c);
 	unlink(path);
 }
+
+/* A user grammar can embed one by name with a mid-line end string, matched
+ * without regard to case; the outer grammar resumes on the end string with
+ * its own rules, and the region carries across lines until it is seen. */
+static void
+t_jsf_embed(Test *t)
+{
+	static const char *text =
+	    "[language \"mini\"]\n"
+	    "[color \"mini\"]\n"
+	    "  tag = red\n"
+	    "[state \"mini.idle\"]\n"
+	    "  color = text\n"
+	    "  rule = \"<\" tag recolor\n"
+	    "  rule = * idle\n"
+	    "[state \"mini.tag\"]\n"
+	    "  color = tag\n"
+	    "  embed = c\n"
+	    "  end = </c>\n"
+	    "  endcase = off\n"
+	    "  rule = \">\" idle\n"
+	    "  rule = * tag\n";
+	char path[256];
+	Cfg *cfg = load_cfg_text(text, path, sizeof(path));
+	const Cfg *old = g_cfg;
+	const Syntax *sy, *c;
+	uint16_t out[32];
+	uint32_t st;
+	int lang, tag, txt, gid, type;
+
+	TAP_ASSERT(t, cfg != NULL);
+	g_cfg = cfg;
+	syntax_load_cfg(&g_user, cfg);
+	lang = jsf_find(&g_user, "mini");
+	TAP_ASSERT(t, lang >= 0);
+	tag = jsf_class_of(lang, "tag");
+	txt = jsf_class_of(lang, "text");
+	sy = syn_for_ext("mini");
+	c = syn_for_ext("c");
+	TAP_ASSERT(t, sy && sy->fsm && c && c->fsm && tag > 0);
+	gid = syn_gid(c);
+	type = fsm_class(c->fsm, "type");
+
+	/* "a<int</C>b": '<' enters tag, which embeds C from the next byte */
+	st = syn_line(sy, sy->start, "a<int</C>b", 10, out);
+	TAP_CHECKF(t, out[0] == txt && out[1] == tag, "lead [%#x %#x]",
+	    out[0], out[1]);
+	TAP_CHECKF(t, out[2] == ((gid << 8) | type) && out[4] == out[2],
+	    "embedded int [%#x %#x]", out[2], out[4]);
+	TAP_CHECKF(t, out[5] == tag && out[8] == tag, "end string [%#x %#x]",
+	    out[5], out[8]);
+	TAP_CHECKF(t, out[9] == txt, "after -> %#x", out[9]);
+	TAP_CHECK(t, st == SYN_PACK(sy->start, 0, 0));
+
+	/* no end on the line: the region carries, and ends on a later line */
+	st = syn_line(sy, sy->start, "<int", 4, out);
+	TAP_CHECKF(t, SYN_GID(st) == gid, "carry gid %d", SYN_GID(st));
+	st = syn_line(sy, st, "char</c>z", 9, out);
+	TAP_CHECKF(t, out[0] == ((gid << 8) | type), "line 2 char -> %#x", out[0]);
+	TAP_CHECKF(t, out[4] == tag && out[8] == txt, "line 2 tail [%#x %#x]",
+	    out[4], out[8]);
+	TAP_CHECK(t, st == SYN_PACK(sy->start, 0, 0));
+
+	g_cfg = old;
+	syntax_load_cfg(&g_user, NULL);
+	vedit_cfg_free(cfg);
+	unlink(path);
+}
+
 
 static void
 t_jsf_linecomment(Test *t)
@@ -1294,7 +1424,7 @@ t_jsf_linecomment(Test *t)
 	Cfg *c = load_cfg_text(text, path, sizeof(path));
 	const Cfg *old = g_cfg;
 	const Syntax *sy;
-	uint8_t out[32];
+	uint16_t out[32];
 	uint16_t carry;
 	int lang, kw, com;
 
@@ -1353,7 +1483,7 @@ t_jsf_recolormark(Test *t)
 	const Cfg *old = g_cfg;
 	const Syntax *sy;
 	const char *line = "a<bcd>e";
-	uint8_t out[16];
+	uint16_t out[16];
 	int lang, reg, txt;
 
 	TAP_ASSERT(t, c != NULL);
@@ -1409,7 +1539,7 @@ t_jsf_include(Test *t)
 	Cfg *c = load_cfg_text(text, path, sizeof(path));
 	const Cfg *old = g_cfg;
 	const Syntax *sy;
-	uint8_t out[16];
+	uint16_t out[16];
 	int lang, ca, cb;
 
 	TAP_ASSERT(t, c != NULL);
@@ -2556,6 +2686,7 @@ const Case tap_cases[] = {
 	{ "syntax_block_comment_carry", t_syntax_block_comment_carry },
 	{ "syntax_refine", t_syntax_refine },
 	{ "syntax_md", t_syntax_md },
+	{ "syntax_md_embed", t_syntax_md_embed },
 	{ "entry_scroll", t_entry_scroll },
 	{ "text_fp_roundtrip", t_text_fp_roundtrip },
 	{ "swap_paths", t_swap_paths },
@@ -2579,6 +2710,7 @@ const Case tap_cases[] = {
 	{ "cfg_theme", t_cfg_theme },
 	{ "jsf_charset", t_jsf_charset },
 	{ "jsf_highlight", t_jsf_highlight },
+	{ "jsf_embed", t_jsf_embed },
 	{ "jsf_linecomment", t_jsf_linecomment },
 	{ "jsf_recolormark", t_jsf_recolormark },
 	{ "jsf_include", t_jsf_include },

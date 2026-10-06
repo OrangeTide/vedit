@@ -355,6 +355,33 @@ end of each line a newline is fed to the machine (as joe does), so a state that
 should not span lines, such as a `//` line comment, returns to idle with a
 `rule = "\n" idle`; a state with only a `*` rule stays and carries on. The
 newline flush also lets a bare keyword at the very end of a line be recognized.
+A state can hand the text after it to another grammar, which is how a fenced
+code block in Markdown is colored as the language its info string names, and
+how a script block inside a page can be colored as script:
+
+```ini
+[state "md.codeblock"]
+    embed = auto          # the grammar named by the token buffered at entry
+    end = ```             # the string that ends the region
+    endbol = on           # ... counted only at the start of a line
+
+[state "page.script"]
+    embed = javascript    # a grammar by name
+    end = </script>
+    endcase = off         # matched without regard to case
+```
+
+`embed` names a grammar, or `auto` to take the first word of the token that
+was being buffered when the state was entered (so the fence's `buffer` rule
+must start it) and look it up as a language name or extension; a word with no
+grammar leaves the region in the state's own color. The embedded grammar runs
+from the byte after the transition (that byte itself after `noeat`) until
+`end` is seen, carrying its own state across lines; the embedding grammar then
+resumes in the same state on the end string, so the state's own rules color
+and leave it. `endbol` restricts the match to the start of a line, after any
+blanks; `endcase = off` ignores case. One level only: an embedded grammar's
+own `embed` states are ignored.
+
 A language whose name matches a file extension is picked up automatically; a
 `syntax.<ext> = <name>` line maps any other extension. The core reads no files:
 the rules are config data, loaded through `vedit_set_config()` like everything
@@ -995,6 +1022,10 @@ plain. Toggle it from the View menu, or with the vi `:syntax` command: `:syntax
 off`, `:syntax on`, or `:syntax c` / `:syntax sh` to force a language. The
 built-in grammars use base-16 colors so they read the same at 16 and 256 colors
 and stay legible on the blue chrome.
+
+A fenced code block in Markdown whose info string names a language the editor
+knows (` ```c `, ` ```sh `, or an extension mapped with `syntax.<ext>`) is
+colored by that language's grammar; other blocks keep the code-block color.
 
 To add or change a language, define a grammar in your config (see "Custom syntax
 highlighting"); a language named like a built-in replaces it.

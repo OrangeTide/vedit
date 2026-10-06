@@ -2846,6 +2846,10 @@ typedef struct jsf_state {
 	uint8_t		klass;		/* default color class for this state */
 	int		rule_first, rule_n;
 	int		include;	/* fall back to this state's rules, or -1 */
+	char		embed[JSF_NAME];	/* grammar run from here ("auto": by token), or "" */
+	char		end[24];	/* string that ends the embedded region */
+	uint8_t		endbol;		/* end counts only at the start of a line */
+	uint8_t		endcase;	/* end is matched case-sensitively */
 } Jsfstate;
 
 typedef struct jsf_word { const char *s; int len; } Jsfword;	/* into g_cfg */
@@ -2875,6 +2879,11 @@ typedef struct jsf_reg {
 
 static Jsfreg	g_user;		/* grammars from the user's config */
 static Jsfreg	g_def;		/* built-in default grammars (C, shell) */
+
+/* The grammars a rendered line's styles may index: g[0] is the buffer's own,
+ * g[id] the one a style's id tags (an embedded grammar). Built per paint by
+ * syn_palette; the ids are explained with syn_line. */
+typedef struct hlpal { const Jsf *g[2 * JSF_LANG_MAX + 1]; } Hlpal;
 
 static int
 jsf_find(const Jsfreg *r, const char *name)
@@ -2906,6 +2915,14 @@ jsf_class(Jsf *j, const char *name)
 	return i;
 }
 
+/* A state attribute's on/off value. */
+static int
+jsf_truth(const char *v)
+{
+	return strcmp(v, "on") == 0 || strcmp(v, "yes") == 0 ||
+	    strcmp(v, "true") == 0 || strcmp(v, "1") == 0;
+}
+
 static int
 jsf_state_idx(Jsf *j, const char *name)
 {
@@ -2922,6 +2939,10 @@ jsf_state_idx(Jsf *j, const char *name)
 	j->states[i].rule_first = j->nrules;
 	j->states[i].rule_n = 0;
 	j->states[i].include = -1;
+	j->states[i].embed[0] = '\0';
+	j->states[i].end[0] = '\0';
+	j->states[i].endbol = 0;
+	j->states[i].endcase = 1;
 	return i;
 }
 
@@ -3035,12 +3056,26 @@ jsf_add_rule(Jsf *j)
 	return &j->rules[j->nrules];
 }
 
-/* Run the FSM over one line into out[] (class per byte); return the end state. */
+/* What jsf_line reports when a transition lands in a state that embeds
+ * another grammar: where that grammar's text begins, and the token buffered
+ * at the transition (the fence info string, say), for an "auto" embed. */
+typedef struct jsf_stop {
+	int	hit;
+	size_t	pos;		/* first byte of the embedded text (may be n) */
+	size_t	tok, toklen;	/* the buffered token, toklen 0 when none */
+} Jsfstop;
+
+/* Run grammar j over bytes[start..n) from state_in, writing a style per byte
+ * into out[start..n) (NULL to carry state only). Each style is hi | class,
+ * where hi tags the grammar for the renderer (0 for a buffer's own grammar).
+ * With stop set, the run ends early at a transition into a state that embeds
+ * a grammar, reporting it there; the caller (syn_line) runs the embedded
+ * grammar from that point. Returns the state at the end of the run. */
 static uint16_t
 jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
-    uint8_t *out)
+    uint16_t *out, size_t start, uint16_t hi, Jsfstop *stop)
 {
-	size_t i = 0, tok = 0, markpos = 0;
+	size_t i = start, tok = start, markpos = start;
 	uint16_t st = state_in < j->nstates ? state_in : j->start;
 	int buffering = 0, hops = 0;
 
@@ -3075,7 +3110,7 @@ jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
 		}
 		if (!R) {			/* no rule: color and consume */
 			if (out && i < n)
-				out[i] = S->klass;
+				out[i] = hi | S->klass;
 			i++;
 			continue;
 		}
@@ -3091,7 +3126,7 @@ jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
 				    (int)(i - tok)))
 					continue;
 				for (p = tok; p < i && p < n; p++)
-					out[p] = kw->klass;
+					out[p] = hi | kw->klass;
 				break;
 			}
 		}
@@ -3104,14 +3139,14 @@ jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
 		/* color the consumed byte with this state's class first, then
 		 * let recolor override it (and any earlier bytes) */
 		if (out && i < n && !(R->flags & JSF_F_NOEAT))
-			out[i] = S->klass;
+			out[i] = hi | S->klass;
 		if ((R->flags & JSF_F_RECOLORMARK) && out) {
 			uint8_t nk = j->states[R->next].klass;
 			size_t end = i < n ? i : n;
 			size_t p;
 
 			for (p = markpos; p < end; p++)
-				out[p] = nk;
+				out[p] = hi | nk;
 		}
 		if (R->recolor && out) {
 			size_t last = i < n ? i : (n ? n - 1 : 0);
@@ -3122,13 +3157,24 @@ jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
 
 			if (i <= n)
 				for (p = from; p <= last && p < n; p++)
-					out[p] = nk;
+					out[p] = hi | nk;
+		}
+		/* entering a state that embeds a grammar: hand over from the
+		 * next byte (this one, when it is not consumed) */
+		if (stop && R->next != st && j->states[R->next].embed[0]) {
+			stop->hit = 1;
+			stop->pos = (R->flags & JSF_F_NOEAT) ? i : i + 1;
+			if (stop->pos > n)
+				stop->pos = n;
+			stop->tok = tok;
+			stop->toklen = (buffering && i > tok) ? i - tok : 0;
+			return R->next;
 		}
 		if (R->flags & JSF_F_NOEAT) {
 			st = R->next;
 			if (++hops > 16) {	/* break a malformed noeat cycle */
 				if (out && i < n)
-					out[i] = j->states[st].klass;
+					out[i] = hi | j->states[st].klass;
 				i++;
 				hops = 0;
 			}
@@ -3384,6 +3430,20 @@ syntax_load_cfg(Jsfreg *r, const Cfg *c)
 				} else if (strcmp(tail, "rule") == 0) {
 					jsf_parse_rule(j,
 					    jsf_state_idx(j, sname), val);
+				} else if (strcmp(tail, "embed") == 0) {
+					Jsfstate *S = &j->states[jsf_state_idx(j, sname)];
+
+					snprintf(S->embed, sizeof(S->embed), "%s", val);
+				} else if (strcmp(tail, "end") == 0) {
+					Jsfstate *S = &j->states[jsf_state_idx(j, sname)];
+
+					snprintf(S->end, sizeof(S->end), "%s", val);
+				} else if (strcmp(tail, "endbol") == 0) {
+					j->states[jsf_state_idx(j, sname)].endbol =
+					    (uint8_t)jsf_truth(val);
+				} else if (strcmp(tail, "endcase") == 0) {
+					j->states[jsf_state_idx(j, sname)].endcase =
+					    (uint8_t)jsf_truth(val);
 				}
 			} else if (strncmp(key, "language.", 9) == 0) {
 				if (pass)
@@ -3664,10 +3724,27 @@ static const char g_default_grammar[] =
 	 * into codeblock, the per-line start state inside a fenced block. */
 	"[state \"md.fence_open\"]\n"
 	"	color = code\n"
+	"	rule = \"a-zA-Z0-9_+#.-\" fence_info buffer\n"
 	"	rule = \"\\n\" codeblock\n"
-	"	rule = * fence_open\n"
+	"	rule = * fence_rest\n"
+	/* The info string's first word is buffered so codeblock's embed=auto can
+	 * pick the language; the rest of the fence line is just colored. */
+	"[state \"md.fence_info\"]\n"
+	"	color = code\n"
+	"	rule = \"a-zA-Z0-9_+#.-\" fence_info\n"
+	"	rule = \"\\n\" codeblock\n"
+	"	rule = * fence_rest\n"
+	"[state \"md.fence_rest\"]\n"
+	"	color = code\n"
+	"	rule = \"\\n\" codeblock\n"
+	"	rule = * fence_rest\n"
+	/* codeblock embeds the grammar the info string names (none known: the
+	 * block stays codeblock-colored) until a closing fence starts a line. */
 	"[state \"md.codeblock\"]\n"
 	"	color = codeblock\n"
+	"	embed = auto\n"
+	"	end = ```\n"
+	"	endbol = on\n"
 	"	rule = \"`\" cb_fence1\n"
 	"	rule = \"\\n\" codeblock\n"
 	"	rule = * cb_line noeat\n"
@@ -3819,18 +3896,6 @@ syntax_load_defaults(void)
 	syntax_load_cfg(&g_def, g_def_cfg);
 }
 
-/* Style one line into out[0..n) (out may be NULL to carry state only). All
- * highlighting goes through the FSM now, so this just dispatches to it. Returns
- * the FSM carry state at end of line (0 when there is no grammar). */
-static uint16_t
-syn_line(const Syntax *sy, uint16_t state_in, const char *bytes,
-    size_t n, uint8_t *out)
-{
-	if (!sy || !sy->fsm)
-		return 0;
-	return jsf_line(sy->fsm, state_in, bytes, n, out);
-}
-
 /* Find a grammar named name: a user grammar first (so a user config overrides a
  * built-in), then a default one. */
 static const Syntax *
@@ -3872,6 +3937,174 @@ syn_for_ext(const char *ext)
 	return NULL;
 }
 
+
+/* ---- nesting: one grammar embedded in another ----
+ *
+ * A state with an "embed" attribute hands the text that follows to another
+ * grammar (a fenced code block in Markdown, a <script> body in HTML) until
+ * the state's "end" string is seen, where the embedding grammar resumes in
+ * that same state, so its own rules consume the end string. One level only:
+ * the embedded grammar's own embed states are ignored.
+ *
+ * The carry state between lines packs the three facts this needs: bits 0-15
+ * the outer state, 16-23 the embedded grammar's id (0 = none), 24-31 its
+ * state. A grammar id names a registry slot (1..JSF_LANG_MAX the user's,
+ * then the built-in ones), which also tags each style the embedded grammar
+ * writes, so the renderer colors it from that grammar's table. */
+
+#define JSF_GID_MAX	(2 * JSF_LANG_MAX)
+#define SYN_OUTER(c)	((uint16_t)((c) & 0xffff))
+#define SYN_GID(c)	((int)(((c) >> 16) & 0xff))
+#define SYN_INNER(c)	((uint16_t)(((c) >> 24) & 0xff))
+#define SYN_PACK(o, g, i) \
+	((uint32_t)(o) | ((uint32_t)(g) << 16) | ((uint32_t)(i) << 24))
+
+/* The grammar a style's id tags, or NULL. */
+static const Jsf *
+jsf_by_gid(int gid)
+{
+	if (gid >= 1 && gid <= JSF_LANG_MAX && gid - 1 < g_user.count)
+		return &g_user.lang[gid - 1];
+	gid -= JSF_LANG_MAX;
+	if (gid >= 1 && gid <= JSF_LANG_MAX && gid - 1 < g_def.count)
+		return &g_def.lang[gid - 1];
+	return 0;
+}
+
+/* The id of a grammar, or 0. */
+static int
+syn_gid(const Syntax *s)
+{
+	if (s >= g_user.syn && s < g_user.syn + g_user.count)
+		return 1 + (int)(s - g_user.syn);
+	if (s >= g_def.syn && s < g_def.syn + g_def.count)
+		return 1 + JSF_LANG_MAX + (int)(s - g_def.syn);
+	return 0;
+}
+
+/* The grammar state S embeds, as an id, or 0 when there is none to run. An
+ * "auto" embed takes the first word of the token buffered at the transition
+ * (the fence's info string) as a language name or extension. */
+static int
+syn_embed_gid(const Jsfstate *S, const char *bytes, const Jsfstop *stop)
+{
+	char name[JSF_NAME];
+	const Syntax *s;
+	size_t i, k = 0;
+
+	if (strcmp(S->embed, "auto") != 0)
+		return syn_gid(syn_reg_find(S->embed));
+	for (i = 0; i < stop->toklen && k + 1 < sizeof(name); i++) {
+		unsigned char c = (unsigned char)bytes[stop->tok + i];
+
+		if (c == ' ' || c == '\t')
+			break;
+		name[k++] = (char)tolower(c);
+	}
+	name[k] = '\0';
+	if (!k)
+		return 0;
+	s = syn_for_ext(name);
+	return s ? syn_gid(s) : 0;
+}
+
+/* Find state S's end string in bytes[pos..n). With endbol it counts only at
+ * the start of the line, after any blanks; otherwise anywhere, and without
+ * regard to case unless endcase is set. Returns 1 with *endpos set. */
+static int
+syn_find_end(const Jsfstate *S, const char *bytes, size_t n, size_t pos,
+    size_t *endpos)
+{
+	size_t elen = strlen(S->end), i;
+
+	if (!elen || elen > n)
+		return 0;
+	if (S->endbol) {
+		if (pos != 0)
+			return 0;
+		for (i = 0; i < n && (bytes[i] == ' ' || bytes[i] == '\t'); i++)
+			;
+		if (n - i < elen || memcmp(bytes + i, S->end, elen) != 0)
+			return 0;
+		*endpos = i;
+		return 1;
+	}
+	for (i = pos; i + elen <= n; i++) {
+		int same = S->endcase ? memcmp(bytes + i, S->end, elen) == 0
+		    : strncasecmp(bytes + i, S->end, elen) == 0;
+
+		if (same) {
+			*endpos = i;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* Style one line into out[0..n) (out may be NULL to carry state only),
+ * running the buffer's grammar and whatever grammar it embeds. Returns the
+ * packed carry state at end of line (0 when there is no grammar). */
+static uint32_t
+syn_line(const Syntax *sy, uint32_t state_in, const char *bytes,
+    size_t n, uint16_t *out)
+{
+	const Jsf *j;
+	uint16_t st, inner;
+	int gid, rounds = 0;
+	size_t pos = 0;
+
+	if (!sy || !sy->fsm)
+		return 0;
+	j = sy->fsm;
+	st = SYN_OUTER(state_in);
+	gid = SYN_GID(state_in);
+	inner = SYN_INNER(state_in);
+	if (st >= j->nstates)
+		st = j->start;
+	for (;;) {
+		Jsfstop stop;
+
+		if (gid) {			/* inside an embedded region */
+			const Jsf *ij = jsf_by_gid(gid);
+			size_t endpos, len;
+			int found;
+
+			if (!ij) {		/* gone (a config reload): drop it */
+				gid = 0;
+				continue;
+			}
+			if (pos >= n)		/* begins on the next line */
+				return SYN_PACK(st, gid, inner);
+			found = syn_find_end(&j->states[st], bytes, n, pos,
+			    &endpos);
+			len = (found ? endpos : n) - pos;
+			inner = jsf_line(ij, inner, bytes + pos, len,
+			    out ? out + pos : NULL, 0, (uint16_t)(gid << 8),
+			    NULL);
+			if (!found)
+				return SYN_PACK(st, gid, inner);
+			pos = endpos;		/* the outer resumes on the end string */
+			gid = 0;
+		}
+		memset(&stop, 0, sizeof(stop));
+		/* a malformed grammar could re-enter an embed state at one
+		 * spot forever; after a while finish the line without stops */
+		st = jsf_line(j, st, bytes, n, out, pos, 0,
+		    ++rounds < 64 ? &stop : NULL);
+		if (!stop.hit)
+			return SYN_PACK(st, 0, 0);
+		pos = stop.pos;
+		gid = syn_embed_gid(&j->states[st], bytes, &stop);
+		if (gid) {
+			const Jsf *ij = jsf_by_gid(gid);
+
+			inner = ij ? ij->start : 0;
+		} else if (pos >= n) {
+			return SYN_PACK(st, 0, 0);
+		}
+		/* no grammar for it: carry on as the outer state from pos */
+	}
+}
 
 #define VEDIT_VERSION "vedit 1.2.0"
 
@@ -5401,7 +5634,7 @@ typedef struct ebuf {
 	int		sel_active;
 	size_t		ay, ax;
 	const Syntax *syn;
-	uint16_t	*line_state;
+	uint32_t	*line_state;
 	size_t		line_state_cap;
 	size_t		hl_valid;
 	int		hex_view;
@@ -5566,10 +5799,10 @@ typedef struct editor {
 	/* syntax highlighting */
 	const Syntax *syn;	/* language, or NULL when none */
 	int		hl_on;		/* highlighting enabled */
-	uint16_t	*line_state;	/* tokenizer state at each line's start */
+	uint32_t	*line_state;	/* packed grammar state at each line's start */
 	size_t		line_state_cap;
 	size_t		hl_valid;	/* line_state[0..hl_valid) are current */
-	uint8_t		*hl_buf;	/* scratch styles for one rendered line */
+	uint16_t	*hl_buf;	/* scratch styles for one rendered line */
 	size_t		hl_buf_cap;
 
 	/* vi personality state */
@@ -7203,7 +7436,7 @@ hl_ensure(Editor *e, size_t upto)
 		upto = nl;
 	if (e->line_state_cap < nl) {
 		size_t cap = e->line_state_cap ? e->line_state_cap : 64;
-		uint16_t *p;
+		uint32_t *p;
 
 		while (cap < nl)
 			cap *= 2;
@@ -7232,18 +7465,18 @@ hl_ensure(Editor *e, size_t upto)
 
 /* Compute the per-byte styles for line idx into e->hl_buf, or return NULL when
  * highlighting is off or the line has no cached start-state. */
-static const uint8_t *
+static const uint16_t *
 hl_line(Editor *e, size_t idx, const char *s, size_t llen)
 {
 	if (!e->syn || !e->hl_on || idx >= e->hl_valid)
 		return NULL;
 	if (e->hl_buf_cap < llen) {
 		size_t cap = e->hl_buf_cap ? e->hl_buf_cap : 128;
-		uint8_t *p;
+		uint16_t *p;
 
 		while (cap < llen)
 			cap *= 2;
-		p = realloc(e->hl_buf, cap);
+		p = realloc(e->hl_buf, cap * sizeof(*p));
 		if (!p)
 			return NULL;
 		e->hl_buf = p;
@@ -8393,9 +8626,8 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
  * first column carries a dim guide glyph. */
 static void
 scr_line(Screen *d, int row, int col0, const char *s, size_t len,
-    int left, int width, int hl_start, int hl_end, const uint8_t *sty,
-    const Color *pal, const uint16_t *pal_attr, int npal,
-    Color base_fg, Color base_bg, int show_tabs)
+    int left, int width, int hl_start, int hl_end, const uint16_t *sty,
+    const Hlpal *hp, Color base_fg, Color base_bg, int show_tabs)
 {
 	const unsigned char *p = (const unsigned char *)s;
 	size_t i = 0;
@@ -8437,12 +8669,16 @@ scr_line(Screen *d, int row, int col0, const char *s, size_t len,
 		 * edges, so a whole rune is in or out); syntax colors the fg */
 		rev = (hl_start < hl_end && col >= hl_start && col < hl_end);
 		attrs = rev ? ATTR_REVERSE : 0;
-		if (sty && pal && sty[i] < npal) {
-			fg = pal[sty[i]];
-			if (pal_attr && !rev)
-				attrs |= pal_attr[sty[i]];
-		} else {
-			fg = base_fg;
+		fg = base_fg;
+		if (sty && hp) {	/* style: grammar id << 8 | class */
+			int gid = sty[i] >> 8, k = sty[i] & 0xff;
+			const Jsf *j = gid <= JSF_GID_MAX ? hp->g[gid] : NULL;
+
+			if (j && k < j->nclasses) {
+				fg = j->fg[k];
+				if (!rev)
+					attrs |= j->attr[k];
+			}
 		}
 
 		if (r == '\t' || r < 0x20 || r == 0x7f) {
@@ -9325,19 +9561,13 @@ scroll_to_cursor_wrap(Editor *e, int text_h, int W)
  * and attributes. With no active grammar the palette is empty, and scr_line
  * leaves every cell at the base color. */
 static void
-syn_palette(const Editor *e, const Screen *d, const Color **pal,
-    const uint16_t **pa, int *np)
+syn_palette(const Editor *e, Hlpal *hp)
 {
-	(void)d;
-	if (e->hl_on && e->syn && e->syn->fsm) {
-		*pal = e->syn->fsm->fg;
-		*pa = e->syn->fsm->attr;
-		*np = e->syn->fsm->nclasses;
-	} else {
-		*pal = NULL;
-		*pa = NULL;
-		*np = 0;
-	}
+	int g;
+
+	hp->g[0] = (e->hl_on && e->syn) ? e->syn->fsm : NULL;
+	for (g = 1; g <= JSF_GID_MAX; g++)
+		hp->g[g] = jsf_by_gid(g);
 }
 
 /* Paint the text area with soft wrap: each buffer line flows across as many
@@ -9349,17 +9579,15 @@ render_body_wrapped(Editor *e, Screen *d, const Pal *p, int text_h,
 {
 	int i = 0;
 	size_t idx = e->top;
-	const Color *pal;
-	const uint16_t *pa;
-	int np;
+	Hlpal hp;
 
-	syn_palette(e, d, &pal, &pa, &np);
+	syn_palette(e, &hp);
 	*cur_row = 0;
 	*cur_col = col0;
 	while (i < text_h) {
 		size_t llen = 0;
 		const char *s = text_line(e->t, idx, &llen);
-		const uint8_t *sty;
+		const uint16_t *sty;
 		int hs, he, row = CHROME_TOP + i;
 		size_t a;
 		int acol, seg;
@@ -9368,7 +9596,7 @@ render_body_wrapped(Editor *e, Screen *d, const Pal *p, int text_h,
 			render_gutter(d, e, row, gutter, idx, 0, p->content_fg,
 			    p->content_bg);
 			scr_line(d, row, col0, "", 0, 0, text_w, -1, -1, NULL,
-			    pal, pa, np, p->content_fg, p->content_bg,
+			    &hp, p->content_fg, p->content_bg,
 			    e->show_tabs);
 			if (idx == e->cy) {
 				*cur_row = i;
@@ -9386,7 +9614,7 @@ render_body_wrapped(Editor *e, Screen *d, const Pal *p, int text_h,
 			render_gutter(d, e, row, gutter, idx, 1, p->content_fg,
 			    p->content_bg);
 			scr_line(d, row, col0, "", 0, 0, text_w, hs, he, NULL,
-			    pal, pa, np, p->content_fg, p->content_bg,
+			    &hp, p->content_fg, p->content_bg,
 			    e->show_tabs);
 			if (idx == e->cy) {
 				*cur_row = i;
@@ -9411,7 +9639,7 @@ render_body_wrapped(Editor *e, Screen *d, const Pal *p, int text_h,
 			render_gutter(d, e, row, gutter, idx, seg == 0,
 			    p->content_fg, p->content_bg);
 			scr_line(d, row, col0, s, end, acol, text_w, hs, he,
-			    sty, pal, pa, np, p->content_fg, p->content_bg,
+			    sty, &hp, p->content_fg, p->content_bg,
 			    e->show_tabs);
 			if (idx == e->cy && (e->cx < next || next >= llen)) {
 				int cc = disp_cols(s, e->cx) - acol;
@@ -9525,17 +9753,15 @@ render_body(Editor *e, Screen *d)
 		render_body_wrapped(e, d, p, text_h, text_w, gutter, col0,
 		    &cur_row, &cur_scol);
 	} else {
-		const Color *pal;
-		const uint16_t *pa;
-		int np;
+		Hlpal hp;
 
-		syn_palette(e, d, &pal, &pa, &np);
+		syn_palette(e, &hp);
 		for (i = 0; i < text_h; i++) {
 			size_t idx = e->top + (size_t)i;
 			size_t llen = 0;
 			const char *s = text_line(e->t, idx, &llen);
 			int hs, he, row = CHROME_TOP + i;
-			const uint8_t *sty = NULL;
+			const uint16_t *sty = NULL;
 
 			sel_cols(e, idx, s, llen, &hs, &he);
 			render_gutter(d, e, row, gutter, idx, 1, p->content_fg,
@@ -9543,11 +9769,11 @@ render_body(Editor *e, Screen *d)
 			if (s) {
 				sty = hl_line(e, idx, s, llen);
 				scr_line(d, row, col0, s, llen, (int)e->left,
-				    text_w, hs, he, sty, pal, pa, np,
+				    text_w, hs, he, sty, &hp,
 				    p->content_fg, p->content_bg, e->show_tabs);
 			} else {
 				scr_line(d, row, col0, "", 0, (int)e->left,
-				    text_w, hs, he, NULL, pal, pa, np,
+				    text_w, hs, he, NULL, &hp,
 				    p->content_fg, p->content_bg, e->show_tabs);
 			}
 		}
@@ -12508,7 +12734,7 @@ buf_load(Editor *e, const Buf *b)
  * active buffer. The diagnostics list is global, not per-buffer, and is
  * freed once at teardown. */
 static void
-buf_free_fields(Text *t, uint16_t *line_state)
+buf_free_fields(Text *t, uint32_t *line_state)
 {
 	text_free(t);
 	free(line_state);
