@@ -72,6 +72,12 @@ even by a different spelling (a symlink, a `./` or `../` detour, or a hard link)
 switches to the existing buffer rather than loading a second copy. vedit requires
 a terminal on both stdin and stdout when run from the command line.
 
+At very small sizes vedit keeps the display coherent instead of drawing a broken
+frame. A narrow menu bar drops whole titles that would collide with the Help
+label rather than overprinting them, and those menus are still reachable by their
+Alt mnemonics. Below a minimum usable size the screen shows a short `window too
+small` notice until the window grows again.
+
 ### Box-drawing mode
 
 The frame, scrollbars, and menus draw three ways, chosen for the client:
@@ -418,12 +424,15 @@ leaves the file half-written, and the previous version survives until the new
 one is complete. With `edit.backup = on` (or `:set backup`) that previous
 version is also kept afterward as `name~`, or in `edit.backupdir` when set.
 
-The swap is a snapshot taken when the editor is idle, not a continuous journal,
-so a crash loses only edits made since the last quiet moment. There is no
-handler for a hard `SIGKILL` or a segfault; recovery relies on the snapshot
-already being on disk, which is the point of writing it on every idle tick. A
-new buffer that has never been saved has no name yet, so it gets no swap until
-its first save.
+The idle snapshot is the baseline, but it is not the only time a swap is written.
+When vedit is killed by `SIGTERM` or `SIGHUP`, for example because the window
+closed or the system is shutting down, it flushes every dirty buffer to its swap
+before exiting, so nothing is lost. On an out-of-memory abort or a fatal fault
+such as a segfault it attempts the same flush on a best-effort basis, since the
+program state may already be damaged by then. Only an uncatchable `SIGKILL` or a
+power loss falls back to the last idle snapshot, losing just the edits made since
+the last quiet moment. A new buffer that has never been saved has no name yet, so
+it gets no swap until its first save.
 
 ### File browser
 
