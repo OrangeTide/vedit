@@ -54,6 +54,16 @@ struct vedit_io {
 	/* Report the window size. Returns 0 and fills rows/cols, or -1 when
 	 * unknown. Optional; a host can use vedit_set_size() instead. */
 	int	(*getsize)(void *ctx, int *rows, int *cols);
+	/* Optional. Wait up to timeout_ms (negative to block) for the transport
+	 * input or any of the nextra extra fds to be readable. On return
+	 * ready[0..*nready) lists the readable extra fds (ready has room for
+	 * nextra). Returns 1 if the transport input is readable, 0 if not, -1 on
+	 * error. When NULL, the editor falls back to poll and cannot watch extra
+	 * fds, which disables the terminal panel. The standalone binary provides
+	 * this; an embedding host wires it to its own event loop to allow
+	 * terminal buffers. */
+	int	(*poll_fds)(void *ctx, int timeout_ms, const int *extra,
+		    int nextra, int *ready, int *nready);
 };
 
 /* How the frame, scrollbars, and menus are drawn. A host picks this from what

@@ -2343,6 +2343,84 @@ rune_width(uint32_t cp)
 	return 1;
 }
 
+/* Truncate a UTF-8 string to fit in maxbytes including the NUL, without
+ * splitting a multibyte sequence. Returns the safe byte length. */
+size_t
+utf8_trunc(const char *s, size_t maxbytes)
+{
+	const unsigned char *p = (const unsigned char *)s;
+	size_t safe = 0;
+	uint32_t cp;
+	int n;
+
+	if (maxbytes == 0)
+		return 0;
+	maxbytes--;	/* reserve space for NUL */
+	while (safe < maxbytes && p[safe]) {
+		n = utf8_decode(&cp, p + safe, maxbytes - safe);
+		if (n <= 0 || cp == UTF8_RUNE_ERROR)
+			break;
+		safe += (size_t)n;
+	}
+	return safe;
+}
+
+/* Abort-on-OOM allocation wrappers. Allocation failure is not something the
+ * editor can usefully recover from mid-operation, so these report and abort
+ * instead of returning NULL, which keeps call sites free of failure branches.
+ * TODO(swap-recovery): before aborting, flush every dirty buffer to its swap
+ * file so an out-of-memory death still leaves a recoverable snapshot. Pairs
+ * with the planned swap-recovery-on-restart feature. */
+static void
+vedit_oom(void)
+{
+	static const char m[] = "vedit: out of memory\n";
+	ssize_t w = write(STDERR_FILENO, m, sizeof(m) - 1);
+
+	(void)w;
+	abort();
+}
+
+void *
+xmalloc(size_t n)
+{
+	void *p = malloc(n ? n : 1);
+
+	if (!p)
+		vedit_oom();
+	return p;
+}
+
+void *
+xrealloc(void *p, size_t n)
+{
+	void *q = realloc(p, n ? n : 1);
+
+	if (!q)
+		vedit_oom();
+	return q;
+}
+
+void *
+xcalloc(size_t nmemb, size_t size)
+{
+	void *p = calloc(nmemb ? nmemb : 1, size ? size : 1);
+
+	if (!p)
+		vedit_oom();
+	return p;
+}
+
+char *
+xstrdup(const char *s)
+{
+	size_t n = strlen(s) + 1;
+	char *p = xmalloc(n);
+
+	memcpy(p, s, n);
+	return p;
+}
+
 /****************************************************************
  * Terminal cell
  ****************************************************************/
@@ -2389,6 +2467,35 @@ vt_cell_clear(Cell *c)
 	c->codepoint = ' ';
 	c->width = 1;
 }
+
+#ifdef VEDIT_TERM
+/* Like vt_cell_clear but keeps bg, for background-color erase. Used by the
+ * embedded VT emulator in the VEDIT_TERM block near the end of this file. */
+static void
+vt_cell_erase(Cell *c, Color bg)
+{
+	vt_cell_clear(c);
+	c->bg = bg;
+}
+
+/* The embedded emulator is the lumi libvt source, which spells the color and
+ * attribute enumerators prefixed VT_COLOR_ and VT_ATTR_. vedit's screen layer
+ * already defines the same values with the COLOR_ and ATTR_ prefixes on the
+ * same struct tags, so map the names across rather than duplicate the types. */
+#define VT_COLOR_DEFAULT	COLOR_DEFAULT
+#define VT_COLOR_INDEXED	COLOR_INDEXED
+#define VT_COLOR_RGB		COLOR_RGB
+#define VT_ATTR_BOLD		ATTR_BOLD
+#define VT_ATTR_UNDERLINE	ATTR_UNDERLINE
+#define VT_ATTR_REVERSE		ATTR_REVERSE
+#define VT_ATTR_ITALIC		ATTR_ITALIC
+#define VT_ATTR_BLINK		ATTR_BLINK
+#define VT_ATTR_UNDERCURL	ATTR_UNDERCURL
+#define VT_ATTR_DIM		ATTR_DIM
+#define VT_ATTR_HIDDEN		ATTR_HIDDEN
+#define VT_ATTR_STRIKE		ATTR_STRIKE
+#define VT_ATTR_PREDICTED	ATTR_PREDICTED
+#endif /* VEDIT_TERM */
 
 /* Parse a color: "default", a 0-255 palette index, "#rrggbb", or one of the 16
  * ANSI names (with a "bright-" prefix for 8-15). Returns 1 on success. Used by
@@ -3934,6 +4041,14 @@ typedef struct draw_term {
 	/* pending output bytes awaiting flush */
 	char		*out;
 	size_t		outlen, outcap;
+
+	/* optional auxiliary-fd multiplexing for terminal panels. When
+	 * aux_collect is set and io.poll_fds exists, in_refill also waits on the
+	 * fds aux_collect reports and hands each ready one to aux_ready. Set by
+	 * the editor under VEDIT_TERM; NULL otherwise (no behavior change). */
+	void		*aux_ctx;
+	int		(*aux_collect)(void *ctx, int *fds, int max);
+	void		(*aux_ready)(void *ctx, int fd);
 } Scrbuf;
 
 typedef struct draw { Scrbuf *t; } Screen;
@@ -4940,6 +5055,8 @@ tkbd_decode(struct tkbd_seq *seq, const unsigned char *buf, int len)
 
 /* Pull more raw bytes into the decode buffer. Returns 1 when bytes arrived,
  * 0 on timeout, -1 on EOF or error. */
+/* Max terminal fds the input multiplexer watches at once. */
+#define VEDIT_TERM_MAX 16
 static int
 in_refill(Scrbuf *t, int timeout_ms)
 {
@@ -4947,7 +5064,22 @@ in_refill(Scrbuf *t, int timeout_ms)
 
 	if (t->inlen >= (int)sizeof(t->inbuf))
 		return 1;		/* buffer full; decode what we have */
-	if (t->io.poll) {
+	if (t->io.poll_fds && t->aux_collect) {
+		/* Terminal panels active: wait on the keyboard and every live
+		 * PTY fd at once, draining any ready PTY into its buffer. */
+		int extra[VEDIT_TERM_MAX], ready[VEDIT_TERM_MAX];
+		int nextra, nready = 0, pr, i;
+
+		nextra = t->aux_collect(t->aux_ctx, extra, VEDIT_TERM_MAX);
+		pr = t->io.poll_fds(t->io.ctx, timeout_ms, extra, nextra,
+		    ready, &nready);
+		for (i = 0; i < nready; i++)
+			t->aux_ready(t->aux_ctx, ready[i]);
+		if (pr == 0)
+			return 0;
+		if (pr < 0)
+			return -1;
+	} else if (t->io.poll) {
 		int pr = t->io.poll(t->io.ctx, timeout_ms);
 
 		if (pr == 0)
@@ -5110,6 +5242,37 @@ scr_record_stop(Screen *d, size_t *len)
 	return d->t->rec;
 }
 
+#ifdef VEDIT_TERM
+/* Wait up to timeout_ms for input, draining any ready terminal fds as a side
+ * effect of in_refill. Returns 1 when keyboard bytes are buffered, 0 on an idle
+ * timeout, -1 on EOF/error. Used by the terminal-buffer input path, which wants
+ * raw bytes rather than decoded key events. */
+static int
+scr_pump(Screen *d, int timeout_ms)
+{
+	if (d->t->inlen > 0)
+		return 1;
+	return in_refill(d->t, timeout_ms);
+}
+
+/* Remove up to max raw input bytes from the decode buffer into buf. Returns the
+ * count. The terminal buffer forwards these straight to its child (raw input
+ * passthrough), bypassing tkbd_decode. */
+static int
+scr_raw_take(Screen *d, unsigned char *buf, int max)
+{
+	Scrbuf *t = d->t;
+	int n = t->inlen < max ? t->inlen : max;
+
+	if (n <= 0)
+		return 0;
+	memcpy(buf, t->inbuf, (size_t)n);
+	memmove(t->inbuf, t->inbuf + n, (size_t)(t->inlen - n));
+	t->inlen -= n;
+	return n;
+}
+#endif /* VEDIT_TERM */
+
 /****************************************************************
  * Editor core types
  ****************************************************************/
@@ -5151,6 +5314,13 @@ typedef struct vi_keylog {
 	int		cap;
 } Keylog;
 
+/* A buffer is either a text file or a terminal session. The kind and the
+ * terminal handle live on every buffer so the buffer-mirror X-macros stay
+ * uniform; without VEDIT_TERM a buffer is always BUF_TEXT with a NULL handle.
+ * Term is defined, with all terminal code, behind VEDIT_TERM near end of file. */
+enum buf_kind { BUF_TEXT = 0, BUF_TERM };
+typedef struct term Term;
+
 /* One open file. The editor keeps a list of these; the active buffer's fields
  * are mirrored into the flat Editor for editing and copied back here on
  * a switch. Only genuinely per-file state lives here -- the draw surface,
@@ -5178,6 +5348,8 @@ typedef struct ebuf {
 	int		swap_on;	/* a swap file exists on disk for it */
 	size_t		swap_rev;	/* text rev at the last swap write */
 	time_t		load_mtime;	/* file mtime at load (swap staleness check) */
+	int		kind;		/* BUF_TEXT or BUF_TERM */
+	Term		*vterm;		/* terminal session when kind == BUF_TERM */
 } Buf;
 
 /* Referenced only by pointer here; the users include the real headers. */
@@ -5378,7 +5550,30 @@ typedef struct editor {
 	/* runtime config reload (set by the standalone CLI) */
 	char		cfg_path[PATH_MAX];	/* config file to re-read, or "" */
 	Cfg		*cfg_owned;	/* a config this editor reloaded and owns */
+
+	/* terminal buffers (VEDIT_TERM). kind/vterm mirror the active buffer;
+	 * term_dirty flags that the active terminal's grid changed and needs a
+	 * repaint; term_prefix is the Ctrl-W prefix state machine. */
+	int		kind;		/* BUF_TEXT or BUF_TERM, mirrors active buf */
+	Term		*vterm;		/* active buffer's terminal session, or NULL */
+	int		term_dirty;	/* active terminal output pending a render */
+	int		term_prefix;	/* 1 = Ctrl-W seen, awaiting a command key */
 } Editor;
+
+#ifdef VEDIT_TERM
+/* Terminal interface, defined with the emulator near end of file. The callers
+ * (render_body, editor_loop, buf_close, teardown, vedit_new) precede it. */
+enum term_step { TERM_CONT, TERM_QUIT, TERM_EOF };
+static int term_is_active(const Editor *e);	/* active buffer is a terminal */
+static const char *term_label(const Editor *e);	/* OSC title, or "terminal" */
+static int term_render(Editor *e, Screen *d);	/* blit the active grid */
+static int term_loop_step(Editor *e);		/* one wait/input/render tick */
+static void term_resize_all(Editor *e);		/* match ptys to the text area */
+static void term_buf_free(Buf *b);		/* reap child, free a term buffer */
+static int term_open(Editor *e, const char *cmd); /* :term; -1 on failure */
+static int term_collect(void *ctx, int *fds, int max);	/* aux_collect hook */
+static void term_drain(void *ctx, int fd);		/* aux_ready hook */
+#endif /* VEDIT_TERM */
 
 /* Set the one-line status message (printf-style). The single choke point for
  * e->status, so every message is bounded by its size the same way. */
@@ -7748,7 +7943,12 @@ ui_frame(Editor *e, const Pal *p)
 	size_t max_left = curw > tw ? (size_t)(curw - tw) : 0;
 	int vthumb = thumb_index(e->top, max_top, th);
 	int hthumb;
+#ifdef VEDIT_TERM
+	const char *name = (e->kind == BUF_TERM) ? term_label(e)
+	    : (e->has_name ? e->path : "Untitled");
+#else
 	const char *name = e->has_name ? e->path : "Untitled";
+#endif
 	char title[80];
 	int tlen, tstart;
 
@@ -8920,6 +9120,14 @@ render_body(Editor *e, Screen *d)
 
 	if (text_w < 1)
 		text_w = 1;
+
+#ifdef VEDIT_TERM
+	if (term_is_active(e)) {
+		e->prev_text_view = 0;	/* terminal grid, not the text view */
+		term_render(e, d);
+		return;
+	}
+#endif
 
 	if (e->hex_view) {
 		e->prev_text_view = 0;	/* hex uses hex_top, not e->top */
@@ -11630,7 +11838,7 @@ buffer_reset(Editor *e)
 	X(t) X(has_name) X(cy) X(cx) X(top) X(left) X(sel_active) X(ay) X(ax) \
 	X(syn) X(line_state) X(line_state_cap) X(hl_valid) X(hex_view) \
 	X(hex_top) X(expand_tabs) X(vi_marks_set) X(swap_on) X(swap_rev) \
-	X(load_mtime)
+	X(load_mtime) X(kind) X(vterm)
 #define BUF_STATE_ARRAYS(X) \
 	X(path) X(vi_mark_y) X(vi_mark_x) X(swap_path)
 
@@ -11825,6 +12033,15 @@ buf_close(Editor *e, int i)
 
 	if (i == e->cur) {
 		swap_remove(e);			/* closed cleanly: drop its swap */
+#ifdef VEDIT_TERM
+		if (e->kind == BUF_TERM) {	/* reap the child before freeing */
+			e->bufs[i].kind = e->kind;
+			e->bufs[i].vterm = e->vterm;
+			term_buf_free(&e->bufs[i]);
+			e->kind = BUF_TEXT;
+			e->vterm = NULL;
+		}
+#endif
 		buf_free_fields(e->t, e->line_state);
 		memmove(&e->bufs[i], &e->bufs[i + 1],
 		    (size_t)(e->nbuf - i - 1) * sizeof(*e->bufs));
@@ -11834,6 +12051,9 @@ buf_close(Editor *e, int i)
 	} else {
 		if (e->bufs[i].swap_on && e->bufs[i].swap_path[0])
 			unlink(e->bufs[i].swap_path);
+#ifdef VEDIT_TERM
+		term_buf_free(&e->bufs[i]);	/* no-op unless it is a terminal */
+#endif
 		buf_free_fields(e->bufs[i].t, e->bufs[i].line_state);
 		memmove(&e->bufs[i], &e->bufs[i + 1],
 		    (size_t)(e->nbuf - i - 1) * sizeof(*e->bufs));
@@ -15893,6 +16113,22 @@ editor_loop(Editor *e)
 		Event ev;
 		struct tkbd_seq seq;
 
+#ifdef VEDIT_TERM
+		/* A terminal buffer takes over input (raw passthrough) and
+		 * rendering until the user switches away or closes it. */
+		if (term_is_active(e)) {
+			switch (term_loop_step(e)) {
+			case TERM_QUIT:
+				return 0;
+			case TERM_EOF:
+				return 1;
+			default:
+				break;
+			}
+			continue;
+		}
+#endif
+
 		switch (scr_wait(e->d, &ev)) {
 		case EVENT_EOF:
 			return 1;
@@ -16072,6 +16308,9 @@ editor_teardown(Editor *e)
 			if (i != e->cur && e->bufs[i].swap_on &&
 			    e->bufs[i].swap_path[0])
 				unlink(e->bufs[i].swap_path);
+#ifdef VEDIT_TERM
+			term_buf_free(&e->bufs[i]);	/* reap any child */
+#endif
 			buf_free_fields(e->bufs[i].t, e->bufs[i].line_state);
 		}
 	} else {
@@ -16143,6 +16382,13 @@ vedit_new(const struct vedit_io *io)
 		return NULL;
 	}
 	scr_size(v->e.d, &v->e.rows, &v->e.cols);
+#ifdef VEDIT_TERM
+	/* Let in_refill multiplex the keyboard with any terminal PTYs. The
+	 * Editor is embedded in struct vedit, so &v->e is stable. */
+	term->aux_ctx = &v->e;
+	term->aux_collect = term_collect;
+	term->aux_ready = term_drain;
+#endif
 	return v;
 }
 
@@ -16496,6 +16742,44 @@ tty_poll(void *ctx, int timeout_ms)
 	return r > 0 ? 1 : 0;
 }
 
+#ifdef VEDIT_TERM
+/* Wait on the keyboard and the terminal PTY fds at once. Fills ready[] with the
+ * readable extra fds. Returns 1 if the keyboard is readable, 0 if not, -1 on
+ * error. This is the native binding of struct vedit_io's poll_fds hook. */
+static int
+tty_poll_fds(void *ctx, int timeout_ms, const int *extra, int nextra,
+    int *ready, int *nready)
+{
+	Ttyio *t = ctx;
+	fd_set rfds;
+	struct timeval tv, *ptv = NULL;
+	int i, maxfd = t->in_fd, r;
+
+	FD_ZERO(&rfds);
+	FD_SET(t->in_fd, &rfds);
+	for (i = 0; i < nextra; i++) {
+		if (extra[i] < 0)
+			continue;
+		FD_SET(extra[i], &rfds);
+		if (extra[i] > maxfd)
+			maxfd = extra[i];
+	}
+	if (timeout_ms >= 0) {
+		tv.tv_sec = timeout_ms / 1000;
+		tv.tv_usec = (timeout_ms % 1000) * 1000;
+		ptv = &tv;
+	}
+	r = select(maxfd + 1, &rfds, NULL, NULL, ptv);
+	*nready = 0;
+	if (r < 0)
+		return (errno == EINTR) ? 0 : -1;
+	for (i = 0; i < nextra; i++)
+		if (extra[i] >= 0 && FD_ISSET(extra[i], &rfds))
+			ready[(*nready)++] = extra[i];
+	return FD_ISSET(t->in_fd, &rfds) ? 1 : 0;
+}
+#endif /* VEDIT_TERM */
+
 static void
 tty_begin(void *ctx)
 {
@@ -16554,6 +16838,3490 @@ tty_getsize(void *ctx, int *rows, int *cols)
 	return -1;
 }
 
+#ifdef VEDIT_TERM
+/* ============================================================
+ * Embedded VT terminal emulator.
+ * Amalgamated from the lumi libvt sources (vt_buf, vt_parse,
+ * vt_state, vt_ops). The cell, color and attribute types are
+ * vedit's own (see the Terminal cell section above); only the
+ * grid/parser/state machine is pulled in here.
+ * ============================================================ */
+
+/* ---- declarations ---- */
+/* vt_buf.h */
+
+
+
+/* per-row metadata */
+#define VT_ROW_WRAPPED	(1u << 0)
+#define VT_ROW_DIRTY	(1u << 1)
+
+struct vt_row {
+	struct vt_cell	*cells;
+	unsigned	flags;
+};
+
+struct vt_buf;
+
+struct vt_buf *vt_buf_new(int rows, int cols, int scrollback);
+void vt_buf_free(struct vt_buf *buf);
+int vt_buf_resize(struct vt_buf *buf, int rows, int cols);
+
+int vt_buf_rows(const struct vt_buf *buf);
+int vt_buf_cols(const struct vt_buf *buf);
+
+/* access visible grid (0 = top of screen) */
+struct vt_row *vt_buf_row(struct vt_buf *buf, int row);
+struct vt_cell *vt_buf_cell(struct vt_buf *buf, int row, int col);
+
+/* scrollback access (-1 = most recent scrollback line, etc.) */
+int vt_buf_scrollback_lines(const struct vt_buf *buf);
+
+/* monotonic counter bumped each time the buffer actually scrolls;
+ * used to detect that content shifted out from under a selection */
+unsigned vt_buf_scroll_gen(const struct vt_buf *buf);
+struct vt_row *vt_buf_scrollback_row(struct vt_buf *buf, int offset);
+
+/* scroll visible region: positive = scroll up (new blank at bottom).
+ * newly exposed rows are filled with bg (background color erase). */
+void vt_buf_scroll(struct vt_buf *buf, int top, int bottom, int count,
+    struct vt_color bg);
+
+/* clear a range of rows, filling with bg (background color erase) */
+void vt_buf_clear_rows(struct vt_buf *buf, int from, int to,
+    struct vt_color bg);
+
+/* mark all rows dirty */
+void vt_buf_dirty_all(struct vt_buf *buf);
+
+/* append `count` visible rows of src (starting at src row `from`) into dst's
+ * scrollback ring as history, deep-copied and clipped to dst width.  a no-op
+ * when dst has no scrollback ring.  used to preserve alt-screen content when
+ * an application leaves the alternate screen. */
+void vt_buf_push_rows(struct vt_buf *dst, struct vt_buf *src, int from,
+    int count);
+
+/* copy rows from the scrollback+visible history into dst.
+ * src_offset is the line index into the virtual concatenation of
+ * [scrollback(0..sb_lines-1)][visible(0..vis_rows-1)].
+ * count rows are copied starting at dst row dst_row.
+ * lines are clipped to the destination width. */
+void vt_buf_copy_scrollback(struct vt_buf *dst, const struct vt_buf *src,
+    int dst_row, int src_offset, int count);
+
+
+/* vt_parse.h */
+
+
+
+struct vt_parse;
+
+/* callback vtable -- parser emits actions through these */
+struct vt_ops {
+	void (*print)(void *ctx, uint32_t cp, int width);
+	void (*execute)(void *ctx, uint8_t c);	/* C0/C1 controls */
+	void (*csi)(void *ctx, const int *params, int nparam,
+	    int intermed, int final);
+	void (*esc)(void *ctx, int intermed, int final);
+	void (*osc)(void *ctx, const char *data, size_t len);
+};
+
+struct vt_parse *vt_parse_new(const struct vt_ops *ops, void *ctx);
+void vt_parse_free(struct vt_parse *p);
+void vt_parse_feed(struct vt_parse *p, const char *data, size_t len);
+void vt_parse_reset(struct vt_parse *p);
+
+/* DCS (Device Control String) passthrough callback.
+ * invoked when a complete DCS sequence (ESC P ... ST) is received.
+ * introducer is the ESC P byte ('P', 'X', '^', or '_').
+ * data/len contain bytes between the introducer and the ST terminator. */
+typedef void (*vt_parse_dcs_cb)(void *ctx, int introducer,
+    const char *data, size_t len);
+
+/* set a DCS passthrough callback with its own context.
+ * pass NULL to disable. */
+void vt_parse_set_dcs_cb(struct vt_parse *p, vt_parse_dcs_cb cb, void *ctx);
+
+/* OSC observation callback.
+ * invoked when a complete OSC sequence (ESC ] ... ST/BEL) is received,
+ * in addition to the ops->osc dispatch.  data/len contain the bytes
+ * between the introducer and the terminator (the "N;..." payload).
+ * used to pass desktop-notification OSCs through to the outer terminal. */
+typedef void (*vt_parse_osc_cb)(void *ctx, const char *data, size_t len);
+
+/* set an OSC observation callback with its own context.
+ * pass NULL to disable. */
+void vt_parse_set_osc_cb(struct vt_parse *p, vt_parse_osc_cb cb, void *ctx);
+
+
+/* vt_state.h */
+
+
+
+
+/* render target selection (indexes into vt_state target array) */
+enum vt_target {
+	VT_TARGET_PRIMARY = 0,	/* normal screen buffer (has scrollback) */
+	VT_TARGET_ALT,		/* alternate screen (no scrollback) */
+	VT_TARGET_SCROLLBACK,	/* scratch buffer for scrollback viewer */
+	VT_TARGET_COUNT,
+};
+
+/* terminal mode flags (DECSET/DECRST and ESC-based modes) */
+#define VT_MODE_AUTOWRAP	(1u << 0)
+#define VT_MODE_CURSOR_VIS	(1u << 1)
+#define VT_MODE_ORIGIN		(1u << 2)
+#define VT_MODE_INSERT		(1u << 3)
+#define VT_MODE_ALTSCREEN	(1u << 4)
+#define VT_MODE_BRACKETPASTE	(1u << 5)
+#define VT_MODE_DECCKM		(1u << 6)
+#define VT_MODE_DECKPAM		(1u << 7)
+#define VT_MODE_MOUSE		(1u << 8)
+
+/* max depth of the kitty keyboard protocol flag stack */
+#define VT_KITTY_KBD_STACK_MAX	16
+
+/* saved cursor state (DECSC/DECRC) */
+struct vt_saved_cursor {
+	int		row;
+	int		col;
+	uint16_t	attrs;
+	struct vt_color	fg;
+	struct vt_color	bg;
+};
+
+struct vt_state {
+	struct vt_buf	*buf;		/* active render target */
+	struct vt_buf	*targets[VT_TARGET_COUNT]; /* render target array */
+	enum vt_target	active_target;	/* which target buf points to */
+
+	int		cursor_row;
+	int		cursor_col;
+	struct vt_saved_cursor saved;
+
+	/* scroll region (0-based, inclusive top, exclusive bottom) */
+	int		scroll_top;
+	int		scroll_bot;
+
+	unsigned	modes;
+
+	/* capture alt-screen content into primary scrollback on leave */
+	int		capture_alt_scroll;
+
+	/* current SGR state applied to new cells */
+	uint16_t	attrs;
+	struct vt_color	fg;
+	struct vt_color	bg;
+
+	/* cursor shape (DECSCUSR: 0=default, 1-6) */
+	int		cursor_shape;
+
+	/* character set (G0/G1) */
+	int		charset;	/* 0 = G0, 1 = G1 */
+	int		g0_set;		/* 0 = ASCII, 1 = line drawing */
+	int		g1_set;
+
+	/* tab stops */
+	uint8_t		*tabstops;	/* one byte per column */
+
+	/* reply fd for DSR/DA responses (-1 = disabled) */
+	int		reply_fd;
+
+	/* child mouse tracking mode (0 = off, 1000/1002/1003) */
+	int		mouse_mode;
+
+	/* keyboard enhancement protocols */
+	int		kitty_kbd_flags;	/* effective flags = top of stack */
+	int		kitty_kbd_stack[VT_KITTY_KBD_STACK_MAX];
+	int		kitty_kbd_depth;	/* entries on the kitty stack */
+	int		modify_other_keys;	/* CSI > 4 ; Pm m (0 = off) */
+
+	/* window title set by OSC 0/2 */
+	char		*title;
+
+	/* xterm title stack (CSI 22/23 t) */
+	char		**title_stack;
+	int		title_stack_len;
+	int		title_stack_cap;
+};
+
+struct vt_state *vt_state_new(int rows, int cols, int scrollback);
+void vt_state_free(struct vt_state *st);
+int vt_state_resize(struct vt_state *st, int rows, int cols);
+
+/* render target selection */
+void vt_state_set_target(struct vt_state *st, enum vt_target tgt);
+
+/* alt screen management */
+void vt_state_altscreen_enter(struct vt_state *st);
+void vt_state_altscreen_leave(struct vt_state *st);
+
+/* cursor operations */
+void vt_state_cursor_save(struct vt_state *st);
+void vt_state_cursor_restore(struct vt_state *st);
+void vt_state_cursor_clamp(struct vt_state *st);
+
+/* index / reverse index: move the cursor down / up one line, scrolling the
+ * scroll region only when the cursor sits on the bottom / top margin.  when
+ * the cursor is outside the region these move within the physical screen
+ * without scrolling.  shared by LF/IND/NEL, RI, and autowrap. */
+void vt_state_index(struct vt_state *st);
+void vt_state_reverse_index(struct vt_state *st);
+
+/* Account for a kitty graphics command's effect on the cursor: if data/len
+ * is a display command (a=T or a=p) that does not set C=1, move the cursor
+ * down by rows-1 and right by cols, matching kitty's rule of leaving it just
+ * past the image's bottom-right cell.  The image size in cells comes from
+ * the explicit r=/c=, else the image pixel size (v=/s=) divided by the cell
+ * pixel size.  Does nothing when the row count cannot be determined (for
+ * example v= absent and the terminal reports no cell height).  data/len is
+ * the APC payload beginning with 'G'. */
+void vt_kgfx_account(struct vt_state *st, const char *data, size_t len,
+    int cell_pw, int cell_ph);
+
+/* set the fd for DSR/DA reply writes (-1 to disable) */
+void vt_state_set_reply_fd(struct vt_state *st, int fd);
+
+/* enable/disable capturing alt-screen content into primary scrollback when
+ * an application leaves the alternate screen (default disabled). */
+void vt_state_set_altscreen_scrollback(struct vt_state *st, int on);
+
+/* kitty keyboard protocol flag stack (CSI > u push, CSI < u pop,
+ * CSI = u set top); kitty_kbd_flags tracks the current top entry */
+void vt_state_kitty_push(struct vt_state *st, int flags);
+void vt_state_kitty_pop(struct vt_state *st, int count);
+void vt_state_kitty_set(struct vt_state *st, int flags, int mode);
+
+/* window title (set by OSC 0/2, NULL if never set) */
+const char *vt_state_title(const struct vt_state *st);
+
+/* replace the window title (NULL or "" clears it). */
+void vt_state_set_title(struct vt_state *st, const char *title);
+
+/* xterm title stack (CSI 22/23 t) */
+void vt_state_title_push(struct vt_state *st);
+void vt_state_title_pop(struct vt_state *st);
+
+/* write a character at cursor, advance cursor */
+void vt_state_putchar(struct vt_state *st, uint32_t cp, int width);
+
+/* tab stops.  reset restores the default stop every 8 columns, which is
+ * the power-on and RIS behavior.  clear_all leaves no stops at all, which
+ * is what TBC with parameter 3 asks for. */
+void vt_state_tab_reset(struct vt_state *st);
+void vt_state_tab_set(struct vt_state *st, int col);
+void vt_state_tab_clear(struct vt_state *st, int col);
+void vt_state_tab_clear_all(struct vt_state *st);
+int vt_state_tab_next(struct vt_state *st, int col);
+int vt_state_tab_prev(struct vt_state *st, int col);
+
+/* synthesize escape sequences that reconstruct the current screen.
+ * calls emit(ctx, data, len) for each chunk of output.
+ * used to replay state to a newly attached client. */
+typedef void (*vt_dump_fn)(void *ctx, const char *data, size_t len);
+void vt_state_dump(struct vt_state *st, vt_dump_fn emit, void *ctx);
+
+
+/* vt_ops.h */
+
+
+
+/* return a vt_ops vtable that drives a vt_state.
+ * pass the vt_state pointer as ctx to vt_parse_new(). */
+const struct vt_ops *vt_ops_default(void);
+
+
+/* ---- definitions ---- */
+/* vt_buf.c */
+
+
+
+struct vt_buf {
+	int		rows;		/* visible rows */
+	int		cols;		/* visible columns */
+	struct vt_row	**grid;		/* row pointers for visible area */
+	struct vt_row	**ring;		/* scrollback ring buffer */
+	int		ring_cap;	/* total ring capacity */
+	int		ring_len;	/* current lines in ring */
+	int		ring_head;	/* next write position */
+	unsigned	scroll_gen;	/* bumped on each actual scroll */
+};
+
+static struct vt_row *
+row_alloc(int cols)
+{
+	struct vt_row *r;
+	int i;
+
+	r = xmalloc(sizeof(*r));
+	r->cells = xmalloc((size_t)cols * sizeof(r->cells[0]));
+	r->flags = 0;
+	for (i = 0; i < cols; i++)
+		vt_cell_clear(&r->cells[i]);
+	return r;
+}
+
+/* allocate a blank row whose cells carry bg (background color erase) */
+static struct vt_row *
+row_alloc_bg(int cols, struct vt_color bg)
+{
+	struct vt_row *r = row_alloc(cols);
+	int i;
+
+	for (i = 0; i < cols; i++)
+		r->cells[i].bg = bg;
+	return r;
+}
+
+static void
+row_free(struct vt_row *r)
+{
+	if (!r)
+		return;
+	free(r->cells);
+	free(r);
+}
+
+static void
+row_resize(struct vt_row *r, int old_cols, int new_cols)
+{
+	int i;
+
+	r->cells = xrealloc(r->cells, (size_t)new_cols * sizeof(r->cells[0]));
+	for (i = old_cols; i < new_cols; i++)
+		vt_cell_clear(&r->cells[i]);
+	r->flags |= VT_ROW_DIRTY;
+}
+
+struct vt_buf *
+vt_buf_new(int rows, int cols, int scrollback)
+{
+	struct vt_buf *buf;
+	int i;
+
+	buf = xcalloc(1, sizeof(*buf));
+	buf->rows = rows;
+	buf->cols = cols;
+
+	buf->grid = xmalloc((size_t)rows * sizeof(buf->grid[0]));
+	for (i = 0; i < rows; i++)
+		buf->grid[i] = row_alloc(cols);
+
+	buf->ring_cap = scrollback;
+	if (scrollback > 0)
+		buf->ring = xcalloc((size_t)scrollback, sizeof(buf->ring[0]));
+	buf->ring_len = 0;
+	buf->ring_head = 0;
+
+	return buf;
+}
+
+void
+vt_buf_free(struct vt_buf *buf)
+{
+	int i;
+
+	if (!buf)
+		return;
+
+	for (i = 0; i < buf->rows; i++)
+		row_free(buf->grid[i]);
+	free(buf->grid);
+
+	for (i = 0; i < buf->ring_cap; i++)
+		row_free(buf->ring[i]);
+	free(buf->ring);
+
+	free(buf);
+}
+
+int
+vt_buf_resize(struct vt_buf *buf, int rows, int cols)
+{
+	int i;
+	int old_rows = buf->rows;
+	int old_cols = buf->cols;
+
+	/* resize existing rows' cell arrays */
+	if (cols != old_cols) {
+		for (i = 0; i < old_rows && i < rows; i++)
+			row_resize(buf->grid[i], old_cols, cols);
+
+		/* resize scrollback rows too */
+		for (i = 0; i < buf->ring_cap; i++) {
+			if (buf->ring[i])
+				row_resize(buf->ring[i], old_cols, cols);
+		}
+	}
+
+	if (rows > old_rows) {
+		/* grow: add new rows */
+		buf->grid = xrealloc(buf->grid,
+		    (size_t)rows * sizeof(buf->grid[0]));
+		for (i = old_rows; i < rows; i++)
+			buf->grid[i] = row_alloc(cols);
+	} else if (rows < old_rows) {
+		/* shrink: free excess rows */
+		for (i = rows; i < old_rows; i++)
+			row_free(buf->grid[i]);
+		buf->grid = xrealloc(buf->grid,
+		    (size_t)rows * sizeof(buf->grid[0]));
+	}
+
+	buf->rows = rows;
+	buf->cols = cols;
+	return 0;
+}
+
+int
+vt_buf_rows(const struct vt_buf *buf)
+{
+	return buf->rows;
+}
+
+int
+vt_buf_cols(const struct vt_buf *buf)
+{
+	return buf->cols;
+}
+
+struct vt_row *
+vt_buf_row(struct vt_buf *buf, int row)
+{
+	if (row < 0 || row >= buf->rows)
+		return NULL;
+	return buf->grid[row];
+}
+
+struct vt_cell *
+vt_buf_cell(struct vt_buf *buf, int row, int col)
+{
+	if (row < 0 || row >= buf->rows)
+		return NULL;
+	if (col < 0 || col >= buf->cols)
+		return NULL;
+	return &buf->grid[row]->cells[col];
+}
+
+int
+vt_buf_scrollback_lines(const struct vt_buf *buf)
+{
+	return buf->ring_len;
+}
+
+unsigned
+vt_buf_scroll_gen(const struct vt_buf *buf)
+{
+	return buf->scroll_gen;
+}
+
+struct vt_row *
+vt_buf_scrollback_row(struct vt_buf *buf, int offset)
+{
+	int idx;
+
+	if (offset >= 0 || -offset > buf->ring_len)
+		return NULL;
+
+	/* offset is negative: -1 = most recent */
+	idx = (buf->ring_head + offset + buf->ring_cap) % buf->ring_cap;
+	return buf->ring[idx];
+}
+
+static void
+ring_push(struct vt_buf *buf, struct vt_row *r)
+{
+	if (buf->ring_cap == 0) {
+		row_free(r);
+		return;
+	}
+
+	row_free(buf->ring[buf->ring_head]);
+	buf->ring[buf->ring_head] = r;
+	buf->ring_head = (buf->ring_head + 1) % buf->ring_cap;
+	if (buf->ring_len < buf->ring_cap)
+		buf->ring_len++;
+}
+
+void
+vt_buf_scroll(struct vt_buf *buf, int top, int bottom, int count,
+    struct vt_color bg)
+{
+	int i;
+
+	if (top < 0)
+		top = 0;
+	if (bottom > buf->rows)
+		bottom = buf->rows;
+	if (top >= bottom || count == 0)
+		return;
+
+	buf->scroll_gen++;
+
+	if (count > 0) {
+		/* scroll up: lines at top go to scrollback */
+		if (count > bottom - top)
+			count = bottom - top;
+
+		/* push departing rows into scrollback */
+		for (i = top; i < top + count; i++) {
+			if (top == 0)
+				ring_push(buf, buf->grid[i]);
+			else
+				row_free(buf->grid[i]);
+		}
+
+		/* shift remaining rows up */
+		for (i = top; i < bottom - count; i++)
+			buf->grid[i] = buf->grid[i + count];
+
+		/* fill bottom with blank rows */
+		for (i = bottom - count; i < bottom; i++)
+			buf->grid[i] = row_alloc_bg(buf->cols, bg);
+	} else {
+		/* scroll down: lines at bottom are lost */
+		count = -count;
+		if (count > bottom - top)
+			count = bottom - top;
+
+		/* free departing rows at bottom */
+		for (i = bottom - count; i < bottom; i++)
+			row_free(buf->grid[i]);
+
+		/* shift remaining rows down */
+		for (i = bottom - 1; i >= top + count; i--)
+			buf->grid[i] = buf->grid[i - count];
+
+		/* fill top with blank rows */
+		for (i = top; i < top + count; i++)
+			buf->grid[i] = row_alloc_bg(buf->cols, bg);
+	}
+
+	/* mark all rows in scroll region dirty for renderer */
+	for (i = top; i < bottom; i++)
+		buf->grid[i]->flags |= VT_ROW_DIRTY;
+}
+
+void
+vt_buf_clear_rows(struct vt_buf *buf, int from, int to, struct vt_color bg)
+{
+	int i, j;
+
+	if (from < 0)
+		from = 0;
+	if (to > buf->rows)
+		to = buf->rows;
+	for (i = from; i < to; i++) {
+		struct vt_row *r = buf->grid[i];
+
+		for (j = 0; j < buf->cols; j++)
+			vt_cell_erase(&r->cells[j], bg);
+		r->flags = VT_ROW_DIRTY;
+	}
+}
+
+void
+vt_buf_dirty_all(struct vt_buf *buf)
+{
+	int i;
+
+	for (i = 0; i < buf->rows; i++)
+		buf->grid[i]->flags |= VT_ROW_DIRTY;
+}
+
+void
+vt_buf_push_rows(struct vt_buf *dst, struct vt_buf *src, int from, int count)
+{
+	int i, j, cc, n;
+
+	if (!dst || !src || dst->ring_cap == 0 || count <= 0)
+		return;
+	if (from < 0)
+		from = 0;
+	n = count;
+	if (from + n > src->rows)
+		n = src->rows - from;
+	if (n <= 0)
+		return;
+
+	cc = (src->cols < dst->cols) ? src->cols : dst->cols;
+	for (i = 0; i < n; i++) {
+		struct vt_row *sr = src->grid[from + i];
+		struct vt_row *r = row_alloc(dst->cols);
+
+		for (j = 0; j < cc; j++)
+			r->cells[j] = sr->cells[j];
+		r->flags = VT_ROW_DIRTY;
+		ring_push(dst, r);	/* takes ownership of r */
+	}
+	dst->scroll_gen++;
+}
+
+/* resolve a line index in the virtual [scrollback][visible] history */
+static const struct vt_row *
+history_row(const struct vt_buf *buf, int line)
+{
+	int sb = buf->ring_len;
+
+	if (line < 0)
+		return NULL;
+
+	if (line < sb) {
+		/* scrollback region: oldest = 0, newest = sb-1 */
+		int off = -(sb - line); /* negative offset for ring */
+		int idx;
+
+		idx = (buf->ring_head + off + buf->ring_cap) %
+		    buf->ring_cap;
+		return buf->ring[idx];
+	}
+
+	line -= sb;
+	if (line < buf->rows)
+		return buf->grid[line];
+
+	return NULL;
+}
+
+void
+vt_buf_copy_scrollback(struct vt_buf *dst, const struct vt_buf *src,
+    int dst_row, int src_offset, int count)
+{
+	int i, j;
+	int dst_cols = dst->cols;
+
+	for (i = 0; i < count; i++) {
+		const struct vt_row *sr;
+		struct vt_row *dr;
+		int src_cols;
+
+		dr = vt_buf_row(dst, dst_row + i);
+		if (!dr)
+			break;
+
+		sr = history_row(src, src_offset + i);
+
+		/* clear destination row first */
+		for (j = 0; j < dst_cols; j++)
+			vt_cell_clear(&dr->cells[j]);
+
+		if (!sr || !sr->cells)
+			goto dirty;
+
+		/* copy cells, clipping to destination width */
+		src_cols = src->cols;
+		if (src_cols > dst_cols)
+			src_cols = dst_cols;
+		for (j = 0; j < src_cols; j++)
+			dr->cells[j] = sr->cells[j];
+dirty:
+		dr->flags |= VT_ROW_DIRTY;
+	}
+}
+
+/* vt_state.c */
+
+
+
+#define DEFAULT_SCROLLBACK 2000
+#define DEFAULT_TAB_WIDTH  8
+
+static void
+tabstops_init(struct vt_state *st)
+{
+	int i;
+	int cols = vt_buf_cols(st->buf);
+
+	st->tabstops = xcalloc(1, (size_t)cols);
+	for (i = 0; i < cols; i += DEFAULT_TAB_WIDTH)
+		st->tabstops[i] = 1;
+}
+
+struct vt_state *
+vt_state_new(int rows, int cols, int scrollback)
+{
+	struct vt_state *st;
+
+	if (scrollback < 0)
+		scrollback = DEFAULT_SCROLLBACK;
+
+	st = xcalloc(1, sizeof(*st));
+	st->targets[VT_TARGET_PRIMARY] = vt_buf_new(rows, cols, scrollback);
+	st->active_target = VT_TARGET_PRIMARY;
+	st->buf = st->targets[VT_TARGET_PRIMARY];
+
+	st->scroll_top = 0;
+	st->scroll_bot = rows;
+
+	st->modes = VT_MODE_AUTOWRAP | VT_MODE_CURSOR_VIS;
+	st->reply_fd = -1;
+
+	tabstops_init(st);
+
+	return st;
+}
+
+void
+vt_state_free(struct vt_state *st)
+{
+	if (!st)
+		return;
+
+	{
+		int i;
+
+		for (i = 0; i < VT_TARGET_COUNT; i++)
+			vt_buf_free(st->targets[i]);
+	}
+	free(st->tabstops);
+	free(st->title);
+	{
+		int i;
+
+		for (i = 0; i < st->title_stack_len; i++)
+			free(st->title_stack[i]);
+		free(st->title_stack);
+	}
+	free(st);
+}
+
+void
+vt_state_set_reply_fd(struct vt_state *st, int fd)
+{
+	st->reply_fd = fd;
+}
+
+void
+vt_state_set_altscreen_scrollback(struct vt_state *st, int on)
+{
+	st->capture_alt_scroll = on ? 1 : 0;
+}
+
+/* push a new entry onto the kitty keyboard flag stack; when the stack is
+ * full the oldest entry is dropped, matching the kitty protocol */
+void
+vt_state_kitty_push(struct vt_state *st, int flags)
+{
+	if (st->kitty_kbd_depth == VT_KITTY_KBD_STACK_MAX) {
+		memmove(&st->kitty_kbd_stack[0], &st->kitty_kbd_stack[1],
+		    (VT_KITTY_KBD_STACK_MAX - 1) * sizeof(int));
+		st->kitty_kbd_depth--;
+	}
+	st->kitty_kbd_stack[st->kitty_kbd_depth++] = flags;
+	st->kitty_kbd_flags = flags;
+}
+
+/* pop count entries (default 1); effective flags become the new top, or 0 */
+void
+vt_state_kitty_pop(struct vt_state *st, int count)
+{
+	if (count < 1)
+		count = 1;
+	if (count > st->kitty_kbd_depth)
+		count = st->kitty_kbd_depth;
+	st->kitty_kbd_depth -= count;
+	st->kitty_kbd_flags = st->kitty_kbd_depth
+	    ? st->kitty_kbd_stack[st->kitty_kbd_depth - 1] : 0;
+}
+
+/* set the top entry's flags in place (CSI = flags ; mode u).
+ * mode 1 = replace (default), 2 = set bits, 3 = clear bits. */
+void
+vt_state_kitty_set(struct vt_state *st, int flags, int mode)
+{
+	int cur = st->kitty_kbd_flags;
+
+	switch (mode) {
+	case 3:	cur &= ~flags; break;
+	case 2:	cur |= flags; break;
+	default: cur = flags; break;
+	}
+	st->kitty_kbd_flags = cur;
+	if (st->kitty_kbd_depth)
+		st->kitty_kbd_stack[st->kitty_kbd_depth - 1] = cur;
+}
+
+const char *
+vt_state_title(const struct vt_state *st)
+{
+	return st->title;
+}
+
+void
+vt_state_set_title(struct vt_state *st, const char *title)
+{
+	free(st->title);
+	st->title = (title && title[0]) ? strdup(title) : NULL;
+}
+
+#define TITLE_STACK_MAX 16
+
+void
+vt_state_title_push(struct vt_state *st)
+{
+	char *copy;
+
+	if (st->title_stack_len >= TITLE_STACK_MAX)
+		return;
+	if (st->title_stack_len >= st->title_stack_cap) {
+		int newcap = st->title_stack_cap ? st->title_stack_cap * 2 : 4;
+		char **p;
+
+		if (newcap > TITLE_STACK_MAX)
+			newcap = TITLE_STACK_MAX;
+		p = realloc(st->title_stack,
+		    (size_t)newcap * sizeof(*p));
+		if (!p)
+			return;
+		st->title_stack = p;
+		st->title_stack_cap = newcap;
+	}
+	copy = st->title ? strdup(st->title) : NULL;
+	st->title_stack[st->title_stack_len++] = copy;
+}
+
+void
+vt_state_title_pop(struct vt_state *st)
+{
+	char *saved;
+
+	if (st->title_stack_len <= 0)
+		return;
+	saved = st->title_stack[--st->title_stack_len];
+	free(st->title);
+	st->title = saved;
+}
+
+int
+vt_state_resize(struct vt_state *st, int rows, int cols)
+{
+	int old_cols = vt_buf_cols(st->buf);
+	int rc, i;
+
+	for (i = 0; i < VT_TARGET_COUNT; i++) {
+		if (!st->targets[i])
+			continue;
+		rc = vt_buf_resize(st->targets[i], rows, cols);
+		if (rc < 0)
+			return rc;
+	}
+
+	/* rebuild tab stops if column count changed */
+	if (cols != old_cols) {
+		free(st->tabstops);
+		st->tabstops = NULL;
+		tabstops_init(st);
+	}
+
+	st->scroll_top = 0;
+	st->scroll_bot = rows;
+
+	vt_state_cursor_clamp(st);
+	return 0;
+}
+
+void
+vt_state_set_target(struct vt_state *st, enum vt_target tgt)
+{
+	if (tgt < 0 || tgt >= VT_TARGET_COUNT)
+		return;
+	if (!st->targets[tgt])
+		return;
+	st->active_target = tgt;
+	st->buf = st->targets[tgt];
+}
+
+void
+vt_state_altscreen_enter(struct vt_state *st)
+{
+	int rows, cols;
+
+	if (st->modes & VT_MODE_ALTSCREEN)
+		return;
+
+	vt_state_cursor_save(st);
+	st->modes |= VT_MODE_ALTSCREEN;
+
+	rows = vt_buf_rows(st->targets[VT_TARGET_PRIMARY]);
+	cols = vt_buf_cols(st->targets[VT_TARGET_PRIMARY]);
+
+	/* create alt screen on demand -- no scrollback */
+	if (!st->targets[VT_TARGET_ALT])
+		st->targets[VT_TARGET_ALT] = vt_buf_new(rows, cols, 0);
+
+	vt_state_set_target(st, VT_TARGET_ALT);
+	vt_buf_clear_rows(st->buf, 0, rows, st->bg);
+	st->cursor_row = 0;
+	st->cursor_col = 0;
+	st->scroll_top = 0;
+	st->scroll_bot = rows;
+}
+
+/* number of alt rows up to and including the last one with visible text,
+ * so trailing blank rows are not pushed into scrollback as empty history. */
+static int
+alt_content_rows(struct vt_buf *b)
+{
+	int rows = vt_buf_rows(b);
+	int cols = vt_buf_cols(b);
+	int r, c, last = -1;
+
+	for (r = 0; r < rows; r++) {
+		struct vt_row *row = vt_buf_row(b, r);
+
+		for (c = 0; c < cols; c++) {
+			uint32_t cp = row->cells[c].codepoint;
+
+			if (cp != ' ' && cp != 0) {
+				last = r;
+				break;
+			}
+		}
+	}
+	return last + 1;
+}
+
+void
+vt_state_altscreen_leave(struct vt_state *st)
+{
+	if (!(st->modes & VT_MODE_ALTSCREEN))
+		return;
+
+	st->modes &= ~VT_MODE_ALTSCREEN;
+
+	/* preserve the alt-screen content as scrollback history before the
+	 * alt buffer is destroyed (no-op unless enabled and primary has a
+	 * scrollback ring). */
+	if (st->capture_alt_scroll && st->targets[VT_TARGET_ALT]) {
+		int n = alt_content_rows(st->targets[VT_TARGET_ALT]);
+
+		if (n > 0)
+			vt_buf_push_rows(st->targets[VT_TARGET_PRIMARY],
+			    st->targets[VT_TARGET_ALT], 0, n);
+	}
+
+	/* destroy alt screen */
+	vt_buf_free(st->targets[VT_TARGET_ALT]);
+	st->targets[VT_TARGET_ALT] = NULL;
+
+	vt_state_set_target(st, VT_TARGET_PRIMARY);
+	st->scroll_top = 0;
+	st->scroll_bot = vt_buf_rows(st->buf);
+
+	vt_state_cursor_restore(st);
+}
+
+void
+vt_state_cursor_save(struct vt_state *st)
+{
+	st->saved.row = st->cursor_row;
+	st->saved.col = st->cursor_col;
+	st->saved.attrs = st->attrs;
+	st->saved.fg = st->fg;
+	st->saved.bg = st->bg;
+}
+
+void
+vt_state_cursor_restore(struct vt_state *st)
+{
+	st->cursor_row = st->saved.row;
+	st->cursor_col = st->saved.col;
+	st->attrs = st->saved.attrs;
+	st->fg = st->saved.fg;
+	st->bg = st->saved.bg;
+	vt_state_cursor_clamp(st);
+}
+
+void
+vt_state_cursor_clamp(struct vt_state *st)
+{
+	int rows = vt_buf_rows(st->buf);
+	int cols = vt_buf_cols(st->buf);
+
+	if (st->cursor_row < 0)
+		st->cursor_row = 0;
+	if (st->cursor_row >= rows)
+		st->cursor_row = rows - 1;
+	if (st->cursor_col < 0)
+		st->cursor_col = 0;
+	if (st->cursor_col >= cols)
+		st->cursor_col = cols - 1;
+}
+
+void
+vt_state_index(struct vt_state *st)
+{
+	int rows = vt_buf_rows(st->buf);
+
+	/* scroll the region up only when the cursor is on the bottom margin.
+	 * below the region, move down within the physical screen and do not
+	 * scroll.  above or inside the region, just move down one line. */
+	if (st->cursor_row == st->scroll_bot - 1)
+		vt_buf_scroll(st->buf, st->scroll_top, st->scroll_bot, 1,
+		    st->bg);
+	else if (st->cursor_row < rows - 1)
+		st->cursor_row++;
+}
+
+void
+vt_state_reverse_index(struct vt_state *st)
+{
+	/* mirror of vt_state_index: scroll the region down only when the
+	 * cursor is on the top margin.  above the region, move up within the
+	 * physical screen and do not scroll. */
+	if (st->cursor_row == st->scroll_top)
+		vt_buf_scroll(st->buf, st->scroll_top, st->scroll_bot, -1,
+		    st->bg);
+	else if (st->cursor_row > 0)
+		st->cursor_row--;
+}
+
+void
+vt_kgfx_account(struct vt_state *st, const char *data, size_t len,
+    int cell_pw, int cell_ph)
+{
+	const char *p, *end;
+	int action = 0, cmove = 0;
+	int rows = 0, cols = 0, vpx = 0, spx = 0;
+	int nrows, ncols;
+
+	/* data is the APC payload: "G" + comma-separated key=value control,
+	 * then an optional ";" and image payload.  Parse only the keys that
+	 * bear on the cursor: a= (action), C= (cursor policy), r=/c= (display
+	 * rows/cols), v=/s= (image pixel height/width). */
+	if (len < 1 || data[0] != 'G')
+		return;
+
+	p = data + 1;
+	end = p;
+	while (end < data + len && *end != ';')
+		end++;
+
+	while (p < end) {
+		int	 key = *p++;
+		int	 vch;
+		long	 val = 0;
+		int	 sign = 1;
+
+		if (p < end && *p == '=')
+			p++;
+		vch = (p < end && *p != ',') ? (unsigned char)*p : 0;
+		if (p < end && *p == '-') {
+			sign = -1;
+			p++;
+		}
+		while (p < end && *p >= '0' && *p <= '9')
+			val = val * 10 + (*p++ - '0');
+		val *= sign;
+
+		switch (key) {
+		case 'a': action = vch;      break;	/* T or p = display */
+		case 'C': cmove = (int)val;  break;	/* 1 = keep cursor put */
+		case 'r': rows = (int)val;   break;	/* display rows */
+		case 'c': cols = (int)val;   break;	/* display cols */
+		case 'v': vpx = (int)val;    break;	/* image pixel height */
+		case 's': spx = (int)val;    break;	/* image pixel width */
+		}
+
+		while (p < end && *p != ',')
+			p++;
+		if (p < end && *p == ',')
+			p++;
+	}
+
+	if (action != 'T' && action != 'p')	/* not a display command */
+		return;
+	if (cmove)				/* client keeps the cursor put */
+		return;
+
+	/* cells the image spans (explicit r=/c=, else ceil(px / cell)) */
+	if (rows > 0)
+		nrows = rows;
+	else if (vpx > 0 && cell_ph > 0)
+		nrows = (vpx + cell_ph - 1) / cell_ph;
+	else
+		return;				/* cannot size the image */
+	if (cols > 0)
+		ncols = cols;
+	else if (spx > 0 && cell_pw > 0)
+		ncols = (spx + cell_pw - 1) / cell_pw;
+	else
+		ncols = 0;			/* leave the column where it is */
+
+	/* kitty (C=0) moves the cursor down by rows-1 and right by cols, so it
+	 * ends just past the bottom-right cell, on the last row of the image. */
+	while (nrows-- > 1)
+		vt_state_index(st);
+	st->cursor_col += ncols;
+	vt_state_cursor_clamp(st);
+}
+
+void
+vt_state_putchar(struct vt_state *st, uint32_t cp, int width)
+{
+	struct vt_cell *c;
+	int cols = vt_buf_cols(st->buf);
+	int rows = vt_buf_rows(st->buf);
+
+	/* auto-wrap: if we're past the edge, wrap to next line */
+	if (st->cursor_col + width > cols) {
+		if (st->modes & VT_MODE_AUTOWRAP) {
+			struct vt_row *r = vt_buf_row(st->buf, st->cursor_row);
+
+			if (r)
+				r->flags |= VT_ROW_WRAPPED;
+			st->cursor_col = 0;
+			vt_state_index(st);
+		} else {
+			/* no autowrap: park at the last cell the glyph fits
+			 * in; clamp so a narrow terminal (cols < width) stays
+			 * >= 0 */
+			st->cursor_col = cols > width ? cols - width : 0;
+		}
+	}
+
+	/* insert mode: shift cells right */
+	if (st->modes & VT_MODE_INSERT) {
+		struct vt_row *r = vt_buf_row(st->buf, st->cursor_row);
+
+		if (r) {
+			int i;
+
+			for (i = cols - 1; i >= st->cursor_col + width; i--)
+				r->cells[i] = r->cells[i - width];
+		}
+	}
+
+	c = vt_buf_cell(st->buf, st->cursor_row, st->cursor_col);
+	if (!c)
+		return;
+
+	c->codepoint = cp;
+	c->attrs = st->attrs;
+	c->fg = st->fg;
+	c->bg = st->bg;
+	c->width = (uint8_t)width;
+
+	/* for wide chars, blank the trailing cell */
+	if (width == 2 && st->cursor_col + 1 < cols) {
+		struct vt_cell *c2;
+
+		c2 = vt_buf_cell(st->buf, st->cursor_row,
+		    st->cursor_col + 1);
+		if (c2) {
+			vt_cell_clear(c2);
+			c2->width = 0; /* continuation cell */
+		}
+	}
+
+	/* mark row dirty */
+	{
+		struct vt_row *r = vt_buf_row(st->buf, st->cursor_row);
+
+		if (r)
+			r->flags |= VT_ROW_DIRTY;
+	}
+
+	st->cursor_col += width;
+
+	/* clamp -- cursor can sit at cols (pending wrap) only with autowrap.
+	 * a glyph wider than the whole terminal wraps to column 0 and still
+	 * overflows, so cap at cols before the autowrap-off case pulls it
+	 * back onto a real cell. */
+	if (st->cursor_col > cols)
+		st->cursor_col = cols;
+	if (!(st->modes & VT_MODE_AUTOWRAP) && st->cursor_col >= cols)
+		st->cursor_col = cols - 1;
+
+	(void)rows;
+}
+
+void
+vt_state_tab_reset(struct vt_state *st)
+{
+	int cols = vt_buf_cols(st->buf);
+	int i;
+
+	memset(st->tabstops, 0, (size_t)cols);
+	for (i = 0; i < cols; i += DEFAULT_TAB_WIDTH)
+		st->tabstops[i] = 1;
+}
+
+void
+vt_state_tab_clear_all(struct vt_state *st)
+{
+	memset(st->tabstops, 0, (size_t)vt_buf_cols(st->buf));
+}
+
+void
+vt_state_tab_set(struct vt_state *st, int col)
+{
+	if (col >= 0 && col < vt_buf_cols(st->buf))
+		st->tabstops[col] = 1;
+}
+
+void
+vt_state_tab_clear(struct vt_state *st, int col)
+{
+	if (col >= 0 && col < vt_buf_cols(st->buf))
+		st->tabstops[col] = 0;
+}
+
+int
+vt_state_tab_next(struct vt_state *st, int col)
+{
+	int cols = vt_buf_cols(st->buf);
+	int i;
+
+	for (i = col + 1; i < cols; i++) {
+		if (st->tabstops[i])
+			return i;
+	}
+	return cols - 1;
+}
+
+int
+vt_state_tab_prev(struct vt_state *st, int col)
+{
+	int i;
+
+	for (i = col - 1; i >= 0; i--) {
+		if (st->tabstops[i])
+			return i;
+	}
+	return 0;
+}
+
+/* ---- screen dump ---- */
+
+/* format a decimal integer, return length */
+static int
+dump_fmt_int(char *buf, int n)
+{
+	int len = 0;
+	char tmp[12];
+	int i;
+
+	if (n <= 0) {
+		buf[0] = '0';
+		return 1;
+	}
+	while (n > 0) {
+		tmp[len++] = '0' + (n % 10);
+		n /= 10;
+	}
+	for (i = 0; i < len; i++)
+		buf[i] = tmp[len - 1 - i];
+	return len;
+}
+
+static void
+dump_sgr(vt_dump_fn emit, void *ctx, const struct vt_cell *c)
+{
+	char buf[64];
+	int len = 0;
+	int need_sep = 0;
+
+	buf[len++] = '\033';
+	buf[len++] = '[';
+	buf[len++] = '0'; /* reset first */
+	need_sep = 1;
+
+#define SEP() do { if (need_sep) buf[len++] = ';'; need_sep = 1; } while (0)
+#define ATTR(flag, code) \
+	do { if (c->attrs & (flag)) { SEP(); len += dump_fmt_int(buf + len, (code)); } } while (0)
+
+	ATTR(VT_ATTR_BOLD, 1);
+	ATTR(VT_ATTR_DIM, 2);
+	ATTR(VT_ATTR_ITALIC, 3);
+	ATTR(VT_ATTR_UNDERLINE, 4);
+	ATTR(VT_ATTR_BLINK, 5);
+	ATTR(VT_ATTR_REVERSE, 7);
+	ATTR(VT_ATTR_HIDDEN, 8);
+	ATTR(VT_ATTR_STRIKE, 9);
+
+#undef ATTR
+
+	if (c->fg.type == VT_COLOR_INDEXED) {
+		if (c->fg.index < 8) {
+			SEP(); len += dump_fmt_int(buf + len, 30 + c->fg.index);
+		} else if (c->fg.index < 16) {
+			SEP(); len += dump_fmt_int(buf + len, 90 + c->fg.index - 8);
+		} else {
+			SEP(); buf[len++]='3'; buf[len++]='8'; buf[len++]=';';
+			buf[len++]='5'; buf[len++]=';';
+			len += dump_fmt_int(buf + len, c->fg.index);
+		}
+	} else if (c->fg.type == VT_COLOR_RGB) {
+		SEP(); buf[len++]='3'; buf[len++]='8'; buf[len++]=';';
+		buf[len++]='2'; buf[len++]=';';
+		len += dump_fmt_int(buf + len, c->fg.rgb.r); buf[len++]=';';
+		len += dump_fmt_int(buf + len, c->fg.rgb.g); buf[len++]=';';
+		len += dump_fmt_int(buf + len, c->fg.rgb.b);
+	}
+
+	if (c->bg.type == VT_COLOR_INDEXED) {
+		if (c->bg.index < 8) {
+			SEP(); len += dump_fmt_int(buf + len, 40 + c->bg.index);
+		} else if (c->bg.index < 16) {
+			SEP(); len += dump_fmt_int(buf + len, 100 + c->bg.index - 8);
+		} else {
+			SEP(); buf[len++]='4'; buf[len++]='8'; buf[len++]=';';
+			buf[len++]='5'; buf[len++]=';';
+			len += dump_fmt_int(buf + len, c->bg.index);
+		}
+	} else if (c->bg.type == VT_COLOR_RGB) {
+		SEP(); buf[len++]='4'; buf[len++]='8'; buf[len++]=';';
+		buf[len++]='2'; buf[len++]=';';
+		len += dump_fmt_int(buf + len, c->bg.rgb.r); buf[len++]=';';
+		len += dump_fmt_int(buf + len, c->bg.rgb.g); buf[len++]=';';
+		len += dump_fmt_int(buf + len, c->bg.rgb.b);
+	}
+
+#undef SEP
+
+	buf[len++] = 'm';
+	emit(ctx, buf, (size_t)len);
+}
+
+void
+vt_state_dump(struct vt_state *st, vt_dump_fn emit, void *ctx)
+{
+	int rows = vt_buf_rows(st->buf);
+	int cols = vt_buf_cols(st->buf);
+	int row, col;
+	char esc[32];
+	int esc_len;
+	int sgr_active = 0;
+
+	/* reset terminal state */
+	emit(ctx, "\033[0m\033[2J\033[H", 11);
+
+	/* select the correct screen.  emit the mode explicitly (not only
+	 * when alt is active) so a replay fed into an existing client VT
+	 * that is already on the other screen is corrected either way. */
+	if (st->modes & VT_MODE_ALTSCREEN)
+		emit(ctx, "\033[?1049h", 8);
+	else
+		emit(ctx, "\033[?1049l", 8);
+
+	/* restore window title */
+	if (st->title && st->title[0]) {
+		char tbuf[256];
+		int tlen;
+
+		tlen = snprintf(tbuf, sizeof(tbuf),
+		    "\033]2;%s\033\\", st->title);
+		if (tlen > 0 && tlen < (int)sizeof(tbuf))
+			emit(ctx, tbuf, (size_t)tlen);
+	}
+
+	for (row = 0; row < rows; row++) {
+		struct vt_row *vr = vt_buf_row(st->buf, row);
+
+		if (!vr)
+			continue;
+
+		/* CUP to start of row */
+		esc_len = 0;
+		esc[esc_len++] = '\033';
+		esc[esc_len++] = '[';
+		esc_len += dump_fmt_int(esc + esc_len, row + 1);
+		esc[esc_len++] = ';';
+		esc[esc_len++] = '1';
+		esc[esc_len++] = 'H';
+		emit(ctx, esc, (size_t)esc_len);
+
+		for (col = 0; col < cols; col++) {
+			struct vt_cell *c = &vr->cells[col];
+			unsigned char ubuf[4];
+			int ulen;
+
+			/* skip continuation cells */
+			if (c->width == 0)
+				continue;
+
+			/* emit SGR if cell has any attributes or colors.
+			 * a plain cell needs an explicit reset whenever a
+			 * style is still in effect, otherwise the style
+			 * bleeds across the rest of the dump. */
+			if (c->attrs != 0 ||
+			    c->fg.type != VT_COLOR_DEFAULT ||
+			    c->bg.type != VT_COLOR_DEFAULT) {
+				dump_sgr(emit, ctx, c);
+				sgr_active = 1;
+			} else if (sgr_active || col == 0 || row == 0) {
+				emit(ctx, "\033[0m", 4);
+				sgr_active = 0;
+			}
+
+			/* emit character */
+			ulen = utf8_encode(ubuf, c->codepoint);
+			if (ulen > 0)
+				emit(ctx, (const char *)ubuf, (size_t)ulen);
+		}
+	}
+
+	/* reset SGR */
+	emit(ctx, "\033[0m", 4);
+
+	/* position cursor */
+	esc_len = 0;
+	esc[esc_len++] = '\033';
+	esc[esc_len++] = '[';
+	esc_len += dump_fmt_int(esc + esc_len, st->cursor_row + 1);
+	esc[esc_len++] = ';';
+	esc_len += dump_fmt_int(esc + esc_len, st->cursor_col + 1);
+	esc[esc_len++] = 'H';
+	emit(ctx, esc, (size_t)esc_len);
+
+	/* cursor visibility */
+	if (st->modes & VT_MODE_CURSOR_VIS)
+		emit(ctx, "\033[?25h", 6);
+	else
+		emit(ctx, "\033[?25l", 6);
+
+	/* cursor shape (DECSCUSR) */
+	if (st->cursor_shape > 0) {
+		esc_len = snprintf(esc, sizeof(esc),
+		    "\033[%d q", st->cursor_shape);
+		if (esc_len > 0)
+			emit(ctx, esc, (size_t)esc_len);
+	}
+
+	/*
+	 * keyboard enhancement state.  the dump above replays only visible
+	 * state.  a client that attaches after the program already turned on
+	 * the kitty keyboard protocol or modifyOtherKeys would otherwise start
+	 * with these off and never forward the enable to the outer terminal,
+	 * so Shift+Enter and other modified keys arrive as their legacy bytes.
+	 * emit the current values (a set, not a stack push) so the replay
+	 * leaves the client VT holding the authoritative flags.
+	 */
+	esc_len = snprintf(esc, sizeof(esc), "\033[=%du", st->kitty_kbd_flags);
+	if (esc_len > 0)
+		emit(ctx, esc, (size_t)esc_len);
+	if (st->modify_other_keys != 0) {
+		esc_len = snprintf(esc, sizeof(esc),
+		    "\033[>4;%dm", st->modify_other_keys);
+		if (esc_len > 0)
+			emit(ctx, esc, (size_t)esc_len);
+	}
+}
+
+/* vt_ops.c */
+
+
+
+
+/* ---- helpers ---- */
+
+static int
+param_or(const int *params, int nparam, int idx, int def)
+{
+	if (idx < nparam && params[idx] >= 0)
+		return params[idx];
+	return def;
+}
+
+/* write a reply string back to the PTY master (for DSR/DA responses) */
+static void
+vt_reply(struct vt_state *st, const char *data, size_t len)
+{
+	if (st->reply_fd < 0)
+		return;
+	while (len > 0) {
+		ssize_t n = write(st->reply_fd, data, len);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		data += n;
+		len -= (size_t)n;
+	}
+}
+
+/* line drawing character map (DEC special graphics, 0x5F-0x7E) */
+static const uint32_t dec_line_drawing[] = {
+	/* 0x5F */ 0x00A0,	/* non-breaking space */
+	/* 0x60 */ 0x25C6,	/* diamond */
+	/* 0x61 */ 0x2592,	/* checkerboard */
+	/* 0x62 */ 0x2409,	/* HT symbol */
+	/* 0x63 */ 0x240C,	/* FF symbol */
+	/* 0x64 */ 0x240D,	/* CR symbol */
+	/* 0x65 */ 0x240A,	/* LF symbol */
+	/* 0x66 */ 0x00B0,	/* degree */
+	/* 0x67 */ 0x00B1,	/* plus/minus */
+	/* 0x68 */ 0x2424,	/* NL symbol */
+	/* 0x69 */ 0x240B,	/* VT symbol */
+	/* 0x6A */ 0x2518,	/* lower right corner */
+	/* 0x6B */ 0x2510,	/* upper right corner */
+	/* 0x6C */ 0x250C,	/* upper left corner */
+	/* 0x6D */ 0x2514,	/* lower left corner */
+	/* 0x6E */ 0x253C,	/* crossing */
+	/* 0x6F */ 0x23BA,	/* scan line 1 */
+	/* 0x70 */ 0x23BB,	/* scan line 3 */
+	/* 0x71 */ 0x2500,	/* horizontal line */
+	/* 0x72 */ 0x23BC,	/* scan line 7 */
+	/* 0x73 */ 0x23BD,	/* scan line 9 */
+	/* 0x74 */ 0x251C,	/* T right */
+	/* 0x75 */ 0x2524,	/* T left */
+	/* 0x76 */ 0x2534,	/* T up */
+	/* 0x77 */ 0x252C,	/* T down */
+	/* 0x78 */ 0x2502,	/* vertical line */
+	/* 0x79 */ 0x2264,	/* less-equal */
+	/* 0x7A */ 0x2265,	/* greater-equal */
+	/* 0x7B */ 0x03C0,	/* pi */
+	/* 0x7C */ 0x2260,	/* not-equal */
+	/* 0x7D */ 0x00A3,	/* pound sterling */
+	/* 0x7E */ 0x00B7,	/* middle dot */
+};
+
+/* ---- print ---- */
+
+static void
+op_print(void *ctx, uint32_t cp, int width)
+{
+	struct vt_state *st = ctx;
+	int active_set;
+
+	/* apply character set translation */
+	active_set = st->charset == 0 ? st->g0_set : st->g1_set;
+	if (active_set == 1 && cp >= 0x5F && cp <= 0x7E)
+		cp = dec_line_drawing[cp - 0x5F];
+
+	vt_state_putchar(st, cp, width);
+}
+
+/* ---- C0/C1 execute ---- */
+
+static void
+op_execute(void *ctx, uint8_t c)
+{
+	struct vt_state *st = ctx;
+	int rows = vt_buf_rows(st->buf);
+
+	switch (c) {
+	case 0x07:	/* BEL -- ignore for now */
+		break;
+
+	case 0x08:	/* BS -- backspace */
+		if (st->cursor_col > 0)
+			st->cursor_col--;
+		break;
+
+	case 0x09:	/* HT -- horizontal tab */
+		st->cursor_col = vt_state_tab_next(st, st->cursor_col);
+		break;
+
+	case 0x0A:	/* LF */
+	case 0x0B:	/* VT */
+	case 0x0C:	/* FF */
+		vt_state_index(st);
+		break;
+
+	case 0x0D:	/* CR -- carriage return */
+		st->cursor_col = 0;
+		break;
+
+	case 0x0E:	/* SO -- shift out (G1) */
+		st->charset = 1;
+		break;
+
+	case 0x0F:	/* SI -- shift in (G0) */
+		st->charset = 0;
+		break;
+	}
+	(void)rows;
+}
+
+/* ---- CSI dispatch ---- */
+
+static void
+csi_sgr(struct vt_state *st, const int *params, int nparam)
+{
+	int i, p;
+
+	if (nparam == 0) {
+		/* CSI m -- reset all */
+		st->attrs = 0;
+		st->fg.type = VT_COLOR_DEFAULT;
+		st->bg.type = VT_COLOR_DEFAULT;
+		return;
+	}
+
+	for (i = 0; i < nparam; i++) {
+		p = params[i] < 0 ? 0 : params[i];
+
+		switch (p) {
+		case 0:
+			st->attrs = 0;
+			st->fg.type = VT_COLOR_DEFAULT;
+			st->bg.type = VT_COLOR_DEFAULT;
+			break;
+		case 1:
+			st->attrs |= VT_ATTR_BOLD;
+			break;
+		case 2:
+			st->attrs |= VT_ATTR_DIM;
+			break;
+		case 3:
+			st->attrs |= VT_ATTR_ITALIC;
+			break;
+		case 4:
+			st->attrs |= VT_ATTR_UNDERLINE;
+			break;
+		case 5:
+			st->attrs |= VT_ATTR_BLINK;
+			break;
+		case 7:
+			st->attrs |= VT_ATTR_REVERSE;
+			break;
+		case 8:
+			st->attrs |= VT_ATTR_HIDDEN;
+			break;
+		case 9:
+			st->attrs |= VT_ATTR_STRIKE;
+			break;
+		case 21:
+			st->attrs &= (uint16_t)~VT_ATTR_BOLD;
+			break;
+		case 22:
+			st->attrs &= (uint16_t)~(VT_ATTR_BOLD | VT_ATTR_DIM);
+			break;
+		case 23:
+			st->attrs &= (uint16_t)~VT_ATTR_ITALIC;
+			break;
+		case 24:
+			st->attrs &= (uint16_t)~VT_ATTR_UNDERLINE;
+			break;
+		case 25:
+			st->attrs &= (uint16_t)~VT_ATTR_BLINK;
+			break;
+		case 27:
+			st->attrs &= (uint16_t)~VT_ATTR_REVERSE;
+			break;
+		case 28:
+			st->attrs &= (uint16_t)~VT_ATTR_HIDDEN;
+			break;
+		case 29:
+			st->attrs &= (uint16_t)~VT_ATTR_STRIKE;
+			break;
+
+		/* foreground: standard 8 */
+		case 30: case 31: case 32: case 33:
+		case 34: case 35: case 36: case 37:
+			st->fg.type = VT_COLOR_INDEXED;
+			st->fg.index = (uint8_t)(p - 30);
+			break;
+
+		/* foreground: extended */
+		case 38:
+			if (i + 1 < nparam && params[i + 1] == 5) {
+				/* 256-color: CSI 38;5;N m */
+				if (i + 2 < nparam) {
+					st->fg.type = VT_COLOR_INDEXED;
+					st->fg.index = (uint8_t)params[i + 2];
+					i += 2;
+				}
+			} else if (i + 1 < nparam && params[i + 1] == 2) {
+				/* RGB: CSI 38;2;R;G;B m */
+				if (i + 4 < nparam) {
+					st->fg.type = VT_COLOR_RGB;
+					st->fg.rgb.r = (uint8_t)params[i + 2];
+					st->fg.rgb.g = (uint8_t)params[i + 3];
+					st->fg.rgb.b = (uint8_t)params[i + 4];
+					i += 4;
+				}
+			}
+			break;
+
+		case 39:	/* default fg */
+			st->fg.type = VT_COLOR_DEFAULT;
+			break;
+
+		/* background: standard 8 */
+		case 40: case 41: case 42: case 43:
+		case 44: case 45: case 46: case 47:
+			st->bg.type = VT_COLOR_INDEXED;
+			st->bg.index = (uint8_t)(p - 40);
+			break;
+
+		/* background: extended */
+		case 48:
+			if (i + 1 < nparam && params[i + 1] == 5) {
+				if (i + 2 < nparam) {
+					st->bg.type = VT_COLOR_INDEXED;
+					st->bg.index = (uint8_t)params[i + 2];
+					i += 2;
+				}
+			} else if (i + 1 < nparam && params[i + 1] == 2) {
+				if (i + 4 < nparam) {
+					st->bg.type = VT_COLOR_RGB;
+					st->bg.rgb.r = (uint8_t)params[i + 2];
+					st->bg.rgb.g = (uint8_t)params[i + 3];
+					st->bg.rgb.b = (uint8_t)params[i + 4];
+					i += 4;
+				}
+			}
+			break;
+
+		case 49:	/* default bg */
+			st->bg.type = VT_COLOR_DEFAULT;
+			break;
+
+		/* foreground: bright 8 */
+		case 90: case 91: case 92: case 93:
+		case 94: case 95: case 96: case 97:
+			st->fg.type = VT_COLOR_INDEXED;
+			st->fg.index = (uint8_t)(p - 90 + 8);
+			break;
+
+		/* background: bright 8 */
+		case 100: case 101: case 102: case 103:
+		case 104: case 105: case 106: case 107:
+			st->bg.type = VT_COLOR_INDEXED;
+			st->bg.index = (uint8_t)(p - 100 + 8);
+			break;
+		}
+	}
+}
+
+static void
+csi_erase_display(struct vt_state *st, int mode)
+{
+	int rows = vt_buf_rows(st->buf);
+	int cols = vt_buf_cols(st->buf);
+
+	switch (mode) {
+	case 0:		/* below */
+		/* clear rest of current row */
+		{
+			struct vt_row *r;
+			int i;
+
+			r = vt_buf_row(st->buf, st->cursor_row);
+			if (r) {
+				for (i = st->cursor_col; i < cols; i++)
+					vt_cell_erase(&r->cells[i], st->bg);
+				r->flags |= VT_ROW_DIRTY;
+			}
+		}
+		vt_buf_clear_rows(st->buf, st->cursor_row + 1, rows, st->bg);
+		break;
+	case 1:		/* above */
+		vt_buf_clear_rows(st->buf, 0, st->cursor_row, st->bg);
+		/* clear beginning of current row */
+		{
+			struct vt_row *r;
+			int i;
+
+			r = vt_buf_row(st->buf, st->cursor_row);
+			if (r) {
+				for (i = 0; i <= st->cursor_col && i < cols;
+				    i++)
+					vt_cell_erase(&r->cells[i], st->bg);
+				r->flags |= VT_ROW_DIRTY;
+			}
+		}
+		break;
+	case 2:		/* entire display */
+	case 3:		/* entire display + scrollback (xterm) */
+		vt_buf_clear_rows(st->buf, 0, rows, st->bg);
+		break;
+	}
+}
+
+static void
+csi_erase_line(struct vt_state *st, int mode)
+{
+	struct vt_row *r;
+	int cols = vt_buf_cols(st->buf);
+	int i, start, end;
+
+	r = vt_buf_row(st->buf, st->cursor_row);
+	if (!r)
+		return;
+
+	switch (mode) {
+	case 0:
+		start = st->cursor_col;
+		end = cols;
+		break;
+	case 1:
+		start = 0;
+		end = st->cursor_col + 1;
+		if (end > cols)
+			end = cols;
+		break;
+	case 2:
+		start = 0;
+		end = cols;
+		break;
+	default:
+		return;
+	}
+
+	for (i = start; i < end; i++)
+		vt_cell_erase(&r->cells[i], st->bg);
+	r->flags |= VT_ROW_DIRTY;
+}
+
+static void
+csi_insert_lines(struct vt_state *st, int count)
+{
+	if (st->cursor_row < st->scroll_top ||
+	    st->cursor_row >= st->scroll_bot)
+		return;
+	vt_buf_scroll(st->buf, st->cursor_row, st->scroll_bot, -count, st->bg);
+}
+
+static void
+csi_delete_lines(struct vt_state *st, int count)
+{
+	if (st->cursor_row < st->scroll_top ||
+	    st->cursor_row >= st->scroll_bot)
+		return;
+	vt_buf_scroll(st->buf, st->cursor_row, st->scroll_bot, count, st->bg);
+}
+
+static void
+csi_insert_chars(struct vt_state *st, int count)
+{
+	struct vt_row *r;
+	int cols = vt_buf_cols(st->buf);
+	int i;
+
+	r = vt_buf_row(st->buf, st->cursor_row);
+	if (!r)
+		return;
+
+	if (count > cols - st->cursor_col)
+		count = cols - st->cursor_col;
+
+	/* shift cells right */
+	for (i = cols - 1; i >= st->cursor_col + count; i--)
+		r->cells[i] = r->cells[i - count];
+
+	/* clear inserted area */
+	for (i = st->cursor_col; i < st->cursor_col + count; i++)
+		vt_cell_erase(&r->cells[i], st->bg);
+
+	r->flags |= VT_ROW_DIRTY;
+}
+
+static void
+csi_delete_chars(struct vt_state *st, int count)
+{
+	struct vt_row *r;
+	int cols = vt_buf_cols(st->buf);
+	int i;
+
+	r = vt_buf_row(st->buf, st->cursor_row);
+	if (!r)
+		return;
+
+	if (count > cols - st->cursor_col)
+		count = cols - st->cursor_col;
+
+	/* shift cells left */
+	for (i = st->cursor_col; i < cols - count; i++)
+		r->cells[i] = r->cells[i + count];
+
+	/* clear vacated area */
+	for (i = cols - count; i < cols; i++)
+		vt_cell_erase(&r->cells[i], st->bg);
+
+	r->flags |= VT_ROW_DIRTY;
+}
+
+static void
+csi_erase_chars(struct vt_state *st, int count)
+{
+	struct vt_row *r;
+	int cols = vt_buf_cols(st->buf);
+	int i;
+
+	r = vt_buf_row(st->buf, st->cursor_row);
+	if (!r)
+		return;
+
+	if (count > cols - st->cursor_col)
+		count = cols - st->cursor_col;
+
+	for (i = st->cursor_col; i < st->cursor_col + count; i++)
+		vt_cell_erase(&r->cells[i], st->bg);
+
+	r->flags |= VT_ROW_DIRTY;
+}
+
+static void
+op_csi(void *ctx, const int *params, int nparam, int intermed, int final)
+{
+	struct vt_state *st = ctx;
+	int rows = vt_buf_rows(st->buf);
+	int cols = vt_buf_cols(st->buf);
+	int n, m;
+
+	/* private mode sequences */
+	if (intermed == '?') {
+		n = param_or(params, nparam, 0, 0);
+		switch (final) {
+		case 'h':	/* DECSET */
+			switch (n) {
+			case 1:		/* DECCKM (application cursor keys) */
+				st->modes |= VT_MODE_DECCKM;
+				break;
+			case 6:		/* DECOM (origin mode) */
+				st->modes |= VT_MODE_ORIGIN;
+				st->cursor_row = st->scroll_top;
+				st->cursor_col = 0;
+				break;
+			case 7:
+				st->modes |= VT_MODE_AUTOWRAP;
+				break;
+			case 25:
+				st->modes |= VT_MODE_CURSOR_VIS;
+				break;
+			case 47:	/* alt screen (old xterm) */
+			case 1047:	/* alt screen (xterm) */
+			case 1049:	/* alt screen + save cursor */
+				vt_state_altscreen_enter(st);
+				break;
+			case 1000:
+			case 1002:
+			case 1003:
+				st->mouse_mode = n;
+				st->modes |= VT_MODE_MOUSE;
+				break;
+			case 2004:
+				st->modes |= VT_MODE_BRACKETPASTE;
+				break;
+			}
+			break;
+		case 'l':	/* DECRST */
+			switch (n) {
+			case 1:		/* DECCKM off */
+				st->modes &= ~VT_MODE_DECCKM;
+				break;
+			case 6:		/* DECOM off */
+				st->modes &= ~VT_MODE_ORIGIN;
+				st->cursor_row = 0;
+				st->cursor_col = 0;
+				break;
+			case 7:
+				st->modes &= ~VT_MODE_AUTOWRAP;
+				break;
+			case 25:
+				st->modes &= ~VT_MODE_CURSOR_VIS;
+				break;
+			case 47:	/* alt screen (old xterm) */
+			case 1047:	/* alt screen (xterm) */
+			case 1049:	/* alt screen + restore cursor */
+				vt_state_altscreen_leave(st);
+				break;
+			case 1000:
+			case 1002:
+			case 1003:
+				st->mouse_mode = 0;
+				st->modes &= ~VT_MODE_MOUSE;
+				break;
+			case 2004:
+				st->modes &= ~VT_MODE_BRACKETPASTE;
+				break;
+			}
+			break;
+		case 'u':	/* kitty keyboard protocol: report flags */
+			{
+				/* CSI ? u -- query current progressive
+				 * enhancement flags; reply CSI ? flags u */
+				char rep[16];
+				int len = snprintf(rep, sizeof(rep),
+				    "\033[?%du", st->kitty_kbd_flags);
+				vt_reply(st, rep, (size_t)len);
+			}
+			break;
+		case 'm':	/* XTQMODKEYS -- query modifyOtherKeys */
+			if (n == 4) {
+				/* CSI ? 4 m -- reply CSI > 4 ; Pv m */
+				char rep[24];
+				int len = snprintf(rep, sizeof(rep),
+				    "\033[>4;%dm", st->modify_other_keys);
+				vt_reply(st, rep, (size_t)len);
+			}
+			break;
+		}
+		return;
+	}
+
+	/* CSI Ps SP q -- DECSCUSR (set cursor shape) */
+	if (intermed == ' ' && final == 'q') {
+		n = param_or(params, nparam, 0, 0);
+		if (n >= 0 && n <= 6)
+			st->cursor_shape = n;
+		return;
+	}
+
+	/* keyboard enhancement protocol sequences */
+	if (intermed == '>' && final == 'u') {
+		/* CSI > flags u -- kitty keyboard protocol push */
+		vt_state_kitty_push(st, param_or(params, nparam, 0, 0));
+		return;
+	}
+	if (intermed == '<' && final == 'u') {
+		/* CSI < Pn u -- kitty keyboard protocol pop (default 1) */
+		vt_state_kitty_pop(st, param_or(params, nparam, 0, 1));
+		return;
+	}
+	if (intermed == '=' && final == 'u') {
+		/* CSI = flags ; mode u -- set the current flags in place */
+		vt_state_kitty_set(st, param_or(params, nparam, 0, 0),
+		    param_or(params, nparam, 1, 1));
+		return;
+	}
+	if (intermed == '>' && final == 'm') {
+		n = param_or(params, nparam, 0, 0);
+		if (n == 4) {
+			/* CSI > 4 ; Pm m -- xterm modifyOtherKeys */
+			st->modify_other_keys = param_or(params, nparam, 1, 0);
+		}
+		return;
+	}
+
+	/* ignore sequences with any private modifier or intermediate byte
+	 * that we don't handle (CSI = ..., CSI ! p, etc.) */
+	if (intermed != 0)
+		return;
+
+	switch (final) {
+	case 'A':	/* CUU -- cursor up */
+		n = param_or(params, nparam, 0, 1);
+		st->cursor_row -= n;
+		if (st->cursor_row < 0)
+			st->cursor_row = 0;
+		break;
+
+	case 'B':	/* CUD -- cursor down */
+		n = param_or(params, nparam, 0, 1);
+		st->cursor_row += n;
+		if (st->cursor_row >= rows)
+			st->cursor_row = rows - 1;
+		break;
+
+	case 'C':	/* CUF -- cursor forward */
+		n = param_or(params, nparam, 0, 1);
+		st->cursor_col += n;
+		if (st->cursor_col >= cols)
+			st->cursor_col = cols - 1;
+		break;
+
+	case 'D':	/* CUB -- cursor back */
+		n = param_or(params, nparam, 0, 1);
+		st->cursor_col -= n;
+		if (st->cursor_col < 0)
+			st->cursor_col = 0;
+		break;
+
+	case 'E':	/* CNL -- cursor next line */
+		n = param_or(params, nparam, 0, 1);
+		st->cursor_row += n;
+		if (st->cursor_row >= rows)
+			st->cursor_row = rows - 1;
+		st->cursor_col = 0;
+		break;
+
+	case 'F':	/* CPL -- cursor previous line */
+		n = param_or(params, nparam, 0, 1);
+		st->cursor_row -= n;
+		if (st->cursor_row < 0)
+			st->cursor_row = 0;
+		st->cursor_col = 0;
+		break;
+
+	case 'G':	/* CHA -- cursor horizontal absolute */
+		n = param_or(params, nparam, 0, 1);
+		st->cursor_col = n - 1;
+		vt_state_cursor_clamp(st);
+		break;
+
+	case 'H':	/* CUP -- cursor position */
+	case 'f':	/* HVP -- horizontal/vertical position */
+		n = param_or(params, nparam, 0, 1);
+		m = param_or(params, nparam, 1, 1);
+		if (st->modes & VT_MODE_ORIGIN) {
+			st->cursor_row = st->scroll_top + n - 1;
+			if (st->cursor_row >= st->scroll_bot)
+				st->cursor_row = st->scroll_bot - 1;
+		} else {
+			st->cursor_row = n - 1;
+		}
+		st->cursor_col = m - 1;
+		vt_state_cursor_clamp(st);
+		break;
+
+	case 'J':	/* ED -- erase display */
+		n = param_or(params, nparam, 0, 0);
+		csi_erase_display(st, n);
+		break;
+
+	case 'K':	/* EL -- erase line */
+		n = param_or(params, nparam, 0, 0);
+		csi_erase_line(st, n);
+		break;
+
+	case 'L':	/* IL -- insert lines */
+		n = param_or(params, nparam, 0, 1);
+		csi_insert_lines(st, n);
+		break;
+
+	case 'M':	/* DL -- delete lines */
+		n = param_or(params, nparam, 0, 1);
+		csi_delete_lines(st, n);
+		break;
+
+	case 'P':	/* DCH -- delete characters */
+		n = param_or(params, nparam, 0, 1);
+		csi_delete_chars(st, n);
+		break;
+
+	case 'S':	/* SU -- scroll up */
+		n = param_or(params, nparam, 0, 1);
+		vt_buf_scroll(st->buf, st->scroll_top, st->scroll_bot, n,
+		    st->bg);
+		break;
+
+	case 'T':	/* SD -- scroll down */
+		n = param_or(params, nparam, 0, 1);
+		vt_buf_scroll(st->buf, st->scroll_top, st->scroll_bot, -n,
+		    st->bg);
+		break;
+
+	case 'X':	/* ECH -- erase characters */
+		n = param_or(params, nparam, 0, 1);
+		csi_erase_chars(st, n);
+		break;
+
+	case '@':	/* ICH -- insert characters */
+		n = param_or(params, nparam, 0, 1);
+		csi_insert_chars(st, n);
+		break;
+
+	case 'c':	/* DA -- device attributes */
+		n = param_or(params, nparam, 0, 0);
+		if (n == 0) {
+			/* DA1: report VT100 with AVO */
+			char da[] = "\033[?1;2c";
+			vt_reply(st, da, sizeof(da) - 1);
+		}
+		break;
+
+	case 'n':	/* DSR -- device status report */
+		n = param_or(params, nparam, 0, 0);
+		if (n == 6) {
+			/* CPR: report cursor position (1-based) */
+			char cpr[32];
+			int len;
+
+			len = snprintf(cpr, sizeof(cpr), "\033[%d;%dR",
+			    st->cursor_row + 1, st->cursor_col + 1);
+			vt_reply(st, cpr, (size_t)len);
+		} else if (n == 5) {
+			/* status report: terminal OK */
+			vt_reply(st, "\033[0n", 4);
+		}
+		break;
+
+	case 'd':	/* VPA -- line position absolute */
+		n = param_or(params, nparam, 0, 1);
+		if (st->modes & VT_MODE_ORIGIN) {
+			st->cursor_row = st->scroll_top + n - 1;
+			if (st->cursor_row >= st->scroll_bot)
+				st->cursor_row = st->scroll_bot - 1;
+		} else {
+			st->cursor_row = n - 1;
+		}
+		vt_state_cursor_clamp(st);
+		break;
+
+	case 'h':	/* SM -- set mode */
+		n = param_or(params, nparam, 0, 0);
+		if (n == 4)
+			st->modes |= VT_MODE_INSERT;
+		break;
+
+	case 'l':	/* RM -- reset mode */
+		n = param_or(params, nparam, 0, 0);
+		if (n == 4)
+			st->modes &= ~VT_MODE_INSERT;
+		break;
+
+	case 'm':	/* SGR */
+		csi_sgr(st, params, nparam);
+		break;
+
+	case 'r':	/* DECSTBM -- set scrolling region */
+		n = param_or(params, nparam, 0, 1);
+		m = param_or(params, nparam, 1, rows);
+		if (n < 1)
+			n = 1;
+		if (m > rows)
+			m = rows;
+		if (n < m) {
+			st->scroll_top = n - 1;
+			st->scroll_bot = m;
+		}
+		st->cursor_row = 0;
+		st->cursor_col = 0;
+		break;
+
+	case 's':	/* SCOSC -- save cursor */
+		vt_state_cursor_save(st);
+		break;
+
+	case 'u':	/* SCORC -- restore cursor */
+		vt_state_cursor_restore(st);
+		break;
+
+	case 'g':	/* TBC -- tab clear */
+		n = param_or(params, nparam, 0, 0);
+		if (n == 0)
+			vt_state_tab_clear(st, st->cursor_col);
+		else if (n == 3)
+			vt_state_tab_clear_all(st);
+		break;
+
+	case 't':	/* XTWINOPS -- window operations */
+		n = param_or(params, nparam, 0, 0);
+		if (n == 22) {
+			/* push title onto stack */
+			vt_state_title_push(st);
+		} else if (n == 23) {
+			/* pop title from stack */
+			vt_state_title_pop(st);
+		}
+		break;
+
+	case 'Z':	/* CBT -- cursor back tab */
+		n = param_or(params, nparam, 0, 1);
+		for (; n > 0; n--)
+			st->cursor_col = vt_state_tab_prev(st,
+			    st->cursor_col);
+		break;
+	}
+}
+
+/* ---- ESC dispatch ---- */
+
+static void
+op_esc(void *ctx, int intermed, int final)
+{
+	struct vt_state *st = ctx;
+
+	if (intermed == 0) {
+		switch (final) {
+		case '7':	/* DECSC -- save cursor */
+			vt_state_cursor_save(st);
+			break;
+		case '8':	/* DECRC -- restore cursor */
+			vt_state_cursor_restore(st);
+			break;
+		case 'D':	/* IND -- index (scroll up) */
+			vt_state_index(st);
+			break;
+		case 'E':	/* NEL -- next line */
+			st->cursor_col = 0;
+			vt_state_index(st);
+			break;
+		case 'H':	/* HTS -- horizontal tab set */
+			vt_state_tab_set(st, st->cursor_col);
+			break;
+		case 'M':	/* RI -- reverse index */
+			vt_state_reverse_index(st);
+			break;
+		case '=':	/* DECKPAM -- application keypad mode */
+			st->modes |= VT_MODE_DECKPAM;
+			break;
+		case '>':	/* DECKPNM -- normal keypad mode */
+			st->modes &= ~VT_MODE_DECKPAM;
+			break;
+		case 'c':	/* RIS -- full reset */
+			if (st->modes & VT_MODE_ALTSCREEN)
+				vt_state_altscreen_leave(st);
+			st->modes = VT_MODE_AUTOWRAP | VT_MODE_CURSOR_VIS;
+			st->attrs = 0;
+			st->fg.type = VT_COLOR_DEFAULT;
+			st->bg.type = VT_COLOR_DEFAULT;
+			st->charset = 0;
+			st->g0_set = 0;
+			st->g1_set = 0;
+			st->scroll_top = 0;
+			st->scroll_bot = vt_buf_rows(st->buf);
+			st->cursor_row = 0;
+			st->cursor_col = 0;
+			st->kitty_kbd_flags = 0;
+			st->kitty_kbd_depth = 0;
+			st->modify_other_keys = 0;
+			vt_state_tab_reset(st);
+			csi_erase_display(st, 2);
+			break;
+		}
+	} else if (intermed == '(') {
+		/* G0 charset designation */
+		switch (final) {
+		case 'B':	/* ASCII */
+			st->g0_set = 0;
+			break;
+		case '0':	/* DEC line drawing */
+			st->g0_set = 1;
+			break;
+		}
+	} else if (intermed == ')') {
+		/* G1 charset designation */
+		switch (final) {
+		case 'B':
+			st->g1_set = 0;
+			break;
+		case '0':
+			st->g1_set = 1;
+			break;
+		}
+	}
+}
+
+/* ---- OSC dispatch ---- */
+
+static void
+op_osc(void *ctx, const char *data, size_t len)
+{
+	struct vt_state *st = ctx;
+	int num;
+	const char *semi;
+
+	if (len == 0)
+		return;
+
+	/* parse "N;text" format */
+	semi = memchr(data, ';', len);
+	if (!semi)
+		return;
+
+	num = 0;
+	for (const char *p = data; p < semi; p++) {
+		if (*p < '0' || *p > '9')
+			return;
+		num = num * 10 + (*p - '0');
+	}
+
+	semi++;	/* skip ';' */
+	len -= (size_t)(semi - data);
+
+	switch (num) {
+	case 0:		/* set icon name + title */
+	case 2:		/* set title */
+		free(st->title);
+		st->title = malloc(len + 1);
+		if (st->title) {
+			memcpy(st->title, semi, len);
+			st->title[len] = '\0';
+		}
+		break;
+	}
+}
+
+/* ---- vtable ---- */
+
+static const struct vt_ops default_ops = {
+	.print = op_print,
+	.execute = op_execute,
+	.csi = op_csi,
+	.esc = op_esc,
+	.osc = op_osc,
+};
+
+const struct vt_ops *
+vt_ops_default(void)
+{
+	return &default_ops;
+}
+
+/* vt_parse.c */
+
+
+
+/* parser states (based on VT500 state diagram) */
+enum {
+	ST_GROUND,
+	ST_ESCAPE,
+	ST_ESCAPE_INTERMED,
+	ST_CSI_ENTRY,
+	ST_CSI_PARAM,
+	ST_CSI_INTERMED,
+	ST_CSI_IGNORE,
+	ST_OSC_STRING,
+	ST_DCS_PASSTHRU,	/* DCS/APC/PM -- absorb until ST */
+};
+
+#define VT_MAX_PARAMS	16
+#define VT_OSC_INIT	256			/* small: most OSCs are titles */
+#define VT_OSC_MAX	(256 * 1024)		/* grows for large OSC 52 */
+#define VT_DCS_INIT	4096
+#define VT_DCS_MAX	(16 * 1024 * 1024)	/* 16 MB cap */
+
+struct vt_parse {
+	int		state;
+	const struct vt_ops *ops;
+	void		*ctx;
+
+	/* CSI parameter accumulation */
+	int		params[VT_MAX_PARAMS];
+	int		nparam;
+	int		cur_param;	/* current param being built */
+	int		has_digit;	/* saw a digit in current param */
+	int		intermed;	/* intermediate byte (0 or char) */
+
+	/* OSC string accumulation (grows on demand, like the DCS buffer) */
+	char		*osc_buf;
+	size_t		osc_len;
+	size_t		osc_cap;
+	vt_parse_osc_cb	osc_cb;
+	void		*osc_ctx;
+
+	/* DCS passthrough accumulation */
+	char		*dcs_buf;
+	size_t		dcs_len;
+	size_t		dcs_cap;
+	int		dcs_introducer;	/* 'P', 'X', '^', or '_' */
+	vt_parse_dcs_cb	dcs_cb;
+	void		*dcs_ctx;
+
+	/* UTF-8 decode state */
+	unsigned char	utf8_buf[4];
+	int		utf8_len;
+	int		utf8_need;
+};
+
+struct vt_parse *
+vt_parse_new(const struct vt_ops *ops, void *ctx)
+{
+	struct vt_parse *p;
+
+	p = xcalloc(1, sizeof(*p));
+	p->ops = ops;
+	p->ctx = ctx;
+	p->state = ST_GROUND;
+	return p;
+}
+
+void
+vt_parse_free(struct vt_parse *p)
+{
+	free(p->dcs_buf);
+	free(p->osc_buf);
+	free(p);
+}
+
+void
+vt_parse_set_dcs_cb(struct vt_parse *p, vt_parse_dcs_cb cb, void *ctx)
+{
+	p->dcs_cb = cb;
+	p->dcs_ctx = ctx;
+}
+
+void
+vt_parse_set_osc_cb(struct vt_parse *p, vt_parse_osc_cb cb, void *ctx)
+{
+	p->osc_cb = cb;
+	p->osc_ctx = ctx;
+}
+
+void
+vt_parse_reset(struct vt_parse *p)
+{
+	const struct vt_ops *ops = p->ops;
+	void *ctx = p->ctx;
+	char *dcs_buf = p->dcs_buf;
+	size_t dcs_cap = p->dcs_cap;
+	vt_parse_dcs_cb dcs_cb = p->dcs_cb;
+	void *dcs_ctx = p->dcs_ctx;
+	vt_parse_osc_cb osc_cb = p->osc_cb;
+	void *osc_ctx = p->osc_ctx;
+	char *osc_buf = p->osc_buf;
+	size_t osc_cap = p->osc_cap;
+
+	memset(p, 0, sizeof(*p));
+	p->ops = ops;
+	p->ctx = ctx;
+	p->dcs_buf = dcs_buf;
+	p->dcs_cap = dcs_cap;
+	p->dcs_cb = dcs_cb;
+	p->dcs_ctx = dcs_ctx;
+	p->osc_cb = osc_cb;
+	p->osc_ctx = osc_ctx;
+	p->osc_buf = osc_buf;
+	p->osc_cap = osc_cap;
+	p->state = ST_GROUND;
+}
+
+static void
+csi_reset(struct vt_parse *p)
+{
+	p->nparam = 0;
+	p->cur_param = 0;
+	p->has_digit = 0;
+	p->intermed = 0;
+}
+
+static void
+csi_finish_param(struct vt_parse *p)
+{
+	if (p->nparam < VT_MAX_PARAMS)
+		p->params[p->nparam++] = p->has_digit ? p->cur_param : -1;
+	p->cur_param = 0;
+	p->has_digit = 0;
+}
+
+static void
+emit_print(struct vt_parse *p, uint32_t cp)
+{
+	int w;
+
+	if (!p->ops->print)
+		return;
+	w = rune_width(cp);
+	if (w < 0)
+		w = 1;
+	p->ops->print(p->ctx, cp, w);
+}
+
+static void
+emit_execute(struct vt_parse *p, uint8_t c)
+{
+	if (p->ops->execute)
+		p->ops->execute(p->ctx, c);
+}
+
+static void
+emit_csi(struct vt_parse *p, int final)
+{
+	if (p->ops->csi)
+		p->ops->csi(p->ctx, p->params, p->nparam,
+		    p->intermed, final);
+}
+
+static void
+emit_esc(struct vt_parse *p, int final)
+{
+	if (p->ops->esc)
+		p->ops->esc(p->ctx, p->intermed, final);
+}
+
+/* Append one OSC string byte, growing the buffer up to VT_OSC_MAX. One slot
+ * is always kept free so emit_osc() can NUL-terminate in place. */
+static void
+osc_append(struct vt_parse *p, unsigned char c)
+{
+	if (p->osc_len + 1 >= VT_OSC_MAX)	/* leave room for the NUL */
+		return;
+	if (p->osc_len + 1 >= p->osc_cap) {
+		size_t newcap = p->osc_cap ? p->osc_cap * 2 : VT_OSC_INIT;
+		char *newbuf;
+
+		if (newcap > VT_OSC_MAX)
+			newcap = VT_OSC_MAX;
+		newbuf = realloc(p->osc_buf, newcap);
+		if (!newbuf)
+			return;
+		p->osc_buf = newbuf;
+		p->osc_cap = newcap;
+	}
+	p->osc_buf[p->osc_len++] = (char)c;
+}
+
+static void
+emit_osc(struct vt_parse *p)
+{
+	const char *data = p->osc_buf ? p->osc_buf : "";
+
+	if (p->osc_buf) {
+		/* trim trailing bytes of a truncated UTF-8 sequence */
+		p->osc_buf[p->osc_len] = '\0';
+		p->osc_len = utf8_trunc(p->osc_buf, p->osc_len + 1);
+	}
+
+	if (p->ops->osc)
+		p->ops->osc(p->ctx, data, p->osc_len);
+	if (p->osc_cb)
+		p->osc_cb(p->osc_ctx, data, p->osc_len);
+}
+
+static void
+dcs_reset(struct vt_parse *p)
+{
+	p->dcs_len = 0;
+}
+
+static void
+dcs_append(struct vt_parse *p, unsigned char c)
+{
+	if (p->dcs_len >= VT_DCS_MAX)
+		return;
+	if (p->dcs_len >= p->dcs_cap) {
+		size_t newcap;
+		char *newbuf;
+
+		newcap = p->dcs_cap ? p->dcs_cap * 2 : VT_DCS_INIT;
+		if (newcap > VT_DCS_MAX)
+			newcap = VT_DCS_MAX;
+		newbuf = realloc(p->dcs_buf, newcap);
+		if (!newbuf)
+			return;
+		p->dcs_buf = newbuf;
+		p->dcs_cap = newcap;
+	}
+	p->dcs_buf[p->dcs_len++] = (char)c;
+}
+
+static void
+emit_dcs(struct vt_parse *p)
+{
+	if (p->dcs_cb && p->dcs_len > 0)
+		p->dcs_cb(p->dcs_ctx, p->dcs_introducer,
+		    p->dcs_buf, p->dcs_len);
+	dcs_reset(p);
+}
+
+static void
+process_ground(struct vt_parse *p, unsigned char c)
+{
+	uint32_t rune;
+
+	/* UTF-8 multi-byte continuation */
+	if (p->utf8_need > 0) {
+		if ((c & 0xC0) == 0x80) {
+			p->utf8_buf[p->utf8_len++] = c;
+			if (p->utf8_len >= p->utf8_need) {
+				utf8_decode(&rune, p->utf8_buf,
+				    (size_t)p->utf8_len);
+				emit_print(p, rune);
+				p->utf8_need = 0;
+				p->utf8_len = 0;
+			}
+			return;
+		}
+		/* broken sequence -- emit replacement */
+		emit_print(p, 0xFFFD);
+		p->utf8_need = 0;
+		p->utf8_len = 0;
+		/* fall through to process c */
+	}
+
+	if (c < 0x20) {
+		/* C0 control */
+		emit_execute(p, c);
+		return;
+	}
+
+	if (c == 0x7F) {
+		/* DEL -- ignore in ground */
+		return;
+	}
+
+	if (c < 0x80) {
+		/* printable ASCII */
+		emit_print(p, c);
+		return;
+	}
+
+	/* UTF-8 lead byte */
+	p->utf8_buf[0] = c;
+	p->utf8_len = 1;
+	if ((c & 0xE0) == 0xC0)
+		p->utf8_need = 2;
+	else if ((c & 0xF0) == 0xE0)
+		p->utf8_need = 3;
+	else if ((c & 0xF8) == 0xF0)
+		p->utf8_need = 4;
+	else {
+		/* invalid lead byte */
+		emit_print(p, 0xFFFD);
+		p->utf8_need = 0;
+		p->utf8_len = 0;
+	}
+}
+
+static void
+process_byte(struct vt_parse *p, unsigned char c)
+{
+	/* anywhere transitions: ESC and certain C0 controls override state */
+	if (c == 0x1B) {
+		/* emit accumulated data on ESC (start of ST = ESC \) */
+		if (p->state == ST_DCS_PASSTHRU)
+			emit_dcs(p);
+		if (p->state == ST_OSC_STRING)
+			emit_osc(p);
+		/* cancel any in-progress UTF-8 */
+		p->utf8_need = 0;
+		p->utf8_len = 0;
+		p->state = ST_ESCAPE;
+		p->intermed = 0;
+		return;
+	}
+
+	/* C0 controls that execute in any state */
+	if (p->state != ST_GROUND && p->state != ST_OSC_STRING) {
+		if (c == 0x07 || c == 0x08 || c == 0x09 || c == 0x0A ||
+		    c == 0x0B || c == 0x0C || c == 0x0D) {
+			emit_execute(p, c);
+			return;
+		}
+	}
+
+	switch (p->state) {
+	case ST_GROUND:
+		process_ground(p, c);
+		break;
+
+	case ST_ESCAPE:
+		if (c == '[') {
+			csi_reset(p);
+			p->state = ST_CSI_ENTRY;
+		} else if (c == ']') {
+			p->osc_len = 0;
+			p->state = ST_OSC_STRING;
+		} else if (c == 'P' || c == 'X' || c == '^' || c == '_') {
+			/* DCS, SOS, PM, APC -- accumulate until ST */
+			p->dcs_introducer = c;
+			dcs_reset(p);
+			p->state = ST_DCS_PASSTHRU;
+		} else if (c >= 0x20 && c <= 0x2F) {
+			/* intermediate byte */
+			p->intermed = c;
+			p->state = ST_ESCAPE_INTERMED;
+		} else if (c >= 0x30 && c <= 0x7E) {
+			/* final byte -- dispatch ESC sequence */
+			emit_esc(p, c);
+			p->state = ST_GROUND;
+		} else {
+			/* unexpected -- back to ground */
+			p->state = ST_GROUND;
+		}
+		break;
+
+	case ST_ESCAPE_INTERMED:
+		if (c >= 0x20 && c <= 0x2F) {
+			/* additional intermediate -- overwrite (simplified) */
+			p->intermed = c;
+		} else if (c >= 0x30 && c <= 0x7E) {
+			emit_esc(p, c);
+			p->state = ST_GROUND;
+		} else {
+			p->state = ST_GROUND;
+		}
+		break;
+
+	case ST_CSI_ENTRY:
+		if (c >= '0' && c <= '9') {
+			p->cur_param = c - '0';
+			p->has_digit = 1;
+			p->state = ST_CSI_PARAM;
+		} else if (c == ';') {
+			csi_finish_param(p);
+			p->state = ST_CSI_PARAM;
+		} else if (c >= 0x3C && c <= 0x3F) {
+			/* private parameter marker (< = > ?) */
+			p->intermed = c;
+			p->state = ST_CSI_PARAM;
+		} else if (c >= 0x20 && c <= 0x2F) {
+			p->intermed = c;
+			p->state = ST_CSI_INTERMED;
+		} else if (c >= 0x40 && c <= 0x7E) {
+			/* final with no params */
+			csi_finish_param(p);
+			emit_csi(p, c);
+			p->state = ST_GROUND;
+		} else {
+			p->state = ST_GROUND;
+		}
+		break;
+
+	case ST_CSI_PARAM:
+		if (c >= '0' && c <= '9') {
+			/* clamp so a long digit run cannot overflow int (UB);
+			 * 65535 is far past any real row/col/SGR value */
+			if (p->cur_param < 65535)
+				p->cur_param = p->cur_param * 10 + (c - '0');
+			p->has_digit = 1;
+		} else if (c == ';') {
+			csi_finish_param(p);
+		} else if (c >= 0x20 && c <= 0x2F) {
+			csi_finish_param(p);
+			p->intermed = c;
+			p->state = ST_CSI_INTERMED;
+		} else if (c >= 0x40 && c <= 0x7E) {
+			csi_finish_param(p);
+			emit_csi(p, c);
+			p->state = ST_GROUND;
+		} else if (c >= 0x3C && c <= 0x3F) {
+			/* ignore additional private modifiers */
+			p->state = ST_CSI_IGNORE;
+		} else {
+			p->state = ST_GROUND;
+		}
+		break;
+
+	case ST_CSI_INTERMED:
+		if (c >= 0x20 && c <= 0x2F) {
+			/* additional intermediate */
+		} else if (c >= 0x40 && c <= 0x7E) {
+			emit_csi(p, c);
+			p->state = ST_GROUND;
+		} else {
+			p->state = ST_CSI_IGNORE;
+		}
+		break;
+
+	case ST_CSI_IGNORE:
+		if (c >= 0x40 && c <= 0x7E)
+			p->state = ST_GROUND;
+		break;
+
+	case ST_DCS_PASSTHRU:
+		/* accumulate until ST (ESC \).
+		 * 0x9C is the 8-bit C1 ST but collides with valid
+		 * UTF-8 continuation bytes, so we ignore it here --
+		 * all modern emitters use 7-bit ESC \ instead. */
+		dcs_append(p, c);
+		break;
+
+	case ST_OSC_STRING:
+		if (c == 0x07) {
+			/* BEL terminates OSC (xterm style) */
+			emit_osc(p);
+			p->state = ST_GROUND;
+		} else {
+			osc_append(p, c);
+		}
+		break;
+	}
+}
+
+void
+vt_parse_feed(struct vt_parse *p, const char *data, size_t len)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++)
+		process_byte(p, (unsigned char)data[i]);
+}
+
+/****************************************************************
+ * Terminal buffers
+ *
+ * A terminal buffer runs a child on a PTY. The child's output is parsed by the
+ * amalgamated emulator above into a vt_state grid; term_render blits that grid
+ * onto the editor screen. Keyboard input is forwarded raw to the child. The
+ * child never writes to the real terminal, so a screen-position mismatch cannot
+ * happen. PTY handling follows lumi libpty/pty.c and libsession/window.c.
+ ****************************************************************/
+
+#include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <fcntl.h>
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
+    defined(__NetBSD__)
+#include <pty.h>
+#elif defined(__APPLE__)
+#include <util.h>
+#endif
+
+struct term {
+	int		master_fd;	/* PTY master, non-blocking; -1 if closed */
+	int		child_pid;
+	int		dead;		/* child has exited */
+	int		exit_status;
+	int		rows, cols;	/* grid size (matches the text area) */
+	struct vt_state	*vt;
+	struct vt_parse	*parser;
+};
+
+/* Resize the PTY so the child learns its new window size. */
+static void
+pty_resize(int fd, int rows, int cols)
+{
+	struct winsize ws;
+
+	memset(&ws, 0, sizeof(ws));
+	ws.ws_row = (unsigned short)rows;
+	ws.ws_col = (unsigned short)cols;
+	ioctl(fd, TIOCSWINSZ, &ws);
+}
+
+/* Open a PTY and fork a child running argv (NULL = the login shell). Returns
+ * the non-blocking master fd and stores the child pid, or -1 on failure. */
+static int
+pty_spawn(int *child_pid, char *const argv[], int rows, int cols)
+{
+	struct winsize ws;
+	int master, flags;
+	pid_t pid;
+
+	memset(&ws, 0, sizeof(ws));
+	ws.ws_row = (unsigned short)(rows > 0 ? rows : 24);
+	ws.ws_col = (unsigned short)(cols > 0 ? cols : 80);
+	pid = forkpty(&master, NULL, NULL, &ws);
+	if (pid < 0)
+		return -1;
+	if (pid == 0) {				/* child */
+		signal(SIGCHLD, SIG_DFL);
+		signal(SIGWINCH, SIG_DFL);
+		signal(SIGINT, SIG_DFL);
+		signal(SIGQUIT, SIG_DFL);
+		signal(SIGTERM, SIG_DFL);
+		signal(SIGHUP, SIG_DFL);
+		setenv("TERM", "xterm-256color", 1);
+		if (argv && argv[0]) {
+			execvp(argv[0], argv);
+		} else {
+			const char *sh = getenv("SHELL");
+
+			if (!sh || !sh[0])
+				sh = "/bin/sh";
+			execlp(sh, sh, (char *)NULL);
+		}
+		_exit(127);
+	}
+	*child_pid = (int)pid;
+	flags = fcntl(master, F_GETFL);
+	if (flags >= 0)
+		fcntl(master, F_SETFL, flags | O_NONBLOCK);
+	return master;
+}
+
+static int
+term_is_active(const Editor *e)
+{
+	return e->kind == BUF_TERM && e->vterm != NULL;
+}
+
+/* The label for a terminal buffer's window: the title the child set via OSC
+ * 0/2, else a generic name. Only meaningful when the active buffer is one. */
+static const char *
+term_label(const Editor *e)
+{
+	const char *title;
+
+	if (e->kind != BUF_TERM || !e->vterm)
+		return "terminal";
+	title = vt_state_title(e->vterm->vt);
+	return (title && title[0]) ? title : "terminal";
+}
+
+/* Hang up and reap the child, free the emulator. No-op on a text buffer. */
+static void
+term_buf_free(Buf *b)
+{
+	Term *t;
+
+	if (!b || b->kind != BUF_TERM || !b->vterm)
+		return;
+	t = b->vterm;
+	if (t->master_fd >= 0)
+		close(t->master_fd);
+	if (t->child_pid > 0) {		/* reap even if term_reap already flagged dead */
+		int st;
+
+		if (!t->dead)
+			kill(t->child_pid, SIGHUP);
+		while (waitpid(t->child_pid, &st, 0) < 0 && errno == EINTR)
+			;
+	}
+	vt_parse_free(t->parser);
+	vt_state_free(t->vt);
+	free(t);
+	b->vterm = NULL;
+	b->kind = BUF_TEXT;
+}
+
+/* aux_collect: gather the live PTY master fds across all buffers. */
+static int
+term_collect(void *ctx, int *fds, int max)
+{
+	Editor *e = ctx;
+	int i, n = 0;
+
+	for (i = 0; i < e->nbuf && n < max; i++) {
+		Term *t = (i == e->cur)
+		    ? (e->kind == BUF_TERM ? e->vterm : NULL)
+		    : (e->bufs[i].kind == BUF_TERM ? e->bufs[i].vterm : NULL);
+
+		if (t && t->master_fd >= 0)
+			fds[n++] = t->master_fd;
+	}
+	return n;
+}
+
+/* Find the terminal that owns fd (few terminals, so a scan is fine). */
+static Term *
+term_by_fd(Editor *e, int fd)
+{
+	int i;
+
+	if (e->kind == BUF_TERM && e->vterm && e->vterm->master_fd == fd)
+		return e->vterm;
+	for (i = 0; i < e->nbuf; i++)
+		if (i != e->cur && e->bufs[i].kind == BUF_TERM &&
+		    e->bufs[i].vterm && e->bufs[i].vterm->master_fd == fd)
+			return e->bufs[i].vterm;
+	return NULL;
+}
+
+/* Reap a child whose PTY just closed. */
+static void
+term_reap(Term *t)
+{
+	int st;
+
+	if (t->master_fd >= 0) {
+		close(t->master_fd);
+		t->master_fd = -1;
+	}
+	if (!t->dead && t->child_pid > 0 &&
+	    waitpid(t->child_pid, &st, WNOHANG) == t->child_pid) {
+		if (WIFEXITED(st))
+			t->exit_status = WEXITSTATUS(st);
+		else if (WIFSIGNALED(st))
+			t->exit_status = 128 + WTERMSIG(st);
+	}
+	t->dead = 1;
+}
+
+/* aux_ready: a PTY fd is readable; drain it into its parser. */
+static void
+term_drain(void *ctx, int fd)
+{
+	Editor *e = ctx;
+	Term *t = term_by_fd(e, fd);
+	int active;
+
+	if (!t || t->master_fd < 0)
+		return;
+	active = (t == e->vterm);
+	for (;;) {
+		char buf[4096];
+		ssize_t r = read(fd, buf, sizeof(buf));
+
+		if (r > 0) {
+			vt_parse_feed(t->parser, buf, (size_t)r);
+			if (active)
+				e->term_dirty = 1;
+			if ((size_t)r < sizeof(buf))
+				break;		/* probably drained */
+		} else if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				break;		/* nothing more for now */
+			term_reap(t);		/* EIO etc: slave closed, gone */
+			if (active)
+				e->term_dirty = 1;
+			break;
+		} else {			/* r == 0: EOF, the child exited */
+			term_reap(t);
+			if (active)
+				e->term_dirty = 1;
+			break;
+		}
+	}
+}
+
+/* Blit the active terminal grid into the text area. Returns 1 (handled). */
+static int
+term_render(Editor *e, Screen *d)
+{
+	const Pal *p = ed_chrome(e);
+	Term *t = e->vterm;
+	int text_h = text_height(e);
+	int text_w = text_width(e);
+	int r, c;
+
+	if (!t)
+		return 0;
+	if (text_h < 1)
+		text_h = 1;
+	if (text_w < 1)
+		text_w = 1;
+
+	scr_clear(d);
+	for (r = 0; r < text_h && r < t->rows; r++) {
+		for (c = 0; c < text_w && c < t->cols; c++) {
+			struct vt_cell *cell = vt_buf_cell(t->vt->buf, r, c);
+
+			if (cell)
+				scr_cell(d, CHROME_TOP + r, CHROME_LEFT + c,
+				    cell->codepoint, cell->fg, cell->bg,
+				    cell->attrs);
+		}
+	}
+
+	if (t->dead)
+		set_status(e, "[process exited %d]  Ctrl-W q to close",
+		    t->exit_status);
+
+	ui_menubar(e, p, -1);
+	ui_frame(e, p);
+	ui_statusbar(e, p, 0);
+
+	if (t->dead) {
+		scr_cursor_vis(d, 0);
+	} else {
+		int cr = t->vt->cursor_row, cc = t->vt->cursor_col;
+
+		if (cr < 0)
+			cr = 0;
+		else if (cr >= text_h)
+			cr = text_h - 1;
+		if (cc < 0)
+			cc = 0;
+		else if (cc >= text_w)
+			cc = text_w - 1;
+		scr_cursor_shape(d, CURSOR_DEFAULT);
+		/* honor DECTCEM (CSI ?25 h/l): the child may hide its cursor */
+		scr_cursor_vis(d, (t->vt->modes & VT_MODE_CURSOR_VIS) ? 1 : 0);
+		scr_cursor(d, CHROME_TOP + cr, CHROME_LEFT + cc);
+	}
+	return 1;
+}
+
+/* Match every live terminal's PTY and grid to the current text-area size. */
+static void
+term_resize_all(Editor *e)
+{
+	int rows = text_height(e), cols = text_width(e);
+	int i;
+
+	if (rows < 1)
+		rows = 1;
+	if (cols < 1)
+		cols = 1;
+	for (i = 0; i < e->nbuf; i++) {
+		Term *t = (i == e->cur)
+		    ? (e->kind == BUF_TERM ? e->vterm : NULL)
+		    : (e->bufs[i].kind == BUF_TERM ? e->bufs[i].vterm : NULL);
+
+		if (!t || t->dead || t->master_fd < 0)
+			continue;
+		if (t->rows == rows && t->cols == cols)
+			continue;
+		t->rows = rows;
+		t->cols = cols;
+		pty_resize(t->master_fd, rows, cols);
+		vt_state_resize(t->vt, rows, cols);
+	}
+}
+
+/* Forward input bytes to the child (raw passthrough). */
+static void
+term_write(Term *t, const char *buf, int n)
+{
+	int off = 0;
+
+	if (!t || t->dead || t->master_fd < 0)
+		return;
+	while (off < n) {
+		ssize_t w = write(t->master_fd, buf + off, (size_t)(n - off));
+
+		if (w < 0) {
+			if (errno == EINTR || errno == EAGAIN)
+				continue;
+			break;
+		}
+		off += (int)w;
+	}
+}
+
+/* Free a terminal handle that was never installed on a buffer. Hangs up a real
+ * child but not an injected fd (child_pid < 0). */
+static void
+term_discard(Term *t)
+{
+	if (!t)
+		return;
+	if (t->master_fd >= 0)
+		close(t->master_fd);
+	if (t->child_pid > 0)
+		kill(t->child_pid, SIGHUP);
+	vt_parse_free(t->parser);
+	vt_state_free(t->vt);
+	free(t);
+}
+
+/* Allocate a terminal handle with its emulator sized rows x cols. The caller
+ * fills in master_fd and child_pid. Returns NULL on failure. */
+static Term *
+term_make(int rows, int cols)
+{
+	Term *t = calloc(1, sizeof(*t));
+
+	if (!t)
+		return NULL;
+	t->master_fd = -1;
+	t->child_pid = -1;
+	t->rows = rows;
+	t->cols = cols;
+	t->vt = vt_state_new(rows, cols, rows * 2);	/* 2x screen scrollback */
+	t->parser = t->vt ? vt_parse_new(vt_ops_default(), t->vt) : NULL;
+	if (!t->vt || !t->parser) {
+		vt_parse_free(t->parser);
+		vt_state_free(t->vt);
+		free(t);
+		return NULL;
+	}
+	return t;
+}
+
+/* Create a buffer that owns t and make it active. On failure frees t (and its
+ * child/fd) and returns -1. */
+static int
+term_install(Editor *e, Term *t)
+{
+	Text *nt = text_new();
+	int i = nt ? buf_slot(e) : -1;
+
+	if (i < 0) {
+		text_free(nt);
+		term_discard(t);
+		return -1;
+	}
+	buf_save(e, &e->bufs[e->cur]);		/* park the current buffer */
+	e->cur = i;
+	e->t = nt;
+	e->path[0] = '\0';
+	e->has_name = 0;
+	e->syn = NULL;
+	e->expand_tabs = 0;
+	e->cy = e->cx = e->top = e->left = 0;
+	e->sel_active = 0;
+	e->line_state = NULL;
+	e->line_state_cap = 0;
+	e->hl_valid = 0;
+	e->hex_view = 0;
+	memset(e->vi_mark_y, 0, sizeof(e->vi_mark_y));
+	memset(e->vi_mark_x, 0, sizeof(e->vi_mark_x));
+	e->vi_marks_set = 0;
+	e->vi_visual = 0;
+	vi_reset_pending(e);
+	e->swap_path[0] = '\0';
+	e->swap_on = 0;
+	e->swap_rev = e->t->rev;
+	e->load_mtime = 0;
+	e->kind = BUF_TERM;
+	e->vterm = t;
+	e->term_prefix = 0;
+	e->term_dirty = 1;
+	buf_save(e, &e->bufs[i]);		/* keep the slot consistent */
+	return i;
+}
+
+/* Open a new terminal buffer running cmd (NULL = the login shell). Returns the
+ * buffer index, or -1. */
+static int
+term_open(Editor *e, const char *cmd)
+{
+	Term *t;
+	int i, rows, cols;
+	char *cmdbuf = NULL, *words[64];
+	char *const *argv = NULL;
+
+	if (!e->d->t->io.poll_fds) {
+		set_status(e, "terminal needs a host that multiplexes fds");
+		return -1;
+	}
+	rows = text_height(e);
+	cols = text_width(e);
+	if (rows < 1)
+		rows = 1;
+	if (cols < 1)
+		cols = 1;
+
+	t = term_make(rows, cols);
+	if (!t) {
+		set_status(e, "out of memory");
+		return -1;
+	}
+
+	if (cmd && cmd[0]) {			/* split on whitespace */
+		int nw = 0;
+		char *save = NULL, *s;
+
+		cmdbuf = strdup(cmd);
+		if (cmdbuf) {
+			for (s = strtok_r(cmdbuf, " \t", &save);
+			    s && nw < 63; s = strtok_r(NULL, " \t", &save))
+				words[nw++] = s;
+			words[nw] = NULL;
+			if (nw > 0)
+				argv = words;
+		}
+	}
+
+	t->master_fd = pty_spawn(&t->child_pid, argv, rows, cols);
+	free(cmdbuf);
+	if (t->master_fd < 0) {
+		term_discard(t);
+		set_status(e, "failed to start terminal");
+		return -1;
+	}
+	vt_state_set_reply_fd(t->vt, t->master_fd);
+
+	i = term_install(e, t);
+	if (i < 0) {
+		set_status(e, "out of memory");
+		return -1;
+	}
+	set_status(e, "terminal [%d/%d]  (Ctrl-W w/W/n/c, Ctrl-W Ctrl-W = literal)",
+	    e->cur + 1, e->nbuf);
+	return i;
+}
+
+#ifdef VEDIT_TEST
+/* Create a terminal buffer around an already-open fd, without forking a child.
+ * The fd is read like a PTY master; a test feeds it from a pipe and drives
+ * term_drain directly, which keeps the emulator path deterministic. Returns the
+ * buffer index, or -1. */
+static int
+term_attach(Editor *e, int fd, int rows, int cols)
+{
+	Term *t;
+
+	if (rows < 1)
+		rows = 1;
+	if (cols < 1)
+		cols = 1;
+	t = term_make(rows, cols);
+	if (!t)
+		return -1;
+	t->master_fd = fd;		/* child_pid stays -1: no child to reap */
+	if (fd >= 0)
+		vt_state_set_reply_fd(t->vt, fd);
+	return term_install(e, t);
+}
+#endif /* VEDIT_TEST */
+
+/* One iteration of the terminal input/output loop while a terminal buffer is
+ * active. Returns a term_step telling editor_loop whether to continue or exit. */
+static int
+term_loop_step(Editor *e)
+{
+	Scrbuf *sb = e->d->t;
+	unsigned char raw[512];
+	char out[512];
+	int rc, n, i, outn = 0;
+	Term *t = e->vterm;
+
+	if (g_winch || sb->want_resize) {
+		int from_signal = g_winch;
+
+		g_winch = 0;
+		sb->want_resize = 0;
+		if (from_signal && sb->io.getsize) {
+			int rows = e->rows, cols = e->cols;
+
+			if (sb->io.getsize(sb->io.ctx, &rows, &cols) == 0 &&
+			    rows >= 1 && cols >= 1 &&
+			    (rows != e->rows || cols != e->cols))
+				scr_resize(e->d, rows, cols);
+		}
+		scr_size(e->d, &e->rows, &e->cols);
+		term_resize_all(e);
+		ed_render(e, e->d);
+		return TERM_CONT;
+	}
+
+	rc = scr_pump(e->d, 200);
+	if (rc < 0)
+		return TERM_EOF;
+	if (rc == 0) {				/* idle: drain/render, swap tick */
+		if (e->term_dirty) {
+			ed_render(e, e->d);
+			e->term_dirty = 0;
+		}
+		swap_maybe_write(e);
+		return TERM_CONT;
+	}
+
+	n = scr_raw_take(e->d, raw, sizeof(raw));
+	for (i = 0; i < n; i++) {
+		unsigned char b = raw[i];
+
+		if (!e->term_prefix) {
+			if (b == 0x17) {	/* Ctrl-W: begin prefix */
+				if (outn) {
+					term_write(t, out, outn);
+					outn = 0;
+				}
+				e->term_prefix = 1;
+			} else {
+				out[outn++] = (char)b;
+				if (outn == (int)sizeof(out)) {
+					term_write(t, out, outn);
+					outn = 0;
+				}
+			}
+			continue;
+		}
+
+		e->term_prefix = 0;		/* a command key follows Ctrl-W */
+		if (outn) {
+			term_write(t, out, outn);
+			outn = 0;
+		}
+		if (b == 0x17) {		/* Ctrl-W Ctrl-W: literal Ctrl-W */
+			char lit = 0x17;
+
+			term_write(t, &lit, 1);
+			continue;
+		}
+		if (b == 'w') {
+			buf_cycle(e, 1);
+			ed_render(e, e->d);
+			return TERM_CONT;
+		}
+		if (b == 'W' || b == 'p') {
+			buf_cycle(e, -1);
+			ed_render(e, e->d);
+			return TERM_CONT;
+		}
+		if (b == 'n') {
+			term_open(e, NULL);
+			ed_render(e, e->d);
+			return TERM_CONT;
+		}
+		if (b == 'c' || b == 'q') {
+			if (e->nbuf > 1) {
+				buf_close(e, e->cur);
+				ed_render(e, e->d);
+				return TERM_CONT;
+			}
+			return TERM_QUIT;	/* last buffer: quit the editor */
+		}
+		if (b >= '1' && b <= '9') {
+			buf_switch(e, b - '1');
+			ed_render(e, e->d);
+			return TERM_CONT;
+		}
+		/* any other key after Ctrl-W is ignored */
+	}
+	if (outn)
+		term_write(t, out, outn);
+
+	ed_render(e, e->d);
+	e->term_dirty = 0;
+	return TERM_CONT;
+}
+
+#endif /* VEDIT_TERM */
 #ifndef VEDIT_NO_TOOLS
 /* The standalone binary's default tool runner: it spawns "sh -c <cmd>" in the
  * file's directory. An embedding host installs its own vedit_tool_api instead
@@ -16677,6 +20445,94 @@ cli_config_path(const char *opt, char *buf, size_t bufsz)
 	return 0;
 }
 
+#ifdef VEDIT_TERM
+/* Proof-of-concept for the embedded VT emulator: parse a canned stream of
+ * escape sequences into a vt_state grid, translate that grid onto vedit's own
+ * screen with scr_cell, and present it. No child process and no input routing,
+ * so this exercises only the parse -> grid -> local-screen path. The child's
+ * bytes never reach the real terminal: they land in the vt_buf and are
+ * re-emitted by scr_present at coordinates vedit chooses. Run: vedit --term-demo */
+static int
+term_demo(const struct vedit_io *io)
+{
+	static const char stream[] =
+	    "\033[2J\033[H"
+	    "  vedit embedded VT emulator (libvt) -- non-interactive render\r\n"
+	    "\r\n"
+	    "  \033[1;31mbold red\033[0m   \033[32mgreen\033[0m   "
+	    "\033[4;34munderline blue\033[0m   \033[3;35mitalic magenta\033[0m\r\n"
+	    "  \033[7mreverse video\033[0m   \033[2mdim\033[0m   "
+	    "\033[9mstrikethrough\033[0m\r\n"
+	    "\r\n"
+	    "  256-color: \033[38;5;202morange\033[0m \033[38;5;46mlime\033[0m "
+	    "\033[38;5;27mazure\033[0m   "
+	    "truecolor: \033[38;2;255;128;0mrgb(255,128,0)\033[0m\r\n"
+	    "  \033[48;5;17m\033[38;5;15m  white on navy background  \033[0m\r\n"
+	    "\r\n"
+	    "  cursor addressing: ";
+	static const char stream2[] =
+	    "\033[20;40HX marks col 40, row 20"
+	    "\033[13;3Hcolumns 3..: 1234567890\r\n";
+	Scrbuf *sb;
+	Screen *d;
+	struct vt_state *st;
+	struct vt_parse *p;
+	int rows = 24, cols = 80, r, c;
+	Event ev;
+
+	sb = scr_new_io(io);
+	if (!sb)
+		return 1;
+	d = scr_new(sb);
+	if (!d) {
+		free(sb);
+		return 1;
+	}
+	scr_begin(d);
+	scr_size(d, &rows, &cols);
+
+	st = vt_state_new(rows, cols, 100);
+	p = st ? vt_parse_new(vt_ops_default(), st) : NULL;
+	if (!st || !p) {
+		if (p)
+			vt_parse_free(p);
+		if (st)
+			vt_state_free(st);
+		scr_end(d);
+		scr_free(d);
+		return 1;
+	}
+
+	vt_parse_feed(p, stream, sizeof(stream) - 1);
+	vt_parse_feed(p, stream2, sizeof(stream2) - 1);
+
+	/* translate the emulator grid onto vedit's screen, cell for cell */
+	scr_clear(d);
+	for (r = 0; r < rows; r++) {
+		for (c = 0; c < cols; c++) {
+			struct vt_cell *cell = vt_buf_cell(st->buf, r, c);
+
+			if (!cell)
+				continue;
+			scr_cell(d, r, c, cell->codepoint, cell->fg, cell->bg,
+			    cell->attrs);
+		}
+	}
+	scr_cursor(d, st->cursor_row, st->cursor_col);
+	scr_present(d);
+
+	/* non-interactive: hold the frame until any key, then restore */
+	while (scr_wait(d, &ev) == EVENT_IDLE)
+		;
+
+	vt_parse_free(p);
+	vt_state_free(st);
+	scr_end(d);
+	scr_free(d);
+	return 0;
+}
+#endif /* VEDIT_TERM */
+
 int
 main(int argc, char **argv)
 {
@@ -16761,6 +20617,12 @@ main(int argc, char **argv)
 	io.begin = tty_begin;
 	io.end = tty_end;
 	io.getsize = tty_getsize;
+#ifdef VEDIT_TERM
+	io.poll_fds = tty_poll_fds;	/* enable terminal-buffer multiplexing */
+
+	if (file && strcmp(file, "--term-demo") == 0)
+		return term_demo(&io);
+#endif
 
 	v = vedit_new(&io);
 	if (!v) {
@@ -20815,7 +24677,7 @@ enum excmd {
 	EX_EDIT, EX_ENEW, EX_WRITE, EX_WQ, EX_XIT, EX_QUIT, EX_QALL, EX_WQALL,
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
 	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD,
-	EX_MARKS, EX_DELMARKS, EX_JUMPS,
+	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM,
 };
 
 static const struct excmd_name {
@@ -20859,6 +24721,9 @@ static const struct excmd_name {
 	{ "marks",	3, EX_MARKS },
 	{ "delmarks",	4, EX_DELMARKS },
 	{ "jumps",	2, EX_JUMPS },
+#ifdef VEDIT_TERM
+	{ "terminal",	4, EX_TERM },
+#endif
 };
 
 /* Copy the leading run of ASCII letters of *pp into word[], advancing *pp past
@@ -21129,6 +24994,11 @@ vi_ex_exec(Editor *e, char *buf)
 	case EX_BPREV:
 		buf_cycle(e, -1);
 		return REQ_CONTINUE;
+#ifdef VEDIT_TERM
+	case EX_TERM:
+		term_open(e, *rest ? rest : NULL);
+		return REQ_CONTINUE;
+#endif
 	case EX_BDELETE:
 		if (!bang && text_dirty(e->t)) {
 			set_status(e,

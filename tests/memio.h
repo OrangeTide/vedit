@@ -111,4 +111,50 @@ memio_free(Memio *m)
 	m->out = NULL;
 }
 
+#ifdef VEDIT_TERM
+#include <sys/select.h>
+
+/* A poll_fds that waits on the terminal PTY fds (the keyboard is the scripted
+ * input, reported ready while any remains). Lets a test drive term_open, which
+ * refuses without a multiplexing host. */
+static int
+memio_poll_fds(void *ctx, int timeout_ms, const int *extra, int nextra,
+    int *ready, int *nready)
+{
+	Memio *m = ctx;
+	fd_set rf;
+	struct timeval tv, *ptv = NULL;
+	int i, maxfd = -1, r;
+
+	FD_ZERO(&rf);
+	for (i = 0; i < nextra; i++) {
+		if (extra[i] < 0)
+			continue;
+		FD_SET(extra[i], &rf);
+		if (extra[i] > maxfd)
+			maxfd = extra[i];
+	}
+	if (timeout_ms >= 0) {
+		tv.tv_sec = timeout_ms / 1000;
+		tv.tv_usec = (timeout_ms % 1000) * 1000;
+		ptv = &tv;
+	}
+	*nready = 0;
+	if (maxfd >= 0) {
+		r = select(maxfd + 1, &rf, NULL, NULL, ptv);
+		if (r > 0)
+			for (i = 0; i < nextra; i++)
+				if (extra[i] >= 0 && FD_ISSET(extra[i], &rf))
+					ready[(*nready)++] = extra[i];
+	}
+	return (m->inpos < m->inlen) ? 1 : 0;
+}
+
+static void
+memio_enable_fds(struct vedit_io *io)
+{
+	io->poll_fds = memio_poll_fds;
+}
+#endif /* VEDIT_TERM */
+
 #endif /* MEMIO_H */

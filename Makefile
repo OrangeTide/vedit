@@ -16,10 +16,22 @@ else
 CFLAGS += -g
 endif
 
+# Embedded VT terminal panel (shell / build output in a buffer). Off by default
+# so a primitive embedding host carries none of the PTY/emulator code. Opt in
+# with `make VEDIT_TERM=1`.
+ifdef VEDIT_TERM
+CFLAGS += -DVEDIT_TERM
+endif
+
 TESTDIR  = tests
 TESTBINS = $(TESTDIR)/test_unit $(TESTDIR)/test_render
 # Tests include vedit.c as one unit, so they build with the same warnings.
 TESTCFLAGS = -std=gnu11 -Wall -Wextra -g
+
+# The terminal-buffer tests build vedit.c with the terminal panel enabled, plus
+# the test-only term_attach() injection point that stands a pipe in for a PTY.
+TERMTESTBIN = $(TESTDIR)/test_term
+TERMTESTCFLAGS = $(TESTCFLAGS) -DVEDIT_TERM -DVEDIT_TEST
 
 # The torture/fuzz suite includes vedit.c directly. A smaller per-search step
 # budget keeps a pathological fuzz pattern from dominating the run time while
@@ -53,8 +65,15 @@ $(TESTDIR)/test_%: $(TESTDIR)/test_%.c $(TESTDIR)/testmain.c $(TESTDIR)/test.h \
 	$(CC) $(TESTCFLAGS) -o $@ $(TESTDIR)/test_$*.c $(TESTDIR)/testmain.c \
 	    $(LDFLAGS)
 
-test: $(TESTDIR)/taptest $(TESTBINS)
-	$(TESTDIR)/taptest --self-test --exe $(TESTBINS)
+# Explicit rule (overrides the pattern above) so the terminal tests get the
+# VEDIT_TERM/VEDIT_TEST flags.
+$(TERMTESTBIN): $(TESTDIR)/test_term.c $(TESTDIR)/testmain.c $(TESTDIR)/test.h \
+    $(TESTDIR)/memio.h $(SRC) $(HDR)
+	$(CC) $(TERMTESTCFLAGS) -o $@ $(TESTDIR)/test_term.c $(TESTDIR)/testmain.c \
+	    $(LDFLAGS)
+
+test: $(TESTDIR)/taptest $(TESTBINS) $(TERMTESTBIN)
+	$(TESTDIR)/taptest --self-test --exe $(TESTBINS) $(TERMTESTBIN)
 
 # Build and run the torture/fuzz suite.
 $(TESTDIR)/torturet: $(TESTDIR)/torture.c $(SRC) $(HDR)
@@ -105,7 +124,8 @@ screenshots: $(PROG)
 	docs/screenshots.sh ./$(PROG)
 
 clean:
-	rm -f $(PROG) $(TESTDIR)/taptest $(TESTBINS) $(TESTDIR)/torturet \
+	rm -f $(PROG) $(TESTDIR)/taptest $(TESTBINS) $(TERMTESTBIN) \
+	    $(TESTDIR)/torturet \
 	    $(TESTDIR)/test_unit-asan $(TESTDIR)/test_render-asan \
 	    $(TESTDIR)/torture-asan $(TESTDIR)/test_unit-ubsan \
 	    $(TESTDIR)/test_render-ubsan $(TESTDIR)/torture-ubsan \
