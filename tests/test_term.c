@@ -901,6 +901,83 @@ t_pane_split(Test *t)
 	memio_free(&m);
 }
 
+/* A text buffer in the pane: Ctrl-W b puts the current buffer below with the
+ * previous one above, Ctrl-W w moves the focus (the current buffer) between
+ * them while the layout stays, both buffers paint in their rows, and
+ * closing the pane keeps the buffer. ui.paneheight sets the pane's rows. */
+static void
+t_pane_text(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Scrbuf *sb;
+	int full, ph, prow0, cur_row;
+
+	memio_init(&m, "wwc", 3, 24, 80);	/* answers for three Ctrl-Ws */
+	memio_bind(&io, &m);
+	memio_enable_fds(&io);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, buf_slot(&v->e) == 0);	/* register the initial buffer */
+	buf_save(&v->e, &v->e.bufs[0]);
+	text_insert(v->e.t, 0, 0, "top line", 8);
+	TAP_ASSERT(t, buf_open(&v->e, NULL) == 1);
+	text_insert(v->e.t, 0, 0, "pane line", 9);
+	TAP_CHECK(t, v->e.cur == 1 && v->e.nbuf == 2 && !pane_shown(&v->e));
+	full = text_height_full(&v->e);
+
+	pane_buffer(&v->e);			/* buffer 1 below, buffer 0 above */
+	TAP_CHECK(t, v->e.in_pane && pane_shown(&v->e));
+	TAP_CHECKF(t, pane_top_idx(&v->e) == 0 && pane_text_idx(&v->e) == 1,
+	    "top %d pane %d", pane_top_idx(&v->e), pane_text_idx(&v->e));
+	ph = pane_height(&v->e);
+	TAP_CHECKF(t, text_height(&v->e) == full - ph - 1, "text %d full %d ph %d",
+	    text_height(&v->e), full, ph);
+	prow0 = CHROME_TOP + text_height(&v->e) + 1;
+
+	ed_render(&v->e, v->e.d);
+	sb = v->e.d->t;
+	TAP_CHECKF(t, sb->cur[(size_t)CHROME_TOP * sb->cols + CHROME_LEFT].codepoint == 't',
+	    "top row shows U+%04X", sb->cur[(size_t)CHROME_TOP * sb->cols + CHROME_LEFT].codepoint);
+	TAP_CHECKF(t, sb->cur[(size_t)prow0 * sb->cols + CHROME_LEFT].codepoint == 'p',
+	    "pane row shows U+%04X", sb->cur[(size_t)prow0 * sb->cols + CHROME_LEFT].codepoint);
+	TAP_CHECK(t, sb->cur[(size_t)(prow0 - 1) * sb->cols + 0].codepoint == GL_H);
+	cur_row = sb->cursor_r;
+	TAP_CHECKF(t, cur_row == prow0, "cursor row %d, want pane row %d", cur_row, prow0);
+	TAP_CHECK(t, v->e.cur == 1);	/* the flat state was restored */
+
+	/* Ctrl-W w: the focus goes up; the layout stays */
+	pane_key(&v->e);
+	TAP_CHECKF(t, v->e.cur == 0 && !v->e.in_pane && v->e.bufs[1].in_pane,
+	    "after Ctrl-W w: cur %d", v->e.cur);
+	TAP_CHECK(t, pane_shown(&v->e) && pane_top_idx(&v->e) == 0);
+	ed_render(&v->e, v->e.d);
+	TAP_CHECK(t, sb->cur[(size_t)CHROME_TOP * sb->cols + CHROME_LEFT].codepoint == 't');
+	TAP_CHECK(t, sb->cur[(size_t)prow0 * sb->cols + CHROME_LEFT].codepoint == 'p');
+	TAP_CHECKF(t, sb->cursor_r == CHROME_TOP, "cursor row %d", sb->cursor_r);
+
+	/* and back down; the top is remembered */
+	pane_key(&v->e);
+	TAP_CHECKF(t, v->e.cur == 1 && v->e.in_pane && v->e.bufs[0].top_last,
+	    "after second Ctrl-W w: cur %d", v->e.cur);
+
+	/* Ctrl-W c: the pane goes, the buffer stays, and fills the frame */
+	pane_key(&v->e);
+	TAP_CHECK(t, !pane_shown(&v->e) && v->e.nbuf == 2 && v->e.cur == 1);
+	TAP_CHECK(t, text_height(&v->e) == full);
+	TAP_CHECK(t, strcmp(v->e.status, "pane closed") == 0);
+
+	/* a configured height wins over the third */
+	v->e.pane_rows = 5;
+	TAP_CHECKF(t, pane_height(&v->e) == 5, "pane rows %d", pane_height(&v->e));
+	v->e.pane_rows = 0;
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* Without a multiplexing host, in_refill uses the plain poll fallback. */
 static void
 t_term_poll_fallback(Test *t)
@@ -1201,6 +1278,7 @@ const Case tap_cases[] = {
 	{ "tool_term_start", t_tool_term_start },
 	{ "tool_term_shell", t_tool_term_shell },
 	{ "pane_split", t_pane_split },
+	{ "pane_text", t_pane_text },
 	{ "term_poll_fallback", t_term_poll_fallback },
 	{ "term_discard", t_term_discard },
 	{ "term_open_nomux", t_term_open_nomux },

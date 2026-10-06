@@ -187,6 +187,7 @@ A gitconfig-style file sets the startup defaults. It is read from the first of
     scroll = on          # VT100 scroll-region fast path
     clipboard = off      # also mirror every copy/yank to the terminal (OSC 52)
     tabs   = on          # mark hard tabs with a guide glyph
+    paneheight = 0       # rows for the pane under the text; 0 = a third
 
 [edit]
     mode = vi            # vi | modeless
@@ -937,28 +938,33 @@ under [Build commands](#build-commands-a-primitive-ide).
 
 ### The pane
 
-One terminal buffer can be shown in a pane under the text, a third of the text
-area high, so a build's output, a shell, or a log stays in view while you edit.
-This is the simplest split that pays off: the text keeps the editor's one cursor
-and scroll state, and a terminal carries its own grid, so drawing it below costs
-nothing. Open a shell there with `Ctrl-W s`, Terminal > Split Terminal, or the vi
-command `:split`; `:split cmd` runs `cmd` in the pane instead, as `:terminal cmd`
-would (`tail -f build.log`, say). The build commands put their output there by
-default.
+One buffer can be shown in a pane under the text, a third of the text area high
+(or `ui.paneheight = N` rows), so a build's output, a shell, a log, or a second
+file stays in view while you edit. Open a shell there with `Ctrl-W s`, Terminal >
+Split Terminal, or the vi command `:split`; `:split cmd` runs `cmd` in the pane
+instead, as `:terminal cmd` would (`tail -f build.log`, say). The build commands
+put their output there by default. `Ctrl-W b`, Terminal > Buffer in Pane, or
+`:sbuffer [N]` shows the current text buffer (or buffer N) in the pane, with the
+buffer last on top, else the previous one, above it.
 
-| Key                       | What it does                                     |
-|---------------------------|--------------------------------------------------|
-| `Ctrl-W s`                | open a shell in the pane, or focus the one there |
-| `Ctrl-W w`                | move the focus into the pane, or back out of it  |
-| `Ctrl-W c`                | close the pane's terminal                        |
+| Key                       | What it does                                         |
+|---------------------------|------------------------------------------------------|
+| `Ctrl-W s`                | open a shell in the pane, or focus the one there     |
+| `Ctrl-W b`                | show this buffer in the pane, another above; undo it |
+| `Ctrl-W w`                | move the focus into the pane, or back out of it      |
+| `Ctrl-W c`                | close the pane (a terminal is closed, a buffer kept) |
 
-The pane's title is drawn reversed while the focus is there; keys then go to its
-program, with `Ctrl-W` as the prefix just as in a full terminal buffer. The pane
-holds one terminal: opening another there hands the previous one back as a plain
-terminal buffer, or closes it when its program had exited. F8 still reaches the
-pane's buffer, which fills the frame like any terminal while it is current, and
-the pane returns when a text buffer is. A window with fewer than eight text rows
-hides the pane rather than squeeze it.
+The pane's title is drawn reversed while the focus is there. With a terminal in
+the pane, keys then go to its program, with `Ctrl-W` as the prefix just as in a
+full terminal buffer. With a text buffer there, the focus is simply which of the
+two buffers is current: `Ctrl-W w` switches between them while the layout stays,
+and editing, searching, and the status line follow the focused one. The pane
+holds one thing: opening another there hands a terminal back as a plain terminal
+buffer, or closes it when its program had exited, and a text buffer simply loses
+its place in the pane. F8 still reaches the pane's buffer, which fills the frame
+like any terminal while it is current, and the pane returns when a text buffer
+is. A window with fewer than eight text rows hides the pane rather than squeeze
+it, as does the hex view.
 
 When the child exits, the buffer shows `[process exited N]` and waits for
 `Ctrl-W q` to close.
