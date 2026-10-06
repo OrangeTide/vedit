@@ -866,6 +866,18 @@ t_jumplist(Test *t)
 	vedit_free(v);
 	memio_free(&m);
 
+	/* a committed / search is a jump: Ctrl-O returns to where it started */
+	memio_init(&m, "/l5\r\x0f", 5, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 10);
+	v->e.mode = MODE_NORMAL;
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.cy == 0, "Ctrl-O after search at line %zu", v->e.cy);
+	vedit_free(v);
+	memio_free(&m);
+
 	/* `` returns to the pre-jump spot; a second `` toggles back */
 	memio_init(&m, "G````", 5, 24, 80);
 	memio_bind(&io, &m);

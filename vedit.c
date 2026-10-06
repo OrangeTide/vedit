@@ -11034,6 +11034,9 @@ isearch_draw(Editor *e, const char *label, const char *q, int found)
  * Enter accepts (storing the query and direction for repeats); an empty query
  * repeats the last search. Esc or Ctrl-C cancels and restores the start. label
  * is the status-line prompt ("/" or "?" for vi, "ISearch: " for modeless). */
+static void jump_record(Editor *e);
+static void jump_record_at(Editor *e, size_t cy, size_t cx);
+
 static void
 incsearch(Editor *e, int dir, const char *label)
 {
@@ -11076,16 +11079,19 @@ incsearch(Editor *e, int dir, const char *label)
 			continue;
 		if (seq.key == TKBD_KEY_ENTER) {
 			if (len == 0) {
-				if (e->last_find[0])
+				if (e->last_find[0]) {
+					jump_record(e);	/* at the origin now */
 					ed_find_dir(e, e->last_find, dir);
+				}
 				return;
 			}
 			snprintf(e->last_find, sizeof(e->last_find), "%s", q);
 			e->vi_search_dir = dir;
-			if (found)
+			if (found) {
+				jump_record_at(e, oy, ox);	/* came from here */
 				set_status(e,
 				    "found '%.80s'", q);
-			else
+			} else
 				set_status(e,
 				    "not found: %.80s", q);
 			return;
@@ -13272,28 +13278,35 @@ jump_append(Editor *e, const char *path, size_t cy, size_t cx)
 	jl->cx = cx;
 }
 
-/* Record the current position as the origin of a jump about to happen, and set
- * the `` / '' previous-position mark to it. Collapses a repeat of the same line
- * in the same file, and drops any forward history past the cursor. */
+/* Record a position as the origin of a jump about to happen, and set the `` / ''
+ * previous-position mark to it. Collapses a repeat of the same line in the same
+ * file, and drops any forward history past the cursor. */
 static void
-jump_record(Editor *e)
+jump_record_at(Editor *e, size_t cy, size_t cx)
 {
 	const char *path = e->has_name ? e->path : "";
 
-	vi_mark_set(e, MARK_PREV, e->cy, e->cx);
+	vi_mark_set(e, MARK_PREV, cy, cx);
 
 	e->jump_n = e->jump_cur;	/* a new jump truncates the forward part */
 	if (e->jump_n > 0) {
 		Tagloc *top = &e->jumps[e->jump_n - 1];
 
-		if (top->cy == e->cy && strcmp(top->path, path) == 0) {
-			top->cx = e->cx;	/* same line: just refresh it */
+		if (top->cy == cy && strcmp(top->path, path) == 0) {
+			top->cx = cx;		/* same line: just refresh it */
 			e->jump_cur = e->jump_n;
 			return;
 		}
 	}
-	jump_append(e, path, e->cy, e->cx);
+	jump_append(e, path, cy, cx);
 	e->jump_cur = e->jump_n;
+}
+
+/* Record the current position as a jump origin. */
+static void
+jump_record(Editor *e)
+{
+	jump_record_at(e, e->cy, e->cx);
 }
 
 /* Move the cursor (opening another file if need be) to a jump-list entry. */
