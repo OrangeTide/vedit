@@ -7190,6 +7190,13 @@ hl_line(Editor *e, size_t idx, const char *s, size_t llen)
 #define CHROME_BOTTOM	2	/* rows below the text (bottom border + status) */
 #define CHROME_RIGHT	1	/* columns right of the text (border/scrollbar) */
 
+/* Below this the framed layout cannot form without overprinting itself (the
+ * chrome alone needs four rows, and the menu bar and title need room), so the
+ * render path paints a short "window too small" notice instead of a garbled
+ * frame. A window at or above this size renders a coherent, if cramped, editor. */
+#define WIN_MIN_COLS	16
+#define WIN_MIN_ROWS	5
+
 static void ui_field(Screen *d, int row, int col, int width,
     const char *s, Color fg, Color bg, uint16_t attrs);
 
@@ -7765,7 +7772,26 @@ menu_col(const Editor *e, int i)
 	return x;
 }
 
-/* Which top-level menu title column x falls on, or -1. */
+/* Whether menu i's title is actually painted on the bar. A left-packed title is
+ * dropped when it would collide with the right-aligned Help label or run off the
+ * right edge, so a narrow bar hides whole titles instead of overprinting them.
+ * Help shows whenever its column is on screen. Keyboard access (mnemonics and
+ * menu navigation) still reaches a menu whose title is hidden here. */
+static int
+menu_title_drawn(const Editor *e, int i)
+{
+	int c = menu_col(e, i);
+
+	if (c < 0)
+		return 0;
+	if (i == MENU_HELP)
+		return 1;
+	return c + menu_disp_w(MENUS[i].title) < e->cols - 5;
+}
+
+/* Which top-level menu title column x falls on, or -1. Only a drawn title can be
+ * clicked, so a narrow bar's hidden menus do not swallow clicks over blank cells
+ * or the Help label. */
 static int
 menu_hit(const Editor *e, int x)
 {
@@ -7774,7 +7800,7 @@ menu_hit(const Editor *e, int x)
 	for (i = 0; i < MENU_COUNT; i++) {
 		int c;
 
-		if (!menu_visible(e, i))
+		if (!menu_title_drawn(e, i))
 			continue;
 		c = menu_col(e, i);
 		if (x >= c && x < c + menu_disp_w(MENUS[i].title))
@@ -7794,7 +7820,7 @@ ui_menubar(Editor *e, const Pal *p, int active)
 		uint16_t a = (i == active) ? (at ^ ATTR_REVERSE) : at;
 		int col = menu_col(e, i);
 
-		if (col < 0 || col >= e->cols)
+		if (!menu_title_drawn(e, i))
 			continue;
 		ui_menu_label(e->d, 0, col, MENUS[i].title, p->bar_fg,
 		    p->bar_bg, a);
@@ -9236,6 +9262,33 @@ render_body_wrapped(Editor *e, Screen *d, const Pal *p, int text_h,
 	}
 }
 
+/* Stand-in for the frame when the window is below the minimum usable size: a
+ * cleared screen with a short centered notice. The longest message that fits is
+ * used, falling back to a single marker so a very small window still shows
+ * something unambiguous instead of a broken frame. */
+static void
+ui_too_small(Editor *e, const Pal *p)
+{
+	static const char *const msg[] = { "window too small", "too small", "!" };
+	Screen *d = e->d;
+	const char *s = msg[2];
+	int k, row = e->rows / 2, col;
+
+	scr_clear(d);
+	scr_cursor_vis(d, 0);		/* no text cursor over the notice */
+	for (k = 0; k < 3; k++)
+		if ((int)strlen(msg[k]) <= e->cols) {
+			s = msg[k];
+			break;
+		}
+	col = (e->cols - (int)strlen(s)) / 2;
+	if (col < 0)
+		col = 0;
+	if (row < 0)
+		row = 0;
+	scr_text(d, row, col, s, p->content_fg, p->content_bg, ATTR_BOLD);
+}
+
 static void
 render_body(Editor *e, Screen *d)
 {
@@ -9249,6 +9302,12 @@ render_body(Editor *e, Screen *d)
 	size_t len = 0;
 	const char *cur = text_line(e->t, e->cy, &len);
 	int cur_col, cur_row = 0, cur_scol = col0;
+
+	if (e->cols < WIN_MIN_COLS || e->rows < WIN_MIN_ROWS) {
+		e->prev_text_view = 0;	/* not the text view; skip scroll reuse */
+		ui_too_small(e, p);
+		return;
+	}
 
 	if (text_w < 1)
 		text_w = 1;

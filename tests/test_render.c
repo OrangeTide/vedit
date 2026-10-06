@@ -1838,6 +1838,94 @@ t_menu_col_pack(Test *t)
 	memio_free(&m);
 }
 
+/* On a narrow bar a title that would collide with the right-aligned Help label
+ * is dropped whole instead of overprinting it, and it stops swallowing clicks,
+ * but it stays reachable by its mnemonic. A wide bar draws them all. */
+static void
+t_menu_narrow(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int fi, ei, si, hi;
+
+	fi = find_menu("&File");
+	ei = find_menu("&Edit");
+	si = find_menu("&Search");
+	hi = MENU_HELP;
+	TAP_ASSERT(t, fi >= 0 && ei >= 0 && si >= 0);
+
+	/* wide: every standard title is drawn */
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_CHECK(t, menu_title_drawn(&v->e, fi));
+	TAP_CHECK(t, menu_title_drawn(&v->e, ei));
+	TAP_CHECK(t, menu_title_drawn(&v->e, si));
+	TAP_CHECK(t, menu_title_drawn(&v->e, hi));
+	vedit_free(v);
+	memio_free(&m);
+
+	/* narrow: File and Edit fit, Search collides with Help so it is hidden */
+	memio_init(&m, "", 0, 24, 20);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_CHECK(t, menu_title_drawn(&v->e, fi));
+	TAP_CHECK(t, menu_title_drawn(&v->e, ei));
+	TAP_CHECK(t, !menu_title_drawn(&v->e, si));	/* would overprint Help */
+	TAP_CHECK(t, menu_title_drawn(&v->e, hi));	/* Help still fits */
+	/* a click where Search used to sit no longer opens it */
+	TAP_CHECK(t, menu_hit(&v->e, menu_col(&v->e, si)) != si);
+	/* but Alt+S still reaches it */
+	TAP_CHECK(t, menu_title_by_mnemonic(&v->e, 's') == si);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* Below the minimum usable size the frame is replaced by a centered notice; at
+ * the floor the real framed editor renders. */
+static void
+t_win_too_small(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	/* too short: notice shown, no status bar */
+	memio_init(&m, "", 0, WIN_MIN_ROWS - 1, 40);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_run(v);
+	TAP_CHECK(t, strstr(m.out, "window too small") != NULL);
+	TAP_CHECK(t, strstr(m.out, "F1") == NULL);	/* no status/menu bar */
+	vedit_free(v);
+	memio_free(&m);
+
+	/* too narrow: a shorter message that fits is used */
+	memio_init(&m, "", 0, 24, WIN_MIN_COLS - 1);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_run(v);
+	TAP_CHECK(t, strstr(m.out, "too small") != NULL);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* exactly at the floor: the framed editor renders, no notice */
+	memio_init(&m, "", 0, WIN_MIN_ROWS, WIN_MIN_COLS);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_run(v);
+	TAP_CHECK(t, strstr(m.out, "too small") == NULL);
+	TAP_CHECK(t, strstr(m.out, "Press F1") != NULL);	/* the status bar is drawn */
+	vedit_free(v);
+	memio_free(&m);
+}
+
 #ifdef VEDIT_TERM
 /* The Terminal menu follows the host's fd multiplexer, and when shown it packs
  * into the slot the hidden Compile/Run left open. */
@@ -1921,6 +2009,8 @@ const Case tap_cases[] = {
 	{ "pick_open_entry", t_pick_open_entry },
 	{ "menu_item_enabled", t_menu_item_enabled },
 	{ "menu_col_pack", t_menu_col_pack },
+	{ "menu_narrow", t_menu_narrow },
+	{ "win_too_small", t_win_too_small },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_f9_make", t_tool_f9_make },
 	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },
