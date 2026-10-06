@@ -879,6 +879,40 @@ t_jumplist(Test *t)
 	memio_free(&m);
 }
 
+/* :delmarks clears a named mark; :marks lists them and jumps to the chosen one. */
+static void
+t_marks_ex(Test *t)
+{
+	static const char *const L[] = { "l0", "l1", "l2", "l3", "l4" };
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	/* set mark a, then :delmarks a clears it */
+	memio_init(&m, "ma:delmarks a\r", 14, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 5);
+	v->e.mode = MODE_NORMAL;
+	vedit_run(v);
+	TAP_CHECK(t, (v->e.vi_marks_set & ((uint64_t)1 << 0)) == 0);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* set mark a on line 2, go home, :marks then Enter jumps back to it */
+	memio_init(&m, "jjmagg:marks\r\r", 14, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 5);
+	v->e.mode = MODE_NORMAL;
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.cy == 2, ":marks jumped to line %zu", v->e.cy);
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* gv reselects the previous visual range after leaving visual mode. */
 static void
 t_gv_reselect(Test *t)
@@ -1485,6 +1519,7 @@ const Case tap_cases[] = {
 	{ "macro_record", t_macro_record },
 	{ "marks_special", t_marks_special },
 	{ "jumplist", t_jumplist },
+	{ "marks_ex", t_marks_ex },
 	{ "shell_cmd", t_shell_cmd },
 	{ "exit_cursor", t_exit_cursor },
 	{ "gv_reselect", t_gv_reselect },

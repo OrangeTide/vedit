@@ -11209,6 +11209,8 @@ static const struct {
 	{ "block: d y I A",	"Delete, yank, insert at left, append at right" },
 	{ "p / P",		"Paste after / before the cursor" },
 	{ "\"a  qa  @a",	"Register a: prefix yank/put, record keys, replay" },
+	{ "ma  `a  'a",		"Set mark a, jump to it (exact / line)" },
+	{ "Ctrl-O / Ctrl-I",	"Jump list: older / newer (`` toggles ends)" },
 	{ "u / Ctrl-R",		"Undo / redo" },
 	{ "/ text  n",		"Search forward, repeat the last search" },
 	{ ":w  :q  :wq / :x",	"Write, quit, write and quit" },
@@ -13235,6 +13237,7 @@ ed_tag_pop(Editor *e)
 #define JUMPS_MAX 100
 
 static void vi_mark_set(Editor *e, int slot, size_t y, size_t x);
+static int mark_index(int ch);
 
 /* Append a location to the jump list, dropping the oldest when full. */
 static void
@@ -13335,6 +13338,207 @@ jump_forward(Editor *e)
 	}
 	e->jump_cur++;
 	jump_goto(e, &e->jumps[e->jump_cur]);
+}
+
+/* The mark character for a slot, as :marks prints it and ` / ' name it. */
+static char
+mark_char(int slot)
+{
+	if (slot >= 0 && slot < MARK_LETTERS)
+		return (char)('a' + slot);
+	switch (slot) {
+	case MARK_PREV:		return '\'';
+	case MARK_CHANGE:	return '.';
+	case MARK_INSERT:	return '^';
+	case MARK_VISLT:	return '<';
+	case MARK_VISGT:	return '>';
+	}
+	return '?';
+}
+
+/* :marks -- a picker over the set marks; choosing one jumps to it. */
+typedef struct {
+	Editor	*e;
+	int	 slot[MARK_SLOTS];	/* the set slots, in display order */
+	int	 n;
+	int	 chosen;		/* slot chosen, or -1 */
+	char	 line[160];
+} Markpick;
+
+static const char *
+markpick_title(void *ctx)
+{
+	(void)ctx;
+	return "mark  line  col  text";
+}
+
+static int
+markpick_count(void *ctx)
+{
+	return ((Markpick *)ctx)->n;
+}
+
+static const char *
+markpick_label(void *ctx, int i)
+{
+	Markpick *mp = ctx;
+	Editor *e = mp->e;
+	int slot;
+	size_t y, llen = 0;
+	const char *s = "";
+
+	if (i < 0 || i >= mp->n)
+		return "";
+	slot = mp->slot[i];
+	y = e->vi_mark_y[slot];
+	if (y < text_lines(e->t))
+		s = text_line(e->t, y, &llen);
+	snprintf(mp->line, sizeof(mp->line), " %c  %6zu %4zu  %.80s",
+	    mark_char(slot), y + 1, e->vi_mark_x[slot], s ? s : "");
+	return mp->line;
+}
+
+static int
+markpick_choose(void *ctx, int i)
+{
+	Markpick *mp = ctx;
+
+	if (i < 0 || i >= mp->n)
+		return PICK_STAY;
+	mp->chosen = mp->slot[i];
+	return PICK_DONE;
+}
+
+static void
+dlg_marks_pick(Editor *e)
+{
+	Picksrc s = {
+		.title = markpick_title, .count = markpick_count,
+		.label = markpick_label, .choose = markpick_choose,
+	};
+	Markpick mp;
+	int slot;
+
+	memset(&mp, 0, sizeof(mp));
+	mp.e = e;
+	mp.chosen = -1;
+	for (slot = 0; slot < MARK_SLOTS; slot++)
+		if (e->vi_marks_set & ((uint64_t)1 << slot))
+			mp.slot[mp.n++] = slot;
+	if (mp.n == 0) {
+		set_status(e, "no marks set");
+		return;
+	}
+	s.ctx = &mp;
+	if (dlg_pick(e, &s) && mp.chosen >= 0) {
+		size_t y = e->vi_mark_y[mp.chosen];
+
+		jump_record(e);
+		if (y >= text_lines(e->t))
+			y = text_lines(e->t) ? text_lines(e->t) - 1 : 0;
+		e->cy = y;
+		e->cx = e->vi_mark_x[mp.chosen];
+		e->sel_active = 0;
+		clamp_col(e);
+	}
+}
+
+/* :jumps -- a picker over the jump list; choosing an entry goes to it. */
+typedef struct {
+	Editor	*e;
+	int	 chosen;
+	char	 line[PATH_MAX];
+} Jumppick;
+
+static const char *
+jumppick_title(void *ctx)
+{
+	(void)ctx;
+	return "jump  line  col  file";
+}
+
+static int
+jumppick_count(void *ctx)
+{
+	return ((Jumppick *)ctx)->e->jump_n;
+}
+
+static const char *
+jumppick_label(void *ctx, int i)
+{
+	Jumppick *jp = ctx;
+	const Tagloc *jl;
+	const char *name;
+
+	if (i < 0 || i >= jp->e->jump_n)
+		return "";
+	jl = &jp->e->jumps[i];
+	name = jl->path[0] ? jl->path : "[No Name]";
+	if (strrchr(name, '/'))
+		name = strrchr(name, '/') + 1;
+	snprintf(jp->line, sizeof(jp->line), " %4d  %6zu %4zu  %.80s",
+	    i, jl->cy + 1, jl->cx, name);
+	return jp->line;
+}
+
+static int
+jumppick_choose(void *ctx, int i)
+{
+	Jumppick *jp = ctx;
+
+	if (i < 0 || i >= jp->e->jump_n)
+		return PICK_STAY;
+	jp->chosen = i;
+	return PICK_DONE;
+}
+
+static void
+dlg_jumps_pick(Editor *e)
+{
+	Picksrc s = {
+		.title = jumppick_title, .count = jumppick_count,
+		.label = jumppick_label, .choose = jumppick_choose,
+	};
+	Jumppick jp;
+
+	if (e->jump_n == 0) {
+		set_status(e, "jump list empty");
+		return;
+	}
+	memset(&jp, 0, sizeof(jp));
+	jp.e = e;
+	jp.chosen = -1;
+	s.ctx = &jp;
+	if (dlg_pick(e, &s) && jp.chosen >= 0)
+		jump_goto(e, &e->jumps[jp.chosen]);
+}
+
+/* :delmarks -- clear named marks (a b c ...), or all a-z marks with a !. */
+static void
+ex_delmarks(Editor *e, const char *rest, int bang)
+{
+	if (bang) {
+		int i;
+
+		for (i = 0; i < MARK_LETTERS; i++)
+			e->vi_marks_set &= ~((uint64_t)1 << i);
+		set_status(e, "cleared marks a-z");
+		return;
+	}
+	if (!*rest) {
+		set_status(e, "E471: argument required");
+		return;
+	}
+	for (; *rest; rest++) {
+		int idx;
+
+		if (*rest == ' ' || *rest == '\t')
+			continue;
+		idx = mark_index((unsigned char)*rest);
+		if (idx >= 0)
+			e->vi_marks_set &= ~((uint64_t)1 << idx);
+	}
+	set_status(e, "marks cleared");
 }
 
 /* Jump to the chosen entry: a buffer line, or a tags entry in another file. */
@@ -20539,6 +20743,7 @@ enum excmd {
 	EX_EDIT, EX_ENEW, EX_WRITE, EX_WQ, EX_XIT, EX_QUIT, EX_QALL, EX_WQALL,
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
 	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD,
+	EX_MARKS, EX_DELMARKS, EX_JUMPS,
 };
 
 static const struct excmd_name {
@@ -20579,6 +20784,9 @@ static const struct excmd_name {
 	{ "retab",	3, EX_RETAB },
 	{ "draw",	2, EX_DRAW },
 	{ "reload",	3, EX_RELOAD },
+	{ "marks",	3, EX_MARKS },
+	{ "delmarks",	4, EX_DELMARKS },
+	{ "jumps",	2, EX_JUMPS },
 };
 
 /* Copy the leading run of ASCII letters of *pp into word[], advancing *pp past
@@ -20817,6 +21025,15 @@ vi_ex_exec(Editor *e, char *buf)
 		return ex_syntax(e, rest);
 	case EX_LS:
 		buf_list(e);
+		return REQ_CONTINUE;
+	case EX_MARKS:
+		dlg_marks_pick(e);
+		return REQ_CONTINUE;
+	case EX_DELMARKS:
+		ex_delmarks(e, rest, bang);
+		return REQ_CONTINUE;
+	case EX_JUMPS:
+		dlg_jumps_pick(e);
 		return REQ_CONTINUE;
 	case EX_BUFFER: {
 		long n;

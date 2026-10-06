@@ -597,11 +597,21 @@ Esc; a block yanked or deleted this way pastes back as a rectangle with `p`.
 uppercase name (`qA`) appends to it instead of replacing it. `@a` plays a
 register back as keystrokes, `@@` repeats the last one, and a count repeats the
 macro (`3@a`). A register can also be filled by yanking into it (`"ayy`), since
-both are just stored bytes. `Ctrl-Home` and `Ctrl-End` jump to the
-first and last line, the same as `gg` and `G`, and work in insert mode too. `ZZ`
+both are just stored bytes. `m` followed by a letter sets a mark; `` ` `` and `'`
+jump to it (to the exact spot and to the line's first non-blank). The marks
+`` ` `` / `'`, `` `. ``, `` `^ ``, and `` `< `` / `` `> `` are kept automatically for the
+previous position, the last change, where insert mode stopped, and the last
+visual selection. A long-range move (`G`, `gg`, a search, a mark jump) is a jump:
+`Ctrl-O` steps back through the jump list and `Ctrl-I` (Tab) forward, `` ` `` /
+`''` toggle between a jump's ends, and `g`` / `g'` jump without recording.
+`:marks` lists the marks (choose one to jump to it), `:delmarks` clears some (or
+`:delmarks!` all a-z), and `:jumps` lists the jump list. `Ctrl-Home` and
+`Ctrl-End` jump to the first and last line, the same as `gg` and `G`, and work
+in insert mode too. `ZZ`
 writes and quits, `ZQ` quits without writing. The `:` line runs `write`, `quit`,
 `wq`, `xit`, `qall`, `wqall`, `cquit`, `edit`, `enew`, `read`, `buffer`,
-`bnext`, `bprevious`, `bdelete`, `buffers`, `tag`, `pop`, `retab`, `:N`,
+`bnext`, `bprevious`, `bdelete`, `buffers`, `tag`, `pop`, `retab`, `marks`,
+`delmarks`, `jumps`, `:N`,
 `:set number` / `:set nonumber`, and `:set wrap` / `:set nowrap`. `:!cmd` runs a
 shell command and shows its output in the build pane (through the host's command
 runner, so it is unavailable when none is installed). Command names
