@@ -343,6 +343,35 @@ tx_fill(Text *tx, const char *const *lines, int n)
 		lines_insert_at(tx, (size_t)i, lines[i], strlen(lines[i]));
 }
 
+/* The picker entry field scrolls its tail into view in fixed jumps, keeping
+ * the cursor visible without reflowing on every keystroke. */
+static void
+t_entry_scroll(Test *t)
+{
+	char s[64];
+	int off, n;
+
+	TAP_CHECK(t, entry_scroll_off("abc", 10) == 0);	/* fits: no scroll */
+
+	/* avail 10, chunk 5: the offset is a multiple of the chunk and always
+	 * leaves the end (the cursor) within avail columns. */
+	for (n = 1; n <= 40; n++) {
+		memset(s, 'x', (size_t)n);
+		s[n] = '\0';
+		off = entry_scroll_off(s, 10);
+		TAP_CHECKF(t, off % 5 == 0, "len %d off %d not a jump", n, off);
+		TAP_CHECKF(t, n - off <= 10, "len %d off %d hides cursor", n, off);
+		TAP_CHECKF(t, n <= 10 ? off == 0 : off > 0,
+		    "len %d off %d scroll wrong", n, off);
+	}
+
+	/* the offset holds steady within a chunk, then jumps by one chunk */
+	memset(s, 'x', 15); s[15] = '\0';
+	TAP_CHECKF(t, entry_scroll_off(s, 10) == 5, "len 15");
+	memset(s, 'x', 16); s[16] = '\0';
+	TAP_CHECKF(t, entry_scroll_off(s, 10) == 10, "len 16 should jump");
+}
+
 /* The FILE* serializer cores round-trip content and every line-ending style. */
 static void
 t_text_fp_roundtrip(Test *t)
@@ -2401,6 +2430,7 @@ const Case tap_cases[] = {
 	{ "syntax_block_comment_carry", t_syntax_block_comment_carry },
 	{ "syntax_refine", t_syntax_refine },
 	{ "syntax_md", t_syntax_md },
+	{ "entry_scroll", t_entry_scroll },
 	{ "text_fp_roundtrip", t_text_fp_roundtrip },
 	{ "swap_paths", t_swap_paths },
 	{ "atomic_save", t_atomic_save },
