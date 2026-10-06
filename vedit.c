@@ -3873,7 +3873,7 @@ syn_for_ext(const char *ext)
 }
 
 
-#define VEDIT_VERSION "vedit 1.1.1"
+#define VEDIT_VERSION "vedit 1.2.0"
 
 /****************************************************************
  * Keyboard input decoding -- It fills the same struct tkbd_seq the editor
