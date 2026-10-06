@@ -1019,6 +1019,39 @@ static const struct vedit_tool_api fake_tools = {
 	NULL, fake_capture, fake_foreground,
 };
 
+/* :!cmd runs through the tool runner and shows the output in the pane. */
+static void
+t_shell_cmd(Test *t)
+{
+	const char keys[] = ":!echo hi\r";	/* ex line, then Enter */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	g_fake_output = "line one\nline two\n";
+	g_fake_rc = 0;
+	g_fake_cmd[0] = '\0';
+	g_fake_fg = 0;
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	v->e.mode = MODE_NORMAL;
+	vedit_set_tools(v, &fake_tools);
+	vedit_run(v);
+
+	TAP_CHECKF(t, strcmp(g_fake_cmd, "echo hi") == 0, "ran '%s'",
+	    g_fake_cmd);
+	TAP_CHECK(t, g_fake_fg == 0);		/* captured, not foreground */
+	TAP_CHECK(t, m.out && strstr(m.out, "line one") != NULL);
+	TAP_CHECKF(t, strstr(v->e.status, "exited 0") != NULL, "status '%s'",
+	    v->e.status);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* F9 (Make): the whole path end to end. The key reaches the dispatcher, the
  * per-language build command is expanded and run, the captured output is parsed
  * into the quickfix list, and the output pane renders it. The pane and then the
@@ -1154,6 +1187,7 @@ const Case tap_cases[] = {
 	{ "search_word", t_search_word },
 	{ "shiftwidth", t_shiftwidth },
 	{ "macro_play", t_macro_play },
+	{ "shell_cmd", t_shell_cmd },
 	{ "gv_reselect", t_gv_reselect },
 	{ "global_yank", t_global_yank },
 	{ "global_shift", t_global_shift },

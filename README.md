@@ -600,7 +600,9 @@ first and last line, the same as `gg` and `G`, and work in insert mode too. `ZZ`
 writes and quits, `ZQ` quits without writing. The `:` line runs `write`, `quit`,
 `wq`, `xit`, `qall`, `wqall`, `cquit`, `edit`, `enew`, `read`, `buffer`,
 `bnext`, `bprevious`, `bdelete`, `buffers`, `tag`, `pop`, `retab`, `:N`,
-`:set number` / `:set nonumber`, and `:set wrap` / `:set nowrap`. Command names
+`:set number` / `:set nonumber`, and `:set wrap` / `:set nowrap`. `:!cmd` runs a
+shell command and shows its output in the build pane (through the host's command
+runner, so it is unavailable when none is installed). Command names
 follow the usual vi abbreviation rule: any leading prefix of the full name down
 to its standard short form works, so `:s` is `:substitute`, `:e` is `:edit`,
 `:w` is `:write`, `:bn` is `:bnext`, while `:se` stays `:set` and `:sy` is

@@ -14429,6 +14429,37 @@ ed_tool_run(Editor *e, const char *which, const char *label)
 	free(cmd);
 }
 
+/* Run an arbitrary shell command (vi :!cmd), capturing its output into the
+ * tool pane. Goes through the host's tool runner, so an embedding host that
+ * installs no runner (or none with capture) simply has no shell access. */
+static void
+ed_shell_cmd(Editor *e, const char *cmd)
+{
+	char dir[PATH_MAX];
+	int rc;
+
+	if (!cmd || !cmd[0]) {
+		set_status(e, "usage: :!command");
+		return;
+	}
+	if (!e->tools || !e->tools->run_capture) {
+		set_status(e, "shell commands are not available");
+		return;
+	}
+	tool_build_dir(e, dir, sizeof(dir));
+	snprintf(e->tool_dir, sizeof(e->tool_dir), "%s", dir);
+	tool_clear_output(e);
+	snprintf(e->tool_title, sizeof(e->tool_title), "! %.40s", cmd);
+	rc = e->tools->run_capture(e->tools->ctx, cmd, dir, tool_emit, e);
+	tool_parse_output(e);
+	e->tool_curerr = -1;
+	dlg_tool_output(e);
+	if (rc < 0)
+		set_status(e, "could not run: %.80s", cmd);
+	else
+		set_status(e, "! exited %d", rc);
+}
+
 /* Map a tool key to its command, or CMD_NONE. Active in both personalities. */
 static Cmd
 tool_key_to_cmd(const struct tkbd_seq *seq)
@@ -20288,6 +20319,18 @@ vi_ex_exec(Editor *e, char *buf)
 
 	while (*p == ' ')
 		p++;
+
+	if (*p == '!') {		/* :!cmd -- run a shell command */
+		p++;
+		while (*p == ' ')
+			p++;
+#ifndef VEDIT_NO_TOOLS
+		ed_shell_cmd(e, p);
+#else
+		set_status(e, "shell commands are not available");
+#endif
+		return REQ_CONTINUE;
+	}
 
 	/* An optional leading line range. */
 	after = p;
