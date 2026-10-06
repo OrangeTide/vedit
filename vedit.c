@@ -11489,64 +11489,40 @@ buffer_reset(Editor *e)
  * buffer is ever read from the flat fields, so a parked slot may lag until the
  * next save. */
 
+/* The per-buffer fields mirrored between the flat Editor and a Buf slot, listed
+ * once so buf_save and buf_load cannot fall out of sync. Adding a mirrored
+ * field means declaring it in both struct ebuf and struct editor, then adding
+ * one line here (scalars assign; fixed-size arrays copy by value). */
+#define BUF_STATE_SCALARS(X) \
+	X(t) X(has_name) X(cy) X(cx) X(top) X(left) X(sel_active) X(ay) X(ax) \
+	X(syn) X(line_state) X(line_state_cap) X(hl_valid) X(hex_view) \
+	X(hex_top) X(expand_tabs) X(vi_marks_set) X(swap_on) X(swap_rev) \
+	X(load_mtime)
+#define BUF_STATE_ARRAYS(X) \
+	X(path) X(vi_mark_y) X(vi_mark_x) X(swap_path)
+
 /* Copy the active buffer's per-file fields into a slot. */
 static void
 buf_save(Editor *e, Buf *b)
 {
-	b->t = e->t;
-	memcpy(b->path, e->path, sizeof(b->path));
-	b->has_name = e->has_name;
-	b->cy = e->cy;
-	b->cx = e->cx;
-	b->top = e->top;
-	b->left = e->left;
-	b->sel_active = e->sel_active;
-	b->ay = e->ay;
-	b->ax = e->ax;
-	b->syn = e->syn;
-	b->line_state = e->line_state;
-	b->line_state_cap = e->line_state_cap;
-	b->hl_valid = e->hl_valid;
-	b->hex_view = e->hex_view;
-	b->hex_top = e->hex_top;
-	b->expand_tabs = e->expand_tabs;
-	memcpy(b->vi_mark_y, e->vi_mark_y, sizeof(b->vi_mark_y));
-	memcpy(b->vi_mark_x, e->vi_mark_x, sizeof(b->vi_mark_x));
-	b->vi_marks_set = e->vi_marks_set;
-	memcpy(b->swap_path, e->swap_path, sizeof(b->swap_path));
-	b->swap_on = e->swap_on;
-	b->swap_rev = e->swap_rev;
-	b->load_mtime = e->load_mtime;
+#define CP(f) b->f = e->f;
+	BUF_STATE_SCALARS(CP)
+#undef CP
+#define CP(f) memcpy(b->f, e->f, sizeof(b->f));
+	BUF_STATE_ARRAYS(CP)
+#undef CP
 }
 
 /* Mirror a slot into the flat editor and drop any in-flight vi command. */
 static void
 buf_load(Editor *e, const Buf *b)
 {
-	e->t = b->t;
-	memcpy(e->path, b->path, sizeof(e->path));
-	e->has_name = b->has_name;
-	e->cy = b->cy;
-	e->cx = b->cx;
-	e->top = b->top;
-	e->left = b->left;
-	e->sel_active = b->sel_active;
-	e->ay = b->ay;
-	e->ax = b->ax;
-	e->syn = b->syn;
-	e->line_state = b->line_state;
-	e->line_state_cap = b->line_state_cap;
-	e->hl_valid = b->hl_valid;
-	e->hex_view = b->hex_view;
-	e->hex_top = b->hex_top;
-	e->expand_tabs = b->expand_tabs;
-	memcpy(e->vi_mark_y, b->vi_mark_y, sizeof(e->vi_mark_y));
-	memcpy(e->vi_mark_x, b->vi_mark_x, sizeof(e->vi_mark_x));
-	e->vi_marks_set = b->vi_marks_set;
-	memcpy(e->swap_path, b->swap_path, sizeof(e->swap_path));
-	e->swap_on = b->swap_on;
-	e->swap_rev = b->swap_rev;
-	e->load_mtime = b->load_mtime;
+#define CP(f) e->f = b->f;
+	BUF_STATE_SCALARS(CP)
+#undef CP
+#define CP(f) memcpy(e->f, b->f, sizeof(e->f));
+	BUF_STATE_ARRAYS(CP)
+#undef CP
 	e->vi_visual = 0;
 	e->vi_want_col = e->vi_vert_run = e->vi_vert_prev = 0;
 	e->hex_ascii = 0;
