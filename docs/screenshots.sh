@@ -102,6 +102,15 @@ EOF
 	printf '\n'
 } > "$work/term.txt"
 
+# A build command for C, so the context-sensitive Compile and Run menus are
+# present in the shots (they hide when no command is configured for the file).
+cat > "$work/veditrc" <<'EOF'
+[command "c"]
+    compile = cc -Wall -c $(filename)
+    build   = make
+    run     = ./$(filenoext)
+EOF
+
 # Run the X server in its own session so its lifetime is not tied to this
 # shell's process group, then wait for the socket to appear.
 setsid Xvfb "$disp" -screen 0 1600x1200x24 >/dev/null 2>&1 &
@@ -114,6 +123,7 @@ done
 export DISPLAY=$disp
 export TERM=xterm-256color COLORTERM=truecolor
 export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+export VEDIT_CONFIG=$work/veditrc
 
 # render OUT FILE KEYSTEP...   each KEYSTEP is one xdotool key invocation.
 render() {

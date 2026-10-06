@@ -574,13 +574,19 @@ terminal through OSC 52, so the internal clipboard and the terminal's stay in
 sync.
 
 The menu bar works the MS-EDIT way. Press F10 to activate it, then press a
-menu's highlighted letter (F, E, S, V, O, C, R, H) to open it, or use the arrow
-keys and Enter. Alt+letter opens a menu in one step, but note that many desktop
-terminal emulators capture Alt+letter for their own menus, so F10 then a letter
-is the reliable path. Inside an open menu, each item's highlighted letter runs
-it.
+menu's highlighted letter to open it, or use the arrow keys and Enter.
+Alt+letter opens a menu in one step, but note that many desktop terminal
+emulators capture Alt+letter for their own menus, so F10 then a letter is the
+reliable path. Inside an open menu, each item's highlighted letter runs it.
 
-![The Edit menu open, with the terminal-clipboard and retab commands](docs/shot-menu.png)
+The bar is context sensitive. An item that cannot act right now is grayed and
+skipped (Paste with an empty clipboard, Undo with nothing to undo, Next Error
+with no diagnostics). A whole menu is hidden when none of its items apply, so
+Compile and Run appear only once a build command is configured for the file's
+language, and the Terminal menu appears only when a terminal can be opened. The
+remaining menus stay put, so their letters do not move.
+
+![The Edit menu open, with grayed items that cannot act on a fresh buffer](docs/shot-menu.png)
 
 ### vi keys
 
@@ -761,7 +767,8 @@ runs that command instead, for example `:terminal make` or `:terminal htop`. The
 command is split on whitespace into an argument list and run directly, with no
 shell in between, so shell syntax such as pipes, redirection, or quoting does not
 apply. Wrap those in `sh -c '...'` yourself when you need them. `terminal`
-abbreviates to `:term`.
+abbreviates to `:term`. The **Terminal** menu (New Terminal / Close Terminal) is
+the menu-bar equivalent; it appears only on a host that multiplexes fds.
 
 ![A terminal buffer running a colored build, inside the editor frame](docs/shot-term.png)
 
