@@ -150,7 +150,10 @@ memio_poll_fds(void *ctx, int timeout_ms, const int *extra, int nextra,
 	return (m->inpos < m->inlen) ? 1 : 0;
 }
 
-static void
+/* Not every test that includes this header multiplexes fds (the torture suite,
+ * for one), so the terminal now being built by default leaves this unused in
+ * those units. */
+__attribute__((unused)) static void
 memio_enable_fds(struct vedit_io *io)
 {
 	io->poll_fds = memio_poll_fds;

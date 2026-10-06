@@ -43,6 +43,15 @@
 /* Public interface (struct vedit_io, enum vedit_box_mode, the embed API). */
 #include "vedit.h"
 
+/* The embedded VT terminal panel (shell / build output in a buffer) is built by
+ * default. A primitive embedding host that wants none of the PTY and emulator
+ * code opts out with -DVEDIT_NO_TERM. The feature's code is guarded by
+ * VEDIT_TERM throughout, so defining it here unless opted out keeps those
+ * guards unchanged. */
+#if !defined(VEDIT_NO_TERM) && !defined(VEDIT_TERM)
+#define VEDIT_TERM 1
+#endif
+
 /****************************************************************
  * Vendored: rx, a compact regular expression engine.
  *

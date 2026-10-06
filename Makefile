@@ -16,11 +16,12 @@ else
 CFLAGS += -g
 endif
 
-# Embedded VT terminal panel (shell / build output in a buffer). Off by default
-# so a primitive embedding host carries none of the PTY/emulator code. Opt in
-# with `make VEDIT_TERM=1`.
-ifdef VEDIT_TERM
-CFLAGS += -DVEDIT_TERM
+# Embedded VT terminal panel (shell / build output in a buffer) is built by
+# default (vedit.c defines VEDIT_TERM unless opted out). A primitive embedding
+# host that wants none of the PTY/emulator code opts out with
+# `make VEDIT_NO_TERM=1`.
+ifdef VEDIT_NO_TERM
+CFLAGS += -DVEDIT_NO_TERM
 endif
 
 TESTDIR  = tests
