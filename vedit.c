@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -5273,6 +5274,20 @@ typedef struct editor {
 	Cfg		*cfg_owned;	/* a config this editor reloaded and owns */
 } Editor;
 
+/* Set the one-line status message (printf-style). The single choke point for
+ * e->status, so every message is bounded by its size the same way. */
+static void set_status(Editor *e, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+static void
+set_status(Editor *e, const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(e->status, sizeof(e->status), fmt, ap);
+	va_end(ap);
+}
+
 /* Core helpers the vi personality relies on, defined in edit.c. */
 int text_height(const Editor *e);
 int disp_cols(const char *s, size_t nbytes);
@@ -5649,8 +5664,11 @@ text_load_fp(Text *t, FILE *fp)
 	}
 	free(data);
 
-	if (t->nlines == 0)
-		lines_insert_at(t, 0, "", 0);	/* empty file: one line */
+	if (t->nlines == 0 &&
+	    lines_insert_at(t, 0, "", 0) != OK) {	/* empty file: one line */
+		errno = ENOMEM;			/* keep the >=1 line invariant */
+		return ERR;
+	}
 	t->dirty = 0;
 	return OK;
 }
@@ -7953,13 +7971,13 @@ hex_overwrite(Editor *e, unsigned char v)
 	char b = (char)v;
 
 	if (off >= total) {		/* an empty buffer has nothing to edit */
-		snprintf(e->status, sizeof(e->status), "no byte to overwrite");
+		set_status(e, "no byte to overwrite");
 		return 0;
 	}
 	hex_pos_at(e->t, off, &cy, &cx);
 	len = text_line_len(e->t, cy);
 	if (cx >= len || v == '\n') {
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "newline bytes are structural (not editable yet)");
 		return 0;
 	}
@@ -8023,7 +8041,7 @@ hex_delete_at(Editor *e)
 	size_t cy, cx, len, nlines;
 
 	if (off >= total) {
-		snprintf(e->status, sizeof(e->status), "no byte to delete");
+		set_status(e, "no byte to delete");
 		return 0;
 	}
 	hex_pos_at(e->t, off, &cy, &cx);
@@ -8038,7 +8056,7 @@ hex_delete_at(Editor *e)
 		text_join(e->t, cy);
 		text_undo_group_end(e->t);
 	} else {
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "the trailing newline is not a deletable byte");
 		return 0;
 	}
@@ -8087,14 +8105,14 @@ hex_do_search(Editor *e, int dir)
 	size_t found;
 
 	if (e->hex_pat_len == 0) {
-		snprintf(e->status, sizeof(e->status), "no previous search");
+		set_status(e, "no previous search");
 		return;
 	}
 	if (hex_find(e->t, e->hex_pat, e->hex_pat_len, from, dir, &found)) {
 		hex_pos_at(e->t, found, &e->cy, &e->cx);
-		snprintf(e->status, sizeof(e->status), "found at %08zx", found);
+		set_status(e, "found at %08zx", found);
 	} else {
-		snprintf(e->status, sizeof(e->status), "pattern not found");
+		set_status(e, "pattern not found");
 	}
 }
 
@@ -8128,7 +8146,7 @@ hex_search_prompt(Editor *e, int ascii)
 			return;
 		if (hex_parse_bytes(buf, pat, sizeof(pat), &plen) != 0 ||
 		    plen == 0) {
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "enter hex byte pairs, e.g. 0a 0d");
 			return;
 		}
@@ -8167,7 +8185,7 @@ hex_yank(Editor *e)
 	unsigned char *buf;
 
 	if (total == 0) {
-		snprintf(e->status, sizeof(e->status), "nothing to yank");
+		set_status(e, "nothing to yank");
 		e->hex_sel = 0;
 		return;
 	}
@@ -8179,14 +8197,14 @@ hex_yank(Editor *e)
 	n = hi - lo + 1;
 	buf = malloc(n);
 	if (buf == NULL) {
-		snprintf(e->status, sizeof(e->status), "out of memory");
+		set_status(e, "out of memory");
 		return;
 	}
 	hex_gather(e->t, lo, buf, n);
 	clip_set(e, (char *)buf, n);
 	e->clip_linewise = 0;
 	e->hex_sel = 0;
-	snprintf(e->status, sizeof(e->status), "yanked %zu byte%s", n,
+	set_status(e, "yanked %zu byte%s", n,
 	    n == 1 ? "" : "s");
 }
 
@@ -8198,7 +8216,7 @@ hex_paste(Editor *e)
 	size_t off = hex_offset_of(e->t, e->cy, e->cx);
 
 	if (e->clip == NULL || e->clip_len == 0) {
-		snprintf(e->status, sizeof(e->status), "clipboard is empty");
+		set_status(e, "clipboard is empty");
 		return;
 	}
 	hex_pos_at(e->t, off, &e->cy, &e->cx);	/* land on a real position */
@@ -8207,7 +8225,7 @@ hex_paste(Editor *e)
 	text_undo_group_end(e->t);
 	e->hl_valid = 0;
 	e->hex_sel = 0;
-	snprintf(e->status, sizeof(e->status), "pasted %zu byte%s", e->clip_len,
+	set_status(e, "pasted %zu byte%s", e->clip_len,
 	    e->clip_len == 1 ? "" : "s");
 }
 
@@ -8349,14 +8367,14 @@ hex_key(Editor *e, const struct tkbd_seq *seq)
 		e->hex_pending = -1;
 		e->hex_cols = e->hex_cols == 8 ? 16 :
 		    e->hex_cols == 16 ? 32 : 8;
-		snprintf(e->status, sizeof(e->status), "%d bytes per row",
+		set_status(e, "%d bytes per row",
 		    e->hex_cols);
 		return REQ_CONTINUE;
 	}
 	if (ch == 'i') {		/* toggle the data-inspector footer */
 		e->hex_pending = -1;
 		e->hex_inspect = !e->hex_inspect;
-		snprintf(e->status, sizeof(e->status), "inspector %s",
+		set_status(e, "inspector %s",
 		    e->hex_inspect ? "on" : "off");
 		return REQ_CONTINUE;
 	}
@@ -8364,12 +8382,12 @@ hex_key(Editor *e, const struct tkbd_seq *seq)
 		e->hex_pending = -1;
 		if (e->hex_sel) {
 			e->hex_sel = 0;
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "selection cleared");
 		} else {
 			e->hex_sel = 1;
 			e->hex_anchor = off;
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "selecting from %08zx", off);
 		}
 		return REQ_CONTINUE;
@@ -9596,7 +9614,7 @@ ed_retab(Editor *e, int to_spaces)
 	n = ed_retab_range(e, lo, hi, to_spaces);
 	e->cx = 0;
 	clamp_col(e);
-	snprintf(e->status, sizeof(e->status), "%s: %d line%s changed",
+	set_status(e, "%s: %d line%s changed",
 	    to_spaces ? "tabs to spaces" : "spaces to tabs", n,
 	    n == 1 ? "" : "s");
 }
@@ -9841,17 +9859,17 @@ static void
 osc_copy(Editor *e, const char *bytes, size_t len, const char *what)
 {
 	if (len == 0) {
-		snprintf(e->status, sizeof(e->status), "nothing to copy");
+		set_status(e, "nothing to copy");
 		return;
 	}
 	if (len > OSC52_MAX) {
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "%s is too large for the terminal clipboard (%d bytes max)",
 		    what, OSC52_MAX);
 		return;
 	}
 	scr_set_clipboard(e->d, bytes, len);
-	snprintf(e->status, sizeof(e->status),
+	set_status(e,
 	    "copied %s to the terminal clipboard (%zu bytes)", what, len);
 }
 
@@ -9875,7 +9893,7 @@ osc_copy_selection(Editor *e)
 		len = ll;
 	}
 	if (!text) {
-		snprintf(e->status, sizeof(e->status), "out of memory");
+		set_status(e, "out of memory");
 		return;
 	}
 	osc_copy(e, text, len, e->sel_active ? "selection" : "line");
@@ -9890,13 +9908,13 @@ osc_copy_file(Editor *e)
 	char *text;
 
 	if (nlines == 0) {
-		snprintf(e->status, sizeof(e->status), "nothing to copy");
+		set_status(e, "nothing to copy");
 		return;
 	}
 	text_line(e->t, nlines - 1, &lastlen);
 	text = region_text(e, 0, 0, nlines - 1, lastlen, &len);
 	if (!text) {
-		snprintf(e->status, sizeof(e->status), "out of memory");
+		set_status(e, "out of memory");
 		return;
 	}
 	osc_copy(e, text, len, "file");
@@ -9960,7 +9978,7 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 	case CMD_UNDO:
 		e->sel_active = 0;	/* the buffer shifts under the anchor */
 		if (text_undo(e->t, &e->cy, &e->cx) != 0)
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "nothing to undo");
 		else {
 			hl_touch(e, 0);	/* an undo may touch any lines */
@@ -9970,7 +9988,7 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 	case CMD_REDO:
 		e->sel_active = 0;
 		if (text_redo(e->t, &e->cy, &e->cx) != 0)
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "nothing to redo");
 		else {
 			hl_touch(e, 0);
@@ -9985,7 +10003,7 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 			r = current_selection_text(e, &rl);
 			if (r) {
 				clip_set(e, r, rl);
-				snprintf(e->status, sizeof(e->status),
+				set_status(e,
 				    "copied %zu bytes", rl);
 			}
 		} else {
@@ -9998,7 +10016,7 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 					memcpy(r, s, ll);
 				r[ll] = '\n';
 				clip_set(e, r, ll + 1);
-				snprintf(e->status, sizeof(e->status),
+				set_status(e,
 				    "copied line");
 			}
 		}
@@ -10009,7 +10027,7 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 		char *r;
 
 		if (!e->sel_active) {
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "select text first (Shift+arrows)");
 			break;
 		}
@@ -10021,12 +10039,12 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 		sel_bounds(e, &y1, &x1, &y2, &x2);
 		delete_region(e, y1, x1, y2, x2);
 		e->sel_active = 0;
-		snprintf(e->status, sizeof(e->status), "cut %zu bytes", rl);
+		set_status(e, "cut %zu bytes", rl);
 		break;
 	}
 	case CMD_PASTE:
 		if (!e->clip || e->clip_len == 0) {
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "clipboard is empty");
 			break;
 		}
@@ -10356,19 +10374,19 @@ replace_prompt(Editor *e)
 
 	snprintf(pat, sizeof(pat), "%s", e->last_find);
 	if (!prompt_line(e, "Replace (regex): ", pat, sizeof(pat), 0)) {
-		snprintf(e->status, sizeof(e->status), "replace cancelled");
+		set_status(e, "replace cancelled");
 		return;
 	}
 	snprintf(repl, sizeof(repl), "%s", e->last_replace);
 	if (!prompt_line(e, "Replace with: ", repl, sizeof(repl), 1)) {
-		snprintf(e->status, sizeof(e->status), "replace cancelled");
+		set_status(e, "replace cancelled");
 		return;
 	}
 	if (pat[0] == '\0')
 		return;
 	re = rx_compile(pat, search_flags(e), &err);
 	if (!re) {
-		snprintf(e->status, sizeof(e->status), "bad pattern: %.80s", err);
+		set_status(e, "bad pattern: %.80s", err);
 		return;
 	}
 	snprintf(e->last_find, sizeof(e->last_find), "%s", pat);
@@ -10415,7 +10433,7 @@ replace_prompt(Editor *e)
 	}
 	text_undo_group_end(e->t);
 	rx_free(re);
-	snprintf(e->status, sizeof(e->status), "replaced %zu occurrence%s",
+	set_status(e, "replaced %zu occurrence%s",
 	    count, count == 1 ? "" : "s");
 }
 
@@ -10686,12 +10704,12 @@ swap_recover(Editor *e, const char *path, Text *t, time_t orig_mtime)
 		    text_load_fp(t, fp) == OK) {
 			t->dirty = 1;
 			fclose(fp);
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "recovered from swap; not yet saved");
 			return SWAP_RECOVERED;
 		}
 		fclose(fp);
-		snprintf(e->status, sizeof(e->status), "swap recovery failed");
+		set_status(e, "swap recovery failed");
 		return SWAP_OPEN;
 	case 'd':
 		fclose(fp);
@@ -10740,7 +10758,7 @@ save_editor(Editor *e)
 
 		name[0] = '\0';
 		if (!dlg_save_file(e, name, sizeof(name))) {
-			snprintf(e->status, sizeof(e->status), "save cancelled");
+			set_status(e, "save cancelled");
 			return -1;
 		}
 		snprintf(e->path, sizeof(e->path), "%s", name);
@@ -10750,11 +10768,11 @@ save_editor(Editor *e)
 	}
 
 	if (ed_save_file(e) < 0) {
-		snprintf(e->status, sizeof(e->status), "save failed: %s",
+		set_status(e, "save failed: %s",
 		    strerror(errno));
 		return -1;
 	}
-	snprintf(e->status, sizeof(e->status), "wrote %.120s", e->path);
+	set_status(e, "wrote %.120s", e->path);
 	return 0;
 }
 
@@ -10773,7 +10791,7 @@ ed_find_dir(Editor *e, const char *q, int dir)
 		return;
 	re = rx_compile(q, search_flags(e), &err);
 	if (!re) {
-		snprintf(e->status, sizeof(e->status), "bad pattern: %.80s", err);
+		set_status(e, "bad pattern: %.80s", err);
 		return;
 	}
 
@@ -10792,7 +10810,7 @@ ed_find_dir(Editor *e, const char *q, int dir)
 				e->cy = ln;
 				e->cx = so;
 				e->sel_active = 0;
-				snprintf(e->status, sizeof(e->status),
+				set_status(e,
 				    "found '%.80s' (line %zu)", q, ln + 1);
 				rx_free(re);
 				return;
@@ -10820,7 +10838,7 @@ ed_find_dir(Editor *e, const char *q, int dir)
 				e->cy = ln;
 				e->cx = so;
 				e->sel_active = 0;
-				snprintf(e->status, sizeof(e->status),
+				set_status(e,
 				    "found '%.80s' (line %zu)", q, ln + 1);
 				rx_free(re);
 				return;
@@ -10828,7 +10846,7 @@ ed_find_dir(Editor *e, const char *q, int dir)
 		}
 	}
 	rx_free(re);
-	snprintf(e->status, sizeof(e->status), "not found: %.80s", q);
+	set_status(e, "not found: %.80s", q);
 }
 
 void
@@ -10975,17 +10993,17 @@ incsearch(Editor *e, int dir, const char *label)
 			snprintf(e->last_find, sizeof(e->last_find), "%s", q);
 			e->vi_search_dir = dir;
 			if (found)
-				snprintf(e->status, sizeof(e->status),
+				set_status(e,
 				    "found '%.80s'", q);
 			else
-				snprintf(e->status, sizeof(e->status),
+				set_status(e,
 				    "not found: %.80s", q);
 			return;
 		}
 		if (seq.key == TKBD_KEY_ESC ||
 		    ((seq.mod & TKBD_MOD_CTRL) && seq.key == TKBD_KEY_C)) {
 			e->cy = oy, e->cx = ox, e->top = otop, e->left = oleft;
-			snprintf(e->status, sizeof(e->status), "search cancelled");
+			set_status(e, "search cancelled");
 			return;
 		}
 		if (seq.key == TKBD_KEY_BACKSPACE ||
@@ -11029,12 +11047,12 @@ goto_prompt(Editor *e)
 
 	buf[0] = '\0';
 	if (!dlg_prompt_line(e, "Go to line: ", buf, sizeof(buf))) {
-		snprintf(e->status, sizeof(e->status), "goto cancelled");
+		set_status(e, "goto cancelled");
 		return;
 	}
 	ln = strtol(buf, &end, 10);
 	if (end == buf || ln < 1) {
-		snprintf(e->status, sizeof(e->status), "bad line number");
+		set_status(e, "bad line number");
 		return;
 	}
 	if ((size_t)ln > text_lines(e->t))
@@ -11043,7 +11061,7 @@ goto_prompt(Editor *e)
 	e->cx = 0;
 	e->sel_active = 0;
 	clamp_col(e);
-	snprintf(e->status, sizeof(e->status), "line %ld", ln);
+	set_status(e, "line %ld", ln);
 }
 
 /* The key bindings, as shown by the help screen. Kept next to the keymap so
@@ -11629,11 +11647,11 @@ buf_open(Editor *e, const char *path)
 	}
 	nt = text_new();
 	if (!nt) {
-		snprintf(e->status, sizeof(e->status), "out of memory");
+		set_status(e, "out of memory");
 		return -1;
 	}
 	if (path && path[0] && text_load(nt, path) < 0 && errno != ENOENT) {
-		snprintf(e->status, sizeof(e->status), "open failed: %s",
+		set_status(e, "open failed: %s",
 		    strerror(errno));
 		text_free(nt);
 		return -1;
@@ -11652,7 +11670,7 @@ buf_open(Editor *e, const char *path)
 	i = buf_slot(e);
 	if (i < 0) {
 		text_free(nt);
-		snprintf(e->status, sizeof(e->status), "out of memory");
+		set_status(e, "out of memory");
 		return -1;
 	}
 	buf_save(e, &e->bufs[e->cur]);		/* park the current buffer */
@@ -11688,7 +11706,7 @@ buf_open(Editor *e, const char *path)
 	}
 	buf_save(e, &e->bufs[i]);		/* keep the slot consistent */
 	if (swap_action != SWAP_RECOVERED)
-		snprintf(e->status, sizeof(e->status), "%.120s [%d/%d]",
+		set_status(e, "%.120s [%d/%d]",
 		    e->has_name ? e->path : "new buffer", e->cur + 1, e->nbuf);
 	return i;
 }
@@ -12695,7 +12713,7 @@ cc_try_open(Editor *e, const char *path)
 		return -1;
 	if (ed_goto_target(e, norm, 0, NULL) != 0)
 		return -1;
-	snprintf(e->status, sizeof(e->status), "opened %.100s", norm);
+	set_status(e, "opened %.100s", norm);
 	return 0;
 }
 
@@ -12714,7 +12732,7 @@ ed_open_header(Editor *e)
 		return;
 	if (include_target(line, len, name, sizeof(name), &angle) == 0 &&
 	    cursor_path(e, name, sizeof(name)) == 0) {
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "no include or filename under cursor");
 		return;
 	}
@@ -12746,7 +12764,7 @@ ed_open_header(Editor *e)
 		if (cc_try_open(e, cand) == 0)
 			return;
 	}
-	snprintf(e->status, sizeof(e->status), "file not found: %.80s", name);
+	set_status(e, "file not found: %.80s", name);
 }
 
 /****************************************************************
@@ -13104,7 +13122,7 @@ ed_tag_pop(Editor *e)
 	Tagloc tl;
 
 	if (e->tag_sp == 0) {
-		snprintf(e->status, sizeof(e->status), "tag stack empty");
+		set_status(e, "tag stack empty");
 		return;
 	}
 	tl = e->tagstack[--e->tag_sp];
@@ -13116,7 +13134,7 @@ ed_tag_pop(Editor *e)
 	e->cx = tl.cx;
 	e->sel_active = 0;
 	clamp_col(e);
-	snprintf(e->status, sizeof(e->status), "%.100s:%zu  (%d on the tag stack)",
+	set_status(e, "%.100s:%zu  (%d on the tag stack)",
 	    tl.path, e->cy + 1, e->tag_sp);
 }
 
@@ -13135,16 +13153,16 @@ sym_goto(Editor *e, Sympick *sp, int i)
 		tagstack_push(e);		/* record where we jumped from */
 		tag_resolve(&sp->db, se->file_idx, target, sizeof(target));
 		if (ed_goto_target(e, target, se->line, se->pattern) == 0)
-			snprintf(e->status, sizeof(e->status), "%.40s  %.90s:%zu",
+			set_status(e, "%.40s  %.90s:%zu",
 			    se->name, target, e->cy + 1);
 		else
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "could not open %.100s", target);
 	} else if (se->line < text_lines(e->t)) {
 		e->cy = se->line;
 		e->cx = 0;
 		e->sel_active = 0;
-		snprintf(e->status, sizeof(e->status), "line %zu", se->line + 1);
+		set_status(e, "line %zu", se->line + 1);
 	}
 }
 
@@ -13169,13 +13187,13 @@ symbol_pick_filtered(Editor *e, const char *want, const char *sub,
 	symscan(&sp);
 	if (sp.n == 0) {
 		if (want)
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "tag not found: %.60s", want);
 		else if (sub)
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "no symbols match: %.60s", sub);
 		else
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "no symbols found");
 		goto done;
 	}
@@ -13231,7 +13249,7 @@ ed_tag_under_cursor(Editor *e)
 	char word[80];
 
 	if (cursor_word(e, word, sizeof(word)) == 0) {
-		snprintf(e->status, sizeof(e->status), "no identifier under cursor");
+		set_status(e, "no identifier under cursor");
 		return;
 	}
 	symbol_pick_filtered(e, word, NULL, 1);
@@ -13246,7 +13264,7 @@ ed_new(Editor *e)
 		return;
 	nt = text_new();
 	if (!nt) {
-		snprintf(e->status, sizeof(e->status), "out of memory");
+		set_status(e, "out of memory");
 		return;
 	}
 	text_free(e->t);
@@ -13256,7 +13274,7 @@ ed_new(Editor *e)
 	e->syn = NULL;
 	buffer_reset(e);
 	buf_save(e, &e->bufs[e->cur]);
-	snprintf(e->status, sizeof(e->status), "new buffer");
+	set_status(e, "new buffer");
 }
 
 /****************************************************************
@@ -13524,11 +13542,11 @@ ed_open(Editor *e)
 		return;
 	nt = text_new();
 	if (!nt) {
-		snprintf(e->status, sizeof(e->status), "out of memory");
+		set_status(e, "out of memory");
 		return;
 	}
 	if (text_load(nt, path) < 0 && errno != ENOENT) {
-		snprintf(e->status, sizeof(e->status), "open failed: %s",
+		set_status(e, "open failed: %s",
 		    strerror(errno));
 		text_free(nt);
 		return;
@@ -13552,7 +13570,7 @@ ed_open(Editor *e)
 		swap_adopt(e, mt, action);
 		buf_save(e, &e->bufs[e->cur]);
 		if (action != SWAP_RECOVERED)
-			snprintf(e->status, sizeof(e->status), "opened %.100s",
+			set_status(e, "opened %.100s",
 			    path);
 	}
 }
@@ -13584,13 +13602,13 @@ toggle_vi(Editor *e)
 		e->sel_active = 0;
 		vi_reset_pending(e);
 		vi_clamp(e);
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "-- NORMAL -- (F2 returns to modeless)");
 	} else {
 		e->mode = MODE_MODELESS;
 		e->sel_active = 0;
 		vi_reset_pending(e);
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "modeless mode (F2 for vi keys)");
 	}
 }
@@ -14077,7 +14095,7 @@ tool_goto_err(Editor *e, int ei)
 	e->sel_active = 0;
 	clamp_col(e);
 	e->tool_curerr = ei;
-	snprintf(e->status, sizeof(e->status), "%s %d/%d: %.120s:%zu",
+	set_status(e, "%s %d/%d: %.120s:%zu",
 	    tool_sev_name(te->sev), ei + 1, e->tool_nerr, te->file, te->line);
 	return 0;
 }
@@ -14131,7 +14149,7 @@ ed_err_step(Editor *e, int dir)
 	int floor, start, idx, i, wrapped = 0;
 
 	if (e->tool_nerr == 0) {
-		snprintf(e->status, sizeof(e->status), "no diagnostics");
+		set_status(e, "no diagnostics");
 		return;
 	}
 	floor = tool_nav_floor(e);
@@ -14194,7 +14212,7 @@ dlg_tool_output(Editor *e)
 	int cur = 0, top = 0;
 
 	if (e->tool_nlines == 0) {
-		snprintf(e->status, sizeof(e->status), "no output to show");
+		set_status(e, "no output to show");
 		return;
 	}
 	if (e->tool_nerr > 0)
@@ -14328,7 +14346,7 @@ ed_tool_run(Editor *e, const char *which, const char *label)
 
 	if (!e->tools ||
 	    (!e->tools->run_capture && !e->tools->run_foreground)) {
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "building is not available");
 		return;
 	}
@@ -14338,7 +14356,7 @@ ed_tool_run(Editor *e, const char *which, const char *label)
 	}
 	tmpl = tool_template(e, which);
 	if (!tmpl || !tmpl[0]) {
-		snprintf(e->status, sizeof(e->status), "no %s command for %s",
+		set_status(e, "no %s command for %s",
 		    which, tool_lang(e) ? tool_lang(e) : "this file type");
 		return;
 	}
@@ -14349,13 +14367,13 @@ ed_tool_run(Editor *e, const char *which, const char *label)
 			if (save_editor(e) != 0)
 				return;
 		} else if (k != 'n') {
-			snprintf(e->status, sizeof(e->status), "cancelled");
+			set_status(e, "cancelled");
 			return;
 		}
 	}
 	cmd = tool_expand(tmpl, e->path);
 	if (!cmd) {
-		snprintf(e->status, sizeof(e->status), "out of memory");
+		set_status(e, "out of memory");
 		return;
 	}
 	tool_build_dir(e, dir, sizeof(dir));
@@ -14367,10 +14385,10 @@ ed_tool_run(Editor *e, const char *which, const char *label)
 		rc = e->tools->run_foreground(e->tools->ctx, cmd, dir);
 		scr_begin(e->d);		/* re-enter; forces a full repaint */
 		if (rc < 0)
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "could not run: %.80s", cmd);
 		else
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "%s finished (exit %d)", label, rc);
 	} else if (e->tools->run_capture) {
 		int fe, ne, nw;
@@ -14387,14 +14405,14 @@ ed_tool_run(Editor *e, const char *which, const char *label)
 		dlg_tool_output(e);
 		tool_counts(e, &ne, &nw);
 		if (rc < 0)
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "could not run: %.80s", cmd);
 		else
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "%s exited %d, %d error%s, %d warning%s", label, rc,
 			    ne, ne == 1 ? "" : "s", nw, nw == 1 ? "" : "s");
 	} else {
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "this command is interactive but no tty runner is set");
 	}
 	free(cmd);
@@ -14509,7 +14527,7 @@ run_menu_act(Editor *e, Menuact act)
 		if (e->last_find[0])
 			ed_find(e, e->last_find);
 		else
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "no previous search");
 		break;
 	case MA_REPLACE:
@@ -14530,27 +14548,27 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_SYNTAX:
 		e->hl_on = !e->hl_on;
 		e->hl_valid = 0;
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "syntax highlight %s", e->hl_on ? "on" : "off");
 		break;
 	case MA_SCHEME: {
 		static const char *const names[] = { "DOS", "black", "plain" };
 
 		e->scheme = (e->scheme + 1) % SCHEME_COUNT;
-		snprintf(e->status, sizeof(e->status), "%s colors",
+		set_status(e, "%s colors",
 		    names[e->scheme]);
 		break;
 	}
 	case MA_LINENO:
 		e->show_lineno = !e->show_lineno;
-		snprintf(e->status, sizeof(e->status), "line numbers %s",
+		set_status(e, "line numbers %s",
 		    e->show_lineno ? "on" : "off");
 		break;
 	case MA_WRAP:
 		e->wrap = !e->wrap;
 		if (e->wrap)
 			e->left = 0;
-		snprintf(e->status, sizeof(e->status), "word wrap %s",
+		set_status(e, "word wrap %s",
 		    e->wrap ? "on" : "off");
 		break;
 	case MA_EOL: {
@@ -14558,23 +14576,23 @@ run_menu_act(Editor *e, Menuact act)
 		int next = (text_eol(e->t) + 1) % 3;
 
 		text_set_eol(e->t, next);
-		snprintf(e->status, sizeof(e->status), "line endings: %s",
+		set_status(e, "line endings: %s",
 		    eol_name(next));
 		break;
 	}
 	case MA_SHOW_TABS:
 		e->show_tabs = !e->show_tabs;
-		snprintf(e->status, sizeof(e->status), "show tabs %s",
+		set_status(e, "show tabs %s",
 		    e->show_tabs ? "on" : "off");
 		break;
 	case MA_AUTO_INDENT:
 		e->auto_indent = !e->auto_indent;
-		snprintf(e->status, sizeof(e->status), "auto-indent %s",
+		set_status(e, "auto-indent %s",
 		    e->auto_indent ? "on" : "off");
 		break;
 	case MA_EXPAND_TABS:
 		e->expand_tabs = !e->expand_tabs;
-		snprintf(e->status, sizeof(e->status), "indent with %s",
+		set_status(e, "indent with %s",
 		    e->expand_tabs ? "spaces" : "tabs");
 		break;
 	case MA_TABS_TO_SPACES:
@@ -14590,7 +14608,7 @@ run_menu_act(Editor *e, Menuact act)
 		e->hex_pending = -1;
 		e->hex_insert = 0;
 		e->hex_sel = 0;
-		snprintf(e->status, sizeof(e->status), "%s view",
+		set_status(e, "%s view",
 		    e->hex_view ? "hex" : "text");
 		break;
 	case MA_DRAW:
@@ -15091,7 +15109,7 @@ draw_block_copy(Editor *e)
 	e->clip_len = off;
 	e->clip_block = 1;
 	e->clip_linewise = 0;
-	snprintf(e->status, sizeof(e->status), "copied %zux%zu block",
+	set_status(e, "copied %zux%zu block",
 	    w, y2 - y1 + 1);
 }
 
@@ -15230,7 +15248,7 @@ draw_block_box(Editor *e)
 	}
 	text_undo_group_end(e->t);
 	e->sel_active = 0;
-	snprintf(e->status, sizeof(e->status), "boxed %zux%zu",
+	set_status(e, "boxed %zux%zu",
 	    x2 - x1 + 1, y2 - y1 + 1);
 }
 
@@ -15244,10 +15262,10 @@ draw_toggle(Editor *e)
 	if (e->draw_mode) {
 		if (e->mode == MODE_INSERT)
 			e->mode = MODE_NORMAL;
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "-- DRAW -- Insert exits; type overwrites, arrows roam free");
 	} else {
-		snprintf(e->status, sizeof(e->status), "draw mode off");
+		set_status(e, "draw mode off");
 	}
 }
 
@@ -15489,12 +15507,12 @@ editor_loop(Editor *e)
 				e->sel_active = 0;
 				vi_reset_pending(e);
 				vi_clamp(e);
-				snprintf(e->status, sizeof(e->status),
+				set_status(e,
 				    "-- NORMAL -- (F2 returns to modeless)");
 			} else {
 				e->mode = MODE_MODELESS;
 				vi_reset_pending(e);
-				snprintf(e->status, sizeof(e->status),
+				set_status(e,
 				    "modeless mode (F2 for vi keys)");
 			}
 			ed_render(e, e->d);
@@ -15786,17 +15804,17 @@ ed_reload_config(Editor *e)
 	Cfg *nc;
 
 	if (e->cfg_path[0] == '\0') {
-		snprintf(e->status, sizeof(e->status), "no config file to reload");
+		set_status(e, "no config file to reload");
 		return;
 	}
 	nc = vedit_cfg_new();
 	if (!nc) {
-		snprintf(e->status, sizeof(e->status), "out of memory");
+		set_status(e, "out of memory");
 		return;
 	}
 	if (vedit_cfg_load(nc, e->cfg_path) != 0) {
 		vedit_cfg_free(nc);
-		snprintf(e->status, sizeof(e->status), "cannot read config: %.80s",
+		set_status(e, "cannot read config: %.80s",
 		    e->cfg_path);
 		return;
 	}
@@ -15813,7 +15831,7 @@ ed_reload_config(Editor *e)
 	ed_apply_config(e);
 	vedit_cfg_free(e->cfg_owned);	/* free the previous reload, if any */
 	e->cfg_owned = nc;
-	snprintf(e->status, sizeof(e->status), "config reloaded");
+	set_status(e, "config reloaded");
 }
 
 /* Hand the editor a parsed configuration (see vedit_cfg_load). It is borrowed,
@@ -15885,7 +15903,7 @@ vedit_run(struct vedit *v)
 		v->registered = 1;
 	}
 	scr_begin(e->d);
-	snprintf(e->status, sizeof(e->status), "Press F1 for help");
+	set_status(e, "Press F1 for help");
 	/* The screen is up now, so the initial file can prompt for recovery
 	 * if a swap from a previous crashed session sits beside it. */
 	if (e->has_name) {
@@ -17492,7 +17510,7 @@ vi_block_delete(Editor *e)
 	e->cy = y1;
 	e->cx = x1;
 	vi_clamp(e);
-	snprintf(e->status, sizeof(e->status), "deleted %zux%zu block",
+	set_status(e, "deleted %zux%zu block",
 	    x2 - x1 + 1, y2 - y1 + 1);
 }
 
@@ -17611,7 +17629,7 @@ vi_block_put(Editor *e, int after)
 	text_undo_group_end(e->t);
 	e->cx = col;
 	vi_clamp(e);
-	snprintf(e->status, sizeof(e->status), "pasted block");
+	set_status(e, "pasted block");
 }
 
 static void
@@ -17623,7 +17641,7 @@ vi_put(Editor *e, int after)
 
 	vi_reg_get(e, &clip, &clip_len, &linewise);
 	if (!clip || clip_len == 0) {
-		snprintf(e->status, sizeof(e->status), "clipboard is empty");
+		set_status(e, "clipboard is empty");
 		e->vi_reg = 0;
 		return;
 	}
@@ -18213,7 +18231,7 @@ vi_do_mark(Editor *e, char cmd, int idx)
 		return REQ_CONTINUE;
 	}
 	if (!(e->vi_marks_set & ((uint32_t)1 << idx))) {
-		snprintf(e->status, sizeof(e->status), "E20: mark not set");
+		set_status(e, "E20: mark not set");
 		vi_reset_pending(e);
 		return REQ_CONTINUE;
 	}
@@ -18395,10 +18413,10 @@ vi_search_word(Editor *e, int dir)
 	size_t len = 0;
 	const char *s = text_line(e->t, e->cy, &len);
 	size_t x = e->cx, start, end, wl;
-	char word[256];
+	char word[250];		/* +"\<" "\>" +NUL still fits e->last_find[256] */
 
 	if (!s || len == 0) {
-		snprintf(e->status, sizeof(e->status), "no word under cursor");
+		set_status(e, "no word under cursor");
 		return;
 	}
 	while (x < len) {			/* find a word char on the line */
@@ -18410,7 +18428,7 @@ vi_search_word(Editor *e, int dir)
 		x += (size_t)(n > 0 ? n : 1);
 	}
 	if (x >= len) {
-		snprintf(e->status, sizeof(e->status), "no word under cursor");
+		set_status(e, "no word under cursor");
 		return;
 	}
 	start = x;
@@ -18551,12 +18569,12 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 		if (c == 'Z') {			/* write if modified, then quit */
 			if (text_dirty(e->t)) {
 				if (!e->has_name) {
-					snprintf(e->status, sizeof(e->status),
+					set_status(e,
 					    "E32: no file name");
 					return REQ_CONTINUE;
 				}
 				if (ed_save_file(e) < 0) {
-					snprintf(e->status, sizeof(e->status),
+					set_status(e,
 					    "save failed: %s",
 					    strerror(errno));
 					return REQ_CONTINUE;
@@ -18601,7 +18619,7 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 			e->sel_active = 0;
 			e->vi_suppress_dot = 1;		/* redo is not a '.' */
 			if (text_redo(e->t, &e->cy, &e->cx) != 0)
-				snprintf(e->status, sizeof(e->status),
+				set_status(e,
 				    "nothing to redo");
 			else {
 				hl_touch(e, 0);
@@ -18900,7 +18918,7 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 		e->sel_active = 0;
 		e->vi_suppress_dot = 1;			/* undo is not a '.' */
 		if (text_undo(e->t, &e->cy, &e->cx) != 0)
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "nothing to undo");
 		else {
 			hl_touch(e, 0);
@@ -18917,7 +18935,7 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 		if (e->last_find[0])
 			ed_find_dir(e, e->last_find, dir);
 		else
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "no previous search");
 		return REQ_CONTINUE;
 	}
@@ -19334,7 +19352,7 @@ vi_dot_replay(Editor *e)
 	int i, n = e->vi_dot.len;
 
 	if (n == 0) {
-		snprintf(e->status, sizeof(e->status), "nothing to repeat");
+		set_status(e, "nothing to repeat");
 		return;
 	}
 	e->vi_cmd_open = 0;		/* keep this repeat out of the recording */
@@ -19457,7 +19475,7 @@ vi_ex_substitute(Editor *e, size_t lo, size_t hi, const char *args)
 	rx_t *re;
 
 	if (!is_ex_delim(delim)) {
-		snprintf(e->status, sizeof(e->status), "E146: missing separator");
+		set_status(e, "E146: missing separator");
 		return REQ_CONTINUE;
 	}
 	while (*p && *p != delim) {			/* pattern */
@@ -19483,13 +19501,13 @@ vi_ex_substitute(Editor *e, size_t lo, size_t hi, const char *args)
 
 	use = pat[0] ? pat : e->last_find;
 	if (!use || !use[0]) {
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "E35: no previous regular expression");
 		return REQ_CONTINUE;
 	}
 	re = rx_compile(use, search_flags(e), &err);
 	if (!re) {
-		snprintf(e->status, sizeof(e->status), "bad pattern: %.80s", err);
+		set_status(e, "bad pattern: %.80s", err);
 		return REQ_CONTINUE;
 	}
 	if (pat[0])
@@ -19511,12 +19529,12 @@ vi_ex_substitute(Editor *e, size_t lo, size_t hi, const char *args)
 	rx_free(re);
 
 	if (subs == 0)
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "pattern not found: %.60s", use);
 	else {
 		e->cx = first_nonblank(e, e->cy);
 		vi_clamp(e);
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "%d substitution%s on %d line%s", subs,
 		    subs == 1 ? "" : "s", lines, lines == 1 ? "" : "s");
 	}
@@ -19538,7 +19556,7 @@ vi_ex_global(Editor *e, size_t lo, size_t hi, int had_range,
 
 	delim = *p;
 	if (!is_ex_delim(delim)) {
-		snprintf(e->status, sizeof(e->status), "E146: missing pattern");
+		set_status(e, "E146: missing pattern");
 		return REQ_CONTINUE;
 	}
 	p++;
@@ -19556,13 +19574,13 @@ vi_ex_global(Editor *e, size_t lo, size_t hi, int had_range,
 
 	use = pat[0] ? pat : e->last_find;
 	if (!use || !use[0]) {
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "E35: no previous regular expression");
 		return REQ_CONTINUE;
 	}
 	re = rx_compile(use, search_flags(e), &err);
 	if (!re) {
-		snprintf(e->status, sizeof(e->status), "bad pattern: %.80s", err);
+		set_status(e, "bad pattern: %.80s", err);
 		return REQ_CONTINUE;
 	}
 	if (pat[0])
@@ -19601,13 +19619,13 @@ vi_ex_global(Editor *e, size_t lo, size_t hi, int had_range,
 	} else {
 		text_undo_group_end(e->t);
 		free(rows);
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "unsupported :g command: %.40s", sub);
 		return REQ_CONTINUE;
 	}
 	text_undo_group_end(e->t);
 
-	snprintf(e->status, sizeof(e->status), "%zu line%s matched", nrows,
+	set_status(e, "%zu line%s matched", nrows,
 	    nrows == 1 ? "" : "s");
 	free(rows);
 	e->cx = first_nonblank(e, e->cy);
@@ -19739,16 +19757,16 @@ vi_ex_read_file(Editor *e, size_t at, const char *fn)
 	size_t nlines, i, total, off;
 
 	if (*fn == '\0') {
-		snprintf(e->status, sizeof(e->status), "E32: no file name");
+		set_status(e, "E32: no file name");
 		return REQ_CONTINUE;
 	}
 	nt = text_new();
 	if (!nt) {
-		snprintf(e->status, sizeof(e->status), "out of memory");
+		set_status(e, "out of memory");
 		return REQ_CONTINUE;
 	}
 	if (text_load(nt, fn) < 0) {
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "E484: cannot open %.80s", fn);
 		text_free(nt);
 		return REQ_CONTINUE;
@@ -19764,7 +19782,7 @@ vi_ex_read_file(Editor *e, size_t at, const char *fn)
 		total += nlines - 1;		/* separators between lines */
 	bytes = malloc(total);
 	if (!bytes) {
-		snprintf(e->status, sizeof(e->status), "out of memory");
+		set_status(e, "out of memory");
 		text_free(nt);
 		return REQ_CONTINUE;
 	}
@@ -19794,7 +19812,7 @@ vi_ex_read_file(Editor *e, size_t at, const char *fn)
 	e->hl_valid = 0;
 	vi_clamp(e);
 
-	snprintf(e->status, sizeof(e->status), "\"%.80s\" %zu line%s", fn,
+	set_status(e, "\"%.80s\" %zu line%s", fn,
 	    nlines, nlines == 1 ? "" : "s");
 	free(bytes);
 	text_free(nt);
@@ -19827,7 +19845,7 @@ ex_set(Editor *e, const char *arg)
 			e->show_tabs = !e->show_tabs;
 		else
 			e->show_tabs = 1;
-		snprintf(e->status, sizeof(e->status), "show tabs %s",
+		set_status(e, "show tabs %s",
 		    e->show_tabs ? "on" : "off");
 		return REQ_CONTINUE;
 	} else if (strcmp(arg, "autoindent") == 0 || strcmp(arg, "ai") == 0 ||
@@ -19840,7 +19858,7 @@ ex_set(Editor *e, const char *arg)
 			e->auto_indent = !e->auto_indent;
 		else
 			e->auto_indent = 1;
-		snprintf(e->status, sizeof(e->status), "auto-indent %s",
+		set_status(e, "auto-indent %s",
 		    e->auto_indent ? "on" : "off");
 		return REQ_CONTINUE;
 	} else if (strcmp(arg, "expandtab") == 0 || strcmp(arg, "et") == 0 ||
@@ -19853,7 +19871,7 @@ ex_set(Editor *e, const char *arg)
 			e->expand_tabs = !e->expand_tabs;
 		else
 			e->expand_tabs = 1;
-		snprintf(e->status, sizeof(e->status), "indent with %s",
+		set_status(e, "indent with %s",
 		    e->expand_tabs ? "spaces" : "tabs");
 		return REQ_CONTINUE;
 	} else if (strcmp(arg, "swapfile") == 0 || strcmp(arg, "swf") == 0 ||
@@ -19868,7 +19886,7 @@ ex_set(Editor *e, const char *arg)
 				swap_remove(e);
 		} else
 			e->swap_enabled = 1;
-		snprintf(e->status, sizeof(e->status), "swap file %s",
+		set_status(e, "swap file %s",
 		    e->swap_enabled ? "on" : "off");
 		return REQ_CONTINUE;
 	} else if (strcmp(arg, "backup") == 0 || strcmp(arg, "bk") == 0 ||
@@ -19880,7 +19898,7 @@ ex_set(Editor *e, const char *arg)
 			e->backup_enabled = !e->backup_enabled;
 		else
 			e->backup_enabled = 1;
-		snprintf(e->status, sizeof(e->status), "backup %s",
+		set_status(e, "backup %s",
 		    e->backup_enabled ? "on" : "off");
 		return REQ_CONTINUE;
 	} else if (strcmp(arg, "ignorecase") == 0 || strcmp(arg, "ic") == 0 ||
@@ -19895,7 +19913,7 @@ ex_set(Editor *e, const char *arg)
 			e->search_icase = !e->search_icase;
 		else
 			e->search_icase = 1;
-		snprintf(e->status, sizeof(e->status), "ignorecase %s",
+		set_status(e, "ignorecase %s",
 		    e->search_icase ? "on" : "off");
 		return REQ_CONTINUE;
 	} else if (strncmp(arg, "ff=", 3) == 0 ||
@@ -19910,26 +19928,26 @@ ex_set(Editor *e, const char *arg)
 		else if (strcmp(val, "nul") == 0)
 			eol = EOL_NUL;
 		else {
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "E474: invalid fileformat: %.20s", val);
 			return REQ_CONTINUE;
 		}
 		text_set_eol(e->t, eol);
-		snprintf(e->status, sizeof(e->status), "fileformat=%s",
+		set_status(e, "fileformat=%s",
 		    eol_name(eol));
 		return REQ_CONTINUE;
 	} else {
-		snprintf(e->status, sizeof(e->status),
+		set_status(e,
 		    "E518: unknown option: %.40s", arg);
 		return REQ_CONTINUE;
 	}
 	if (e->wrap)
 		e->left = 0;
 	if (strstr(arg, "wrap"))
-		snprintf(e->status, sizeof(e->status), "word wrap %s",
+		set_status(e, "word wrap %s",
 		    e->wrap ? "on" : "off");
 	else
-		snprintf(e->status, sizeof(e->status), "line numbers %s",
+		set_status(e, "line numbers %s",
 		    e->show_lineno ? "on" : "off");
 	return REQ_CONTINUE;
 }
@@ -19947,7 +19965,7 @@ ex_syntax(Editor *e, const char *arg)
 		const Syntax *sy = syn_for_ext(arg);
 
 		if (!sy) {
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "no syntax for '%.40s'", arg);
 			return REQ_CONTINUE;
 		}
@@ -20052,11 +20070,11 @@ static int
 ex_write_current(Editor *e)
 {
 	if (!e->has_name) {
-		snprintf(e->status, sizeof(e->status), "E32: no file name");
+		set_status(e, "E32: no file name");
 		return -1;
 	}
 	if (ed_save_file(e) < 0) {
-		snprintf(e->status, sizeof(e->status), "save failed: %s",
+		set_status(e, "save failed: %s",
 		    strerror(errno));
 		return -1;
 	}
@@ -20083,7 +20101,7 @@ vi_ex_exec(Editor *e, char *buf)
 	after = p;
 	rr = vi_ex_parse_range(e, &after, &lo, &hi);
 	if (rr < 0) {
-		snprintf(e->status, sizeof(e->status), "E16: invalid range");
+		set_status(e, "E16: invalid range");
 		return REQ_CONTINUE;
 	}
 	while (*after == ' ')
@@ -20128,7 +20146,7 @@ vi_ex_exec(Editor *e, char *buf)
 			rest++;
 		}
 		if (!is_ex_delim(*rest)) {
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "E146: missing pattern");
 			return REQ_CONTINUE;
 		}
@@ -20164,7 +20182,7 @@ vi_ex_exec(Editor *e, char *buf)
 			return REQ_CONTINUE;
 		}
 		if (!e->has_name) {		/* :e -- reload the current file */
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "E32: no file name");
 			return REQ_CONTINUE;
 		}
@@ -20172,12 +20190,12 @@ vi_ex_exec(Editor *e, char *buf)
 			Text *nt = text_new();
 
 			if (!nt) {
-				snprintf(e->status, sizeof(e->status),
+				set_status(e,
 				    "out of memory");
 				return REQ_CONTINUE;
 			}
 			if (text_load(nt, e->path) < 0) {
-				snprintf(e->status, sizeof(e->status),
+				set_status(e,
 				    "reload failed: %s", strerror(errno));
 				text_free(nt);
 				return REQ_CONTINUE;
@@ -20187,7 +20205,7 @@ vi_ex_exec(Editor *e, char *buf)
 			e->cy = e->cx = e->top = e->left = 0;
 			e->sel_active = 0;
 			e->hl_valid = 0;
-			snprintf(e->status, sizeof(e->status), "reloaded %.100s",
+			set_status(e, "reloaded %.100s",
 			    e->path);
 		}
 		return REQ_CONTINUE;
@@ -20200,7 +20218,7 @@ vi_ex_exec(Editor *e, char *buf)
 			e->has_name = 1;
 		}
 		if (ex_write_current(e) == 0)
-			snprintf(e->status, sizeof(e->status), "wrote %.120s",
+			set_status(e, "wrote %.120s",
 			    e->path);
 		return REQ_CONTINUE;
 	case EX_WQ:
@@ -20210,14 +20228,14 @@ vi_ex_exec(Editor *e, char *buf)
 		return REQ_FORCE_QUIT;
 	case EX_QUIT:
 		if (!bang && text_dirty(e->t)) {
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "E37: no write since last change (:q! overrides)");
 			return REQ_CONTINUE;
 		}
 		return REQ_FORCE_QUIT;
 	case EX_QALL:
 		if (!bang && text_dirty(e->t)) {
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "E37: no write since last change (add ! to override)");
 			return REQ_CONTINUE;
 		}
@@ -20239,13 +20257,13 @@ vi_ex_exec(Editor *e, char *buf)
 		long n;
 
 		if (*rest < '0' || *rest > '9') {
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "E471: argument required");
 			return REQ_CONTINUE;
 		}
 		n = strtol(rest, NULL, 10);
 		if (n < 1 || n > e->nbuf)
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "E86: no buffer %ld", n);
 		else
 			buf_switch(e, (int)(n - 1));
@@ -20259,12 +20277,12 @@ vi_ex_exec(Editor *e, char *buf)
 		return REQ_CONTINUE;
 	case EX_BDELETE:
 		if (!bang && text_dirty(e->t)) {
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "E89: no write since last change (add ! to override)");
 			return REQ_CONTINUE;
 		}
 		if (buf_close(e, e->cur) < 0)
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "cannot close the last buffer");
 		return REQ_CONTINUE;
 	case EX_TAG:
@@ -20273,7 +20291,7 @@ vi_ex_exec(Editor *e, char *buf)
 		else if (*rest)
 			symbol_pick_filtered(e, rest, NULL, 1);
 		else
-			snprintf(e->status, sizeof(e->status),
+			set_status(e,
 			    "E471: argument required");
 		return REQ_CONTINUE;
 	case EX_POP:
@@ -20293,7 +20311,7 @@ vi_ex_exec(Editor *e, char *buf)
 	}
 
 unknown:
-	snprintf(e->status, sizeof(e->status), "E492: not an editor command: "
+	set_status(e, "E492: not an editor command: "
 	    "%.80s", after);
 	return REQ_CONTINUE;
 }
