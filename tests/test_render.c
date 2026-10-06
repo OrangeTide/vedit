@@ -1245,8 +1245,38 @@ fake_foreground(void *ctx, const char *cmd, const char *dir)
 	return 0;
 }
 
+static int g_fake_filter_rc;		/* exit status run_filter returns */
+static int g_fake_filter_called;	/* run_filter was invoked */
+
+/* A fake format filter: uppercases whatever it is fed, so a test can see the
+ * buffer go through it. A nonzero g_fake_filter_rc simulates a failing
+ * formatter (emitting nothing). */
+static int
+fake_filter(void *ctx, const char *cmd, const char *dir,
+    const char *input, size_t inlen,
+    void (*emit)(void *sink, const char *buf, size_t n), void *sink)
+{
+	size_t i;
+	char *up;
+
+	(void)ctx;
+	(void)dir;
+	g_fake_filter_called = 1;
+	snprintf(g_fake_cmd, sizeof(g_fake_cmd), "%s", cmd);
+	if (g_fake_filter_rc != 0)
+		return g_fake_filter_rc;
+	up = malloc(inlen ? inlen : 1);
+	if (!up)
+		return -1;
+	for (i = 0; i < inlen; i++)
+		up[i] = (char)toupper((unsigned char)input[i]);
+	emit(sink, up, inlen);
+	free(up);
+	return 0;
+}
+
 static const struct vedit_tool_api fake_tools = {
-	NULL, fake_capture, fake_foreground,
+	NULL, fake_capture, fake_foreground, fake_filter,
 };
 
 /* On exit the editor parks the cursor on the last row and scrolls up one, so a
@@ -1416,6 +1446,104 @@ t_tool_ctrl_f9_run(Test *t)
 	memio_free(&m);
 	g_cfg = NULL;			/* see t_tool_f9_make */
 	vedit_cfg_free(cfg);
+}
+
+/* :format / the Format menu item pipe the buffer through command.<lang>.format
+ * and replace it with the result; a failing formatter leaves the buffer alone. */
+static void
+t_format(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Cfg *cfg;
+	const char *s;
+	size_t len = 0;
+
+	cfg = cfg_from_text("[command \"c\"]\n\tformat = fmt\n");
+	TAP_ASSERT(t, cfg != NULL);
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config(v, cfg);
+	vedit_set_tools(v, &fake_tools);
+	vedit_open(v, "x.c");			/* new named .c buffer: lang c */
+	text_insert(v->e.t, 0, 0, "abc", 3);
+
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_FORMAT));	/* formatter ready */
+
+	g_fake_filter_rc = 0;
+	g_fake_filter_called = 0;
+	TAP_CHECK(t, ed_format(&v->e) == 1);
+	TAP_CHECK(t, g_fake_filter_called);
+	s = text_line(v->e.t, 0, &len);
+	TAP_CHECKF(t, len == 3 && memcmp(s, "ABC", 3) == 0,
+	    "after format: '%.*s'", (int)len, s ? s : "");
+	TAP_CHECK(t, text_can_undo(v->e.t));	/* the reformat is undoable */
+
+	/* a failing formatter must not disturb the buffer */
+	g_fake_filter_rc = 2;
+	TAP_CHECK(t, ed_format(&v->e) == 0);
+	s = text_line(v->e.t, 0, &len);
+	TAP_CHECK(t, len == 3 && memcmp(s, "ABC", 3) == 0);
+
+	g_fake_filter_rc = 0;
+	vedit_free(v);
+	memio_free(&m);
+	g_cfg = NULL;
+	vedit_cfg_free(cfg);
+}
+
+/* With format-on-save enabled, saving runs the formatter first, so the file on
+ * disk holds the formatted text. */
+static void
+t_format_on_save(Test *t)
+{
+	char dir[] = "/tmp/vedit_fmtXXXXXX";
+	char path[PATH_MAX];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Cfg *cfg;
+	Text *rd;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/s.c", dir);
+
+	cfg = cfg_from_text("[command \"c\"]\n\tformat = fmt\n");
+	TAP_ASSERT(t, cfg != NULL);
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config(v, cfg);
+	vedit_set_tools(v, &fake_tools);
+	vedit_open(v, path);
+	text_insert(v->e.t, 0, 0, "hello", 5);
+	v->e.t->final_newline = 1;
+	v->e.format_on_save = 1;
+
+	g_fake_filter_rc = 0;
+	TAP_CHECK(t, ed_save_file(&v->e) == OK);
+
+	rd = text_new();
+	TAP_ASSERT(t, rd && text_load(rd, path) == OK);
+	{
+		size_t len = 0;
+		const char *s = text_line(rd, 0, &len);
+
+		TAP_CHECKF(t, len == 5 && s && memcmp(s, "HELLO", 5) == 0,
+		    "saved: '%.*s'", (int)len, s ? s : "");
+	}
+	text_free(rd);
+
+	vedit_free(v);
+	memio_free(&m);
+	g_cfg = NULL;
+	vedit_cfg_free(cfg);
+	unlink(path);
+	rmdir(dir);
 }
 #endif /* VEDIT_NO_TOOLS */
 
@@ -2043,6 +2171,8 @@ const Case tap_cases[] = {
 	{ "tool_f9_make", t_tool_f9_make },
 	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },
 	{ "menu_hide_tools", t_menu_hide_tools },
+	{ "format", t_format },
+	{ "format_on_save", t_format_on_save },
 #endif
 #ifdef VEDIT_TERM
 	{ "menu_terminal", t_menu_terminal },

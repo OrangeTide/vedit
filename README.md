@@ -155,6 +155,7 @@ A gitconfig-style file sets the startup defaults. It is read from the first of
     swapdir =            # where swap files go; empty = beside the file
     backup = off         # keep the previous version as a "~" file on save
     backupdir =          # where backups go; empty = beside the file
+    formatonsave = off   # run command.<lang>.format before each save
 
 [indent]
     expand = off         # off = indent with tabs, on = with spaces
@@ -191,6 +192,7 @@ and a set, non-empty value wins over the config file:
 | `command.<lang>.compile`   | `VEDIT_COMMAND_<LANG>_COMPILE` |
 | `command.<lang>.build`     | `VEDIT_COMMAND_<LANG>_BUILD`   |
 | `command.<lang>.run`       | `VEDIT_COMMAND_<LANG>_RUN`     |
+| `command.<lang>.format`    | `VEDIT_COMMAND_<LANG>_FORMAT`  |
 
 Only these per-project keys read the environment; editor preferences such as the
 theme or key mode stay in the config file.
@@ -737,6 +739,31 @@ A command marked with a sibling
 `<command>.interactive = on` key runs on the real terminal instead, for a program
 that reads input or draws its own screen. vedit leaves the alternate screen while
 it runs and returns when it exits.
+
+### Formatting
+
+A `command.<lang>.format` key names a formatter for the file type, run as a
+filter: vedit feeds it the whole buffer on standard input and replaces the buffer
+with what it writes to standard output. The command reads stdin and writes
+stdout, the way `gofmt`, `clang-format`, and `prettier` do by default.
+
+```ini
+[command "c"]
+    format = clang-format
+[command "go"]
+    format = gofmt
+```
+
+Run it by hand with `:format` (vi keys) or Edit > Format. The change is one undo
+step, and the cursor keeps its line. A formatter that fails (a nonzero exit) or
+produces no output leaves the buffer untouched, so a syntax error in progress
+never discards your work. Formatting needs a tool runner, so it is unavailable in
+a build compiled with `VEDIT_NO_TOOLS` and in a host that installs no filter.
+
+Turn on `edit.formatonsave` (or `:set formatonsave`) to run the formatter
+automatically before every save. It is off by default. Only the buffer's own
+`command.<lang>.format` runs, so a file type with no formatter configured saves
+unchanged.
 
 ### Opening headers
 

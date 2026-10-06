@@ -152,6 +152,15 @@ struct vedit_tool_api {
 	 * for an interactive program. Returns the exit status, or -1. May be
 	 * NULL, in which case interactive commands fall back to run_capture. */
 	int	(*run_foreground)(void *ctx, const char *cmd, const char *dir);
+	/* Run cmd in directory dir as a filter: feed it input[0..inlen) on
+	 * stdin and capture its stdout by calling emit(sink, buf, n) for each
+	 * chunk (stderr is discarded). Returns the exit status (>=0), or -1 if
+	 * it could not run. Used by format-on-save. May be NULL, in which case
+	 * formatting is unavailable. */
+	int	(*run_filter)(void *ctx, const char *cmd, const char *dir,
+		    const char *input, size_t inlen,
+		    void (*emit)(void *sink, const char *buf, size_t n),
+		    void *sink);
 };
 
 /* Install the tool runner. Pass NULL to disable the build/run commands. The

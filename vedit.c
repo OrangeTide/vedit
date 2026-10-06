@@ -5502,6 +5502,7 @@ typedef struct editor {
 	int		shiftwidth;	/* >> / << shift size in columns; 0 = a tab stop */
 	int		swap_enabled;	/* write .swp crash-recovery snapshots */
 	int		backup_enabled;	/* keep the previous version on save */
+	int		format_on_save;	/* run the format command before each save */
 	char		swap_path[PATH_MAX];	/* active buffer's swap file, or "" */
 	int		swap_on;	/* a swap file exists on disk for it */
 	size_t		swap_rev;	/* text rev at the last swap write */
@@ -7552,6 +7553,7 @@ typedef enum menu_act {
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS,
 	MA_VI_MODE, MA_RELOAD_CONFIG,
 #ifndef VEDIT_NO_TOOLS
+	MA_FORMAT,
 	MA_COMPILE, MA_MAKE, MA_RUN, MA_VIEW_OUTPUT, MA_ERR_NEXT, MA_ERR_PREV,
 #endif
 #ifdef VEDIT_TERM
@@ -7602,6 +7604,10 @@ static const Menuitem mi_edit[] = {
 	{ "",		"",		"",		MA_SEP },
 	{ "Tabs to &Spaces",	"",	":retab",	MA_TABS_TO_SPACES },
 	{ "Spaces to &Tabs",	"",	"",	MA_SPACES_TO_TABS },
+#ifndef VEDIT_NO_TOOLS
+	{ "",		"",		"",		MA_SEP },
+	{ "&Format",	"",		":format",	MA_FORMAT },
+#endif
 };
 static const Menuitem mi_search[] = {
 	{ "&Find...",		"Ctrl+F",	"/",	MA_FIND },
@@ -7957,6 +7963,11 @@ menu_item_enabled(const Editor *e, Menuact act)
 	case MA_TAG_POP:
 		return e->tag_sp > 0;
 #ifndef VEDIT_NO_TOOLS
+	case MA_FORMAT: {
+		const char *tf = tool_template(e, "format");
+
+		return e->tools && e->tools->run_filter && tf && tf[0];
+	}
 	case MA_COMPILE:
 		return tool_cmd_ready(e, "compile");
 	case MA_MAKE:
@@ -11307,6 +11318,10 @@ swap_recover(Editor *e, const char *path, Text *t, time_t orig_mtime)
 	}
 }
 
+#ifndef VEDIT_NO_TOOLS
+static int ed_format(Editor *e);	/* reformat the buffer in place (below) */
+#endif
+
 /* Save the active buffer to e->path, keeping the previous version as a backup
  * first when backups are enabled. On success the swap becomes redundant and is
  * removed. Returns OK, or ERR with errno set (as text_save). */
@@ -11315,6 +11330,10 @@ ed_save_file(Editor *e)
 {
 	int rc;
 
+#ifndef VEDIT_NO_TOOLS
+	if (e->format_on_save && e->has_name && tool_template(e, "format"))
+		ed_format(e);		/* best effort; a failure leaves the buffer */
+#endif
 	if (e->backup_enabled && e->has_name) {
 		struct stat st;
 		char backup[PATH_MAX];
@@ -15261,6 +15280,138 @@ tool_build_dir(Editor *e, char *out, size_t outsz)
 		snprintf(out, outsz, "%s", dir);
 }
 
+/* A growable byte sink the filter emit callback appends to. */
+struct fmtbuf {
+	char	*buf;
+	size_t	len, cap;
+	int	oom;
+};
+
+static void
+fmt_emit(void *sink, const char *buf, size_t n)
+{
+	struct fmtbuf *b = sink;
+
+	if (b->oom)
+		return;
+	if (b->len + n + 1 > b->cap) {
+		size_t cap = b->cap ? b->cap : 4096;
+		char *p;
+
+		while (cap < b->len + n + 1)
+			cap *= 2;
+		p = realloc(b->buf, cap);
+		if (!p) {
+			b->oom = 1;
+			return;
+		}
+		b->buf = p;
+		b->cap = cap;
+	}
+	memcpy(b->buf + b->len, buf, n);
+	b->len += n;
+}
+
+/* Replace the whole buffer with buf[0..len) as one undo step, mapping a single
+ * trailing newline to the final-newline flag the way a file load does, and
+ * keeping the cursor on its line number. */
+static void
+ed_replace_all(Editor *e, const char *buf, size_t len)
+{
+	Text *t = e->t;
+	size_t cy = e->cy;
+	int final_nl = (len > 0 && buf[len - 1] == '\n');
+	size_t body = final_nl ? len - 1 : len;
+	size_t l0 = 0;
+
+	text_undo_group_begin(t);
+	while (text_lines(t) > 1)	/* collapse down to a single line */
+		text_join(t, 0);
+	text_line(t, 0, &l0);
+	if (l0)
+		text_delete(t, 0, 0, l0);
+	e->cy = e->cx = 0;
+	if (body)
+		insert_bytes(e, buf, body);	/* splits on '\n', undo-tracked */
+	t->final_newline = final_nl;
+	text_undo_group_end(t);
+
+	e->hl_valid = 0;
+	e->cx = 0;
+	e->cy = cy < text_lines(t) ? cy : (text_lines(t) ? text_lines(t) - 1 : 0);
+	clamp_col(e);
+}
+
+/* Pipe the buffer through the per-language format command (command.<lang>.format)
+ * and replace it with the result, as one undo step. Best effort: a missing
+ * command, an unavailable filter, a nonzero exit, or empty output leaves the
+ * buffer untouched. Returns 1 when the buffer was reformatted. */
+static int
+ed_format(Editor *e)
+{
+	const char *tmpl = tool_template(e, "format");
+	struct fmtbuf out = { NULL, 0, 0, 0 };
+	char dir[PATH_MAX];
+	char *cmd, *in = NULL;
+	size_t inlen = 0;
+	FILE *mp;
+	int rc;
+
+	if (!tmpl || !tmpl[0]) {
+		set_status(e, "no format command for %s",
+		    tool_lang(e) ? tool_lang(e) : "this file type");
+		return 0;
+	}
+	if (!e->tools || !e->tools->run_filter) {
+		set_status(e, "formatting is not available");
+		return 0;
+	}
+
+	mp = open_memstream(&in, &inlen);	/* serialize the buffer to bytes */
+	if (!mp) {
+		set_status(e, "out of memory");
+		return 0;
+	}
+	text_write_fp(e->t, mp);
+	if (fclose(mp) != 0 || !in) {
+		free(in);
+		set_status(e, "out of memory");
+		return 0;
+	}
+
+	cmd = tool_expand(tmpl, e->path);
+	if (!cmd) {
+		free(in);
+		set_status(e, "out of memory");
+		return 0;
+	}
+	tool_build_dir(e, dir, sizeof(dir));
+	rc = e->tools->run_filter(e->tools->ctx, cmd, dir, in, inlen,
+	    fmt_emit, &out);
+	free(cmd);
+	free(in);
+
+	if (rc != 0) {
+		set_status(e, "format failed (exit %d)", rc);
+		free(out.buf);
+		return 0;
+	}
+	if (out.oom) {
+		set_status(e, "out of memory");
+		free(out.buf);
+		return 0;
+	}
+	if (out.len == 0) {		/* a formatter that empties a file is a bug */
+		set_status(e, "formatter produced no output");
+		free(out.buf);
+		return 0;
+	}
+	ed_replace_all(e, out.buf, out.len);
+	free(out.buf);
+	set_status(e, "formatted %.120s", e->path);
+	return 1;
+}
+
 /* Resolve and run the per-language command `which` (labelled `label`). Compile
  * and make capture to the pane; a command marked interactive runs on the tty. */
 static void
@@ -15559,6 +15710,11 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_SPACES_TO_TABS:
 		ed_retab(e, 0);
 		break;
+#ifndef VEDIT_NO_TOOLS
+	case MA_FORMAT:
+		ed_format(e);
+		break;
+#endif
 	case MA_HEX:
 		e->hex_view = !e->hex_view;
 		e->hex_top = 0;
@@ -16418,6 +16574,7 @@ editor_init(Editor *e)
 	e->auto_indent = 1;	/* copy the previous line's indent by default */
 	e->swap_enabled = 1;	/* write crash-recovery swap files by default */
 	e->backup_enabled = 0;	/* keep no previous-version backup by default */
+	e->format_on_save = 0;	/* do not reformat on save unless asked */
 	e->hex_pending = -1;
 	e->hex_cols = 16;
 	e->scheme = SCHEME_DOS;	/* MS-EDIT look by default; View cycles it */
@@ -16787,6 +16944,7 @@ ed_apply_config(Editor *e)
 	e->auto_indent = cfg_bool(g_cfg, "edit.autoindent", e->auto_indent);
 	e->swap_enabled = cfg_bool(g_cfg, "edit.swap", e->swap_enabled);
 	e->backup_enabled = cfg_bool(g_cfg, "edit.backup", e->backup_enabled);
+	e->format_on_save = cfg_bool(g_cfg, "edit.formatonsave", e->format_on_save);
 	e->search_icase = cfg_bool(g_cfg, "edit.ignorecase", e->search_icase);
 	s = cfg_get(g_cfg, "edit.shiftwidth");
 	if (s) {
@@ -20817,8 +20975,103 @@ cli_run_foreground(void *ctx, const char *cmd, const char *dir)
 	return -1;
 }
 
+/* Run cmd in dir as a filter: write input[0..inlen) to its stdin and pass its
+ * stdout to emit() (stderr goes to /dev/null). A separate writer child feeds
+ * stdin so the parent can read stdout at the same time without deadlocking on a
+ * full pipe. Returns the exit status, or -1 if it could not be started. */
+static int
+cli_run_filter(void *ctx, const char *cmd, const char *dir,
+    const char *input, size_t inlen,
+    void (*emit)(void *sink, const char *buf, size_t n), void *sink)
+{
+	int inp[2], outp[2];
+	pid_t pid, wpid;
+	int status;
+
+	(void)ctx;
+	if (pipe(inp) != 0)
+		return -1;
+	if (pipe(outp) != 0) {
+		close(inp[0]);
+		close(inp[1]);
+		return -1;
+	}
+	pid = fork();
+	if (pid < 0) {
+		close(inp[0]);
+		close(inp[1]);
+		close(outp[0]);
+		close(outp[1]);
+		return -1;
+	}
+	if (pid == 0) {			/* child: the formatter */
+		int devnull = open("/dev/null", O_WRONLY);
+
+		close(inp[1]);
+		close(outp[0]);
+		dup2(inp[0], STDIN_FILENO);
+		dup2(outp[1], STDOUT_FILENO);
+		if (devnull >= 0)
+			dup2(devnull, STDERR_FILENO);
+		if (inp[0] != STDIN_FILENO)
+			close(inp[0]);
+		if (outp[1] != STDOUT_FILENO)
+			close(outp[1]);
+		if (devnull >= 0 && devnull != STDERR_FILENO)
+			close(devnull);
+		if (dir && dir[0] && chdir(dir) != 0)
+			_exit(127);
+		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+		_exit(127);
+	}
+	close(inp[0]);
+	close(outp[1]);
+	wpid = fork();			/* writer: feed stdin independently */
+	if (wpid == 0) {
+		size_t off = 0;
+
+		signal(SIGPIPE, SIG_IGN);	/* a short read must not kill us */
+		close(outp[0]);
+		while (off < inlen) {
+			ssize_t w = write(inp[1], input + off, inlen - off);
+
+			if (w > 0)
+				off += (size_t)w;
+			else if (w < 0 && errno == EINTR)
+				continue;
+			else
+				break;		/* EPIPE: formatter closed stdin */
+		}
+		close(inp[1]);
+		_exit(0);
+	}
+	close(inp[1]);			/* the writer owns stdin now */
+	for (;;) {
+		char buf[4096];
+		ssize_t n = read(outp[0], buf, sizeof(buf));
+
+		if (n > 0)
+			emit(sink, buf, (size_t)n);
+		else if (n == 0)
+			break;
+		else if (errno != EINTR)
+			break;
+	}
+	close(outp[0]);
+	if (wpid > 0)
+		while (waitpid(wpid, NULL, 0) < 0 && errno == EINTR)
+			;
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+		;
+	if (WIFEXITED(status))
+		return WEXITSTATUS(status);
+	if (WIFSIGNALED(status))
+		return 128 + WTERMSIG(status);
+	return -1;
+}
+
 static const struct vedit_tool_api cli_tools = {
-	NULL, cli_run_capture, cli_run_foreground,
+	NULL, cli_run_capture, cli_run_foreground, cli_run_filter,
 };
 #endif /* VEDIT_NO_TOOLS */
 
@@ -25003,6 +25256,18 @@ ex_set(Editor *e, const char *arg)
 		set_status(e, "backup %s",
 		    e->backup_enabled ? "on" : "off");
 		return REQ_CONTINUE;
+	} else if (strcmp(arg, "formatonsave") == 0 || strcmp(arg, "fos") == 0 ||
+	    strcmp(arg, "noformatonsave") == 0 || strcmp(arg, "nofos") == 0 ||
+	    strcmp(arg, "formatonsave!") == 0 || strcmp(arg, "invformatonsave") == 0) {
+		if (arg[0] == 'n')
+			e->format_on_save = 0;
+		else if (strchr(arg, '!') || arg[0] == 'i')
+			e->format_on_save = !e->format_on_save;
+		else
+			e->format_on_save = 1;
+		set_status(e, "format on save %s",
+		    e->format_on_save ? "on" : "off");
+		return REQ_CONTINUE;
 	} else if (strcmp(arg, "ignorecase") == 0 || strcmp(arg, "ic") == 0 ||
 	    strcmp(arg, "noignorecase") == 0 || strcmp(arg, "noic") == 0 ||
 	    strcmp(arg, "ignorecase!") == 0 || strcmp(arg, "invignorecase") == 0) {
@@ -25100,7 +25365,7 @@ enum excmd {
 	EX_EDIT, EX_ENEW, EX_WRITE, EX_WQ, EX_XIT, EX_QUIT, EX_QALL, EX_WQALL,
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
 	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD,
-	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM,
+	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_FORMAT,
 };
 
 static const struct excmd_name {
@@ -25144,6 +25409,9 @@ static const struct excmd_name {
 	{ "marks",	3, EX_MARKS },
 	{ "delmarks",	4, EX_DELMARKS },
 	{ "jumps",	2, EX_JUMPS },
+#ifndef VEDIT_NO_TOOLS
+	{ "format",	4, EX_FORMAT },
+#endif
 #ifdef VEDIT_TERM
 	{ "terminal",	4, EX_TERM },
 #endif
@@ -25447,6 +25715,11 @@ vi_ex_exec(Editor *e, char *buf)
 	case EX_RETAB:
 		ed_retab(e, e->expand_tabs);
 		return REQ_CONTINUE;
+#ifndef VEDIT_NO_TOOLS
+	case EX_FORMAT:
+		ed_format(e);
+		return REQ_CONTINUE;
+#endif
 	case EX_DRAW:
 		draw_toggle(e);
 		return REQ_CONTINUE;
