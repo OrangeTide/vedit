@@ -8984,8 +8984,43 @@ typedef struct picker {
 	int		 vis;		/* visible list rows (set by draw) */
 	int		 listy;		/* first list row on screen (set by draw) */
 	int		 focus;		/* 0 list, 1 entry */
+	int		 ecurx;		/* entry cursor column on screen (set by draw) */
 	char		 entry[PATH_MAX];
 } Picker;
+
+/* Choose a horizontal scroll offset (a byte index into s) so the end of s
+ * stays visible within avail columns. Editing the entry only appends or
+ * backspaces, so the cursor is always at the end; this hides whole chunks of
+ * the left side at a time rather than shifting one column per keystroke, so a
+ * long path does not reflow the whole field (and resend it over a slow link)
+ * on every key. Returns the byte offset of the first visible rune. */
+static int
+entry_scroll_off(const char *s, int avail)
+{
+	size_t i = 0, slen = strlen(s);
+	int total = disp_cols(s, slen);
+	int hide, chunk, acc = 0;
+
+	if (avail < 1 || total <= avail)
+		return 0;
+	chunk = avail / 2 < 1 ? 1 : avail / 2;
+	hide = total - avail;			/* least we must hide on the left */
+	hide = ((hide + chunk - 1) / chunk) * chunk;	/* round up to a jump */
+	while (i < slen && acc < hide) {	/* walk past the hidden columns */
+		uint32_t cp;
+		int n = utf8_decode(&cp, (const unsigned char *)s + i, slen - i);
+		int w;
+
+		if (n <= 0)
+			n = 1;
+		w = rune_width(cp);
+		if (w < 1)
+			w = 1;
+		acc += w;
+		i += (size_t)n;
+	}
+	return (int)i;
+}
 
 /* Copy src into dst keeping at most w display columns; return columns used. */
 static int
@@ -9080,14 +9115,18 @@ pick_draw(Editor *e, const Modal *m, Picker *pk)
 
 	row = m->y + 1;
 	if (src->entry_label) {
-		int lw;
+		int lw, avail, used, eoff;
 
 		scr_fill(d, row, m->x + 1, m->w - 2, ' ', m->fg, m->bg, m->base);
 		lw = scr_text(d, row, listx, src->entry_label,
 		    m->fg, m->bg, m->base);
-		pick_fit(buf, sizeof(buf), pk->entry,
-		    m->x + m->w - 2 - lw);
+		avail = m->x + m->w - 2 - lw;	/* columns left for the text */
+		if (avail < 1)
+			avail = 1;
+		eoff = entry_scroll_off(pk->entry, avail);	/* scroll the tail in */
+		used = pick_fit(buf, sizeof(buf), pk->entry + eoff, avail);
 		scr_text(d, row, lw, buf, m->fg, m->bg, m->base);
+		pk->ecurx = lw + used;		/* cursor sits after the text */
 		row++;
 		scr_fill(d, row, m->x + 1, m->w - 2, GL_H, m->fg, m->bg,
 		    m->base);
@@ -9115,10 +9154,7 @@ pick_draw(Editor *e, const Modal *m, Picker *pk)
 	}
 
 	if (pk->focus == 1 && src->entry_label) {
-		int lw = disp_cols(src->entry_label, strlen(src->entry_label));
-
-		scr_cursor(d, m->y + 1,
-		    listx + lw + disp_cols(pk->entry, strlen(pk->entry)));
+		scr_cursor(d, m->y + 1, pk->ecurx);	/* kept within the field */
 		scr_cursor_vis(d, 1);
 	} else {
 		scr_cursor_vis(d, 0);
