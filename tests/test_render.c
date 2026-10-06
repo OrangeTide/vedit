@@ -693,6 +693,38 @@ t_search_word(Test *t)
 	memio_free(&m);
 }
 
+/* shiftwidth controls the >> indent: spaces when expandtab is on, a tab by
+ * default, and the chosen column width. */
+static void
+t_shiftwidth(Test *t)
+{
+	static const char *const L[] = { "x" };
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 1);
+
+	v->e.expand_tabs = 1;
+	v->e.shiftwidth = 4;
+	vi_shift_lines(&v->e, 0, 0, 1);
+	TAP_CHECK(t, vline_is(v, 0, "    x"));		/* four spaces */
+	vi_shift_lines(&v->e, 0, 0, -1);
+	TAP_CHECK(t, vline_is(v, 0, "x"));		/* and back */
+
+	v->e.expand_tabs = 0;
+	v->e.shiftwidth = 0;				/* default: one tab */
+	vi_shift_lines(&v->e, 0, 0, 1);
+	TAP_CHECK(t, vline_is(v, 0, "\tx"));
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* True when line y of the buffer equals the NUL-terminated want. */
 static int
 vline_is(struct vedit *v, size_t y, const char *want)
@@ -983,6 +1015,7 @@ const Case tap_cases[] = {
 	{ "swap_recover_delete", t_swap_recover_delete },
 	{ "search_icase", t_search_icase },
 	{ "search_word", t_search_word },
+	{ "shiftwidth", t_shiftwidth },
 	{ "vblock_delete", t_vblock_delete },
 	{ "vblock_insert", t_vblock_insert },
 	{ "vblock_yank_put", t_vblock_yank_put },

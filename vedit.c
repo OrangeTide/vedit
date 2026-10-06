@@ -5209,6 +5209,7 @@ typedef struct editor {
 	int		show_tabs;	/* draw a guide glyph at each hard tab */
 	int		auto_indent;	/* a new line copies the previous indent */
 	int		expand_tabs;	/* Tab and auto-indent use spaces (per buffer) */
+	int		shiftwidth;	/* >> / << shift size in columns; 0 = a tab stop */
 	int		swap_enabled;	/* write .swp crash-recovery snapshots */
 	int		backup_enabled;	/* keep the previous version on save */
 	char		swap_path[PATH_MAX];	/* active buffer's swap file, or "" */
@@ -15767,6 +15768,13 @@ ed_apply_config(Editor *e)
 	e->swap_enabled = cfg_bool(g_cfg, "edit.swap", e->swap_enabled);
 	e->backup_enabled = cfg_bool(g_cfg, "edit.backup", e->backup_enabled);
 	e->search_icase = cfg_bool(g_cfg, "edit.ignorecase", e->search_icase);
+	s = cfg_get(g_cfg, "edit.shiftwidth");
+	if (s) {
+		int v = atoi(s);
+
+		if (v >= 0 && v <= 32)
+			e->shiftwidth = v;
+	}
 	e->expand_tabs = indent_expand_default(e->syn ? e->syn->name : NULL);
 	e->hl_on = cfg_bool(g_cfg, "syntax.enable", e->hl_on);
 	e->clip_osc52 = cfg_bool(g_cfg, "ui.clipboard", e->clip_osc52);
@@ -17817,6 +17825,9 @@ vi_shift_lines(Editor *e, size_t y1, size_t y2, int dir)
 	if (y2 >= text_lines(e->t))
 		y2 = text_lines(e->t) - 1;
 
+	/* Shift by shiftwidth columns, or one tab stop when it is unset. */
+	int sw = e->shiftwidth > 0 ? e->shiftwidth : TAB_WIDTH;
+
 	text_undo_group_begin(e->t);
 	for (y = y1; y <= y2; y++) {
 		size_t len = 0;
@@ -17825,16 +17836,39 @@ vi_shift_lines(Editor *e, size_t y1, size_t y2, int dir)
 		if (len == 0)			/* leave blank lines unindented */
 			continue;
 		if (dir > 0) {
-			text_insert(e->t, y, 0, "\t", 1);
-		} else if (s[0] == '\t') {
-			text_delete(e->t, y, 0, 1);
-		} else {
-			size_t sp = 0;
+			char ind[TAB_WIDTH * 8 + 8];	/* a bounded indent run */
+			int ni = 0, cols = sw;
 
-			while (sp < len && sp < TAB_WIDTH && s[sp] == ' ')
-				sp++;
-			if (sp)
-				text_delete(e->t, y, 0, sp);
+			if (e->expand_tabs) {
+				while (cols-- > 0 && ni < (int)sizeof(ind))
+					ind[ni++] = ' ';
+			} else {
+				while (cols >= TAB_WIDTH && ni < (int)sizeof(ind)) {
+					ind[ni++] = '\t';
+					cols -= TAB_WIDTH;
+				}
+				while (cols-- > 0 && ni < (int)sizeof(ind))
+					ind[ni++] = ' ';
+			}
+			if (ni)
+				text_insert(e->t, y, 0, ind, (size_t)ni);
+		} else {
+			size_t i = 0;
+			int cols = 0;
+
+			/* drop leading whitespace up to sw columns (a tab is a
+			 * full stop, so the last one may slightly overshoot) */
+			while (i < len && cols < sw) {
+				if (s[i] == '\t')
+					cols += TAB_WIDTH;
+				else if (s[i] == ' ')
+					cols += 1;
+				else
+					break;
+				i++;
+			}
+			if (i)
+				text_delete(e->t, y, 0, i);
 		}
 	}
 	e->cy = y1;
@@ -19919,6 +19953,18 @@ ex_set(Editor *e, const char *arg)
 			e->search_icase = 1;
 		set_status(e, "ignorecase %s",
 		    e->search_icase ? "on" : "off");
+		return REQ_CONTINUE;
+	} else if (strncmp(arg, "shiftwidth=", 11) == 0 ||
+	    strncmp(arg, "sw=", 3) == 0) {
+		int v = atoi(strchr(arg, '=') + 1);
+
+		if (v < 0 || v > 32) {
+			set_status(e, "shiftwidth out of range (0-32)");
+			return REQ_CONTINUE;
+		}
+		e->shiftwidth = v;
+		set_status(e, "shiftwidth %d%s", v,
+		    v == 0 ? " (one tab stop)" : "");
 		return REQ_CONTINUE;
 	} else if (strncmp(arg, "ff=", 3) == 0 ||
 	    strncmp(arg, "fileformat=", 11) == 0) {

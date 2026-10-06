@@ -143,6 +143,7 @@ A gitconfig-style file sets the startup defaults. It is read from the first of
     mode = vi            # vi | modeless
     autoindent = on      # new lines copy the previous indent
     ignorecase = off     # on = searches match regardless of case
+    shiftwidth = 0       # >> / << indent width in columns; 0 = one tab stop
     swap = on            # write a .swp crash-recovery snapshot (on by default)
     swapdir =            # where swap files go; empty = beside the file
     backup = off         # keep the previous version as a "~" file on save
@@ -362,6 +363,12 @@ with it off (the default) they use a hard tab, with it on they use spaces to the
 next stop. It is per buffer. A fresh buffer's default comes from the config, by
 language, then tabs when nothing sets it (see below). In vi keys it is
 `:set expandtab` / `:set noexpandtab` (`:set et` / `:set noet`).
+
+The vi `>>` and `<<` commands (and `>`/`<` over a visual selection) indent by
+one tab stop by default. `edit.shiftwidth = N`, or `:set shiftwidth=N` (`:set
+sw=N`) during a session, shifts by N columns instead: N spaces when indenting
+with spaces, otherwise tabs with a spaces remainder. `N = 0` keeps the one-tab
+default.
 
 **Edit > Tabs to Spaces** and **Edit > Spaces to Tabs** rewrite whitespace over
 the selection, or the whole buffer when there is no selection. "Tabs to Spaces"
