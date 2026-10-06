@@ -1560,7 +1560,169 @@ t_pick_open_entry(Test *t)
 	rmdir(dir);
 }
 
+/* scr_resize reallocates the grid to the new size, marks every row dirty, and
+ * drops shadow_valid so the next present repaints the whole screen. */
+static void
+t_resize_grid(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	Scrbuf *sb;
+	Screen *d;
+	int rows, cols;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	sb = scr_new_io(&io);
+	TAP_ASSERT(t, sb != NULL);
+	d = scr_new(sb);
+	TAP_ASSERT(t, d != NULL);
+
+	scr_size(d, &rows, &cols);
+	TAP_CHECKF(t, rows == 24 && cols == 80, "initial size %dx%d", rows, cols);
+
+	sb->shadow_valid = 1;		/* pretend the screen is in sync */
+	scr_resize(d, 40, 120);
+	scr_size(d, &rows, &cols);
+	TAP_CHECKF(t, rows == 40 && cols == 120, "resized to %dx%d", rows, cols);
+	TAP_CHECK(t, sb->shadow_valid == 0);	/* forces a full repaint */
+	TAP_CHECK(t, sb->rowdirty[0] == 1 && sb->rowdirty[39] == 1);
+
+	scr_resize(d, 0, 0);		/* degenerate size clamps to 1x1 */
+	scr_size(d, &rows, &cols);
+	TAP_CHECKF(t, rows == 1 && cols == 1, "clamped to %dx%d", rows, cols);
+
+	scr_free(d);
+	memio_free(&m);
+}
+
+/* A SIGWINCH (g_winch) only flags that the window changed: scr_wait re-reads
+ * the live size via getsize, resizes to it, and returns EVENT_RESIZE without
+ * consuming input. */
+static void
+t_resize_signal(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	Scrbuf *sb;
+	Screen *d;
+	Event ev;
+	int rows, cols, rc;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	sb = scr_new_io(&io);
+	TAP_ASSERT(t, sb != NULL);
+	d = scr_new(sb);
+	TAP_ASSERT(t, d != NULL);
+
+	m.rows = 50;			/* the window changed under us */
+	m.cols = 100;
+	g_winch = 1;			/* as the SIGWINCH handler would set it */
+
+	memset(&ev, 0, sizeof(ev));
+	rc = scr_wait(d, &ev);
+	TAP_CHECKF(t, rc == EVENT_RESIZE, "scr_wait returned %d", rc);
+	TAP_CHECK(t, ev.type == EVENT_RESIZE);
+	TAP_CHECK(t, g_winch == 0);
+	scr_size(d, &rows, &cols);
+	TAP_CHECKF(t, rows == 50 && cols == 100, "size after signal %dx%d",
+	    rows, cols);
+
+	scr_free(d);
+	memio_free(&m);
+}
+
+/* A host-driven resize (vedit_set_size sets want_resize after applying its own
+ * size) is reported by scr_wait as EVENT_RESIZE without re-querying getsize, so
+ * a stale getsize cannot override the host's dimensions. */
+static void
+t_resize_event(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	Scrbuf *sb;
+	Screen *d;
+	Event ev;
+	int rows, cols, rc;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	sb = scr_new_io(&io);
+	TAP_ASSERT(t, sb != NULL);
+	d = scr_new(sb);
+	TAP_ASSERT(t, d != NULL);
+
+	scr_resize(d, 50, 100);		/* the host applied its size */
+	m.rows = 24;			/* getsize is stale and must be ignored */
+	m.cols = 80;
+	sb->want_resize = 1;		/* as vedit_set_size would set it */
+
+	memset(&ev, 0, sizeof(ev));
+	rc = scr_wait(d, &ev);
+	TAP_CHECKF(t, rc == EVENT_RESIZE, "scr_wait returned %d", rc);
+	TAP_CHECK(t, ev.type == EVENT_RESIZE);
+	TAP_CHECK(t, sb->want_resize == 0);
+	scr_size(d, &rows, &cols);
+	TAP_CHECKF(t, rows == 50 && cols == 100,
+	    "host size overridden to %dx%d", rows, cols);
+
+	scr_free(d);
+	memio_free(&m);
+}
+
+/* Shrinking the window keeps the cursor on screen: after vedit_set_size the
+ * next render re-clamps the scroll offset around the cursor. */
+static void
+t_resize_reflow(Test *t)
+{
+	static const char *const L[] = {
+		"l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9", "l10",
+		"l11", "l12", "l13", "l14", "l15", "l16", "l17", "l18", "l19",
+		"l20"
+	};
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int rows, cols, th;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 20);
+
+	/* Put the cursor on the last line and lay out at the full height. */
+	v->e.cy = 19;
+	render_body(&v->e, v->e.d);
+	TAP_CHECK(t, v->e.cy >= v->e.top);
+
+	/* Shrink the window; the grid and the editor dimensions both follow. */
+	vedit_set_size(v, 10, 40);
+	scr_size(v->e.d, &rows, &cols);
+	TAP_CHECKF(t, rows == 10 && cols == 40, "grid %dx%d after shrink",
+	    rows, cols);
+	TAP_CHECKF(t, v->e.rows == 10 && v->e.cols == 40,
+	    "editor %dx%d after shrink", v->e.rows, v->e.cols);
+
+	/* Re-render at the new height: the cursor must stay within the text
+	 * area, so the scroll offset has to move down with it. */
+	render_body(&v->e, v->e.d);
+	th = text_height(&v->e);
+	TAP_CHECK(t, v->e.cy >= v->e.top);
+	TAP_CHECKF(t, v->e.cy < v->e.top + (size_t)th,
+	    "cursor %zu off screen: top %zu height %d",
+	    v->e.cy, v->e.top, th);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 const Case tap_cases[] = {
+	{ "resize_grid", t_resize_grid },
+	{ "resize_signal", t_resize_signal },
+	{ "resize_event", t_resize_event },
+	{ "resize_reflow", t_resize_reflow },
 	{ "cursor_end_home", t_cursor_end_home },
 	{ "cursor_home", t_cursor_home },
 	{ "wrap_shows_tail", t_wrap_shows_tail },

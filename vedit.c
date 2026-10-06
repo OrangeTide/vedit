@@ -5054,13 +5054,20 @@ scr_wait(Screen *d, Event *ev)
 		int rc;
 
 		if (g_winch || t->want_resize) {
-			int rows = t->rows, cols = t->cols;
+			int from_signal = g_winch;
 
 			g_winch = 0;
 			t->want_resize = 0;
-			if (t->io.getsize &&
-			    t->io.getsize(t->io.ctx, &rows, &cols) == 0) {
-				if (rows >= 1 && cols >= 1 &&
+			/* A SIGWINCH only flags that the window changed, so ask
+			 * the OS for the new size. A host-driven resize
+			 * (vedit_set_size) has already applied its size, so trust
+			 * it and do not re-query, which would let a stale getsize
+			 * override the host's dimensions. */
+			if (from_signal && t->io.getsize) {
+				int rows = t->rows, cols = t->cols;
+
+				if (t->io.getsize(t->io.ctx, &rows, &cols) == 0 &&
+				    rows >= 1 && cols >= 1 &&
 				    (rows != t->rows || cols != t->cols))
 					scr_resize(d, rows, cols);
 			}
