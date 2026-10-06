@@ -599,9 +599,9 @@ register back as keystrokes, `@@` repeats the last one, and a count repeats the
 macro (`3@a`). A register can also be filled by yanking into it (`"ayy`), since
 both are just stored bytes. `m` followed by a letter sets a mark; `` ` `` and `'`
 jump to it (to the exact spot and to the line's first non-blank). The marks
-`` ` `` / `'`, `` `. ``, `` `^ ``, and `` `< `` / `` `> `` are kept automatically for the
-previous position, the last change, where insert mode stopped, and the last
-visual selection. A long-range move (`G`, `gg`, a search, a mark jump) is a jump:
+`` ` `` / `'`, `` `. ``, `` `^ ``, `` `< `` / `` `> ``, and `` `[ `` / `` `] `` are kept
+automatically for the previous position, the last change, where insert mode
+stopped, the last visual selection, and the bounds of the last change or yank. A long-range move (`G`, `gg`, a search, a mark jump) is a jump:
 `Ctrl-O` steps back through the jump list and `Ctrl-I` (Tab) forward, `` ` `` /
 `''` toggle between a jump's ends, and `g`` / `g'` jump without recording.
 `:marks` lists the marks (choose one to jump to it), `:delmarks` clears some (or

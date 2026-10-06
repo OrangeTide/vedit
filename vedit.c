@@ -5124,6 +5124,8 @@ enum {
 	MARK_INSERT,			/* ^ : where insert mode last stopped */
 	MARK_VISLT,			/* < : start of the last visual selection */
 	MARK_VISGT,			/* > : end of the last visual selection */
+	MARK_LBRACK,			/* [ : start of the last change or yank */
+	MARK_RBRACK,			/* ] : end of the last change or yank */
 	MARK_SLOTS
 };
 
@@ -13237,6 +13239,7 @@ ed_tag_pop(Editor *e)
 #define JUMPS_MAX 100
 
 static void vi_mark_set(Editor *e, int slot, size_t y, size_t x);
+static void vi_mark_bracket(Editor *e, size_t sy, size_t sx, size_t ey, size_t ex);
 static int mark_index(int ch);
 
 /* Append a location to the jump list, dropping the oldest when full. */
@@ -13352,6 +13355,8 @@ mark_char(int slot)
 	case MARK_INSERT:	return '^';
 	case MARK_VISLT:	return '<';
 	case MARK_VISGT:	return '>';
+	case MARK_LBRACK:	return '[';
+	case MARK_RBRACK:	return ']';
 	}
 	return '?';
 }
@@ -17787,6 +17792,7 @@ static void
 enter_insert(Editor *e)
 {
 	e->mode = MODE_INSERT;
+	vi_mark_set(e, MARK_LBRACK, e->cy, e->cx);	/* '[ at the insert start */
 }
 
 static void vi_shift_lines(Editor *e, size_t y1, size_t y2, int dir);
@@ -17799,6 +17805,7 @@ vi_op_lines(Editor *e, char op, size_t lo, size_t hi)
 {
 	vi_yank_lines(e, lo, hi);
 	if (op == 'y') {
+		vi_mark_bracket(e, lo, 0, hi, text_line_len(e->t, hi));
 		e->cy = lo;
 		e->cx = first_nonblank(e, lo);
 		vi_clamp(e);
@@ -17806,6 +17813,8 @@ vi_op_lines(Editor *e, char op, size_t lo, size_t hi)
 		return REQ_CONTINUE;
 	}
 	vi_delete_lines(e, lo, hi);
+	vi_mark_set(e, MARK_LBRACK, lo < text_lines(e->t) ? lo : 0, 0);
+	vi_mark_set(e, MARK_RBRACK, lo < text_lines(e->t) ? lo : 0, 0);
 	if (op == 'c') {
 		if (lo >= text_lines(e->t)) {
 			size_t last = text_lines(e->t) - 1;
@@ -17889,6 +17898,7 @@ vi_apply_operator(Editor *e, char op, Motion m)
 	}
 	vi_yank_region(e, sy, sx, ey, ex);
 	if (op == 'y') {
+		vi_mark_bracket(e, sy, sx, ey, ex);
 		e->cy = sy;
 		e->cx = sx;
 		vi_clamp(e);
@@ -17900,6 +17910,8 @@ vi_apply_operator(Editor *e, char op, Motion m)
 		enter_insert(e);
 		return REQ_CONTINUE;		/* group stays open until Esc */
 	}
+	vi_mark_set(e, MARK_LBRACK, sy, sx);	/* a delete collapses '[ = '] */
+	vi_mark_set(e, MARK_RBRACK, sy, sx);
 	vi_clamp(e);
 	text_undo_group_end(e->t);
 	return REQ_CONTINUE;
@@ -18133,7 +18145,21 @@ vi_put(Editor *e, int after)
 		e->cy = first;
 		e->cx = first_nonblank(e, first);
 		vi_clamp(e);
+		{				/* '[ / '] bracket the pasted lines */
+			size_t nseg = 1, k, last;
+
+			for (k = 0; k < l; k++)
+				if (clip[k] == '\n')
+					nseg++;
+			last = first + nseg - 1;
+			if (last >= text_lines(e->t))
+				last = text_lines(e->t) ? text_lines(e->t) - 1 : 0;
+			vi_mark_bracket(e, first, 0, last,
+			    text_line_len(e->t, last));
+		}
 	} else {
+		size_t by, bx;
+
 		if (after) {
 			size_t len = 0;
 			const char *s = text_line(e->t, e->cy, &len);
@@ -18141,6 +18167,8 @@ vi_put(Editor *e, int after)
 			if (e->cx < len)
 				e->cx += rune_len_at(s, len, e->cx);
 		}
+		by = e->cy;
+		bx = e->cx;			/* '[ : first pasted byte */
 		insert_bytes(e, clip, clip_len);
 		if (e->cx > 0) {		/* rest on the last pasted rune */
 			size_t len = 0;
@@ -18149,6 +18177,8 @@ vi_put(Editor *e, int after)
 			e->cx -= prev_rune_len(s, e->cx);
 		}
 		vi_clamp(e);
+		vi_mark_set(e, MARK_LBRACK, by, bx);
+		vi_mark_set(e, MARK_RBRACK, e->cy, e->cx);	/* '] : last rune */
 	}
 	text_undo_group_end(e->t);
 	e->vi_reg = 0;				/* consume the selection */
@@ -18671,6 +18701,7 @@ vi_apply_textobject_op(Editor *e, char op, size_t sy, size_t sx,
 	}
 	vi_yank_region(e, sy, sx, ey, ex);
 	if (op == 'y') {
+		vi_mark_bracket(e, sy, sx, ey, ex);
 		e->cy = sy;
 		e->cx = sx;
 		vi_clamp(e);
@@ -18682,6 +18713,8 @@ vi_apply_textobject_op(Editor *e, char op, size_t sy, size_t sx,
 		enter_insert(e);
 		return REQ_CONTINUE;		/* group stays open until Esc */
 	}
+	vi_mark_set(e, MARK_LBRACK, sy, sx);	/* a delete collapses '[ = '] */
+	vi_mark_set(e, MARK_RBRACK, sy, sx);
 	vi_clamp(e);
 	text_undo_group_end(e->t);
 	return REQ_CONTINUE;
@@ -18701,6 +18734,8 @@ mark_index(int ch)
 	case '^':		return MARK_INSERT;
 	case '<':		return MARK_VISLT;
 	case '>':		return MARK_VISGT;
+	case '[':		return MARK_LBRACK;
+	case ']':		return MARK_RBRACK;
 	}
 	return -1;
 }
@@ -18714,6 +18749,22 @@ vi_mark_set(Editor *e, int slot, size_t y, size_t x)
 	e->vi_mark_y[slot] = y;
 	e->vi_mark_x[slot] = x;
 	e->vi_marks_set |= (uint64_t)1 << slot;
+}
+
+/* Set '[ and '] to bracket a change or yank spanning [sy,sx)..(ey,ex), where ex
+ * is one byte past the last. '] lands on the last character of the span. */
+static void
+vi_mark_bracket(Editor *e, size_t sy, size_t sx, size_t ey, size_t ex)
+{
+	if (ex > 0 && (ey > sy || ex > sx)) {
+		size_t llen = 0;
+		const char *s = text_line(e->t, ey, &llen);
+
+		if (s && ex <= llen)
+			ex -= prev_rune_len(s, ex);
+	}
+	vi_mark_set(e, MARK_LBRACK, sy, sx);
+	vi_mark_set(e, MARK_RBRACK, ey, ex);
 }
 
 /* Jump to a stored mark position (my,mx). cmd is '`' (go to the exact column)
@@ -19630,6 +19681,7 @@ vi_insert_key(Editor *e, const struct tkbd_seq *seq)
 		}
 		vi_clamp(e);
 		vi_mark_set(e, MARK_INSERT, e->cy, e->cx);	/* '^ */
+		vi_mark_set(e, MARK_RBRACK, e->cy, e->cx);	/* '] ends the change */
 		return REQ_CONTINUE;
 	case TKBD_KEY_ENTER:
 		ed_newline_indent(e);

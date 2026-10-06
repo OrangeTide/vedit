@@ -913,6 +913,58 @@ t_marks_ex(Test *t)
 	memio_free(&m);
 }
 
+/* '[ and '] bracket the last change, yank, or put. */
+static void
+t_marks_bracket(Test *t)
+{
+	static const char *const L[] = { "abcdef" };
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	/* yank three chars: '] is the last of them (col 2) */
+	memio_init(&m, "y3l$`]", 6, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 1);
+	v->e.mode = MODE_NORMAL;
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.cy == 0 && v->e.cx == 2, "'] after yank at %zu,%zu",
+	    v->e.cy, v->e.cx);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* insert "XY" at the start: '[ at the start, '] on the last inserted */
+	memio_init(&m, "iXY\x1b", 4, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 1);
+	v->e.mode = MODE_NORMAL;
+	vedit_run(v);
+	TAP_CHECK(t, v->e.vi_mark_y[MARK_LBRACK] == 0 &&
+	    v->e.vi_mark_x[MARK_LBRACK] == 0);
+	TAP_CHECKF(t, v->e.vi_mark_y[MARK_RBRACK] == 0 &&
+	    v->e.vi_mark_x[MARK_RBRACK] == 1, "'] after insert at %zu,%zu",
+	    v->e.vi_mark_y[MARK_RBRACK], v->e.vi_mark_x[MARK_RBRACK]);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* yank a char and put it: '[ is the pasted char (col 1) */
+	memio_init(&m, "ylp$`[", 6, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 1);
+	v->e.mode = MODE_NORMAL;
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.cy == 0 && v->e.cx == 1, "'[ after put at %zu,%zu",
+	    v->e.cy, v->e.cx);
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* gv reselects the previous visual range after leaving visual mode. */
 static void
 t_gv_reselect(Test *t)
@@ -1520,6 +1572,7 @@ const Case tap_cases[] = {
 	{ "marks_special", t_marks_special },
 	{ "jumplist", t_jumplist },
 	{ "marks_ex", t_marks_ex },
+	{ "marks_bracket", t_marks_bracket },
 	{ "shell_cmd", t_shell_cmd },
 	{ "exit_cursor", t_exit_cursor },
 	{ "gv_reselect", t_gv_reselect },
