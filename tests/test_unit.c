@@ -344,6 +344,117 @@ t_syntax_md_embed(Test *t)
 	TAP_CHECK(t, out[0] == cb && SYN_GID(st) == 0);
 }
 
+/* The JavaScript grammar: keywords, builtins, a line comment, and a template
+ * literal that carries its string color across lines. */
+static void
+t_syntax_js(Test *t)
+{
+	const Syntax *js = syn_for_ext("js");
+	uint16_t out[64];
+	uint32_t st;
+	int kw, type, str, com, txt;
+
+	TAP_ASSERT(t, js && js->fsm && syn_for_ext("mjs") == js);
+	kw = fsm_class(js->fsm, "keyword");
+	type = fsm_class(js->fsm, "type");
+	str = fsm_class(js->fsm, "string");
+	com = fsm_class(js->fsm, "comment");
+	txt = fsm_class(js->fsm, "text");
+	TAP_ASSERT(t, kw > 0 && type > 0 && str > 0 && com > 0);
+
+	/* "const $x = null; // c" */
+	syn_line(js, js->start, "const $x = null; // c", 21, out);
+	TAP_CHECKF(t, out[0] == kw && out[4] == kw, "const [%d %d]", out[0], out[4]);
+	TAP_CHECKF(t, out[6] == txt && out[7] == txt, "$x [%d %d]", out[6], out[7]);
+	TAP_CHECKF(t, out[11] == type && out[14] == type, "null [%d %d]",
+	    out[11], out[14]);
+	TAP_CHECKF(t, out[17] == com && out[20] == com, "comment [%d %d]",
+	    out[17], out[20]);
+
+	/* a template literal spans lines; a double-quoted string does not */
+	st = syn_line(js, js->start, "f(`a ${b}", 9, out);
+	TAP_CHECKF(t, out[2] == str && out[8] == str, "template [%d %d]",
+	    out[2], out[8]);
+	st = syn_line(js, st, "c` + 1", 6, out);
+	TAP_CHECKF(t, out[0] == str && out[1] == str && out[3] == txt,
+	    "template carry [%d %d %d]", out[0], out[1], out[3]);
+	TAP_CHECK(t, st == SYN_PACK(js->start, 0, 0));
+	st = syn_line(js, js->start, "\"open", 5, out);
+	TAP_CHECK(t, st == SYN_PACK(js->start, 0, 0));
+}
+
+/* The HTML grammar: tags, attributes, quoted values, entities, comments, and
+ * a <script> body colored by the JavaScript grammar until </script>. */
+static void
+t_syntax_html(Test *t)
+{
+	const Syntax *html = syn_for_ext("html");
+	const Syntax *js = syn_for_ext("js");
+	uint16_t out[64];
+	uint32_t st;
+	int tag, attr, str, com, ent, txt, gid, kw;
+
+	TAP_ASSERT(t, html && html->fsm && js && js->fsm);
+	TAP_CHECK(t, syn_for_ext("htm") == html);
+	tag = fsm_class(html->fsm, "tag");
+	attr = fsm_class(html->fsm, "attr");
+	str = fsm_class(html->fsm, "string");
+	com = fsm_class(html->fsm, "comment");
+	ent = fsm_class(html->fsm, "entity");
+	txt = fsm_class(html->fsm, "text");
+	gid = syn_gid(js);
+	kw = fsm_class(js->fsm, "keyword");
+	TAP_ASSERT(t, tag > 0 && attr > 0 && str > 0 && com > 0 && ent > 0 && gid > 0);
+
+	/* <a href="x">&amp;</a> */
+	syn_line(html, html->start, "<a href=\"x\">&amp;</a>", 21, out);
+	TAP_CHECKF(t, out[0] == tag && out[1] == tag, "open tag [%d %d]",
+	    out[0], out[1]);
+	TAP_CHECKF(t, out[3] == attr && out[6] == attr, "attr [%d %d]", out[3], out[6]);
+	TAP_CHECKF(t, out[8] == str && out[10] == str, "value [%d %d]", out[8], out[10]);
+	TAP_CHECKF(t, out[11] == tag, "close > %d", out[11]);
+	TAP_CHECKF(t, out[12] == ent && out[16] == ent, "entity [%d %d]",
+	    out[12], out[16]);
+	TAP_CHECKF(t, out[17] == tag && out[20] == tag, "end tag [%d %d]",
+	    out[17], out[20]);
+
+	/* a comment carries across lines; a doctype does not */
+	st = syn_line(html, html->start, "x<!-- c", 7, out);
+	TAP_CHECKF(t, out[0] == txt && out[1] == com && out[6] == com,
+	    "comment [%d %d %d]", out[0], out[1], out[6]);
+	st = syn_line(html, st, "--> y", 5, out);
+	TAP_CHECKF(t, out[0] == com && out[4] == txt, "comment end [%d %d]",
+	    out[0], out[4]);
+	TAP_CHECK(t, st == SYN_PACK(html->start, 0, 0));
+
+	/* <script>var x</script>: the body is JavaScript, the tags are HTML */
+	syn_line(html, html->start, "<script>var x</script>!", 23, out);
+	TAP_CHECKF(t, out[8] == ((gid << 8) | kw) && out[10] == out[8],
+	    "script var [%#x %#x]", out[8], out[10]);
+	TAP_CHECKF(t, out[13] == tag && out[21] == tag && out[22] == txt,
+	    "script close [%d %d %d]", out[13], out[21], out[22]);
+
+	/* with attributes and in upper case, carrying to a later line */
+	st = syn_line(html, html->start, "<SCRIPT type=\"module\">let a", 27, out);
+	TAP_CHECKF(t, out[8] == attr && out[14] == str, "script attrs [%d %d]",
+	    out[8], out[14]);
+	TAP_CHECKF(t, out[22] == ((gid << 8) | kw), "let -> %#x", out[22]);
+	TAP_CHECKF(t, SYN_GID(st) == gid, "carry gid %d", SYN_GID(st));
+	st = syn_line(html, st, "b</SCRIPT><p>", 13, out);
+	TAP_CHECKF(t, (out[0] >> 8) == gid && out[1] == tag && out[10] == tag,
+	    "after script [%#x %d %d]", out[0], out[1], out[10]);
+	TAP_CHECK(t, st == SYN_PACK(html->start, 0, 0));
+
+	/* "<scripts>" is an ordinary tag, not a script */
+	st = syn_line(html, html->start, "<scripts>if", 11, out);
+	TAP_CHECKF(t, out[9] == txt && SYN_GID(st) == 0, "scripts tag %d gid %d",
+	    out[9], SYN_GID(st));
+
+	/* a Markdown fence names JavaScript by extension */
+	st = syn_line(syn_for_ext("md"), syn_for_ext("md")->start, "```js", 5, out);
+	TAP_CHECKF(t, SYN_GID(st) == gid, "md js fence gid %d", SYN_GID(st));
+}
+
 /* Serialize the whole buffer the way the file on disk would read: each line's
  * bytes in order, joined by '\n', with no trailing newline. Caller frees. */
 static char *
@@ -2687,6 +2798,8 @@ const Case tap_cases[] = {
 	{ "syntax_refine", t_syntax_refine },
 	{ "syntax_md", t_syntax_md },
 	{ "syntax_md_embed", t_syntax_md_embed },
+	{ "syntax_js", t_syntax_js },
+	{ "syntax_html", t_syntax_html },
 	{ "entry_scroll", t_entry_scroll },
 	{ "text_fp_roundtrip", t_text_fp_roundtrip },
 	{ "swap_paths", t_swap_paths },

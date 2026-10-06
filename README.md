@@ -288,7 +288,8 @@ builds from `vedit_cfg_new()` / `vedit_cfg_load()`.
 
 ### Custom syntax highlighting
 
-Beyond the built-in C, shell, and Markdown highlighters, the config file can
+Beyond the built-in C, shell, Markdown, JavaScript, and HTML highlighters, the
+config file can
 define a language as a small state machine (the model joe uses), authored in the same
 gitconfig format, no separate file. A language is a set of states; each state
 has an ordered list of transition `rule` lines keyed on a character set.
@@ -387,7 +388,7 @@ A language whose name matches a file extension is picked up automatically; a
 the rules are config data, loaded through `vedit_set_config()` like everything
 else.
 
-The built-in C, shell, and Markdown highlighters are themselves grammars in this format,
+The built-in highlighters are themselves grammars in this format,
 compiled into the binary and loaded at startup, so they need no config file.
 Defining a language of the same name in your config replaces the matching
 built-in outright (the two are not merged), so to customize one, copy its whole
@@ -1006,17 +1007,23 @@ a diagram into a source file.
 ## Syntax highlighting
 
 vedit highlights through a single data-driven engine, the state-machine model
-described under "Custom syntax highlighting" above. The C-family and shell
-highlighters that ship with it are grammars in that same config format, compiled
-into the binary and loaded at startup rather than written as hardcoded lexers.
-They color keywords, types, strings, character and number literals, line and
-block comments (a block comment may span lines), and preprocessor lines,
-including a string inside a `#include` or `#define` and a macro continued over a
-trailing backslash. The shell grammar also colors `$var` and `${var}`, including
-inside double-quoted strings.
+described under "Custom syntax highlighting" above. The highlighters that ship
+with it are grammars in that same config format, compiled into the binary and
+loaded at startup rather than written as hardcoded lexers. The C grammar colors
+keywords, types, strings, character and number literals, line and block comments
+(a block comment may span lines), and preprocessor lines, including a string
+inside a `#include` or `#define` and a macro continued over a trailing
+backslash. The shell grammar also colors `$var` and `${var}`, including inside
+double-quoted strings. The JavaScript grammar follows the C one with
+JavaScript's keywords and builtins, `$` in names, and a template literal that
+spans lines; a regular expression literal, which needs parser context, reads as
+operators and text. The HTML grammar colors tags, attribute names and quoted
+values, comments, the doctype, and entities, and hands the body of a `<script>`
+tag to the JavaScript grammar until `</script>`; a `<style>` body stays plain.
 
 The language is chosen from the file extension: `.c .h .cc .cpp .cxx .hpp .hh
-.lpc .i` use the C grammar, and `.sh .bash` use the shell grammar. Highlighting
+.lpc .i` use the C grammar, `.sh .bash` the shell grammar, `.md .markdown .mdown
+.mkd` Markdown, `.js .mjs .cjs` JavaScript, and `.html .htm .xhtml` HTML. Highlighting
 is on by default when the type is recognized, and files with no match are left
 plain. Toggle it from the View menu, or with the vi `:syntax` command: `:syntax
 off`, `:syntax on`, or `:syntax c` / `:syntax sh` to force a language. The
