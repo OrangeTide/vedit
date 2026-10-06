@@ -4629,9 +4629,18 @@ scr_end(Screen *d)
 {
 	Scrbuf *t = d->t;
 
+	char mv[32];
+
 	scr_str(t, "\033[0m");
 	scr_str(t, "\033[?2004l");
 	scr_str(t, "\033[?25h");
+	/* Drop the cursor to the bottom and scroll up one line, so on a client
+	 * without the alternate screen the shell prompt lands on a fresh line
+	 * below the editor instead of in the middle of the chrome. A client that
+	 * honors the alt screen discards this when it restores below. */
+	snprintf(mv, sizeof(mv), "\033[%d;1H", t->rows > 0 ? t->rows : 1);
+	scr_str(t, mv);
+	scr_str(t, "\r\n");
 	scr_str(t, "\033[?1049l");	/* leave alt screen */
 	scr_flush(t);
 	t->begun = 0;

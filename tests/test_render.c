@@ -1019,6 +1019,28 @@ static const struct vedit_tool_api fake_tools = {
 	NULL, fake_capture, fake_foreground,
 };
 
+/* On exit the editor parks the cursor on the last row and scrolls up one, so a
+ * client without the alternate screen gets a clean prompt line. */
+static void
+t_exit_cursor(Test *t)
+{
+	static const char *const L[] = { "hello" };
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 1);
+	vedit_run(v);
+	vedit_free(v);				/* teardown emits the exit sequence */
+
+	TAP_CHECK(t, m.out && strstr(m.out, "\033[24;1H\r\n") != NULL);
+	memio_free(&m);
+}
+
 /* :!cmd runs through the tool runner and shows the output in the pane. */
 static void
 t_shell_cmd(Test *t)
@@ -1188,6 +1210,7 @@ const Case tap_cases[] = {
 	{ "shiftwidth", t_shiftwidth },
 	{ "macro_play", t_macro_play },
 	{ "shell_cmd", t_shell_cmd },
+	{ "exit_cursor", t_exit_cursor },
 	{ "gv_reselect", t_gv_reselect },
 	{ "global_yank", t_global_yank },
 	{ "global_shift", t_global_shift },
