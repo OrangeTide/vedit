@@ -1884,6 +1884,33 @@ t_menu_narrow(Test *t)
 	memio_free(&m);
 }
 
+/* A pending termination signal unwinds the run like end-of-input: scr_wait
+ * reports EOF while g_sig_quit is set, so vedit_run returns promptly. (The
+ * command-line handler, self-pipe, and re-raise are CLI-only and not exercised
+ * here.) */
+static void
+t_sig_quit_unwinds(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int rc;
+
+	/* a long scripted input that would otherwise keep the loop busy */
+	memio_init(&m, "iiiiiiiiii", 10, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+
+	g_sig_quit = SIGTERM;		/* as the fatal handler would set it */
+	rc = vedit_run(v);		/* scr_wait returns EOF at once */
+	g_sig_quit = 0;			/* do not leak into later tests */
+	TAP_CHECK(t, rc == 1);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* Below the minimum usable size the frame is replaced by a centered notice; at
  * the floor the real framed editor renders. */
 static void
@@ -2011,6 +2038,7 @@ const Case tap_cases[] = {
 	{ "menu_col_pack", t_menu_col_pack },
 	{ "menu_narrow", t_menu_narrow },
 	{ "win_too_small", t_win_too_small },
+	{ "sig_quit_unwinds", t_sig_quit_unwinds },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_f9_make", t_tool_f9_make },
 	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },

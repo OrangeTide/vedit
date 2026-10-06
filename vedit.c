@@ -4072,6 +4072,14 @@ typedef struct draw { Scrbuf *t; } Screen;
  * instead and never touches this. */
 static volatile sig_atomic_t g_winch;
 
+/* The pending termination signal (SIGTERM/SIGHUP), or 0. The command-line
+ * binding's handler sets it and wakes the poll through a self-pipe; scr_wait
+ * then reports end-of-input so the editor unwinds to the top of the run, where
+ * the binding flushes swaps, restores the terminal, and re-raises the signal.
+ * Keeping the real work out of the handler lets it use ordinary stdio. An
+ * embedded host manages its own signals and never touches this. */
+static volatile sig_atomic_t g_sig_quit;
+
 static void
 scr_reserve(Scrbuf *t, size_t need)
 {
@@ -5198,6 +5206,14 @@ scr_wait(Screen *d, Event *ev)
 
 	for (;;) {
 		int rc;
+
+		/* A caught termination signal unwinds like end-of-input; the
+		 * flag stays set so every nested loop bails out too, and the
+		 * command-line binding acts on it once the run returns. */
+		if (g_sig_quit) {
+			ev->type = EVENT_EOF;
+			return EVENT_EOF;
+		}
 
 		if (g_winch || t->want_resize) {
 			int from_signal = g_winch;
@@ -16962,6 +16978,7 @@ typedef struct tty_io {
 	int		in_fd, out_fd;
 	struct termios	saved;
 	int		raw;
+	int		sig_rd, sig_wr;	/* self-pipe: handler -> poll wakeup */
 } Ttyio;
 
 static Ttyio g_tty;	/* the CLI runs a single editor */
@@ -16971,6 +16988,40 @@ tty_on_winch(int sig)
 {
 	(void)sig;
 	g_winch = 1;
+}
+
+/* Handle a polite termination signal (SIGTERM/SIGHUP) by only recording it and
+ * nudging the self-pipe, both async-signal-safe. The event loop then unwinds
+ * (scr_wait reports EOF on g_sig_quit) and the real shutdown runs synchronously
+ * in main, where stdio is safe. A second such signal means the loop is not
+ * responding, so stop being polite and die immediately with the default action. */
+static void
+tty_on_quit(int sig)
+{
+	if (g_sig_quit) {
+		signal(sig, SIG_DFL);
+		raise(sig);
+		return;
+	}
+	g_sig_quit = sig;
+	if (g_tty.sig_wr >= 0) {
+		char b = 1;
+		ssize_t w = write(g_tty.sig_wr, &b, 1);
+
+		(void)w;
+	}
+}
+
+/* Drain any bytes the self-pipe holds so it does not keep the poll hot. */
+static void
+tty_drain_sigpipe(Ttyio *t)
+{
+	char buf[16];
+
+	if (t->sig_rd < 0)
+		return;
+	while (read(t->sig_rd, buf, sizeof(buf)) > 0)
+		;
 }
 
 /* Last-ditch cleanup when the process is killed (SIGTERM/SIGHUP) or crashes
@@ -17043,19 +17094,26 @@ tty_poll(void *ctx, int timeout_ms)
 	Ttyio *t = ctx;
 	fd_set rfds;
 	struct timeval tv, *ptv = NULL;
-	int r;
+	int maxfd = t->in_fd, r;
 
 	FD_ZERO(&rfds);
 	FD_SET(t->in_fd, &rfds);
+	if (t->sig_rd >= 0) {		/* wake promptly on a termination signal */
+		FD_SET(t->sig_rd, &rfds);
+		if (t->sig_rd > maxfd)
+			maxfd = t->sig_rd;
+	}
 	if (timeout_ms >= 0) {
 		tv.tv_sec = timeout_ms / 1000;
 		tv.tv_usec = (timeout_ms % 1000) * 1000;
 		ptv = &tv;
 	}
-	r = select(t->in_fd + 1, &rfds, NULL, NULL, ptv);
+	r = select(maxfd + 1, &rfds, NULL, NULL, ptv);
 	if (r < 0)
 		return (errno == EINTR) ? 0 : -1;
-	return r > 0 ? 1 : 0;
+	if (t->sig_rd >= 0 && FD_ISSET(t->sig_rd, &rfds))
+		tty_drain_sigpipe(t);	/* g_sig_quit carries the verdict */
+	return FD_ISSET(t->in_fd, &rfds) ? 1 : 0;
 }
 
 #ifdef VEDIT_TERM
@@ -17073,6 +17131,11 @@ tty_poll_fds(void *ctx, int timeout_ms, const int *extra, int nextra,
 
 	FD_ZERO(&rfds);
 	FD_SET(t->in_fd, &rfds);
+	if (t->sig_rd >= 0) {		/* wake promptly on a termination signal */
+		FD_SET(t->sig_rd, &rfds);
+		if (t->sig_rd > maxfd)
+			maxfd = t->sig_rd;
+	}
 	for (i = 0; i < nextra; i++) {
 		if (extra[i] < 0)
 			continue;
@@ -17089,6 +17152,8 @@ tty_poll_fds(void *ctx, int timeout_ms, const int *extra, int nextra,
 	*nready = 0;
 	if (r < 0)
 		return (errno == EINTR) ? 0 : -1;
+	if (t->sig_rd >= 0 && FD_ISSET(t->sig_rd, &rfds))
+		tty_drain_sigpipe(t);	/* g_sig_quit carries the verdict */
 	for (i = 0; i < nextra; i++)
 		if (extra[i] >= 0 && FD_ISSET(extra[i], &rfds))
 			ready[(*nready)++] = extra[i];
@@ -17102,6 +17167,22 @@ tty_begin(void *ctx)
 	Ttyio *t = ctx;
 	struct termios raw;
 	struct sigaction sa;
+	int pfd[2];
+
+	/* Self-pipe: the termination-signal handler writes a byte so a blocked
+	 * poll wakes at once instead of waiting out its timeout. Non-blocking so
+	 * the handler's write and the drain never stall; close-on-exec so a
+	 * spawned child (a terminal buffer) does not inherit it. */
+	t->sig_rd = t->sig_wr = -1;
+	g_sig_quit = 0;
+	if (pipe(pfd) == 0) {
+		fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+		fcntl(pfd[1], F_SETFL, O_NONBLOCK);
+		fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+		fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
+		t->sig_rd = pfd[0];
+		t->sig_wr = pfd[1];
+	}
 
 	if (tcgetattr(t->in_fd, &t->saved) == 0) {
 		raw = t->saved;
@@ -17118,9 +17199,13 @@ tty_begin(void *ctx)
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = tty_on_winch;
 	sigaction(SIGWINCH, &sa, NULL);
-	sa.sa_handler = tty_on_fatal;		/* flush swaps + restore terminal */
+	/* Polite kills drain synchronously through the self-pipe. */
+	sa.sa_handler = tty_on_quit;
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGHUP, &sa, NULL);
+	/* Faults cannot be deferred to the loop (the faulting instruction cannot
+	 * retire), so they keep the in-handler best-effort flush and restore. */
+	sa.sa_handler = tty_on_fatal;
 	sigaction(SIGSEGV, &sa, NULL);
 	sigaction(SIGBUS, &sa, NULL);
 	sigaction(SIGILL, &sa, NULL);
@@ -17144,6 +17229,14 @@ tty_end(void *ctx)
 	sigaction(SIGILL, &sa, NULL);
 	sigaction(SIGFPE, &sa, NULL);
 	sigaction(SIGABRT, &sa, NULL);
+	if (t->sig_rd >= 0) {
+		close(t->sig_rd);
+		t->sig_rd = -1;
+	}
+	if (t->sig_wr >= 0) {
+		close(t->sig_wr);
+		t->sig_wr = -1;
+	}
 	if (t->raw) {
 		tcsetattr(t->in_fd, TCSAFLUSH, &t->saved);
 		t->raw = 0;
@@ -20925,6 +21018,7 @@ main(int argc, char **argv)
 	g_tty.in_fd = STDIN_FILENO;
 	g_tty.out_fd = STDOUT_FILENO;
 	g_tty.raw = 0;
+	g_tty.sig_rd = g_tty.sig_wr = -1;
 	memset(&io, 0, sizeof(io));
 	io.ctx = &g_tty;
 	io.read = tty_read;
@@ -20969,6 +21063,19 @@ main(int argc, char **argv)
 		return 1;
 	}
 	rc = vedit_run(v);
+	if (g_sig_quit) {
+		int sig = (int)g_sig_quit;
+
+		/* A termination signal was caught and drained in the loop. Flush
+		 * dirty buffers to their swap files, restore the terminal, and
+		 * die by the signal so the exit status reflects it. vedit_free is
+		 * skipped on purpose: its clean-exit teardown would delete the
+		 * swaps just written, and the OS reclaims the memory at exit. */
+		swap_flush_all(&v->e);
+		scr_end(v->e.d);	/* leave alt screen + restore raw mode */
+		signal(sig, SIG_DFL);
+		raise(sig);
+	}
 	vedit_free(v);
 	vedit_cfg_free(cfg);
 	return rc;
