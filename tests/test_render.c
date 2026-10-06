@@ -1189,6 +1189,147 @@ t_tool_ctrl_f9_run(Test *t)
 }
 #endif /* VEDIT_NO_TOOLS */
 
+/* Write a small C file with three top-level functions and open it, so the
+ * symbol picker (Ctrl-T) lists exactly alpha/bravo/charlie at lines 0/3/6. */
+static struct vedit *
+open_syms(Memio *m, struct vedit_io *io, char *dir, size_t dirsz, char *src,
+    size_t srcsz)
+{
+	struct vedit *v;
+	FILE *f;
+
+	snprintf(dir, dirsz, "/tmp/vedit_pkXXXXXX");
+	if (!mkdtemp(dir))
+		return NULL;
+	snprintf(src, srcsz, "%s/sym.c", dir);
+	f = fopen(src, "w");
+	if (!f)
+		return NULL;
+	fputs("int alpha(void)\n{\n}\nint bravo(void)\n{\n}\n"
+	    "int charlie(void)\n{\n}\n", f);
+	fclose(f);
+
+	memio_bind(io, m);
+	v = vedit_new(io);
+	if (!v)
+		return NULL;
+	if (vedit_open(v, src) != 0) {
+		vedit_free(v);
+		return NULL;
+	}
+	v->e.cy = 0;
+	v->e.cx = 0;
+	return v;
+}
+
+/* The symbol picker, driven through the modal loop: Ctrl-T opens it, Down moves
+ * to the second row (bravo at line 3), Enter chooses it and jumps there. */
+static void
+t_pick_symbol_choose(Test *t)
+{
+	char dir[PATH_MAX], src[PATH_MAX];
+	const char keys[] = "\x14\033[B\r";	/* Ctrl-T, Down, Enter */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	v = open_syms(&m, &io, dir, sizeof(dir), src, sizeof(src));
+	TAP_ASSERT(t, v != NULL);
+
+	vedit_run(v);
+
+	TAP_CHECKF(t, v->e.cy == 3, "chose row 1 -> line %zu", v->e.cy);
+
+	vedit_free(v);
+	memio_free(&m);
+	g_cfg = NULL;
+	unlink(src);
+	rmdir(dir);
+}
+
+/* Esc cancels the picker: after a Down, Esc closes it and the cursor stays put
+ * (no row was chosen, so no jump). */
+static void
+t_pick_symbol_cancel(Test *t)
+{
+	char dir[PATH_MAX], src[PATH_MAX];
+	const char keys[] = "\x14\033[B\033";	/* Ctrl-T, Down, Esc */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	v = open_syms(&m, &io, dir, sizeof(dir), src, sizeof(src));
+	TAP_ASSERT(t, v != NULL);
+
+	vedit_run(v);
+
+	TAP_CHECKF(t, v->e.cy == 0, "cancelled; cursor at line %zu", v->e.cy);
+
+	vedit_free(v);
+	memio_free(&m);
+	g_cfg = NULL;
+	unlink(src);
+	rmdir(dir);
+}
+
+/* The file picker's entry line, reached through the menu: Alt-F opens the File
+ * menu, 'o' picks Open, Tab moves focus to the entry field, a typed absolute
+ * path is submitted with Enter, and the editor opens that file. Exercises the
+ * entry focus toggle, pick_entry_key typing, and submit -> PICK_DONE. */
+static void
+t_pick_open_entry(Test *t)
+{
+	char dir[] = "/tmp/vedit_poXXXXXX";
+	char start[PATH_MAX], target[PATH_MAX];
+	char keys[PATH_MAX + 16];
+	size_t klen;
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	FILE *f;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(start, sizeof(start), "%s/start.txt", dir);
+	snprintf(target, sizeof(target), "%s/target.txt", dir);
+	f = fopen(start, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("x\n", f);
+	fclose(f);
+	f = fopen(target, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("hello\n", f);
+	fclose(f);
+
+	/* Alt-F, 'o', Tab, <absolute path>, Enter */
+	klen = (size_t)snprintf(keys, sizeof(keys), "\033fo\t%s\r", target);
+
+	memio_init(&m, keys, klen, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, start) == 0);
+
+	vedit_run(v);
+
+	TAP_CHECK(t, v->e.has_name &&
+	    strcmp(v->e.path + strlen(v->e.path) - 10, "target.txt") == 0);
+	{
+		size_t len = 0;
+		const char *line = text_line(v->e.t, 0, &len);
+
+		TAP_CHECK(t, line && len == 5 && memcmp(line, "hello", 5) == 0);
+	}
+
+	vedit_free(v);
+	memio_free(&m);
+	g_cfg = NULL;
+	unlink(start);
+	unlink(target);
+	rmdir(dir);
+}
+
 const Case tap_cases[] = {
 	{ "cursor_end_home", t_cursor_end_home },
 	{ "cursor_home", t_cursor_home },
@@ -1217,6 +1358,9 @@ const Case tap_cases[] = {
 	{ "vblock_delete", t_vblock_delete },
 	{ "vblock_insert", t_vblock_insert },
 	{ "vblock_yank_put", t_vblock_yank_put },
+	{ "pick_symbol_choose", t_pick_symbol_choose },
+	{ "pick_symbol_cancel", t_pick_symbol_cancel },
+	{ "pick_open_entry", t_pick_open_entry },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_f9_make", t_tool_f9_make },
 	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },
