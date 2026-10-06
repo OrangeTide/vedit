@@ -2218,6 +2218,23 @@ t_tool_run(Test *t)
 	TAP_CHECKF(t, rc == 3, "exit-status %d", rc);
 }
 
+/* tool_strip_ctl drops CSI and OSC sequences and carriage returns. */
+static void
+t_tool_strip(Test *t)
+{
+	static const char in[] =
+	    "\033[1m\033[Kx.c:1:2:\033[m \033]0;title\007y\r\n\033]2;t\033\\z\033Mq";
+	char out[sizeof(in)];
+	size_t n = tool_strip_ctl(in, sizeof(in) - 1, out);
+
+	out[n] = '\0';
+	TAP_CHECKF(t, strcmp(out, "x.c:1:2: y\nzq") == 0, "got '%s'", out);
+	/* a truncated sequence at the end is dropped, not read past */
+	n = tool_strip_ctl("ab\033[3", 5, out);
+	out[n] = '\0';
+	TAP_CHECKF(t, strcmp(out, "ab") == 0, "got '%s'", out);
+}
+
 /* Diagnostic severity is read from the word after "file:line:col: ". */
 static void
 t_tool_sev(Test *t)
@@ -2586,6 +2603,7 @@ const Case tap_cases[] = {
 	{ "tool_parse", t_tool_parse },
 	{ "tool_pattern", t_tool_pattern },
 	{ "tool_run", t_tool_run },
+	{ "tool_strip", t_tool_strip },
 #endif
 	{ "buf_same_file", t_buf_same_file },
 	{ "buf_switch_clears_status", t_buf_switch_clears_status },

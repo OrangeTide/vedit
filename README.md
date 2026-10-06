@@ -208,6 +208,9 @@ A gitconfig-style file sets the startup defaults. It is read from the first of
 [cc]
     file = /path/to/compile_commands.json # include paths for gf / Open Header
 
+[command]
+    terminal = on        # run Compile / Make / Run in a terminal buffer
+
 [error]
     pattern = ^([^(]+)\(([0-9]+),([0-9]+)\):  # extra build-error format
 
@@ -752,11 +755,28 @@ you want. For example:
     run.interactive = on
 ```
 
-Compile and Make capture the command's output into a scrollable pane. Output that
-looks like a gcc, clang, or MSVC diagnostic (`file:line:col: ...` or
+Compile, Make, and Run start the command in a terminal buffer (see
+[Terminal buffers](#terminal-buffers)), labelled with the command name, so its
+output shows live, in color, and a program that prompts can be answered. The
+buffer stays after the command exits, with the exit status and the diagnostic
+counts on its status line, and the next build replaces it. `Ctrl-W w` returns
+to the file while a command runs; `Alt+F5` (Run > View Output) switches back to
+the build terminal. The output is also captured for the parser below: it is the
+same capture that feeds the output pane, which is what the command falls back to
+when a terminal buffer is not possible, either because the host cannot multiplex
+file descriptors, the editor was built with `VEDIT_NO_TERM`, or `command.terminal`
+is `off` in the config:
+
+```ini
+[command]
+    terminal = off       # capture into the output pane instead
+```
+
+Output that looks like a gcc, clang, or MSVC diagnostic (`file:line:col: ...` or
 `file:line: ...`, including a Windows `C:\path` with a drive letter) becomes a
-jump target: press Enter on it in the pane, or use `F4` and `Shift+F4` from the
-editor to step through them. A diagnostic in another file opens or switches to
+jump target: use `F4` and `Shift+F4` from the editor to step through them, or
+press Enter on it in the output pane (Run > View Output from inside the build
+terminal's menu opens the pane instead of switching). A diagnostic in another file opens or switches to
 that file.
 
 Toolchains with a different format are handled by adding `error.pattern` keys
@@ -771,16 +791,18 @@ whole.
 The severity word after the location (`error`, `warning`, `note`) is read and
 used. The pane colors errors red, warnings yellow, and notes cyan, and the pane
 title and the post-build status line count the errors and warnings separately.
-After a build the cursor lands on the first error, so it is in place the moment
-the pane closes. `F4` and `Shift+F4` step through the errors, skipping warnings
+When a build ends with errors the cursor lands on the first one, switching back
+to the file from the build terminal; a clean build leaves the terminal in front
+so its output can be read. `F4` and `Shift+F4` step through the errors, skipping warnings
 and notes, and wrap around at the ends. When a build has no errors, they step
 through its warnings instead. Anything that matches the location form but carries
 no recognized severity word, such as a linker line, counts as an error.
 
 A command marked with a sibling
-`<command>.interactive = on` key runs on the real terminal instead, for a program
-that reads input or draws its own screen. vedit leaves the alternate screen while
-it runs and returns when it exits.
+`<command>.interactive = on` key runs on the real terminal instead of a terminal
+buffer, for a program that needs the full terminal rather than the embedded
+emulator. vedit leaves the alternate screen while it runs and returns when it
+exits.
 
 ### Formatting
 
@@ -874,6 +896,10 @@ The editor shortcuts, including F1, F8, F10, and Alt+letter, reach the child
 rather than the editor while a terminal has focus. `Ctrl-W m` is the way to
 the menu bar, and from there to every editor command; when the menu closes,
 focus returns to the terminal.
+
+The build commands (F9, Alt+F9, Ctrl+F9) open a terminal buffer of their own,
+labelled with the command name, described under
+[Build commands](#build-commands-a-primitive-ide).
 
 When the child exits, the buffer shows `[process exited N]` and waits for
 `Ctrl-W q` to close.

@@ -622,6 +622,171 @@ t_term_loop_flush(Test *t)
 	memio_free(&m);
 }
 
+/* ---- build commands in a tool terminal ---- */
+
+/* Write a small file at dir/name. */
+static void
+write_file(const char *dir, const char *name, const char *text)
+{
+	char path[PATH_MAX];
+	FILE *f;
+
+	snprintf(path, sizeof(path), "%s/%s", dir, name);
+	f = fopen(path, "w");
+	if (f) {
+		fputs(text, f);
+		fclose(f);
+	}
+}
+
+static void
+remove_file(const char *dir, const char *name)
+{
+	char path[PATH_MAX];
+
+	snprintf(path, sizeof(path), "%s/%s", dir, name);
+	unlink(path);
+}
+
+/* Output through a tool terminal is captured, stripped of colors and CRs,
+ * parsed when the child end closes, and the editor lands on the first error.
+ * Driven through a socketpair so no child is forked. */
+static void
+t_tool_term_capture(Test *t)
+{
+	static const char out[] =
+	    "\033[1m\033[Ka.c:2:1:\033[m\033[K \033[01;31m\033[Kerror:\033[m"
+	    "\033[K boom\r\n"
+	    "a.c:3:1: warning: meh\r\n";
+	char dir[] = "/tmp/vedit-tool-XXXXXX";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child, tries;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	write_file(dir, "a.c", "int a;\nint b;\nint c;\n");
+
+	v = term_editor_in(&m, &io, "", 0, 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+	v->e.vterm->tool = 1;
+	snprintf(v->e.vterm->tool_label, sizeof(v->e.vterm->tool_label), "Make");
+	snprintf(v->e.tool_title, sizeof(v->e.tool_title), "Make");
+	snprintf(v->e.tool_dir, sizeof(v->e.tool_dir), "%s", dir);
+
+	TAP_ASSERT(t, write(child, out, sizeof(out) - 1) == (ssize_t)(sizeof(out) - 1));
+	close(child);				/* "the command exited" */
+	for (tries = 0; tries < 20 && term_is_active(&v->e); tries++)
+		TAP_ASSERT(t, term_loop_step(&v->e) == TERM_CONT);
+
+	TAP_CHECKF(t, v->e.tool_rawlen == sizeof(out) - 1, "captured %zu bytes",
+	    v->e.tool_rawlen);
+	TAP_CHECKF(t, v->e.tool_nerr == 2, "parsed %d diagnostics", v->e.tool_nerr);
+	if (v->e.tool_nerr == 2) {
+		TAP_CHECKF(t, strcmp(v->e.tool_errs[0].file, "a.c") == 0 &&
+		    v->e.tool_errs[0].line == 2 && v->e.tool_errs[0].sev == TSEV_ERROR,
+		    "first: %s:%zu sev %d", v->e.tool_errs[0].file,
+		    v->e.tool_errs[0].line, v->e.tool_errs[0].sev);
+		TAP_CHECK(t, v->e.tool_errs[1].sev == TSEV_WARN);
+	}
+	TAP_CHECKF(t, v->e.tool_nlines == 2 &&
+	    strcmp(v->e.tool_lines[0], "a.c:2:1: error: boom") == 0,
+	    "line 0 '%s'", v->e.tool_nlines ? v->e.tool_lines[0] : "");
+	/* landed on a.c line 2 in a text buffer; the terminal stays open */
+	TAP_CHECKF(t, v->e.kind == BUF_TEXT && v->e.cy == 1,
+	    "kind %d cy %zu", v->e.kind, v->e.cy);
+	TAP_CHECK(t, v->e.has_name && strstr(v->e.path, "a.c") != NULL);
+	TAP_CHECK(t, v->e.nbuf == 2 && tool_term_find(&v->e, NULL) != NULL);
+	TAP_CHECKF(t, strcmp(v->e.tool_result,
+	    "Make exited 0, 1 error, 1 warning") == 0, "result '%s'",
+	    v->e.tool_result);
+	TAP_CHECKF(t, strcmp(v->e.status, v->e.tool_result) == 0, "status '%s'",
+	    v->e.status);
+
+	/* View Output switches back to the tool terminal, labelled by command */
+	tool_view_output(&v->e);
+	TAP_CHECK(t, term_is_active(&v->e) && v->e.vterm->tool);
+	TAP_CHECKF(t, strcmp(term_label(&v->e), "Make") == 0, "label '%s'",
+	    term_label(&v->e));
+	ed_render(&v->e, v->e.d);		/* dead tool terminal: result in the status */
+	TAP_CHECKF(t, strstr(v->e.status, "[Make exited 0, 1 error, 1 warning]") != NULL,
+	    "status '%s'", v->e.status);
+
+	vedit_free(v);
+	memio_free(&m);
+	remove_file(dir, "a.c");
+	rmdir(dir);
+}
+
+/* tool_term_start forks the command through the shell in dir; the exit status
+ * reaches the result line, and a second start replaces the finished terminal
+ * rather than adding one. Skipped when a pty cannot be opened. */
+static void
+t_tool_term_start(Test *t)
+{
+	char dir[] = "/tmp/vedit-tool-XXXXXX";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Term *old;
+	int tries, idx = -1;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	write_file(dir, "b.c", "int a;\nint b;\nint c;\n");
+
+	v = term_editor_in(&m, &io, "", 0, 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	snprintf(v->e.tool_dir, sizeof(v->e.tool_dir), "%s", dir);
+
+	if (tool_term_start(&v->e, "printf 'b.c:3:1: error: x\\n'; exit 3", dir,
+	    "Make") < 0) {
+		vedit_free(v);			/* no pty here: skip */
+		memio_free(&m);
+		remove_file(dir, "b.c");
+		rmdir(dir);
+		return;
+	}
+	TAP_CHECK(t, term_is_active(&v->e) && v->e.vterm->tool);
+	for (tries = 0; tries < 200 && term_is_active(&v->e); tries++)
+		if (term_loop_step(&v->e) != TERM_CONT)
+			break;
+	TAP_CHECKF(t, strcmp(v->e.tool_result, "Make exited 3, 1 error, 0 warnings") == 0,
+	    "result '%s' after %d steps", v->e.tool_result, tries);
+	TAP_CHECKF(t, v->e.kind == BUF_TEXT && v->e.cy == 2 &&
+	    strstr(v->e.path, "b.c") != NULL, "kind %d cy %zu path %s",
+	    v->e.kind, v->e.cy, v->e.path);
+	old = tool_term_find(&v->e, &idx);
+	TAP_CHECK(t, old != NULL && old->dead && old->exit_status == 3);
+	TAP_CHECKF(t, v->e.nbuf == 2, "nbuf %d", v->e.nbuf);	/* term, b.c */
+
+	/* a second build replaces the finished terminal */
+	TAP_CHECK(t, tool_term_start(&v->e, "exit 0", dir, "Make") == 0);
+	TAP_CHECKF(t, v->e.nbuf == 2, "nbuf %d after restart", v->e.nbuf);
+	TAP_CHECK(t, tool_term_find(&v->e, NULL) == v->e.vterm && v->e.vterm != old);
+	TAP_CHECK(t, v->e.tool_nerr == 0);	/* the capture was cleared */
+	for (tries = 0; tries < 200 && !v->e.vterm->dead; tries++)
+		if (term_loop_step(&v->e) != TERM_CONT)
+			break;
+	for (tries = 0; tries < 5 && v->e.tool_done_pending; tries++)
+		term_loop_step(&v->e);
+	TAP_CHECKF(t, strcmp(v->e.tool_result, "Make exited 0, 0 errors, 0 warnings") == 0,
+	    "result '%s'", v->e.tool_result);
+	TAP_CHECK(t, term_is_active(&v->e));	/* no error: stays on the output */
+
+	/* a running build refuses a second start */
+	TAP_CHECK(t, tool_term_start(&v->e, "sleep 5", dir, "Make") == 0);
+	TAP_CHECK(t, tool_term_start(&v->e, "exit 0", dir, "Make") < 0);
+	TAP_CHECK(t, strstr(v->e.status, "still running") != NULL);
+
+	vedit_free(v);
+	memio_free(&m);
+	remove_file(dir, "b.c");
+	rmdir(dir);
+}
+
 /* Without a multiplexing host, in_refill uses the plain poll fallback. */
 static void
 t_term_poll_fallback(Test *t)
@@ -916,6 +1081,8 @@ const Case tap_cases[] = {
 	{ "term_loop_digit", t_term_loop_digit },
 	{ "term_loop_flush", t_term_loop_flush },
 	{ "term_loop_menu", t_term_loop_menu },
+	{ "tool_term_capture", t_tool_term_capture },
+	{ "tool_term_start", t_tool_term_start },
 	{ "term_poll_fallback", t_term_poll_fallback },
 	{ "term_discard", t_term_discard },
 	{ "term_open_nomux", t_term_open_nomux },

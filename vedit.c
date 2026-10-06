@@ -5366,8 +5366,25 @@ typedef struct vi_keylog {
  * terminal handle live on every buffer so the buffer-mirror X-macros stay
  * uniform; without VEDIT_TERM a buffer is always BUF_TEXT with a NULL handle.
  * Term is defined, with all terminal code, behind VEDIT_TERM near end of file. */
+#define TOOLTITLE_MAX	64	/* label of the last build/shell command */
+
 enum buf_kind { BUF_TEXT = 0, BUF_TERM };
 typedef struct term Term;
+
+/* A terminal session behind a BUF_TERM buffer. Defined here, ahead of the
+ * terminal code, so the tool layer can read its exit state. The vt types are
+ * the emulator's, declared with it. */
+struct term {
+	int		master_fd;	/* PTY master, non-blocking; -1 if closed */
+	int		child_pid;
+	int		dead;		/* child has exited */
+	int		exit_status;
+	int		tool;		/* runs a build command: output is also captured */
+	char		tool_label[TOOLTITLE_MAX];	/* frame label for a tool terminal */
+	int		rows, cols;	/* grid size (matches the text area) */
+	struct vt_state	*vt;
+	struct vt_parse	*parser;
+};
 
 /* One open file. The editor keeps a list of these; the active buffer's fields
  * are mirrored into the flat Editor for editing and copied back here on
@@ -5408,7 +5425,6 @@ struct tkbd_seq;
 /* Fixed-size text buffers carried on the Editor struct. */
 #define STATUS_MAX	160	/* transient status/message line */
 #define FIND_MAX	256	/* last search and replacement strings */
-#define TOOLTITLE_MAX	64	/* label of the last build/shell command */
 #define HEXPAT_MAX	64	/* last searched byte pattern (hex view) */
 
 /* Editing personality. The default is a modeless (nano-style) editor;
@@ -5501,6 +5517,9 @@ typedef struct editor {
 	int		tool_curerr;		/* selected error (F4/Shift+F4), -1 */
 	char	tool_title[TOOLTITLE_MAX];	/* label of the last command, for the pane */
 	char	tool_dir[PATH_MAX];	/* directory the last command ran in */
+	int		tool_in_term;		/* run build commands in a terminal buffer */
+	int		tool_done_pending;	/* a tool terminal exited; parse on the next tick */
+	char	tool_result[STATUS_MAX];	/* "Make exited 0, ..." for the frame */
 #endif
 	int		draw_mode;	/* 2D/block draw mode: free cursor + overtype */
 	char		last_find[FIND_MAX];	/* last search string, for repeat */
@@ -5619,6 +5638,12 @@ static int term_render(Editor *e, Screen *d);	/* blit the active grid */
 static int term_loop_step(Editor *e);		/* one wait/input/render tick */
 static void term_resize_all(Editor *e);		/* match ptys to the text area */
 static void term_buf_free(Buf *b);		/* reap child, free a term buffer */
+static int term_open_argv(Editor *e, char *const argv[], const char *dir,
+    const char *label);			/* spawn argv in a new terminal buffer */
+#ifndef VEDIT_NO_TOOLS
+static Term *tool_term_find(const Editor *e, int *idx);	/* the build terminal */
+static int tool_poll_done(Editor *e);		/* finish an exited build */
+#endif
 static int term_open(Editor *e, const char *cmd); /* :term; -1 on failure */
 static int term_collect(void *ctx, int *fds, int max);	/* aux_collect hook */
 static void term_drain(void *ctx, int fd);		/* aux_ready hook */
@@ -7993,6 +8018,10 @@ menu_item_enabled(const Editor *e, Menuact act)
 	case MA_RUN:
 		return tool_cmd_ready(e, "run");
 	case MA_VIEW_OUTPUT:
+#ifdef VEDIT_TERM
+		if (tool_term_find(e, NULL))
+			return 1;
+#endif
 		return e->tool_nlines > 0;
 	case MA_ERR_NEXT:
 	case MA_ERR_PREV:
@@ -11904,6 +11933,10 @@ static const char *const tut_term[] = {
 	"    cycle between it and your files like any other buffer.",
 	"  - When the program exits, the buffer stays so you can read its",
 	"    last output. Close it with Ctrl-W q.",
+	"  - Make, Compile, and Run (F9, Alt+F9, Ctrl+F9) open a terminal",
+	"    buffer of their own, labelled with the command. A build that",
+	"    ends with errors lands you on the first one; Alt+F5 switches",
+	"    back to its output, and the next build replaces the buffer.",
 	"",
 	"Control keys",
 	"",
@@ -12472,6 +12505,10 @@ buf_open(Editor *e, const char *path)
 	buf_save(e, &e->bufs[e->cur]);		/* park the current buffer */
 	e->cur = i;
 	e->t = nt;				/* set up the flat new buffer */
+#ifdef VEDIT_TERM
+	e->kind = BUF_TEXT;		/* parked a terminal: this slot is text */
+	e->vterm = NULL;
+#endif
 	if (path && path[0]) {
 		snprintf(e->path, sizeof(e->path), "%s", path);
 		e->has_name = 1;
@@ -14390,6 +14427,13 @@ ed_new(Editor *e)
 {
 	Text *nt;
 
+#ifdef VEDIT_TERM
+	if (e->kind == BUF_TERM) {	/* keep the session: open beside it */
+		if (buf_open(e, NULL) == 0)
+			set_status(e, "new buffer");
+		return;
+	}
+#endif
 	if (!dlg_confirm_discard(e))
 		return;
 	nt = text_new();
@@ -15094,6 +15138,10 @@ tool_group_num(const char *s, const rx_match *m)
 /* How many user "error.pattern" regexes are honored, beyond the built-ins. */
 #define TOOL_MAX_PAT 16
 
+/* Bytes of a tool terminal's output kept for the parser; a long-running
+ * program (Run) would otherwise grow the capture without bound. */
+#define TOOL_CAPTURE_MAX (4u << 20)
+
 /* Record a diagnostic if line s matches one of the patterns. Patterns are
  * tried in order and the first match wins. Capture group 1 is the file, group 2
  * the line, and the optional group 3 the column. Severity is read from the text
@@ -15150,30 +15198,81 @@ tool_patterns(rx_t **pats)
 	return npat;
 }
 
+/* Drop terminal escape sequences and carriage returns from n bytes of in,
+ * writing to out (which may be as large as in). Returns the new length. Output
+ * read from a pty carries the compiler's colors and CRLF line ends, which
+ * would otherwise land inside the file name of a parsed diagnostic. */
+static size_t
+tool_strip_ctl(const char *in, size_t n, char *out)
+{
+	size_t i = 0, o = 0;
+
+	while (i < n) {
+		unsigned char c = (unsigned char)in[i];
+
+		if (c == 0x1B) {
+			i++;
+			if (i < n && in[i] == '[') {	/* CSI: to a final byte */
+				i++;
+				while (i < n && ((unsigned char)in[i] < 0x40 ||
+				    (unsigned char)in[i] > 0x7E))
+					i++;
+				if (i < n)
+					i++;
+			} else if (i < n && in[i] == ']') {	/* OSC: to BEL or ST */
+				i++;
+				while (i < n && in[i] != 0x07 &&
+				    !(in[i] == 0x1B && i + 1 < n && in[i + 1] == '\\'))
+					i++;
+				if (i < n)
+					i += (in[i] == 0x07) ? 1 : 2;
+			} else if (i < n) {
+				i++;			/* two-byte escape */
+			}
+			continue;
+		}
+		if (c != '\r')
+			out[o++] = (char)c;
+		i++;
+	}
+	return o;
+}
+
 /* Split the captured bytes into lines and build the diagnostic list. */
 static void
 tool_parse_output(Editor *e)
 {
 	rx_t *pats[TOOL_MAX_PAT + 2];
 	int npat = tool_patterns(pats), i;
-	size_t start = 0, k;
+	size_t start = 0, k, len = 0;
+	char *clean = NULL;
+	const char *raw = e->tool_raw;
 
-	for (k = 0; e->tool_raw && k < e->tool_rawlen; k++) {
-		if (e->tool_raw[k] != '\n')
+	if (raw && e->tool_rawlen) {
+		clean = malloc(e->tool_rawlen);
+		if (clean) {
+			len = tool_strip_ctl(raw, e->tool_rawlen, clean);
+			raw = clean;
+		} else {
+			len = e->tool_rawlen;	/* no memory: parse as is */
+		}
+	}
+	for (k = 0; k < len; k++) {
+		if (raw[k] != '\n')
 			continue;
-		if (tool_add_line(e, e->tool_raw + start, k - start) == 0)
+		if (tool_add_line(e, raw + start, k - start) == 0)
 			tool_parse_line(e, pats, npat,
 			    e->tool_lines[e->tool_nlines - 1],
 			    e->tool_nlines - 1);
 		start = k + 1;
 	}
-	if (e->tool_raw && start < e->tool_rawlen) {	/* final partial line */
-		if (tool_add_line(e, e->tool_raw + start,
-		    e->tool_rawlen - start) == 0)
+	if (start < len) {				/* final partial line */
+		if (tool_add_line(e, raw + start, len - start) == 0)
 			tool_parse_line(e, pats, npat,
 			    e->tool_lines[e->tool_nlines - 1],
 			    e->tool_nlines - 1);
 	}
+	free(clean);
 	for (i = 0; i < npat; i++)
 		rx_free(pats[i]);
 }
@@ -15596,8 +15695,129 @@ ed_format(Editor *e)
 	return 1;
 }
 
-/* Resolve and run the per-language command `which` (labelled `label`). Compile
- * and make capture to the pane; a command marked interactive runs on the tty. */
+#ifdef VEDIT_TERM
+/* ---- running in a terminal buffer ---- */
+
+/* The tool terminal (the buffer the last build command ran in), or NULL. Its
+ * buffer index goes to *idx when set. The buffer is found by its flag rather
+ * than remembered, so closing it with Ctrl-W c leaves nothing dangling. */
+static Term *
+tool_term_find(const Editor *e, int *idx)
+{
+	int i;
+
+	for (i = 0; i < e->nbuf; i++) {
+		Term *t = (i == e->cur)
+		    ? (e->kind == BUF_TERM ? e->vterm : NULL)
+		    : (e->bufs[i].kind == BUF_TERM ? e->bufs[i].vterm : NULL);
+
+		if (t && t->tool) {
+			if (idx)
+				*idx = i;
+			return t;
+		}
+	}
+	return NULL;
+}
+
+/* Whether build commands run in a terminal buffer: command.terminal is not
+ * off and the host multiplexes fds (the capture pane is the fallback). */
+static int
+tool_use_term(Editor *e)
+{
+	return e->tool_in_term && e->d->t->io.poll_fds != NULL;
+}
+
+/* Start cmd in a tool terminal buffer, through the shell, in dir. The buffer
+ * becomes current so the output shows live; the raw bytes are also captured
+ * so the diagnostics are parsed when the command exits (tool_poll_done). A
+ * finished tool terminal from the previous command is replaced; a running
+ * one is left alone. Returns 0, or -1 with the status set. */
+static int
+tool_term_start(Editor *e, const char *cmd, const char *dir, const char *label)
+{
+	char *argv[4];
+	Term *old = tool_term_find(e, NULL);
+	int i;
+
+	if (old && !old->dead) {
+		set_status(e, "%s is still running (Ctrl-W c in its buffer stops it)",
+		    e->tool_title);
+		return -1;
+	}
+	tool_clear_output(e);
+	snprintf(e->tool_title, sizeof(e->tool_title), "%s", label);
+	e->tool_done_pending = 0;
+	e->tool_result[0] = '\0';
+	argv[0] = "/bin/sh";
+	argv[1] = "-c";
+	argv[2] = (char *)cmd;
+	argv[3] = NULL;
+	if (term_open_argv(e, argv, dir, label) < 0)
+		return -1;
+	if (old) {				/* drop the finished predecessor */
+		for (i = 0; i < e->nbuf; i++)
+			if (i != e->cur && e->bufs[i].kind == BUF_TERM &&
+			    e->bufs[i].vterm == old) {
+				buf_close(e, i);
+				break;
+			}
+	}
+	set_status(e, "%s: running in a terminal buffer (Ctrl-W w returns to the file)",
+	    label);
+	return 0;
+}
+
+/* Called by the input loops once a tool terminal's command has exited: parse
+ * the captured output, report the exit status and counts, and land on the
+ * first error. Deferred to the loops, rather than done where the exit is
+ * noticed, because that happens inside any nested read and landing on an
+ * error switches buffers. Returns 1 when it acted (the caller repaints). */
+static int
+tool_poll_done(Editor *e)
+{
+	Term *t;
+	int rc, ne, nw, fe;
+
+	if (!e->tool_done_pending)
+		return 0;
+	e->tool_done_pending = 0;
+	t = tool_term_find(e, NULL);
+	rc = t ? t->exit_status : -1;
+	tool_parse_output(e);
+	e->tool_curerr = -1;
+	tool_counts(e, &ne, &nw);
+	snprintf(e->tool_result, sizeof(e->tool_result),
+	    "%s exited %d, %d error%s, %d warning%s", e->tool_title, rc,
+	    ne, ne == 1 ? "" : "s", nw, nw == 1 ? "" : "s");
+	fe = tool_first_error(e);
+	if (fe >= 0)				/* land on the first error */
+		tool_goto_err(e, fe);
+	set_status(e, "%s", e->tool_result);
+	return 1;
+}
+#endif /* VEDIT_TERM */
+
+/* Alt+F5: show the last command's output. A tool terminal is switched to when
+ * one exists; from inside it (via the menu) the pane shows the jump list.
+ * Otherwise the pane shows the capture. */
+static void
+tool_view_output(Editor *e)
+{
+#ifdef VEDIT_TERM
+	int idx;
+
+	if (tool_term_find(e, &idx) && idx != e->cur) {
+		buf_switch(e, idx);
+		return;
+	}
+#endif
+	dlg_tool_output(e);
+}
+
+/* Resolve and run the per-language command `which` (labelled `label`). It
+ * runs in a terminal buffer when one is possible, else captures to the pane; a
+ * command marked interactive runs on the tty. */
 static void
 ed_tool_run(Editor *e, const char *which, const char *label)
 {
@@ -15652,6 +15872,10 @@ ed_tool_run(Editor *e, const char *which, const char *label)
 		else
 			set_status(e,
 			    "%s finished (exit %d)", label, rc);
+#ifdef VEDIT_TERM
+	} else if (tool_use_term(e)) {
+		tool_term_start(e, cmd, dir, label);
+#endif
 	} else if (e->tools->run_capture) {
 		int fe, ne, nw;
 
@@ -15746,7 +15970,7 @@ run_tool_cmd(Editor *e, Cmd c)
 	case CMD_COMPILE:	ed_tool_run(e, "compile", "Compile"); break;
 	case CMD_MAKE:		ed_tool_run(e, "build", "Make"); break;
 	case CMD_RUN:		ed_tool_run(e, "run", "Run"); break;
-	case CMD_VIEW_OUTPUT:	dlg_tool_output(e); break;
+	case CMD_VIEW_OUTPUT:	tool_view_output(e); break;
 	case CMD_ERR_NEXT:	ed_err_step(e, +1); break;
 	case CMD_ERR_PREV:	ed_err_step(e, -1); break;
 	default:		break;
@@ -16762,6 +16986,9 @@ editor_init(Editor *e)
 	e->swap_enabled = 1;	/* write crash-recovery swap files by default */
 	e->backup_enabled = 0;	/* keep no previous-version backup by default */
 	e->format_on_save = 0;	/* do not reformat on save unless asked */
+#ifndef VEDIT_NO_TOOLS
+	e->tool_in_term = 1;	/* build in a terminal buffer when one is possible */
+#endif
 	e->hex_pending = -1;
 	e->hex_cols = 16;
 	e->scheme = SCHEME_DOS;	/* MS-EDIT look by default; View cycles it */
@@ -16775,6 +17002,13 @@ editor_loop(Editor *e)
 	for (;;) {
 		Event ev;
 		struct tkbd_seq seq;
+
+#if defined(VEDIT_TERM) && !defined(VEDIT_NO_TOOLS)
+		/* A build in a background terminal buffer finished during the
+		 * last wait: report it and land on its first error. */
+		if (tool_poll_done(e))
+			ed_render(e, e->d);
+#endif
 
 #ifdef VEDIT_TERM
 		/* A terminal buffer takes over input (raw passthrough) and
@@ -17132,6 +17366,9 @@ ed_apply_config(Editor *e)
 	e->swap_enabled = cfg_bool(g_cfg, "edit.swap", e->swap_enabled);
 	e->backup_enabled = cfg_bool(g_cfg, "edit.backup", e->backup_enabled);
 	e->format_on_save = cfg_bool(g_cfg, "edit.formatonsave", e->format_on_save);
+#ifndef VEDIT_NO_TOOLS
+	e->tool_in_term = cfg_bool(g_cfg, "command.terminal", e->tool_in_term);
+#endif
 	e->search_icase = cfg_bool(g_cfg, "edit.ignorecase", e->search_icase);
 	s = cfg_get(g_cfg, "edit.shiftwidth");
 	if (s) {
@@ -20500,16 +20737,6 @@ vt_parse_feed(struct vt_parse *p, const char *data, size_t len)
 #include <util.h>
 #endif
 
-struct term {
-	int		master_fd;	/* PTY master, non-blocking; -1 if closed */
-	int		child_pid;
-	int		dead;		/* child has exited */
-	int		exit_status;
-	int		rows, cols;	/* grid size (matches the text area) */
-	struct vt_state	*vt;
-	struct vt_parse	*parser;
-};
-
 /* Resize the PTY so the child learns its new window size. */
 static void
 pty_resize(int fd, int rows, int cols)
@@ -20522,10 +20749,12 @@ pty_resize(int fd, int rows, int cols)
 	ioctl(fd, TIOCSWINSZ, &ws);
 }
 
-/* Open a PTY and fork a child running argv (NULL = the login shell). Returns
- * the non-blocking master fd and stores the child pid, or -1 on failure. */
+/* Open a PTY and fork a child running argv (NULL = the login shell) in dir
+ * (NULL = inherit the cwd). Returns the non-blocking master fd and stores the
+ * child pid, or -1 on failure. */
 static int
-pty_spawn(int *child_pid, char *const argv[], int rows, int cols)
+pty_spawn(int *child_pid, char *const argv[], const char *dir, int rows,
+    int cols)
 {
 	struct winsize ws;
 	int master, flags;
@@ -20545,6 +20774,8 @@ pty_spawn(int *child_pid, char *const argv[], int rows, int cols)
 		signal(SIGTERM, SIG_DFL);
 		signal(SIGHUP, SIG_DFL);
 		setenv("TERM", "xterm-256color", 1);
+		if (dir && dir[0] && chdir(dir) != 0)
+			_exit(127);
 		if (argv && argv[0]) {
 			execvp(argv[0], argv);
 		} else {
@@ -20579,7 +20810,11 @@ term_label(const Editor *e)
 	if (e->kind != BUF_TERM || !e->vterm)
 		return "terminal";
 	title = vt_state_title(e->vterm->vt);
-	return (title && title[0]) ? title : "terminal";
+	if (title && title[0])
+		return title;
+	if (e->vterm->tool && e->vterm->tool_label[0])
+		return e->vterm->tool_label;
+	return "terminal";
 }
 
 /* Hang up and reap the child, free the emulator. No-op on a text buffer. */
@@ -20662,6 +20897,19 @@ term_reap(Term *t)
 }
 
 /* aux_ready: a PTY fd is readable; drain it into its parser. */
+/* A tool terminal has exited: flag it for the input loops (tool_poll_done). */
+static void
+term_note_exit(Editor *e, Term *t)
+{
+#ifndef VEDIT_NO_TOOLS
+	if (t->tool)
+		e->tool_done_pending = 1;
+#else
+	(void)e;
+	(void)t;
+#endif
+}
+
 static void
 term_drain(void *ctx, int fd)
 {
@@ -20678,6 +20926,10 @@ term_drain(void *ctx, int fd)
 
 		if (r > 0) {
 			vt_parse_feed(t->parser, buf, (size_t)r);
+#ifndef VEDIT_NO_TOOLS
+			if (t->tool && e->tool_rawlen < TOOL_CAPTURE_MAX)
+				tool_emit(e, buf, (size_t)r);
+#endif
 			if (active)
 				e->term_dirty = 1;
 			if ((size_t)r < sizeof(buf))
@@ -20688,11 +20940,13 @@ term_drain(void *ctx, int fd)
 			if (errno == EAGAIN || errno == EWOULDBLOCK)
 				break;		/* nothing more for now */
 			term_reap(t);		/* EIO etc: slave closed, gone */
+			term_note_exit(e, t);
 			if (active)
 				e->term_dirty = 1;
 			break;
 		} else {			/* r == 0: EOF, the child exited */
 			term_reap(t);
+			term_note_exit(e, t);
 			if (active)
 				e->term_dirty = 1;
 			break;
@@ -20725,9 +20979,15 @@ term_render(Editor *e, Screen *d)
 		}
 	}
 
-	if (t->dead)
+	if (t->dead) {
+#ifndef VEDIT_NO_TOOLS
+		if (t->tool && e->tool_result[0])
+			set_status(e, "[%s]  Ctrl-W q to close", e->tool_result);
+		else
+#endif
 		set_status(e, "[process exited %d]  Ctrl-W q to close, Ctrl-W m for the menu",
 		    t->exit_status);
+	}
 
 	ui_menubar(e, p, -1);
 	ui_frame(e, p);
@@ -20880,15 +21140,16 @@ term_install(Editor *e, Term *t)
 	return i;
 }
 
-/* Open a new terminal buffer running cmd (NULL = the login shell). Returns the
- * buffer index, or -1. */
+/* Open a new terminal buffer running argv (NULL = the login shell) in dir
+ * (NULL = the editor's cwd). label, when set, marks it as a tool terminal:
+ * its output is also captured for the diagnostic parser and the frame shows
+ * the label. Returns the buffer index, or -1. */
 static int
-term_open(Editor *e, const char *cmd)
+term_open_argv(Editor *e, char *const argv[], const char *dir,
+    const char *label)
 {
 	Term *t;
 	int i, rows, cols;
-	char *cmdbuf = NULL, *words[64];
-	char *const *argv = NULL;
 
 	if (!e->d->t->io.poll_fds) {
 		set_status(e, "terminal needs a host that multiplexes fds");
@@ -20902,6 +21163,37 @@ term_open(Editor *e, const char *cmd)
 		set_status(e, "out of memory");
 		return -1;
 	}
+	if (label) {
+		t->tool = 1;
+		snprintf(t->tool_label, sizeof(t->tool_label), "%s", label);
+	}
+
+	t->master_fd = pty_spawn(&t->child_pid, argv, dir, rows, cols);
+	if (t->master_fd < 0) {
+		term_discard(t);
+		set_status(e, "failed to start terminal");
+		return -1;
+	}
+	vt_state_set_reply_fd(t->vt, t->master_fd);
+
+	i = term_install(e, t);
+	if (i < 0) {
+		set_status(e, "out of memory");
+		return -1;
+	}
+	set_status(e, "terminal [%d/%d]  Ctrl-W then m = menu, w/W/n/c, Ctrl-W = literal",
+	    e->cur + 1, e->nbuf);
+	return i;
+}
+
+/* Open a new terminal buffer running cmd (NULL = the login shell), split on
+ * whitespace and run directly, with no shell. Returns the buffer index, or -1. */
+static int
+term_open(Editor *e, const char *cmd)
+{
+	char *cmdbuf = NULL, *words[64];
+	char *const *argv = NULL;
+	int i;
 
 	if (cmd && cmd[0]) {			/* split on whitespace */
 		int nw = 0;
@@ -20917,23 +21209,8 @@ term_open(Editor *e, const char *cmd)
 				argv = words;
 		}
 	}
-
-	t->master_fd = pty_spawn(&t->child_pid, argv, rows, cols);
+	i = term_open_argv(e, argv, NULL, NULL);
 	free(cmdbuf);
-	if (t->master_fd < 0) {
-		term_discard(t);
-		set_status(e, "failed to start terminal");
-		return -1;
-	}
-	vt_state_set_reply_fd(t->vt, t->master_fd);
-
-	i = term_install(e, t);
-	if (i < 0) {
-		set_status(e, "out of memory");
-		return -1;
-	}
-	set_status(e, "terminal [%d/%d]  Ctrl-W then m = menu, w/W/n/c, Ctrl-W = literal",
-	    e->cur + 1, e->nbuf);
 	return i;
 }
 
@@ -20996,6 +21273,13 @@ term_loop_step(Editor *e)
 	rc = scr_pump(e->d, 200);
 	if (rc < 0)
 		return TERM_EOF;
+#ifndef VEDIT_NO_TOOLS
+	if (tool_poll_done(e)) {	/* a build finished: report, maybe jump */
+		ed_render(e, e->d);
+		e->term_dirty = 0;
+		return TERM_CONT;
+	}
+#endif
 	if (rc == 0) {				/* idle: drain/render, swap tick */
 		if (e->term_dirty) {
 			ed_render(e, e->d);
