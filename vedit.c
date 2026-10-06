@@ -2106,6 +2106,10 @@ cfg_load_mem(Cfg *c, char *text)
 				}
 				*q2 = '\0';
 				subsect = cfg_dup(q + 1);
+				if (!subsect) {	/* OOM: do not mismap the key */
+					rc = -1;
+					break;
+				}
 			}
 			base = cfg_skip_ws(base);
 			cfg_trim_end(base);
