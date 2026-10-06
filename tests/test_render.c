@@ -693,6 +693,38 @@ t_search_word(Test *t)
 	memio_free(&m);
 }
 
+/* gv reselects the previous visual range after leaving visual mode. */
+static void
+t_gv_reselect(Test *t)
+{
+	static const char *const L[] = { "abcd", "efgh", "ijkl" };
+	/* select (0,0)-(1,1), leave with v (not Esc, which a canned feed would
+	 * coalesce with the following g into Alt-g), then gv to reselect */
+	const char keys[] = "vjlvgv";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 3);
+	v->e.mode = MODE_NORMAL;
+	vedit_run(v);
+
+	TAP_CHECKF(t, v->e.vi_visual == 'v', "not in visual: %d",
+	    v->e.vi_visual);
+	TAP_CHECK(t, v->e.sel_active);
+	TAP_CHECKF(t, v->e.ay == 0 && v->e.ax == 0, "anchor %zu,%zu",
+	    v->e.ay, v->e.ax);
+	TAP_CHECKF(t, v->e.cy == 1 && v->e.cx == 1, "cursor %zu,%zu",
+	    v->e.cy, v->e.cx);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* :g/re/y yanks every matching line (linewise) into the clipboard. */
 static void
 t_global_yank(Test *t)
@@ -1067,6 +1099,7 @@ const Case tap_cases[] = {
 	{ "search_icase", t_search_icase },
 	{ "search_word", t_search_word },
 	{ "shiftwidth", t_shiftwidth },
+	{ "gv_reselect", t_gv_reselect },
 	{ "global_yank", t_global_yank },
 	{ "global_shift", t_global_shift },
 	{ "vblock_delete", t_vblock_delete },

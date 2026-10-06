@@ -5242,6 +5242,9 @@ typedef struct editor {
 	/* vi personality state */
 	Mode	mode;
 	char		vi_visual;	/* 0, 'v' charwise, or 'V' linewise */
+	char		vi_last_vis;	/* kind of the last selection, for gv (0 none) */
+	size_t		vi_lv_ay, vi_lv_ax;	/* its anchor */
+	size_t		vi_lv_cy, vi_lv_cx;	/* its cursor end */
 	int		vi_count;	/* pending motion count, 0 = none */
 	char		vi_op;		/* pending operator: 0, 'd', 'c', 'y' */
 	int		vi_op_count;	/* count typed before the operator */
@@ -18737,6 +18740,22 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 			vi_reset_pending(e);
 			return REQ_CONTINUE;
 		}
+		if (c == 'v' && e->vi_last_vis) {	/* reselect the last range */
+			size_t nl = text_lines(e->t);
+
+			vi_reset_pending(e);
+			e->vi_visual = e->vi_last_vis;
+			e->sel_block = (e->vi_last_vis == VI_VBLOCK);
+			e->ay = e->vi_lv_ay < nl ? e->vi_lv_ay : nl - 1;
+			e->cy = e->vi_lv_cy < nl ? e->vi_lv_cy : nl - 1;
+			e->ax = e->vi_lv_ax;
+			e->cx = e->vi_lv_cx;
+			if (e->ax > text_line_len(e->t, e->ay))
+				e->ax = text_line_len(e->t, e->ay);
+			e->sel_active = 1;
+			vi_clamp(e);		/* fix the cursor end if it moved */
+			return REQ_CONTINUE;
+		}
 		vi_reset_pending(e);
 		return REQ_CONTINUE;
 	}
@@ -19126,6 +19145,14 @@ vi_visual_key(Editor *e, const struct tkbd_seq *seq)
 {
 	uint32_t c = seq->ch;
 	int ctrl = (seq->mod & TKBD_MOD_CTRL) != 0;
+
+	/* Remember the selection before this key acts on it, so gv can reselect
+	 * the same extent even after an operator consumes it. */
+	e->vi_last_vis = e->vi_visual;
+	e->vi_lv_ay = e->ay;
+	e->vi_lv_ax = e->ax;
+	e->vi_lv_cy = e->cy;
+	e->vi_lv_cx = e->cx;
 
 	/* A pending i/a takes the next key as the object name (viw, va(): the
 	 * object becomes the selection, cursor on its last rune. */
