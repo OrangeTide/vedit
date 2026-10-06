@@ -42,7 +42,7 @@ TORTURE_ROUNDS ?= 20000
 # Shared flags for the sanitizer builds of the tests and the torture suite.
 SANCFLAGS = -std=gnu11 -Wall -Wextra -g -O1 -fno-omit-frame-pointer
 
-.PHONY: all clean install uninstall test torture asan ubsan cov screenshots
+.PHONY: all clean install uninstall test torture asan ubsan cov cov-term screenshots
 
 all: $(PROG)
 
@@ -118,6 +118,15 @@ cov:
 	    gcov test_unit-cov-test_unit.gcda >/dev/null 2>&1 || true
 	@echo "see $(TESTDIR)/vedit.c.gcov for per-line counts"
 
+# Line coverage of the terminal-buffer code: the terminal tests built with the
+# feature on. The gate for making VEDIT_TERM the default is >90% of the
+# terminal code covered. Informational.
+cov-term:
+	cd $(TESTDIR) && $(CC) $(TERMTESTCFLAGS) -O0 --coverage test_term.c \
+	    testmain.c -o test_term-cov && ./test_term-cov >/dev/null && \
+	    gcov test_term-cov-test_term.gcda >/dev/null 2>&1 || true
+	@echo "see $(TESTDIR)/vedit.c.gcov for per-line counts"
+
 # Regenerate the README screenshots (docs/shot-*.png) from the built binary.
 # Needs Xvfb, xterm, xdotool, and ImageMagick's import on PATH.
 screenshots: $(PROG)
@@ -129,8 +138,8 @@ clean:
 	    $(TESTDIR)/test_unit-asan $(TESTDIR)/test_render-asan \
 	    $(TESTDIR)/torture-asan $(TESTDIR)/test_unit-ubsan \
 	    $(TESTDIR)/test_render-ubsan $(TESTDIR)/torture-ubsan \
-	    $(TESTDIR)/test_unit-cov $(TESTDIR)/*.gcno $(TESTDIR)/*.gcda \
-	    $(TESTDIR)/*.gcov
+	    $(TESTDIR)/test_unit-cov $(TESTDIR)/test_term-cov \
+	    $(TESTDIR)/*.gcno $(TESTDIR)/*.gcda $(TESTDIR)/*.gcov
 
 install: $(PROG)
 	mkdir -p $(DESTDIR)$(BINDIR)
