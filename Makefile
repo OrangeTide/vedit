@@ -5,6 +5,7 @@ CFLAGS  ?= -std=gnu11 -Wall -Wextra -O2
 LDFLAGS ?=
 PREFIX  ?= $(HOME)/.local
 BINDIR  ?= $(PREFIX)/bin
+MANDIR  ?= $(PREFIX)/share/man
 
 PROG = vedit
 SRC  = vedit.c
@@ -179,6 +180,9 @@ clean:
 install: $(PROG)
 	mkdir -p $(DESTDIR)$(BINDIR)
 	install -m 0755 $(PROG) $(DESTDIR)$(BINDIR)/$(PROG)
+	mkdir -p $(DESTDIR)$(MANDIR)/man1
+	install -m 0644 man/vedit.1 $(DESTDIR)$(MANDIR)/man1/vedit.1
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(PROG)
+	rm -f $(DESTDIR)$(MANDIR)/man1/vedit.1

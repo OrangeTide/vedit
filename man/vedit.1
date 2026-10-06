@@ -1,0 +1,220 @@
+.TH VEDIT 1 "2026-10-06" "vedit 1.1.0" "User Commands"
+.SH NAME
+vedit \- a single-file visual text editor for primitive terminals
+.SH SYNOPSIS
+.B vedit
+.RI [ options ]
+.RI [ file ]
+.SH DESCRIPTION
+.B vedit
+is a full-screen text editor with an MS-EDIT style menu and chrome. It runs on
+plain terminals, including slow or limited ones, and draws its frame with
+Unicode box-drawing, DEC VT100 line-drawing, or plain ASCII depending on the
+client. It has two key personalities: a modeless (MS-EDIT) one by default and a
+modal
+.I vi
+one, toggled at run time with
+.BR F2 .
+.PP
+A missing
+.I file
+opens as a new, named buffer. Opening a file that is already open, even by a
+different spelling such as a symlink or a
+.RB \(lq ./ \(rq
+detour, switches to the existing buffer instead of loading a second copy. When
+run from the command line, vedit requires a terminal on both standard input and
+standard output.
+.PP
+Press
+.B F1
+inside the editor for the key bindings of the active personality, and open the
+Help menu, or press
+.B t
+on the key-bindings screen, for the built-in tutorials.
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Show a usage summary and exit.
+.TP
+.BR \-V ", " \-\-version
+Show the version and exit.
+.TP
+.B \-\-utf8
+Draw the frame with Unicode box-drawing characters.
+.TP
+.B \-\-dec
+Draw the frame with DEC VT100 line-drawing characters.
+.TP
+.BR \-a ", " \-\-ascii
+Draw the frame with plain ASCII
+.RB ( + ", " \- ", " | ).
+The default is UTF-8 under a UTF-8 locale, otherwise ASCII. It can also be set
+with
+.B VEDIT_BOX=utf8|dec|ascii
+or
+.BR VEDIT_ASCII .
+.TP
+.B \-\-16color
+Map colors to the 16 ANSI colors for old clients.
+.TP
+.B \-\-256color
+Use the full 256-color palette. The default is 256 when
+.B TERM
+or
+.B COLORTERM
+says so, otherwise 16. It can also be set with
+.BR VEDIT_COLORS=256|16 .
+.TP
+.B \-\-scroll
+Use the VT100 scroll region when scrolling, which is faster on a slow link but
+needs a client that supports it.
+.TP
+.B \-\-no\-scroll
+Repaint instead of scrolling. This is the default. The behavior can also be set
+with
+.BR VEDIT_SCROLL=0|1 .
+.TP
+.BI \-\-config " FILE"
+Read settings from
+.I FILE
+instead of the default locations.
+.TP
+.B \-\-no\-config
+Skip the configuration file entirely.
+.SH KEYS
+This is a brief orientation. Press
+.B F1
+in the editor for the full, personality-specific list.
+.SS Modeless (MS-EDIT)
+.TP
+.B arrows, Home, End, PgUp, PgDn
+Move the cursor; Ctrl+Home and Ctrl+End jump to the start and end of the file.
+.TP
+.B Shift+arrows
+Extend a selection.
+.TP
+.BR Ctrl\-C ", " Ctrl\-X ", " Ctrl\-V
+Copy (the current line when nothing is selected), cut, and paste.
+.TP
+.BR Ctrl\-Z ", " Ctrl\-Y
+Undo and redo.
+.TP
+.BR Ctrl\-F ", " Ctrl\-R
+Incremental find, and replace confirming each match.
+.TP
+.BR Ctrl\-S ", " Ctrl\-Q
+Save and quit; both prompt when needed.
+.TP
+.BR F10 ", Alt+" letter
+Open the menu bar.
+.TP
+.BR F1 ", " F2
+Show the key bindings, and toggle the vi personality.
+.SS vi
+NORMAL mode has the usual motions
+.RB ( "h j k l" ", " "0 ^ $" ", " "w b e" ", " "gg G" ", " "f F t T" )
+and counts, operators
+.RB ( "d c y" )
+with motions, visual modes
+.RB ( v " / " V " / Ctrl-V" ),
+registers, marks, and a jump list.
+.B :
+runs ex commands and
+.B /
+searches. Press
+.B F2
+to return to the modeless keys.
+.SH CONFIGURATION
+Settings are read from a gitconfig-style file. Without
+.BR \-\-config ,
+vedit uses
+.BR $VEDIT_CONFIG ,
+then
+.BR $XDG_CONFIG_HOME/vedit/config ,
+then
+.BR ~/.veditrc .
+Keys are dotted and may be grouped under section headers. Booleans accept
+.BR on / off ,
+.BR yes / no ,
+.BR true / false ,
+or
+.BR 1 / 0 .
+The main sections are
+.B [ui]
+(scheme, line numbers, word wrap, box mode, colors),
+.B [edit]
+(personality, auto-indent, swap and backup files, format-on-save),
+.B [indent]
+(tabs versus spaces),
+.BR [tags] ,
+.BR [cc] ,
+.BR [error] ,
+.BR [syntax] ,
+and per-language
+.BI [command\  """lang"""]
+sections for the compile, build, run, and format commands. See
+.B README.md
+for the full list.
+.PP
+Keys that commonly vary per project can be overridden by an environment
+variable named
+.B VEDIT_
+followed by the key uppercased with each
+.RB \(lq . \(rq
+turned into
+.RB \(lq _ \(rq,
+for example
+.B VEDIT_TAGS_FILE
+or
+.BR VEDIT_COMMAND_C_FORMAT .
+A set, non-empty value wins over the file.
+.SH ENVIRONMENT
+.TP
+.B VEDIT_CONFIG
+Path to the configuration file.
+.TP
+.BR VEDIT_BOX ", " VEDIT_ASCII
+Override the box-drawing mode.
+.TP
+.B VEDIT_COLORS
+Override the color depth
+.RB ( 256 " or " 16 ).
+.TP
+.B VEDIT_SCROLL
+Enable
+.RB ( 1 )
+or disable
+.RB ( 0 )
+the scroll-region fast path.
+.TP
+.BI VEDIT_ "KEY"
+Per-key overrides for the project-varying config keys (see CONFIGURATION).
+.SH FILES
+.TP
+.B ~/.veditrc
+Default configuration file (after
+.B $VEDIT_CONFIG
+and the XDG path).
+.TP
+.BI . name .swp
+Crash-recovery swap file written beside an edited file, unless relocated with
+.BR edit.swapdir .
+.TP
+.IB name ~
+Previous version kept on save when
+.B edit.backup
+is on, unless relocated with
+.BR edit.backupdir .
+.SH EXIT STATUS
+.B vedit
+exits 0 on a normal quit and non-zero on a usage error, an unreadable file, or
+when input ends unexpectedly. The vi
+.B :cq
+command exits with a non-zero status on purpose.
+.SH SEE ALSO
+Project documentation in
+.BR README.md .
+.SH NOTES
+Dirty buffers are snapshotted to swap files while the editor is idle and flushed
+again when it is terminated by a signal, so a crash or a kill loses little or no
+unsaved work. Reopen the file afterward to recover from the swap.

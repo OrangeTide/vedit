@@ -61,6 +61,48 @@ two sanitizer suites, and the torture fuzz on every push and pull request. A
 single `ci-ok` job gates on all of them, so branch protection can require that
 one check.
 
+## Getting started
+
+Open a file (or start an empty, named buffer) and you are editing:
+
+```sh
+vedit notes.txt
+```
+
+The top row is the menu bar, a frame surrounds the text, and the bottom row is
+the status line. Out of the box vedit uses modeless, MS-EDIT style keys, so you
+can just type, and the arrow keys, `Home`, `End`, `PgUp`, and `PgDn` move around.
+`Enter` splits a line, `Backspace` and `Delete` remove a character, and holding
+`Shift` while moving selects text.
+
+A first session covers only a handful of keys:
+
+- `Ctrl-S` saves (it asks for a name if the buffer has none), and `Ctrl-Q` quits,
+  prompting when there are unsaved changes.
+- `Ctrl-C`, `Ctrl-X`, and `Ctrl-V` copy, cut, and paste. With nothing selected,
+  `Ctrl-C` copies the whole line.
+- `Ctrl-Z` and `Ctrl-Y` undo and redo.
+- `Ctrl-F` finds as you type (`Enter` repeats the last search), `Ctrl-R` replaces
+  with confirmation, and `Ctrl-L` jumps to a line number.
+
+Everything else lives in the menu bar. Press `F10`, or `Alt` plus the underlined
+letter of a menu (for example `Alt+V` for View), then use the arrows and `Enter`,
+or the underlined letter of an item. The View menu toggles line numbers, word
+wrap, the color scheme, and syntax highlighting; the Edit menu has formatting and
+tab conversions; the Search menu has find, replace, and go-to.
+
+Two keys are worth knowing early:
+
+- `F1` shows the key bindings for whichever personality is active. Press `t` on
+  that screen for a tutorial.
+- `F2` toggles the vi personality, for modal editing with `h j k l`, operators
+  like `dw` and `cc`, `:` ex commands, and `/` search. Press `F2` again to return
+  to the modeless keys.
+
+If vedit or the connection dies with unsaved changes, reopen the file: a
+crash-recovery snapshot is kept beside it and vedit offers to restore it. See
+[Crash recovery](#crash-recovery-swap-and-backup-files) for the details.
+
 ## Running
 
 ```sh
