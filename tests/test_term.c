@@ -749,6 +749,126 @@ t_term_kill(Test *t)
 	memio_free(&m);
 }
 
+/* term_label, term_buf_free, and term_discard all no-op on a non-terminal
+ * buffer or a NULL handle. */
+static void
+t_term_nonterm(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Buf b;
+
+	v = term_editor(&m, &io);		/* a plain text buffer, no attach */
+	TAP_ASSERT(t, v != NULL);
+	TAP_CHECK(t, v->e.kind != BUF_TERM);
+	TAP_CHECK(t, strcmp(term_label(&v->e), "terminal") == 0);
+
+	memset(&b, 0, sizeof(b));		/* kind == BUF_TEXT */
+	term_buf_free(&b);			/* no vterm: nothing to free */
+	term_discard(NULL);			/* NULL handle: no-op */
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* term_drain ignores an fd that no terminal owns. */
+static void
+t_term_drain_unknown(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int pr[2];
+
+	v = term_editor(&m, &io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, pipe(pr) == 0);
+	TAP_ASSERT(t, term_attach(&v->e, pr[0], 10, 40) >= 0);
+
+	term_drain(&v->e, pr[1]);		/* an fd no terminal reads from */
+
+	close(pr[1]);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* A cursor reported above or left of the visible area is clamped into it, as
+ * is a column past the right edge. */
+static void
+t_term_cursor_clamp_edges(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child;
+
+	v = term_editor(&m, &io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, term_pair(v, &child, 40, 200) == 0);
+
+	v->e.vterm->vt->cursor_row = -5;	/* above the top row */
+	v->e.vterm->vt->cursor_col = -5;	/* left of the first column */
+	ed_render(&v->e, v->e.d);		/* must clamp to (0,0) */
+
+	v->e.vterm->vt->cursor_row = 0;
+	v->e.vterm->vt->cursor_col = 1000;	/* past the right edge */
+	ed_render(&v->e, v->e.d);		/* must clamp to text_width - 1 */
+
+	TAP_CHECK(t, 1);			/* reached here without an off-area cursor */
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* term_attach treats a non-positive rows/cols as one. */
+static void
+t_term_attach_tiny(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int pr[2];
+
+	v = term_editor(&m, &io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, pipe(pr) == 0);
+	TAP_ASSERT(t, term_attach(&v->e, pr[0], 0, 0) >= 0);
+	TAP_CHECK(t, v->e.vterm->rows == 1 && v->e.vterm->cols == 1);
+
+	close(pr[1]);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* term_resize_all skips a terminal already at the target size and one whose
+ * child has gone, and term_write to a dead terminal is a no-op. */
+static void
+t_term_resize_skips(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int pr[2];
+
+	v = term_editor(&m, &io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, pipe(pr) == 0);
+	TAP_ASSERT(t, term_attach(&v->e, pr[0], 10, 40) >= 0);
+
+	term_resize_all(&v->e);			/* sets the grid to the text area */
+	term_resize_all(&v->e);			/* same size: nothing to do */
+
+	close(pr[1]);				/* EOF: the terminal goes dead */
+	term_drain(&v->e, pr[0]);
+	TAP_CHECK(t, v->e.vterm->dead == 1);
+	term_resize_all(&v->e);			/* dead/no-fd: skipped */
+	term_write(v->e.vterm, "x", 1);		/* dead: no-op */
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 const Case tap_cases[] = {
 	{ "term_attach_render", t_term_attach_render },
 	{ "term_collect", t_term_collect },
@@ -775,5 +895,10 @@ const Case tap_cases[] = {
 	{ "term_loop_resize_grow", t_term_loop_resize_grow },
 	{ "term_cursor_clamp", t_term_cursor_clamp },
 	{ "term_kill", t_term_kill },
+	{ "term_nonterm", t_term_nonterm },
+	{ "term_drain_unknown", t_term_drain_unknown },
+	{ "term_cursor_clamp_edges", t_term_cursor_clamp_edges },
+	{ "term_attach_tiny", t_term_attach_tiny },
+	{ "term_resize_skips", t_term_resize_skips },
 	{ NULL, NULL },
 };

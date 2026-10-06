@@ -3,9 +3,13 @@
 /tests/taptest
 /tests/test_unit
 /tests/test_render
+/tests/test_term
+/tests/test_termfault
 /tests/torturet
 /tests/*-asan
 /tests/*-ubsan
+/tests/*-cov
 /tests/*.gcno
 /tests/*.gcda
 /tests/*.gcov
+/tests/vedit.c.gcov.*
