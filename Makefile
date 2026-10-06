@@ -59,7 +59,10 @@ $(PROG): $(SRC) $(HDR)
 
 # Static build against musl, handy for dropping the binary onto a server:
 #   make static
+# The binary is removed first because the flags are not a prerequisite, so an
+# up-to-date native build would otherwise be left in place.
 static:
+	rm -f $(PROG)
 	$(MAKE) CC=musl-gcc LDFLAGS=-static RELEASE=1
 
 # Unit and integration tests, run through the vendored taptest driver.

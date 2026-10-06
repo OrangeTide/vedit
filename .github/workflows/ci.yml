@@ -51,19 +51,99 @@ jobs:
       - name: Fuzz the parsers and regex engine
         run: make torture TORTURE_ROUNDS=200000
 
+  # Cross-compile for other Linux architectures with the distro cross
+  # toolchains, then run the test suite under qemu user-mode emulation.
+  # qemu-user-binfmt registers the emulators with binfmt_misc, so the taptest
+  # driver can exec the foreign test binaries as if they were native, and
+  # QEMU_LD_PREFIX points qemu at the matching cross sysroot for ld.so.
+  cross:
+    name: cross (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            triplet: aarch64-linux-gnu
+          - arch: armhf
+            triplet: arm-linux-gnueabihf
+          - arch: riscv64
+            triplet: riscv64-linux-gnu
+    env:
+      QEMU_LD_PREFIX: /usr/${{ matrix.triplet }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install the cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-${{ matrix.triplet }} qemu-user-binfmt
+      - name: Build
+        run: make CC=${{ matrix.triplet }}-gcc
+      - name: Run the cross-built binary
+        run: ./vedit --version
+      - name: Test under qemu
+        run: make test CC=${{ matrix.triplet }}-gcc
+
+  # A static musl binary, the `make static` target, so the build that gets
+  # dropped onto a server stays buildable.
+  static:
+    name: static (musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: make static
+      - name: Check that the binary is static
+        run: |
+          file vedit
+          if ldd vedit 2>/dev/null; then echo "vedit is not static"; exit 1; fi
+          ./vedit --version
+
+  # The embedding-host configuration without the terminal panel.
+  no-term:
+    name: no-term
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build without the terminal panel
+        run: make VEDIT_NO_TERM=1
+      - name: Test
+        run: make test VEDIT_NO_TERM=1
+
+  # macOS: the pty code takes the <util.h> path there. The allocation-failure
+  # test needs the GNU linker's --wrap, which Apple's ld lacks, so it is left
+  # out and the other suites run directly.
+  macos:
+    name: macos
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build
+        run: make
+      - name: Test
+        run: |
+          make tests/taptest tests/test_unit tests/test_render tests/test_term
+          tests/taptest --self-test --exe tests/test_unit tests/test_render tests/test_term
+
   # Single required status check for the branch ruleset. It passes only when
   # every other job passed, so the ruleset gates on this one name and the job
   # list can change without touching the ruleset.
   ci-ok:
     name: ci-ok
-    needs: [build-test, sanitize, torture]
+    needs: [build-test, sanitize, torture, cross, static, no-term, macos]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Check that the required jobs succeeded
         run: |
-          results="${{ needs.build-test.result }} ${{ needs.sanitize.result }} ${{ needs.torture.result }}"
+          results="${{ needs.build-test.result }} ${{ needs.sanitize.result }} ${{ needs.torture.result }} ${{ needs.cross.result }} ${{ needs.static.result }} ${{ needs.no-term.result }} ${{ needs.macos.result }}"
           echo "results: $results"
           for r in $results; do
             if [ "$r" != "success" ]; then
