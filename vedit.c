@@ -19654,11 +19654,34 @@ vi_ex_global(Editor *e, size_t lo, size_t hi, int had_range,
 	} else if (sub[0] == 's' && is_ex_delim(sub[1])) {
 		for (i = 0; i < nrows; i++)	/* substitute keeps line count */
 			vi_ex_substitute(e, rows[i], rows[i], sub + 1);
+	} else if (sub[0] == 'y' && (sub[1] == '\0' || sub[1] == ' ')) {
+		size_t total = 0, off = 0;	/* yank the matches, linewise */
+		char *buf;
+
+		for (i = 0; i < nrows; i++)
+			total += text_line_len(e->t, rows[i]) + 1;
+		buf = malloc(total ? total : 1);
+		if (buf) {
+			for (i = 0; i < nrows; i++) {
+				size_t ll = 0;
+				const char *s = text_line(e->t, rows[i], &ll);
+
+				if (ll)
+					memcpy(buf + off, s, ll);
+				off += ll;
+				buf[off++] = '\n';
+			}
+			vi_reg_store(e, buf, off, 1);	/* takes the buffer */
+		}
+	} else if ((sub[0] == '>' || sub[0] == '<') &&
+	    (sub[1] == '\0' || sub[1] == ' ')) {
+		for (i = 0; i < nrows; i++)	/* shift keeps line count */
+			vi_shift_lines(e, rows[i], rows[i], sub[0] == '>' ? 1 : -1);
 	} else {
 		text_undo_group_end(e->t);
 		free(rows);
 		set_status(e,
-		    "unsupported :g command: %.40s", sub);
+		    "unsupported :g command (d, s, y, >, <): %.30s", sub);
 		return REQ_CONTINUE;
 	}
 	text_undo_group_end(e->t);

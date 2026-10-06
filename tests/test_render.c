@@ -693,6 +693,57 @@ t_search_word(Test *t)
 	memio_free(&m);
 }
 
+/* :g/re/y yanks every matching line (linewise) into the clipboard. */
+static void
+t_global_yank(Test *t)
+{
+	static const char *const L[] = { "keep1", "drop", "keep2" };
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 3);
+
+	vi_ex_global(&v->e, 0, 0, 0, "/keep/y", 0);
+	TAP_CHECK(t, v->e.clip_linewise);
+	TAP_CHECKF(t, v->e.clip_len == 12 &&
+	    memcmp(v->e.clip, "keep1\nkeep2\n", 12) == 0,
+	    "clip len %zu", v->e.clip_len);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* :g/re/> shifts every matching line, leaving the rest alone. */
+static void
+t_global_shift(Test *t)
+{
+	static const char *const L[] = { "aa", "bb", "ac" };
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 3);
+	v->e.expand_tabs = 0;
+	v->e.shiftwidth = 0;			/* one tab */
+
+	vi_ex_global(&v->e, 0, 0, 0, "/^a/>", 0);
+	TAP_CHECK(t, vline_is(v, 0, "\taa"));	/* matched: shifted */
+	TAP_CHECK(t, vline_is(v, 1, "bb"));	/* no match: untouched */
+	TAP_CHECK(t, vline_is(v, 2, "\tac"));	/* matched: shifted */
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* shiftwidth controls the >> indent: spaces when expandtab is on, a tab by
  * default, and the chosen column width. */
 static void
@@ -1016,6 +1067,8 @@ const Case tap_cases[] = {
 	{ "search_icase", t_search_icase },
 	{ "search_word", t_search_word },
 	{ "shiftwidth", t_shiftwidth },
+	{ "global_yank", t_global_yank },
+	{ "global_shift", t_global_shift },
 	{ "vblock_delete", t_vblock_delete },
 	{ "vblock_insert", t_vblock_insert },
 	{ "vblock_yank_put", t_vblock_yank_put },

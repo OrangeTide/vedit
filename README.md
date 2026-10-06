@@ -607,7 +607,9 @@ cursor following the first match as you type, Esc restoring the start) and `n` /
 follows the usual vi forms: `:s/old/new/`, `:s/old/new/g` for every match on the
 line, a leading range such as `:%s/old/new/g` for the whole file, and
 `:g/pat/...` / `:v/pat/...` to run a command on matching (or non-matching) lines.
-The replacement supports `&` and `\1`..`\9` and the `\U \L \u \l \E` case
+The global command runs `d` (delete), `s///` (substitute), `y` (yank the lines
+to the clipboard), or `>` / `<` (shift them). The replacement supports `&` and
+`\1`..`\9` and the `\U \L \u \l \E` case
 escapes. In the modeless personality, Ctrl-R walks the matches one at a time and
 asks before each.
 
