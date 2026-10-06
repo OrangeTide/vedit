@@ -2234,6 +2234,38 @@ t_buf_same_file(Test *t)
 	rmdir(dir);
 }
 
+/* Switching buffers clears the outgoing buffer's transient status message, so a
+ * message like a terminal's "Ctrl-W q to close" does not linger after the move.
+ * buf_load is the single mirror point, so this also covers closing a buffer. */
+static void
+t_buf_switch_clears_status(Test *t)
+{
+	Editor e;
+	Buf bufs[2];
+
+	editor_init(&e);
+	memset(bufs, 0, sizeof(bufs));
+	e.bufs = bufs;
+	e.nbuf = 2;
+	e.cur = 0;
+	e.swap_enabled = 0;
+
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	bufs[0].t = e.t;
+	bufs[1].t = text_new();
+	TAP_ASSERT(t, bufs[1].t != NULL);
+
+	set_status(&e, "stale message");
+	TAP_CHECK(t, e.status[0] != '\0');
+
+	buf_switch(&e, 1);
+	TAP_CHECKF(t, e.status[0] == '\0', "status not cleared: %s", e.status);
+
+	text_free(bufs[0].t);
+	text_free(bufs[1].t);
+}
+
 static void
 t_bufpick(Test *t)
 {
@@ -2478,6 +2510,7 @@ const Case tap_cases[] = {
 	{ "tool_run", t_tool_run },
 #endif
 	{ "buf_same_file", t_buf_same_file },
+	{ "buf_switch_clears_status", t_buf_switch_clears_status },
 	{ "bufpick", t_bufpick },
 	{ "sym_classify", t_sym_classify },
 	{ "symscan", t_symscan },

@@ -12003,6 +12003,7 @@ buf_load(Editor *e, const Buf *b)
 	e->hex_insert = 0;
 	e->hex_sel = 0;
 	vi_reset_pending(e);
+	e->status[0] = '\0';	/* the old buffer's transient message is stale */
 }
 
 /* Free the file resources a slot owns (its text and syntax scratch). Used
