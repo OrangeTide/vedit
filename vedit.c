@@ -5115,6 +5115,18 @@ scr_record_stop(Screen *d, size_t *len)
 
 
 
+/* Mark slots. 'a'..'z' occupy 0..25; the rest are special read-only marks that
+ * commands set automatically. mark_index() maps a mark character to a slot. */
+enum {
+	MARK_LETTERS = 26,		/* 'a'..'z' -> 0..25 */
+	MARK_PREV = MARK_LETTERS,	/* ` and ' : position before the last jump */
+	MARK_CHANGE,			/* . : last change */
+	MARK_INSERT,			/* ^ : where insert mode last stopped */
+	MARK_VISLT,			/* < : start of the last visual selection */
+	MARK_VISGT,			/* > : end of the last visual selection */
+	MARK_SLOTS
+};
+
 /* A yank/delete register: owned bytes, their length, and whether the content
  * is whole lines (put restores it as new lines). */
 typedef struct vi_reg {
@@ -5150,9 +5162,9 @@ typedef struct ebuf {
 	int		hex_view;
 	size_t		hex_top;
 	int		expand_tabs;	/* indent with spaces in this buffer */
-	size_t		vi_mark_y[26];
-	size_t		vi_mark_x[26];
-	uint32_t	vi_marks_set;
+	size_t		vi_mark_y[MARK_SLOTS];
+	size_t		vi_mark_x[MARK_SLOTS];
+	uint64_t	vi_marks_set;
 	char		swap_path[PATH_MAX];	/* this buffer's swap file, or "" */
 	int		swap_on;	/* a swap file exists on disk for it */
 	size_t		swap_rev;	/* text rev at the last swap write */
@@ -5327,9 +5339,9 @@ typedef struct editor {
 	char		vi_recording;	/* register being recorded (a-z), 0 = none */
 	int		vi_rec_append;	/* recording was armed with A-Z: append */
 	int		vi_overtype;	/* R Replace mode: typing overwrites */
-	size_t		vi_mark_y[26];	/* line of mark 'a'..'z' */
-	size_t		vi_mark_x[26];	/* byte column of the mark */
-	uint32_t	vi_marks_set;	/* bit i set: mark 'a'+i is defined */
+	size_t		vi_mark_y[MARK_SLOTS];	/* line of each mark slot */
+	size_t		vi_mark_x[MARK_SLOTS];	/* byte column of the mark */
+	uint64_t	vi_marks_set;	/* bit i set: mark slot i is defined */
 	Reg	vi_regs[26];	/* named registers "a..z */
 	char		vi_reg;		/* selected register a-z/A-Z, 0 = none */
 	char		vi_reg_fresh;	/* vi_reg was just armed by " */
@@ -18349,9 +18361,38 @@ vi_apply_textobject_op(Editor *e, char op, size_t sy, size_t sx,
 	return REQ_CONTINUE;
 }
 
+/* Map a mark character to a slot index, or -1 if it names no mark. The special
+ * marks (. ^ < > and the ` / ' previous-position pair) are set by commands, not
+ * by the user, so m rejects them (see the markcmd handler). */
+static int
+mark_index(int ch)
+{
+	if (ch >= 'a' && ch <= 'z')
+		return ch - 'a';
+	switch (ch) {
+	case '`': case '\'':	return MARK_PREV;
+	case '.':		return MARK_CHANGE;
+	case '^':		return MARK_INSERT;
+	case '<':		return MARK_VISLT;
+	case '>':		return MARK_VISGT;
+	}
+	return -1;
+}
+
+/* Record a position in a mark slot. */
+static void
+vi_mark_set(Editor *e, int slot, size_t y, size_t x)
+{
+	if (slot < 0 || slot >= MARK_SLOTS)
+		return;
+	e->vi_mark_y[slot] = y;
+	e->vi_mark_x[slot] = x;
+	e->vi_marks_set |= (uint64_t)1 << slot;
+}
+
 /* Set or jump to a mark. cmd is 'm' (set), '`' (jump to the exact spot), or
- * '\'' (jump to the first non-blank of the mark's line); idx is 0..25 for
- * 'a'..'z'. A jump with an operator armed applies it over the span: charwise
+ * '\'' (jump to the first non-blank of the mark's line); idx is a slot from
+ * mark_index. A jump with an operator armed applies it over the span: charwise
  * and exclusive for '`', linewise for '\''. Marks hold absolute positions and
  * do not shift as the buffer is edited. */
 static Req
@@ -18361,13 +18402,11 @@ vi_do_mark(Editor *e, char cmd, int idx)
 	char op;
 
 	if (cmd == 'm') {
-		e->vi_mark_y[idx] = e->cy;
-		e->vi_mark_x[idx] = e->cx;
-		e->vi_marks_set |= (uint32_t)1 << idx;
+		vi_mark_set(e, idx, e->cy, e->cx);
 		vi_reset_pending(e);
 		return REQ_CONTINUE;
 	}
-	if (!(e->vi_marks_set & ((uint32_t)1 << idx))) {
+	if (!(e->vi_marks_set & ((uint64_t)1 << idx))) {
 		set_status(e, "E20: mark not set");
 		vi_reset_pending(e);
 		return REQ_CONTINUE;
@@ -18711,16 +18750,18 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 		return vi_apply_textobject_op(e, op, sy, sx, ey, ex);
 	}
 
-	/* A pending m/`/' takes the next key as the mark letter (a-z). */
+	/* A pending m/`/' takes the next key as the mark name. m sets a-z only;
+	 * the jumps ` and ' also reach the special marks (. ^ < > and ` / '). */
 	if (e->vi_markcmd) {
 		char cmd = e->vi_markcmd;
+		int idx = ctrl ? -1 : mark_index((int)c);
 
 		e->vi_markcmd = 0;
-		if (ctrl || c < 'a' || c > 'z') {
+		if (idx < 0 || (cmd == 'm' && idx >= MARK_LETTERS)) {
 			vi_reset_pending(e);
 			return REQ_CONTINUE;
 		}
-		return vi_do_mark(e, cmd, (int)(c - 'a'));
+		return vi_do_mark(e, cmd, idx);
 	}
 
 	/* A pending @ takes the next key as the macro register to play (a-z,
@@ -19239,6 +19280,7 @@ vi_insert_key(Editor *e, const struct tkbd_seq *seq)
 			e->cx -= prev_rune_len(s, e->cx);
 		}
 		vi_clamp(e);
+		vi_mark_set(e, MARK_INSERT, e->cy, e->cx);	/* '^ */
 		return REQ_CONTINUE;
 	case TKBD_KEY_ENTER:
 		ed_newline_indent(e);
@@ -19345,6 +19387,16 @@ vi_visual_key(Editor *e, const struct tkbd_seq *seq)
 	e->vi_lv_ax = e->ax;
 	e->vi_lv_cy = e->cy;
 	e->vi_lv_cx = e->cx;
+
+	/* Keep '< and '> on the current selection, so they still point at the
+	 * last range after it is left (by Esc, a motion to normal, or an op). */
+	if (e->ay < e->cy || (e->ay == e->cy && e->ax <= e->cx)) {
+		vi_mark_set(e, MARK_VISLT, e->ay, e->ax);
+		vi_mark_set(e, MARK_VISGT, e->cy, e->cx);
+	} else {
+		vi_mark_set(e, MARK_VISLT, e->cy, e->cx);
+		vi_mark_set(e, MARK_VISGT, e->ay, e->ax);
+	}
 
 	/* A pending i/a takes the next key as the object name (viw, va(): the
 	 * object becomes the selection, cursor on its last rune. */
@@ -19705,13 +19757,15 @@ vi_dispatch(Editor *e, const struct tkbd_seq *seq)
 
 	r = vi_dispatch_key(e, seq);
 
-	/* Back at rest: if the buffer changed and the command is repeatable,
-	 * it becomes the new '.'. */
+	/* Back at rest: if the buffer changed, record the change position for '.
+	 * and, when the command is repeatable, make it the new dot command. */
 	if (e->vi_cmd_open && vi_at_rest(e)) {
 		e->vi_cmd_open = 0;
-		if (!e->vi_suppress_dot &&
-		    text_revision(e->t) != e->vi_cmd_rev)
-			vi_dot_commit(e);
+		if (text_revision(e->t) != e->vi_cmd_rev) {
+			vi_mark_set(e, MARK_CHANGE, e->cy, e->cx);	/* '. */
+			if (!e->vi_suppress_dot)
+				vi_dot_commit(e);
+		}
 	}
 	return r;
 }

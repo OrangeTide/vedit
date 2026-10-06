@@ -779,6 +779,58 @@ t_macro_record(Test *t)
 	memio_free(&m);
 }
 
+/* The automatic special marks: '> on the last visual selection, '. on the last
+ * change, and '^ where insert mode stopped. */
+static void
+t_marks_special(Test *t)
+{
+	static const char *const L[] = { "abcde", "fghij", "klmno" };
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	/* '>: select (0,0)..(1,1), leave with v, then `> jumps to the end */
+	memio_init(&m, "vjlv`>", 6, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 3);
+	v->e.mode = MODE_NORMAL;
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.cy == 1 && v->e.cx == 1, "'> at %zu,%zu",
+	    v->e.cy, v->e.cx);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* '.: x changes line 0, G leaves, `. returns to the change */
+	memio_init(&m, "xG`.", 4, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 3);
+	v->e.mode = MODE_NORMAL;
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.cy == 0, "'. at line %zu", v->e.cy);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* '^: insert Z then Esc (Esc last, so a canned feed cannot fold it into
+	 * the next key); the mark lands where insert stopped. */
+	memio_init(&m, "iZ\x1b", 3, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 3);
+	v->e.mode = MODE_NORMAL;
+	vedit_run(v);
+	TAP_CHECK(t, (v->e.vi_marks_set & ((uint64_t)1 << MARK_INSERT)) != 0);
+	TAP_CHECKF(t, v->e.vi_mark_y[MARK_INSERT] == 0 &&
+	    v->e.vi_mark_x[MARK_INSERT] == 0, "'^ at %zu,%zu",
+	    v->e.vi_mark_y[MARK_INSERT], v->e.vi_mark_x[MARK_INSERT]);
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* gv reselects the previous visual range after leaving visual mode. */
 static void
 t_gv_reselect(Test *t)
@@ -1383,6 +1435,7 @@ const Case tap_cases[] = {
 	{ "shiftwidth", t_shiftwidth },
 	{ "macro_play", t_macro_play },
 	{ "macro_record", t_macro_record },
+	{ "marks_special", t_marks_special },
 	{ "shell_cmd", t_shell_cmd },
 	{ "exit_cursor", t_exit_cursor },
 	{ "gv_reselect", t_gv_reselect },
