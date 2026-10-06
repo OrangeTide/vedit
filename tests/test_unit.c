@@ -606,6 +606,83 @@ t_swap_write_clear(Test *t)
 	rmdir(dir);
 }
 
+/* The crash/OOM flush writes a swap for every dirty buffer: the active one from
+ * the flat editor state and the parked ones from their slots (deriving a swap
+ * path when the slot never had one). */
+static void
+t_swap_flush_all(Test *t)
+{
+	char dir[] = "/tmp/vedit_flushXXXXXX";
+	char pa[PATH_MAX], pb[PATH_MAX], spa[PATH_MAX], spb[PATH_MAX], line[256];
+	static const char *const A[] = { "active-dirty" };
+	static const char *const B[] = { "parked-dirty" };
+	Editor e;
+	Buf bufs[2];
+	FILE *fp;
+	Text *rd;
+	long body;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(pa, sizeof(pa), "%s/a.txt", dir);
+	snprintf(pb, sizeof(pb), "%s/b.txt", dir);
+
+	editor_init(&e);
+	memset(bufs, 0, sizeof(bufs));
+	e.bufs = bufs;
+	e.nbuf = 2;
+	e.cur = 0;
+
+	/* buffer 0: active, named, dirty -- flushed from the flat state */
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, A, 1);
+	e.t->final_newline = 1;
+	e.has_name = 1;
+	snprintf(e.path, sizeof(e.path), "%s", pa);
+	bufs[0].t = e.t;
+	bufs[0].has_name = 1;
+	snprintf(bufs[0].path, sizeof(bufs[0].path), "%s", pa);
+
+	/* buffer 1: parked, named, dirty, no swap path yet -- derived on flush */
+	bufs[1].t = text_new();
+	TAP_ASSERT(t, bufs[1].t != NULL);
+	tx_fill(bufs[1].t, B, 1);
+	bufs[1].t->final_newline = 1;
+	bufs[1].has_name = 1;
+	snprintf(bufs[1].path, sizeof(bufs[1].path), "%s", pb);
+
+	TAP_ASSERT(t, swap_path_for(pa, spa, sizeof(spa)));
+	TAP_ASSERT(t, swap_path_for(pb, spb, sizeof(spb)));
+
+	swap_flush_all(&e);
+
+	TAP_CHECK(t, access(spa, F_OK) == 0);	/* active buffer flushed */
+	TAP_CHECK(t, access(spb, F_OK) == 0);	/* parked buffer flushed */
+
+	/* the parked snapshot carries that buffer's text, not the active one's */
+	fp = fopen(spb, "rb");
+	TAP_ASSERT(t, fp != NULL);
+	TAP_ASSERT(t, fgets(line, sizeof(line), fp) &&
+	    strncmp(line, SWAP_MAGIC, strlen(SWAP_MAGIC)) == 0);
+	while (fgets(line, sizeof(line), fp) && line[0] != '\n')
+		;
+	body = ftell(fp);
+	rd = text_new();
+	TAP_ASSERT(t, rd && fseek(fp, body, SEEK_SET) == 0);
+	TAP_CHECK(t, text_load_fp(rd, fp) == OK);
+	TAP_CHECK(t, dump_is(rd, "parked-dirty"));
+	text_free(rd);
+	fclose(fp);
+
+	text_free(bufs[0].t);
+	text_free(bufs[1].t);
+	unlink(spa);
+	unlink(spb);
+	unlink(pa);
+	unlink(pb);
+	rmdir(dir);
+}
+
 static void
 t_text_edit_undo(Test *t)
 {
@@ -2469,6 +2546,7 @@ const Case tap_cases[] = {
 	{ "save_rodir_fallback", t_save_rodir_fallback },
 	{ "backup_save", t_backup_save },
 	{ "swap_write_clear", t_swap_write_clear },
+	{ "swap_flush_all", t_swap_flush_all },
 	{ "text_edit_undo", t_text_edit_undo },
 	{ "edit_roundtrip", t_edit_roundtrip },
 	{ "multiline_buffer", t_multiline_buffer },

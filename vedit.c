@@ -2374,12 +2374,16 @@ utf8_trunc(const char *s, size_t maxbytes)
 	return safe;
 }
 
+/* Flush every dirty buffer to its swap file, for the last-ditch out-of-memory
+ * and crash paths. Defined once the editor and swap machinery are in scope; a
+ * NULL running editor (nothing started yet) makes it a no-op. */
+static void vedit_flush_swaps(void);
+
 /* Abort-on-OOM allocation wrappers. Allocation failure is not something the
  * editor can usefully recover from mid-operation, so these report and abort
  * instead of returning NULL, which keeps call sites free of failure branches.
- * TODO(swap-recovery): before aborting, flush every dirty buffer to its swap
- * file so an out-of-memory death still leaves a recoverable snapshot. Pairs
- * with the planned swap-recovery-on-restart feature. */
+ * Before aborting we flush every dirty buffer to its swap file, so an
+ * out-of-memory death still leaves a recoverable snapshot for the next run. */
 static void
 vedit_oom(void)
 {
@@ -2387,6 +2391,7 @@ vedit_oom(void)
 	ssize_t w = write(STDERR_FILENO, m, sizeof(m) - 1);
 
 	(void)w;
+	vedit_flush_swaps();
 	abort();
 }
 
@@ -11082,42 +11087,54 @@ swap_set_path(Editor *e)
 		swap_path_for(e->path, e->swap_path, sizeof(e->swap_path));
 }
 
-/* Write a snapshot of the active buffer to its swap file (atomically, via a
- * sibling temp and a rename). Best effort: a failure never disturbs editing,
- * it just leaves the swap stale. */
-static void
-swap_write(Editor *e)
+/* Write a snapshot of `t` to `swap_path` atomically, via a sibling temp and a
+ * rename. Returns 1 on success. Best effort: a failure just leaves the swap
+ * stale. Shared by the active buffer and the flush-all crash path, so it takes
+ * the per-buffer fields by value rather than reading the flat editor. */
+static int
+swap_write_snapshot(const char *swap_path, const char *path, time_t mtime,
+    const Text *t)
 {
 	char tmp[PATH_MAX];
 	FILE *fp;
 	int ok;
 
-	if (!e->swap_enabled || !e->has_name)
-		return;
-	if (!e->swap_path[0])
-		swap_set_path(e);
-	if (!e->swap_path[0])
-		return;
-	if ((size_t)snprintf(tmp, sizeof(tmp), "%s.new", e->swap_path) >=
+	if (!swap_path[0])
+		return 0;
+	if ((size_t)snprintf(tmp, sizeof(tmp), "%s.new", swap_path) >=
 	    sizeof(tmp))
-		return;
+		return 0;
 	fp = fopen(tmp, "wb");
 	if (!fp)
-		return;
+		return 0;
 	ok = fprintf(fp, "%s\t1\npath\t%s\nmtime\t%ld\neol\t%d\n"
-	    "final_newline\t%d\npid\t%ld\n\n", SWAP_MAGIC, e->path,
-	    (long)e->load_mtime, e->t->eol, e->t->final_newline,
-	    (long)getpid()) >= 0 && text_write_fp(e->t, fp) == OK;
+	    "final_newline\t%d\npid\t%ld\n\n", SWAP_MAGIC, path,
+	    (long)mtime, t->eol, t->final_newline,
+	    (long)getpid()) >= 0 && text_write_fp(t, fp) == OK;
 	if (fflush(fp) != 0 || fsync(fileno(fp)) != 0)
 		ok = 0;
 	if (fclose(fp) != 0)
 		ok = 0;
-	if (!ok || rename(tmp, e->swap_path) != 0) {
+	if (!ok || rename(tmp, swap_path) != 0) {
 		unlink(tmp);
-		return;
+		return 0;
 	}
-	e->swap_on = 1;
-	e->swap_rev = e->t->rev;
+	return 1;
+}
+
+/* Write a snapshot of the active buffer to its swap file. Best effort: a
+ * failure never disturbs editing, it just leaves the swap stale. */
+static void
+swap_write(Editor *e)
+{
+	if (!e->swap_enabled || !e->has_name)
+		return;
+	if (!e->swap_path[0])
+		swap_set_path(e);
+	if (swap_write_snapshot(e->swap_path, e->path, e->load_mtime, e->t)) {
+		e->swap_on = 1;
+		e->swap_rev = e->t->rev;
+	}
 }
 
 /* Remove the active buffer's swap file, if one exists. */
@@ -11137,6 +11154,60 @@ swap_maybe_write(Editor *e)
 	if (e->swap_enabled && e->has_name && text_dirty(e->t) &&
 	    e->t->rev != e->swap_rev)
 		swap_write(e);
+}
+
+/* The running editor, recorded while vedit_run drives the event loop so the
+ * out-of-memory and crash paths can find it. NULL when nothing is running. */
+static Editor *g_crash_ed;
+
+/* Flush every dirty buffer (the active one from the flat editor, the rest from
+ * their parked slots) to its swap file. Runs at most once, and writes directly
+ * from each buffer's own fields so it never disturbs editor state. This is the
+ * body behind vedit_flush_swaps; call that from the crash paths.
+ *
+ * Reached from vedit_oom and, on the CLI, from the fatal-signal handler. It
+ * calls stdio (fopen/fprintf/rename), which is not async-signal-safe, so from a
+ * signal handler this is a best-effort recovery aid, not a guarantee. The
+ * handler resets the signal to its default first, so a fault while flushing
+ * dumps core instead of looping. */
+static void
+swap_flush_all(Editor *e)
+{
+	static volatile sig_atomic_t done;
+	int i;
+
+	if (!e || done || !e->swap_enabled)
+		return;
+	done = 1;
+
+	/* active buffer: the flat fields are authoritative */
+	if (e->has_name && e->t && text_dirty(e->t)) {
+		if (!e->swap_path[0])
+			swap_set_path(e);
+		swap_write_snapshot(e->swap_path, e->path, e->load_mtime, e->t);
+	}
+
+	/* parked buffers: snapshot from each slot */
+	for (i = 0; i < e->nbuf; i++) {
+		const Buf *b = &e->bufs[i];
+		char sp[PATH_MAX];
+		const char *swap = b->swap_path;
+
+		if (i == e->cur || !b->has_name || !b->t || !text_dirty(b->t))
+			continue;
+		if (!swap[0]) {		/* never snapshotted while active */
+			if (!swap_path_for(b->path, sp, sizeof(sp)))
+				continue;
+			swap = sp;
+		}
+		swap_write_snapshot(swap, b->path, b->load_mtime, b->t);
+	}
+}
+
+static void
+vedit_flush_swaps(void)
+{
+	swap_flush_all(g_crash_ed);
 }
 
 /* Record swap state on the active buffer after an open or recovery decision:
@@ -16847,6 +16918,7 @@ vedit_run(struct vedit *v)
 		buf_save(e, &e->bufs[0]);
 		v->registered = 1;
 	}
+	g_crash_ed = e;		/* the crash/OOM paths can now flush its swaps */
 	scr_begin(e->d);
 	set_status(e, "Press F1 for help");
 	/* The screen is up now, so the initial file can prompt for recovery
@@ -16856,6 +16928,7 @@ vedit_run(struct vedit *v)
 
 		if (action == SWAP_ABORT) {
 			scr_end(e->d);
+			g_crash_ed = NULL;
 			return 1;
 		}
 		swap_adopt(e, e->load_mtime, action);
@@ -16863,6 +16936,7 @@ vedit_run(struct vedit *v)
 	}
 	ed_render(e, e->d);
 	rc = editor_loop(e);
+	g_crash_ed = NULL;
 	return rc;
 }
 
@@ -16872,6 +16946,8 @@ vedit_free(struct vedit *v)
 {
 	if (!v)
 		return;
+	if (g_crash_ed == &v->e)	/* do not flush a freed editor on a later crash */
+		g_crash_ed = NULL;
 	editor_teardown(&v->e);
 	free(v);
 }
@@ -16897,11 +16973,18 @@ tty_on_winch(int sig)
 	g_winch = 1;
 }
 
-/* Restore the terminal when the process is killed (SIGTERM/SIGHUP), so a
- * closed window or a kill does not leave the shell in raw mode and the alt
- * screen. Uses only async-signal-safe calls, then re-raises with the default
- * handler so the exit status reflects the signal. (Ctrl-C and friends do not
- * reach here: raw mode clears ISIG, so they arrive as ordinary keys.) */
+/* Last-ditch cleanup when the process is killed (SIGTERM/SIGHUP) or crashes
+ * (SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGABRT). Flush dirty buffers to their swap
+ * files so the work is recoverable next run, then restore the terminal so a
+ * closed window or a crash does not leave the shell in raw mode and the alt
+ * screen, then re-raise with the default handler so the exit status reflects
+ * the signal. (Ctrl-C and friends do not reach here: raw mode clears ISIG, so
+ * they arrive as ordinary keys.)
+ *
+ * The signal is reset to its default first, so a fault during the swap flush
+ * dumps core instead of re-entering this handler. The flush uses stdio, which
+ * is not async-signal-safe, so it is a best-effort recovery aid: the terminal
+ * restore below (async-safe) still runs if the process survives the flush. */
 static void
 tty_on_fatal(int sig)
 {
@@ -16909,13 +16992,14 @@ tty_on_fatal(int sig)
 	    "\033[0m\033[?2004l\033[?25h\033[?1049l";
 	ssize_t wr;
 
+	signal(sig, SIG_DFL);
+	vedit_flush_swaps();
 	if (g_tty.raw) {
 		tcsetattr(g_tty.in_fd, TCSANOW, &g_tty.saved);
 		g_tty.raw = 0;
 	}
 	wr = write(g_tty.out_fd, restore, sizeof(restore) - 1);
 	(void)wr;
-	signal(sig, SIG_DFL);
 	raise(sig);
 }
 
@@ -17034,9 +17118,14 @@ tty_begin(void *ctx)
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = tty_on_winch;
 	sigaction(SIGWINCH, &sa, NULL);
-	sa.sa_handler = tty_on_fatal;		/* restore on a kill */
+	sa.sa_handler = tty_on_fatal;		/* flush swaps + restore terminal */
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGHUP, &sa, NULL);
+	sigaction(SIGSEGV, &sa, NULL);
+	sigaction(SIGBUS, &sa, NULL);
+	sigaction(SIGILL, &sa, NULL);
+	sigaction(SIGFPE, &sa, NULL);
+	sigaction(SIGABRT, &sa, NULL);
 }
 
 static void
@@ -17050,6 +17139,11 @@ tty_end(void *ctx)
 	sigaction(SIGWINCH, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGHUP, &sa, NULL);
+	sigaction(SIGSEGV, &sa, NULL);
+	sigaction(SIGBUS, &sa, NULL);
+	sigaction(SIGILL, &sa, NULL);
+	sigaction(SIGFPE, &sa, NULL);
+	sigaction(SIGABRT, &sa, NULL);
 	if (t->raw) {
 		tcsetattr(t->in_fd, TCSAFLUSH, &t->saved);
 		t->raw = 0;
