@@ -5297,6 +5297,9 @@ typedef struct editor {
 	time_t		load_mtime;	/* file mtime at load (swap staleness check) */
 	Tagloc		*tagstack;	/* positions to return to after tag jumps */
 	int		tag_sp, tag_cap;	/* stack depth and capacity */
+	Tagloc		*jumps;		/* jump list for Ctrl-O / Ctrl-I and `` / '' */
+	int		jump_n, jump_cap;	/* entries and capacity */
+	int		jump_cur;	/* position in the list; == jump_n means live */
 	int		hex_view;	/* render the buffer as a hex dump */
 	size_t		hex_top;	/* first visible hex row (byte offset >> 4) */
 	int		hex_ascii;	/* editing the ascii column, not the hex */
@@ -5331,6 +5334,7 @@ typedef struct editor {
 	char		vi_charsearch;	/* f/F/t/T awaiting its target char */
 	char		vi_textobj;	/* i/a awaiting a text-object char */
 	char		vi_markcmd;	/* m/`/' awaiting its mark letter */
+	char		vi_mark_norec;	/* the pending mark jump is g`/g': no jump */
 	char		vi_rpending;	/* r typed, awaiting the new character */
 	char		vi_atpending;	/* @ typed, awaiting the register name */
 	char		vi_last_macro;	/* last register played with @, for @@ */
@@ -13223,6 +13227,116 @@ ed_tag_pop(Editor *e)
 	    tl.path, e->cy + 1, e->tag_sp);
 }
 
+/****************************************************************
+ * Jump list: a history of the positions a "jump" command left, so Ctrl-O and
+ * Ctrl-I can walk back and forth across it (and the `` / '' marks name the most
+ * recent one). A jump command records where it started before it moves.
+ ****************************************************************/
+#define JUMPS_MAX 100
+
+static void vi_mark_set(Editor *e, int slot, size_t y, size_t x);
+
+/* Append a location to the jump list, dropping the oldest when full. */
+static void
+jump_append(Editor *e, const char *path, size_t cy, size_t cx)
+{
+	Tagloc *jl;
+
+	if (e->jump_n == e->jump_cap) {
+		int nc = e->jump_cap ? e->jump_cap * 2 : 16;
+		Tagloc *ns;
+
+		if (nc > JUMPS_MAX)
+			nc = JUMPS_MAX;
+		if (e->jump_n >= nc) {		/* full: drop the oldest entry */
+			memmove(e->jumps, e->jumps + 1,
+			    (size_t)(e->jump_n - 1) * sizeof(*e->jumps));
+			e->jump_n--;
+		} else {
+			ns = realloc(e->jumps, (size_t)nc * sizeof(*ns));
+			if (!ns)
+				return;
+			e->jumps = ns;
+			e->jump_cap = nc;
+		}
+	}
+	jl = &e->jumps[e->jump_n++];
+	snprintf(jl->path, sizeof(jl->path), "%s", path);
+	jl->cy = cy;
+	jl->cx = cx;
+}
+
+/* Record the current position as the origin of a jump about to happen, and set
+ * the `` / '' previous-position mark to it. Collapses a repeat of the same line
+ * in the same file, and drops any forward history past the cursor. */
+static void
+jump_record(Editor *e)
+{
+	const char *path = e->has_name ? e->path : "";
+
+	vi_mark_set(e, MARK_PREV, e->cy, e->cx);
+
+	e->jump_n = e->jump_cur;	/* a new jump truncates the forward part */
+	if (e->jump_n > 0) {
+		Tagloc *top = &e->jumps[e->jump_n - 1];
+
+		if (top->cy == e->cy && strcmp(top->path, path) == 0) {
+			top->cx = e->cx;	/* same line: just refresh it */
+			e->jump_cur = e->jump_n;
+			return;
+		}
+	}
+	jump_append(e, path, e->cy, e->cx);
+	e->jump_cur = e->jump_n;
+}
+
+/* Move the cursor (opening another file if need be) to a jump-list entry. */
+static void
+jump_goto(Editor *e, const Tagloc *jl)
+{
+	if (jl->path[0] && !(e->has_name && strcmp(jl->path, e->path) == 0)) {
+		if (buf_open(e, jl->path) < 0)
+			return;			/* buf_open set the status */
+	}
+	if (text_lines(e->t) == 0)
+		return;
+	e->cy = jl->cy < text_lines(e->t) ? jl->cy : text_lines(e->t) - 1;
+	e->cx = jl->cx;
+	e->sel_active = 0;
+	clamp_col(e);
+}
+
+/* Ctrl-O: go to an older position in the jump list. */
+static void
+jump_back(Editor *e)
+{
+	if (e->jump_n == 0 || e->jump_cur == 0) {
+		set_status(e, "already at oldest jump");
+		return;
+	}
+	if (e->jump_cur >= e->jump_n) {		/* leaving the live position */
+		const char *path = e->has_name ? e->path : "";
+
+		jump_append(e, path, e->cy, e->cx);	/* so Ctrl-I can return */
+		e->jump_cur = e->jump_n - 2;
+	} else {
+		e->jump_cur--;
+	}
+	jump_goto(e, &e->jumps[e->jump_cur]);
+}
+
+/* Ctrl-I: go to a newer position in the jump list. */
+static void
+jump_forward(Editor *e)
+{
+	if (e->jump_cur + 1 >= e->jump_n) {
+		set_status(e, "already at newest jump");
+		return;
+	}
+	e->jump_cur++;
+	jump_goto(e, &e->jumps[e->jump_cur]);
+}
+
 /* Jump to the chosen entry: a buffer line, or a tags entry in another file. */
 static void
 sym_goto(Editor *e, Sympick *sp, int i)
@@ -15742,6 +15856,7 @@ editor_teardown(Editor *e)
 	free(e->vi_rec.ev);
 	free(e->hl_buf);
 	free(e->tagstack);
+	free(e->jumps);
 	if (g_cfg == e->cfg_owned)	/* don't leave the global dangling */
 		g_cfg = NULL;
 	vedit_cfg_free(e->cfg_owned);
@@ -18015,6 +18130,13 @@ vi_do_motion(Editor *e, uint32_t motchar)
 		return REQ_CONTINUE;
 	}
 
+	/* The long-range motions are jumps: remember where we came from. */
+	if (!e->vi_op && (motchar == 'G' || motchar == 'g' || motchar == 'H' ||
+	    motchar == 'M' || motchar == 'L' || motchar == '%' ||
+	    motchar == '{' || motchar == '}' || motchar == '(' ||
+	    motchar == ')'))
+		jump_record(e);
+
 	if (e->vi_op) {
 		char op = e->vi_op;
 
@@ -18390,33 +18512,21 @@ vi_mark_set(Editor *e, int slot, size_t y, size_t x)
 	e->vi_marks_set |= (uint64_t)1 << slot;
 }
 
-/* Set or jump to a mark. cmd is 'm' (set), '`' (jump to the exact spot), or
- * '\'' (jump to the first non-blank of the mark's line); idx is a slot from
- * mark_index. A jump with an operator armed applies it over the span: charwise
- * and exclusive for '`', linewise for '\''. Marks hold absolute positions and
- * do not shift as the buffer is edited. */
+/* Jump to a stored mark position (my,mx). cmd is '`' (go to the exact column)
+ * or '\'' (go to the line's first non-blank). With an operator armed it applies
+ * the operator over the span instead of moving: charwise and exclusive for '`',
+ * linewise for '\''. Taking (my,mx) by value lets the caller read the mark
+ * before anything (like recording the jump) overwrites it. */
 static Req
-vi_do_mark(Editor *e, char cmd, int idx)
+vi_goto_pos(Editor *e, char cmd, size_t my, size_t mx)
 {
-	size_t y, x;
-	char op;
+	size_t y = my, x;
+	char op = e->vi_op;
 
-	if (cmd == 'm') {
-		vi_mark_set(e, idx, e->cy, e->cx);
-		vi_reset_pending(e);
-		return REQ_CONTINUE;
-	}
-	if (!(e->vi_marks_set & ((uint64_t)1 << idx))) {
-		set_status(e, "E20: mark not set");
-		vi_reset_pending(e);
-		return REQ_CONTINUE;
-	}
-	y = e->vi_mark_y[idx];
 	if (y >= text_lines(e->t))
 		y = text_lines(e->t) - 1;
-	x = (cmd == '`') ? e->vi_mark_x[idx] : first_nonblank(e, y);
+	x = (cmd == '`') ? mx : first_nonblank(e, y);
 
-	op = e->vi_op;
 	if (op) {
 		Motion m = { y, x, 0, 0, 1 };
 
@@ -18751,17 +18861,37 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 	}
 
 	/* A pending m/`/' takes the next key as the mark name. m sets a-z only;
-	 * the jumps ` and ' also reach the special marks (. ^ < > and ` / '). */
+	 * the jumps ` and ' also reach the special marks (. ^ < > and ` / '). A
+	 * plain jump records the origin in the jump list; the g`/g' variants do
+	 * not (vi_mark_norec). */
 	if (e->vi_markcmd) {
 		char cmd = e->vi_markcmd;
+		int norec = e->vi_mark_norec;
 		int idx = ctrl ? -1 : mark_index((int)c);
+		size_t my, mx;
 
 		e->vi_markcmd = 0;
+		e->vi_mark_norec = 0;
 		if (idx < 0 || (cmd == 'm' && idx >= MARK_LETTERS)) {
 			vi_reset_pending(e);
 			return REQ_CONTINUE;
 		}
-		return vi_do_mark(e, cmd, idx);
+		if (cmd == 'm') {			/* set the mark */
+			vi_mark_set(e, idx, e->cy, e->cx);
+			vi_reset_pending(e);
+			return REQ_CONTINUE;
+		}
+		if (!(e->vi_marks_set & ((uint64_t)1 << idx))) {
+			set_status(e, "E20: mark not set");
+			vi_reset_pending(e);
+			return REQ_CONTINUE;
+		}
+		/* Read the target before jump_record rewrites the ` / ' mark. */
+		my = e->vi_mark_y[idx];
+		mx = e->vi_mark_x[idx];
+		if (!norec)
+			jump_record(e);
+		return vi_goto_pos(e, cmd, my, mx);
 	}
 
 	/* A pending @ takes the next key as the macro register to play (a-z,
@@ -18867,6 +18997,7 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 			vi_move_lines(e, -page);
 			break;
 		case TKBD_KEY_HOME:		/* Ctrl+Home: start of file (gg) */
+			jump_record(e);
 			e->cy = 0;
 			e->cx = first_nonblank(e, 0);
 			vi_clamp(e);
@@ -18874,6 +19005,7 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 		case TKBD_KEY_END: {		/* Ctrl+End: end of file (G) */
 			size_t last = text_lines(e->t);
 
+			jump_record(e);
 			e->cy = last ? last - 1 : 0;
 			e->cx = first_nonblank(e, e->cy);
 			vi_clamp(e);
@@ -18894,6 +19026,9 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 			ed_tag_pop(e);
 			vi_clamp(e);
 			break;
+		case TKBD_KEY_O:			/* Ctrl-O: older jump-list entry */
+			jump_back(e);
+			break;
 		case TKBD_KEY_V:			/* Ctrl-V: visual block select */
 			e->vi_visual = VI_VBLOCK;
 			e->sel_active = 1;
@@ -18911,6 +19046,10 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 		switch (seq->key) {
 		case TKBD_KEY_ESC:
 			vi_reset_pending(e);
+			return REQ_CONTINUE;
+		case TKBD_KEY_TAB:		/* Ctrl-I: newer jump-list entry */
+			vi_reset_pending(e);
+			jump_forward(e);
 			return REQ_CONTINUE;
 		case TKBD_KEY_F1:
 			vi_reset_pending(e);
@@ -18958,6 +19097,11 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 		e->vi_gpending = 0;
 		if (c == 'g')
 			return vi_do_motion(e, 'g');
+		if (c == '`' || c == '\'') {	/* g` / g': jump without a jumplist push */
+			e->vi_markcmd = (char)c;
+			e->vi_mark_norec = 1;
+			return REQ_CONTINUE;
+		}
 		if (c == 'f') {
 			ed_open_header(e);
 			vi_reset_pending(e);
@@ -19222,9 +19366,10 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 		if (c == 'N')				/* repeat the other way */
 			dir = -dir;
 		vi_reset_pending(e);
-		if (e->last_find[0])
+		if (e->last_find[0]) {
+			jump_record(e);
 			ed_find_dir(e, e->last_find, dir);
-		else
+		} else
 			set_status(e,
 			    "no previous search");
 		return REQ_CONTINUE;

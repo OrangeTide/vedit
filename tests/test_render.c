@@ -831,6 +831,54 @@ t_marks_special(Test *t)
 	memio_free(&m);
 }
 
+/* The jump list: G records the origin, Ctrl-O walks back to it and Ctrl-I
+ * forward again, and `` toggles between a jump's two ends. */
+static void
+t_jumplist(Test *t)
+{
+	static const char *const L[] = { "l0", "l1", "l2", "l3", "l4",
+	    "l5", "l6", "l7", "l8", "l9" };
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	/* G jumps to the last line, Ctrl-O (0x0f) returns to the origin */
+	memio_init(&m, "G\x0f", 2, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 10);
+	v->e.mode = MODE_NORMAL;
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.cy == 0, "Ctrl-O landed on line %zu", v->e.cy);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* ... and Ctrl-I (Tab, 0x09) goes forward again */
+	memio_init(&m, "G\x0f\x09", 3, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 10);
+	v->e.mode = MODE_NORMAL;
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.cy == 9, "Ctrl-I landed on line %zu", v->e.cy);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* `` returns to the pre-jump spot; a second `` toggles back */
+	memio_init(&m, "G````", 5, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 10);
+	v->e.mode = MODE_NORMAL;
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.cy == 9, "`` toggled to line %zu", v->e.cy);
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* gv reselects the previous visual range after leaving visual mode. */
 static void
 t_gv_reselect(Test *t)
@@ -1436,6 +1484,7 @@ const Case tap_cases[] = {
 	{ "macro_play", t_macro_play },
 	{ "macro_record", t_macro_record },
 	{ "marks_special", t_marks_special },
+	{ "jumplist", t_jumplist },
 	{ "shell_cmd", t_shell_cmd },
 	{ "exit_cursor", t_exit_cursor },
 	{ "gv_reselect", t_gv_reselect },
