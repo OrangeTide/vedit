@@ -693,6 +693,60 @@ t_search_word(Test *t)
 	memio_free(&m);
 }
 
+/* Put bytes into register a (as if recorded), for the @ playback tests. */
+static void
+set_reg_a(struct vedit *v, const char *bytes, size_t n)
+{
+	char *b = malloc(n);
+
+	if (b) {
+		memcpy(b, bytes, n);
+		free(v->e.vi_regs[0].bytes);
+		v->e.vi_regs[0].bytes = b;
+		v->e.vi_regs[0].len = n;
+		v->e.vi_regs[0].linewise = 0;
+	}
+}
+
+/* @a replays register a as keystrokes, including an embedded Esc that leaves
+ * insert mode; a count repeats the whole macro. */
+static void
+t_macro_play(Test *t)
+{
+	static const char *const L[] = { "X" };
+	static const char *const L2[] = { "abcd" };
+	const char ins[] = { 'i', 'h', 'i', 0x1b };	/* insert "hi", then Esc */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	/* a macro that switches to insert mode and back */
+	memio_init(&m, "@a", 2, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 1);
+	v->e.mode = MODE_NORMAL;
+	set_reg_a(v, ins, sizeof(ins));
+	vedit_run(v);
+	TAP_CHECK(t, vline_is(v, 0, "hiX"));
+	vedit_free(v);
+	memio_free(&m);
+
+	/* a count repeats the macro: 2@a deletes two characters */
+	memio_init(&m, "2@a", 3, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L2, 1);
+	v->e.mode = MODE_NORMAL;
+	set_reg_a(v, "x", 1);
+	vedit_run(v);
+	TAP_CHECK(t, vline_is(v, 0, "cd"));
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* gv reselects the previous visual range after leaving visual mode. */
 static void
 t_gv_reselect(Test *t)
@@ -1099,6 +1153,7 @@ const Case tap_cases[] = {
 	{ "search_icase", t_search_icase },
 	{ "search_word", t_search_word },
 	{ "shiftwidth", t_shiftwidth },
+	{ "macro_play", t_macro_play },
 	{ "gv_reselect", t_gv_reselect },
 	{ "global_yank", t_global_yank },
 	{ "global_shift", t_global_shift },

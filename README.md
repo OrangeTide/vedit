@@ -593,7 +593,9 @@ rectangle) supports `d`/`x` to delete
 the columns, `y` to yank them, and `I` / `A` to insert at the left edge or append
 past the right edge, replicating the typed text down every row when you press
 Esc; a block yanked or deleted this way pastes back as a rectangle with `p`.
-`Ctrl-Home` and `Ctrl-End` jump to the
+`@a` plays register a back as keystrokes, `@@` repeats the last one, and a count
+repeats the macro (`3@a`); a register is filled by yanking into it (`"ayy`), as
+there is no key recording yet. `Ctrl-Home` and `Ctrl-End` jump to the
 first and last line, the same as `gg` and `G`, and work in insert mode too. `ZZ`
 writes and quits, `ZQ` quits without writing. The `:` line runs `write`, `quit`,
 `wq`, `xit`, `qall`, `wqall`, `cquit`, `edit`, `enew`, `read`, `buffer`,

@@ -5253,6 +5253,9 @@ typedef struct editor {
 	char		vi_textobj;	/* i/a awaiting a text-object char */
 	char		vi_markcmd;	/* m/`/' awaiting its mark letter */
 	char		vi_rpending;	/* r typed, awaiting the new character */
+	char		vi_atpending;	/* @ typed, awaiting the register name */
+	char		vi_last_macro;	/* last register played with @, for @@ */
+	int		vi_macro_depth;	/* @ recursion guard */
 	int		vi_overtype;	/* R Replace mode: typing overwrites */
 	size_t		vi_mark_y[26];	/* line of mark 'a'..'z' */
 	size_t		vi_mark_x[26];	/* byte column of the mark */
@@ -18505,6 +18508,7 @@ vi_search_word(Editor *e, int dir)
 }
 
 static void vi_dot_replay(Editor *e);
+static void vi_play_register(Editor *e, char reg, int count);
 
 /* Handle one key in vi normal mode. */
 static Req
@@ -18574,6 +18578,29 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 			return REQ_CONTINUE;
 		}
 		return vi_do_mark(e, cmd, (int)(c - 'a'));
+	}
+
+	/* A pending @ takes the next key as the macro register to play (a-z,
+	 * @ for the last one, " for the unnamed register). */
+	if (e->vi_atpending) {
+		int cnt = e->vi_count > 0 ? e->vi_count : 1;
+		char reg = 0;
+
+		e->vi_atpending = 0;
+		if (ctrl)
+			reg = 0;
+		else if (c == '@')
+			reg = e->vi_last_macro;
+		else if (c >= 'a' && c <= 'z')
+			reg = (char)c;
+		else if (c >= 'A' && c <= 'Z')
+			reg = (char)(c - 'A' + 'a');
+		else if (c == '"')
+			reg = '"';
+		vi_reset_pending(e);
+		if (reg)
+			vi_play_register(e, reg, cnt);
+		return REQ_CONTINUE;
 	}
 
 	/* A pending " takes the next key as the register name (a-z/A-Z). */
@@ -18917,6 +18944,9 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 	case '.':
 		vi_reset_pending(e);
 		vi_dot_replay(e);
+		return REQ_CONTINUE;
+	case '@':			/* play a register as keystrokes */
+		e->vi_atpending = 1;
 		return REQ_CONTINUE;
 	case 'J': {
 		int cnt = e->vi_count > 0 ? e->vi_count : 1;
@@ -19428,6 +19458,68 @@ vi_dot_replay(Editor *e)
 		vi_dispatch(e, &seq);
 	}
 	e->vi_replaying = 0;
+}
+
+/* Play a register's bytes back as keystrokes (vi @), count times. The bytes
+ * are decoded the same way typed input is, except a bare ESC byte is always
+ * the Esc key (never folded into an escape sequence) so a macro can leave
+ * insert mode. A depth guard stops a register that calls itself. */
+static void
+vi_play_register(Editor *e, char reg, int count)
+{
+	const char *bytes;
+	size_t len;
+	int rep;
+
+	if (reg == '"' || reg == 0) {
+		bytes = e->clip;
+		len = e->clip_len;
+	} else if (reg >= 'a' && reg <= 'z') {
+		bytes = e->vi_regs[reg - 'a'].bytes;
+		len = e->vi_regs[reg - 'a'].len;
+	} else {
+		set_status(e, "no such register");
+		return;
+	}
+	if (!bytes || len == 0) {
+		set_status(e, "register empty");
+		return;
+	}
+	if (e->vi_macro_depth > 50) {
+		set_status(e, "macro nesting too deep");
+		return;
+	}
+	if (count < 1)
+		count = 1;
+	e->vi_last_macro = reg ? reg : '"';
+	e->vi_macro_depth++;
+	for (rep = 0; rep < count; rep++) {
+		size_t i = 0;
+		int save = e->vi_replaying;
+
+		e->vi_replaying = 1;		/* a macro records nothing itself */
+		while (i < len) {
+			struct tkbd_seq seq;
+			int n;
+
+			if ((unsigned char)bytes[i] == 0x1b) {
+				seq_simple(&seq, TKBD_KEY_ESC, 0);
+				n = 1;
+			} else {
+				n = tkbd_decode(&seq,
+				    (const unsigned char *)bytes + i,
+				    (int)(len - i));
+				if (n <= 0) {	/* incomplete/unusable: skip a byte */
+					i++;
+					continue;
+				}
+			}
+			vi_dispatch(e, &seq);
+			i += (size_t)n;
+		}
+		e->vi_replaying = save;
+	}
+	e->vi_macro_depth--;
 }
 
 Req
