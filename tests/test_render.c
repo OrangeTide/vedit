@@ -638,6 +638,61 @@ t_swap_recover_delete(Test *t)
 	rmdir(dir);
 }
 
+/* :set ignorecase makes a search match regardless of case. */
+static void
+t_search_icase(Test *t)
+{
+	static const char *const L[] = { "alpha", "BetaGAMMA" };
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 2);
+
+	v->e.cy = v->e.cx = 0;
+	v->e.search_icase = 0;
+	ed_find_dir(&v->e, "gamma", 1);
+	TAP_CHECKF(t, v->e.cy == 0, "case-sensitive should miss, cy=%zu",
+	    v->e.cy);
+
+	v->e.cy = v->e.cx = 0;
+	v->e.search_icase = 1;
+	ed_find_dir(&v->e, "gamma", 1);
+	TAP_CHECKF(t, v->e.cy == 1, "ignorecase should hit line 1, cy=%zu",
+	    v->e.cy);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* The * word search matches whole words only: it skips "foobar" and lands on
+ * the standalone "foo". */
+static void
+t_search_word(Test *t)
+{
+	static const char *const L[] = { "foo", "foobar", "zz foo" };
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 3);
+
+	v->e.cy = v->e.cx = 0;
+	vi_search_word(&v->e, 1);		/* like pressing * on "foo" */
+	TAP_CHECKF(t, v->e.cy == 2, "* should skip 'foobar', cy=%zu", v->e.cy);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* True when line y of the buffer equals the NUL-terminated want. */
 static int
 vline_is(struct vedit *v, size_t y, const char *want)
@@ -926,6 +981,8 @@ const Case tap_cases[] = {
 	{ "swap_file_created", t_swap_file_created },
 	{ "swap_recover_key", t_swap_recover_key },
 	{ "swap_recover_delete", t_swap_recover_delete },
+	{ "search_icase", t_search_icase },
+	{ "search_word", t_search_word },
 	{ "vblock_delete", t_vblock_delete },
 	{ "vblock_insert", t_vblock_insert },
 	{ "vblock_yank_put", t_vblock_yank_put },

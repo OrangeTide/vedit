@@ -5193,6 +5193,7 @@ typedef struct editor {
 	char		last_find[256];	/* last search string, for repeat */
 	char		last_replace[256]; /* last replacement string */
 	int		vi_search_dir;	/* last search direction: 1 fwd, -1 back */
+	int		search_icase;	/* match searches case-insensitively */
 	int		vi_want_col;	/* display column j/k aim for (INT_MAX=EOL) */
 	int		vi_vert_run;	/* this command was a vertical j/k/$ move */
 	int		vi_vert_prev;	/* the previous command was one */
@@ -10332,6 +10333,14 @@ replace_at(Editor *e, size_t ln, size_t col, size_t patlen,
 		text_insert(e->t, ln, col, repl, repllen);
 }
 
+/* rx_compile flags for a user-initiated search or replace: case-insensitive
+ * when :set ignorecase is on. Build-error grammars compile without it. */
+static int
+search_flags(const Editor *e)
+{
+	return e->search_icase ? RX_ICASE : 0;
+}
+
 /* Prompt for a regex pattern and a replacement template, then walk the matches
  * from the cursor to the end of the buffer. At each one, y replaces, n skips, a
  * replaces it and all that follow, and q (or Esc) stops. The template honours
@@ -10357,7 +10366,7 @@ replace_prompt(Editor *e)
 	}
 	if (pat[0] == '\0')
 		return;
-	re = rx_compile(pat, 0, &err);
+	re = rx_compile(pat, search_flags(e), &err);
 	if (!re) {
 		snprintf(e->status, sizeof(e->status), "bad pattern: %.80s", err);
 		return;
@@ -10762,7 +10771,7 @@ ed_find_dir(Editor *e, const char *q, int dir)
 
 	if (!q[0])
 		return;
-	re = rx_compile(q, 0, &err);
+	re = rx_compile(q, search_flags(e), &err);
 	if (!re) {
 		snprintf(e->status, sizeof(e->status), "bad pattern: %.80s", err);
 		return;
@@ -10843,7 +10852,7 @@ isearch_scan_dir(Editor *e, const char *q, size_t oy, size_t ox, int dir,
 
 	if (!q[0] || nlines == 0)
 		return 0;
-	re = rx_compile(q, 0, NULL);
+	re = rx_compile(q, search_flags(e), NULL);
 	if (!re)
 		return 0;
 	if (dir >= 0) {
@@ -15735,6 +15744,7 @@ ed_apply_config(Editor *e)
 	e->auto_indent = cfg_bool(g_cfg, "edit.autoindent", e->auto_indent);
 	e->swap_enabled = cfg_bool(g_cfg, "edit.swap", e->swap_enabled);
 	e->backup_enabled = cfg_bool(g_cfg, "edit.backup", e->backup_enabled);
+	e->search_icase = cfg_bool(g_cfg, "edit.ignorecase", e->search_icase);
 	e->expand_tabs = indent_expand_default(e->syn ? e->syn->name : NULL);
 	e->hl_on = cfg_bool(g_cfg, "syntax.enable", e->hl_on);
 	e->clip_osc52 = cfg_bool(g_cfg, "ui.clipboard", e->clip_osc52);
@@ -18427,10 +18437,12 @@ vi_search_word(Editor *e, int dir)
 		return;
 	memcpy(word, s + start, wl);
 	word[wl] = '\0';
-	snprintf(e->last_find, sizeof(e->last_find), "%s", word);
+	/* match the whole word only, like Vim's * and # (the word is made of
+	 * identifier characters, so it needs no regex escaping). */
+	snprintf(e->last_find, sizeof(e->last_find), "\\<%s\\>", word);
 	e->vi_search_dir = dir;
 	e->cx = start;				/* search from the word start */
-	ed_find_dir(e, word, dir);
+	ed_find_dir(e, e->last_find, dir);
 }
 
 static void vi_dot_replay(Editor *e);
@@ -19475,7 +19487,7 @@ vi_ex_substitute(Editor *e, size_t lo, size_t hi, const char *args)
 		    "E35: no previous regular expression");
 		return REQ_CONTINUE;
 	}
-	re = rx_compile(use, 0, &err);
+	re = rx_compile(use, search_flags(e), &err);
 	if (!re) {
 		snprintf(e->status, sizeof(e->status), "bad pattern: %.80s", err);
 		return REQ_CONTINUE;
@@ -19548,7 +19560,7 @@ vi_ex_global(Editor *e, size_t lo, size_t hi, int had_range,
 		    "E35: no previous regular expression");
 		return REQ_CONTINUE;
 	}
-	re = rx_compile(use, 0, &err);
+	re = rx_compile(use, search_flags(e), &err);
 	if (!re) {
 		snprintf(e->status, sizeof(e->status), "bad pattern: %.80s", err);
 		return REQ_CONTINUE;
@@ -19870,6 +19882,21 @@ ex_set(Editor *e, const char *arg)
 			e->backup_enabled = 1;
 		snprintf(e->status, sizeof(e->status), "backup %s",
 		    e->backup_enabled ? "on" : "off");
+		return REQ_CONTINUE;
+	} else if (strcmp(arg, "ignorecase") == 0 || strcmp(arg, "ic") == 0 ||
+	    strcmp(arg, "noignorecase") == 0 || strcmp(arg, "noic") == 0 ||
+	    strcmp(arg, "ignorecase!") == 0 || strcmp(arg, "invignorecase") == 0) {
+		/* "ignorecase" and "ic" both begin with 'i', so the usual
+		 * arg[0] heuristic for inv/no does not apply; match exactly. */
+		if (strcmp(arg, "noignorecase") == 0 || strcmp(arg, "noic") == 0)
+			e->search_icase = 0;
+		else if (strcmp(arg, "ignorecase!") == 0 ||
+		    strcmp(arg, "invignorecase") == 0)
+			e->search_icase = !e->search_icase;
+		else
+			e->search_icase = 1;
+		snprintf(e->status, sizeof(e->status), "ignorecase %s",
+		    e->search_icase ? "on" : "off");
 		return REQ_CONTINUE;
 	} else if (strncmp(arg, "ff=", 3) == 0 ||
 	    strncmp(arg, "fileformat=", 11) == 0) {

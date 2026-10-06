@@ -142,6 +142,7 @@ A gitconfig-style file sets the startup defaults. It is read from the first of
 [edit]
     mode = vi            # vi | modeless
     autoindent = on      # new lines copy the previous indent
+    ignorecase = off     # on = searches match regardless of case
     swap = on            # write a .swp crash-recovery snapshot (on by default)
     swapdir =            # where swap files go; empty = beside the file
     backup = off         # keep the previous version as a "~" file on save
@@ -617,6 +618,12 @@ matches within a single line. The engine lives in `vedit.c` between the
 block.
 
 [rx]: https://github.com/OrangeTide/rx
+
+Searches are case sensitive by default. `edit.ignorecase = on`, or `:set
+ignorecase` (`:set ic`) during a session, makes every search and the regex
+replace match regardless of case; `:set noignorecase` turns it back off. In vi
+keys, `*` and `#` search for the whole word under the cursor (wrapped in the
+`\< \>` boundaries), so they skip a substring match inside a longer word.
 
 ### Build commands (a primitive IDE)
 
