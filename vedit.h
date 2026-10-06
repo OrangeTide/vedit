@@ -105,8 +105,9 @@ void vedit_set_scroll(struct vedit *v, int on);
  * one or more files with vedit_cfg_load(), hand it to vedit_set_config() before
  * vedit_run(), and free it with vedit_cfg_free() after vedit_run(). Recognized
  * keys include ui.box, ui.colors, ui.scroll, ui.scheme, ui.wrap, ui.number,
- * edit.mode, and syntax.enable (see README). Config values rank below the
- * VEDIT_* environment variables and the explicit setters above. */
+ * edit.mode, edit.swap, edit.swapdir, edit.backup, edit.backupdir, and
+ * syntax.enable (see README). Config values rank below the VEDIT_*
+ * environment variables and the explicit setters above. */
 struct cfg;
 struct cfg *vedit_cfg_new(void);
 int vedit_cfg_load(struct cfg *c, const char *path);

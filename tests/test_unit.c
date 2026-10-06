@@ -330,6 +330,253 @@ dump_is(Text *tx, const char *want)
 	return ok;
 }
 
+/* Fill a fresh (one empty line) Text with n whole lines. */
+static void
+tx_fill(Text *tx, const char *const *lines, int n)
+{
+	int i;
+
+	if (n <= 0)
+		return;
+	text_insert(tx, 0, 0, lines[0], strlen(lines[0]));
+	for (i = 1; i < n; i++)
+		lines_insert_at(tx, (size_t)i, lines[i], strlen(lines[i]));
+}
+
+/* The FILE* serializer cores round-trip content and every line-ending style. */
+static void
+t_text_fp_roundtrip(Test *t)
+{
+	static const char *const L[] = { "alpha", "beta", "gamma" };
+	int eols[] = { EOL_LF, EOL_CRLF, EOL_NUL };
+	size_t k;
+
+	for (k = 0; k < sizeof(eols) / sizeof(eols[0]); k++) {
+		Text *a = text_new(), *b = text_new();
+		FILE *fp = tmpfile();
+
+		TAP_ASSERT(t, a && b && fp);
+		tx_fill(a, L, 3);
+		a->eol = eols[k];
+		a->final_newline = (k != 1);	/* also exercise no-final-newline */
+		TAP_CHECK(t, text_write_fp(a, fp) == OK);
+		rewind(fp);
+		TAP_CHECK(t, text_load_fp(b, fp) == OK);
+		TAP_CHECKF(t, dump_is(b, "alpha\nbeta\ngamma"),
+		    "eol %d body mismatch", eols[k]);
+		TAP_CHECKF(t, b->eol == eols[k], "eol %d not detected: %d",
+		    eols[k], b->eol);
+		TAP_CHECKF(t, b->final_newline == (k != 1),
+		    "final_newline %d wrong for eol %d", b->final_newline,
+		    eols[k]);
+		fclose(fp);
+		text_free(a);
+		text_free(b);
+	}
+}
+
+/* Swap and backup path construction: beside the file, and in a shared dir. */
+static void
+t_swap_paths(Test *t)
+{
+	char dir[] = "/tmp/vedit_spXXXXXX";
+	char out[PATH_MAX], want[PATH_MAX];
+
+	TAP_ASSERT(t, swap_path_for("/a/b/foo.c", out, sizeof(out)));
+	TAP_CHECKF(t, strcmp(out, "/a/b/.foo.c.swp") == 0, "beside swap: %s",
+	    out);
+	TAP_ASSERT(t, swap_path_for("foo.c", out, sizeof(out)));
+	TAP_CHECKF(t, strcmp(out, ".foo.c.swp") == 0, "no-dir swap: %s", out);
+	TAP_ASSERT(t, backup_path_for("/a/b/foo.c", out, sizeof(out)));
+	TAP_CHECKF(t, strcmp(out, "/a/b/foo.c~") == 0, "beside backup: %s",
+	    out);
+
+	/* A configured swapdir mangles the full path into one flat name. */
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	setenv("VEDIT_EDIT_SWAPDIR", dir, 1);
+	TAP_ASSERT(t, swap_path_for("/a/b/foo.c", out, sizeof(out)));
+	snprintf(want, sizeof(want), "%s/%%a%%b%%foo.c.swp", dir);
+	TAP_CHECKF(t, strcmp(out, want) == 0, "swapdir name: %s", out);
+	unsetenv("VEDIT_EDIT_SWAPDIR");
+	rmdir(dir);
+}
+
+/* text_save writes atomically: the target gets the new bytes and no temp file
+ * is left behind in the directory. */
+static void
+t_atomic_save(Test *t)
+{
+	char dir[] = "/tmp/vedit_asXXXXXX";
+	char path[PATH_MAX];
+	static const char *const L[] = { "one", "two" };
+	Text *tx = text_new();
+	DIR *d;
+	struct dirent *de;
+	int leftover = 0;
+
+	TAP_ASSERT(t, tx && mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/out.txt", dir);
+	tx_fill(tx, L, 2);
+	tx->final_newline = 1;
+	TAP_CHECK(t, text_save(tx, path) == OK);
+
+	{
+		Text *rd = text_new();
+
+		TAP_ASSERT(t, rd && text_load(rd, path) == OK);
+		TAP_CHECK(t, dump_is(rd, "one\ntwo"));
+		text_free(rd);
+	}
+	d = opendir(dir);
+	TAP_ASSERT(t, d != NULL);
+	while ((de = readdir(d)))
+		if (strncmp(de->d_name, ".vedit-save-", 12) == 0)
+			leftover = 1;
+	closedir(d);
+	TAP_CHECK(t, !leftover);
+
+	text_free(tx);
+	unlink(path);
+	rmdir(dir);
+}
+
+/* A writable file in a read-only directory still saves: the atomic temp cannot
+ * be created there, so text_save falls back to a direct in-place write. */
+static void
+t_save_rodir_fallback(Test *t)
+{
+	char dir[] = "/tmp/vedit_roXXXXXX";
+	char path[PATH_MAX];
+	static const char *const L[] = { "updated" };
+	Text *tx;
+	FILE *f;
+
+	if (geteuid() == 0) {		/* root ignores directory permissions */
+		TAP_CHECK(t, 1);
+		return;
+	}
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/f.txt", dir);
+	f = fopen(path, "wb");
+	TAP_ASSERT(t, f != NULL);
+	fputs("old\n", f);
+	fclose(f);
+	TAP_ASSERT(t, chmod(dir, 0500) == 0);	/* read + execute, no write */
+
+	tx = text_new();
+	TAP_ASSERT(t, tx != NULL);
+	tx_fill(tx, L, 1);
+	tx->final_newline = 1;
+	TAP_CHECK(t, text_save(tx, path) == OK);	/* direct-write fallback */
+
+	chmod(dir, 0700);			/* restore so we can read/clean up */
+	{
+		Text *rd = text_new();
+
+		TAP_ASSERT(t, rd && text_load(rd, path) == OK);
+		TAP_CHECK(t, dump_is(rd, "updated"));
+		text_free(rd);
+	}
+	text_free(tx);
+	unlink(path);
+	rmdir(dir);
+}
+
+/* With backups on, a save copies the previous version to a "~" file first. */
+static void
+t_backup_save(Test *t)
+{
+	char dir[] = "/tmp/vedit_bkXXXXXX";
+	char path[PATH_MAX], backup[PATH_MAX];
+	static const char *const NEW[] = { "new" };
+	Editor e;
+	FILE *f;
+	Text *rd;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/f.txt", dir);
+	f = fopen(path, "wb");
+	TAP_ASSERT(t, f != NULL);
+	fputs("old\n", f);
+	fclose(f);
+
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, NEW, 1);
+	e.t->final_newline = 1;
+	snprintf(e.path, sizeof(e.path), "%s", path);
+	e.has_name = 1;
+	e.backup_enabled = 1;
+	TAP_CHECK(t, ed_save_file(&e) == OK);
+
+	rd = text_new();
+	TAP_ASSERT(t, rd && text_load(rd, path) == OK);
+	TAP_CHECK(t, dump_is(rd, "new"));		/* target updated */
+	text_free(rd);
+
+	TAP_ASSERT(t, backup_path_for(path, backup, sizeof(backup)));
+	rd = text_new();
+	TAP_ASSERT(t, rd && text_load(rd, backup) == OK);
+	TAP_CHECK(t, dump_is(rd, "old"));		/* previous kept */
+	text_free(rd);
+
+	text_free(e.t);
+	unlink(backup);
+	unlink(path);
+	rmdir(dir);
+}
+
+/* swap_write lays down a parseable snapshot; a save then clears it. */
+static void
+t_swap_write_clear(Test *t)
+{
+	char dir[] = "/tmp/vedit_swXXXXXX";
+	char path[PATH_MAX], line[256];
+	static const char *const L[] = { "swapme" };
+	Editor e;
+	FILE *fp;
+	Text *rd;
+	long body;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/s.txt", dir);
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, L, 1);
+	e.t->final_newline = 1;
+	snprintf(e.path, sizeof(e.path), "%s", path);
+	e.has_name = 1;
+	swap_write(&e);
+	TAP_CHECK(t, e.swap_on && e.swap_path[0]);
+	TAP_CHECK(t, access(e.swap_path, F_OK) == 0);
+
+	/* parse the swap header, then load its body back */
+	fp = fopen(e.swap_path, "rb");
+	TAP_ASSERT(t, fp != NULL);
+	TAP_ASSERT(t, fgets(line, sizeof(line), fp) &&
+	    strncmp(line, SWAP_MAGIC, strlen(SWAP_MAGIC)) == 0);
+	while (fgets(line, sizeof(line), fp) && line[0] != '\n')
+		;
+	body = ftell(fp);
+	rd = text_new();
+	TAP_ASSERT(t, rd && fseek(fp, body, SEEK_SET) == 0);
+	TAP_CHECK(t, text_load_fp(rd, fp) == OK);
+	TAP_CHECK(t, dump_is(rd, "swapme"));
+	text_free(rd);
+	fclose(fp);
+
+	/* a successful save removes the now-redundant swap */
+	TAP_CHECK(t, ed_save_file(&e) == OK);
+	TAP_CHECK(t, !e.swap_on);
+	TAP_CHECK(t, access(e.swap_path, F_OK) != 0);
+
+	text_free(e.t);
+	unlink(path);
+	rmdir(dir);
+}
+
 static void
 t_text_edit_undo(Test *t)
 {
@@ -2154,6 +2401,12 @@ const Case tap_cases[] = {
 	{ "syntax_block_comment_carry", t_syntax_block_comment_carry },
 	{ "syntax_refine", t_syntax_refine },
 	{ "syntax_md", t_syntax_md },
+	{ "text_fp_roundtrip", t_text_fp_roundtrip },
+	{ "swap_paths", t_swap_paths },
+	{ "atomic_save", t_atomic_save },
+	{ "save_rodir_fallback", t_save_rodir_fallback },
+	{ "backup_save", t_backup_save },
+	{ "swap_write_clear", t_swap_write_clear },
 	{ "text_edit_undo", t_text_edit_undo },
 	{ "edit_roundtrip", t_edit_roundtrip },
 	{ "multiline_buffer", t_multiline_buffer },

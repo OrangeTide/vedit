@@ -3883,6 +3883,7 @@ typedef enum draw_event_type {
 	EVENT_RESIZE,
 	EVENT_RESUME,
 	EVENT_EOF,
+	EVENT_IDLE,		/* input went quiet (poll timeout); no key */
 } EventType;
 
 typedef struct draw_event {
@@ -5029,7 +5030,10 @@ scr_wait(Screen *d, Event *ev)
 			ev->type = EVENT_EOF;
 			return EVENT_EOF;
 		}
-		/* rc == 0: timeout; loop to re-check resize */
+		/* rc == 0: input is quiet. Surface an idle tick so the main loop
+		 * can refresh the swap file; nested modal loops ignore it. */
+		ev->type = EVENT_IDLE;
+		return EVENT_IDLE;
 	}
 }
 
@@ -5083,6 +5087,10 @@ typedef struct ebuf {
 	size_t		vi_mark_y[26];
 	size_t		vi_mark_x[26];
 	uint32_t	vi_marks_set;
+	char		swap_path[PATH_MAX];	/* this buffer's swap file, or "" */
+	int		swap_on;	/* a swap file exists on disk for it */
+	size_t		swap_rev;	/* text rev at the last swap write */
+	time_t		load_mtime;	/* file mtime at load (swap staleness check) */
 } Buf;
 
 /* Referenced only by pointer here; the users include the real headers. */
@@ -5195,6 +5203,12 @@ typedef struct editor {
 	int		show_tabs;	/* draw a guide glyph at each hard tab */
 	int		auto_indent;	/* a new line copies the previous indent */
 	int		expand_tabs;	/* Tab and auto-indent use spaces (per buffer) */
+	int		swap_enabled;	/* write .swp crash-recovery snapshots */
+	int		backup_enabled;	/* keep the previous version on save */
+	char		swap_path[PATH_MAX];	/* active buffer's swap file, or "" */
+	int		swap_on;	/* a swap file exists on disk for it */
+	size_t		swap_rev;	/* text rev at the last swap write */
+	time_t		load_mtime;	/* file mtime at load (swap staleness check) */
 	Tagloc		*tagstack;	/* positions to return to after tag jumps */
 	int		tag_sp, tag_cap;	/* stack depth and capacity */
 	int		hex_view;	/* render the buffer as a hex dump */
@@ -5534,19 +5548,19 @@ text_free(Text *t)
  * Load and save
  ****************************************************************/
 
+/* Read a whole stream into t, replacing its contents and resetting history.
+ * The caller owns fp (this never closes it); fp must be positioned at the
+ * start of the bytes to load. Detects the line-ending style from the bytes,
+ * so it serves both a real file and a recovered swap body. Returns OK, or ERR
+ * with errno set on a read or allocation failure. */
 int
-text_load(Text *t, const char *path)
+text_load_fp(Text *t, FILE *fp)
 {
-	FILE *fp;
 	char *data = NULL;
 	size_t len = 0, cap = 0;
 	int c;
 	size_t start, i;
 	int saved_errno;
-
-	fp = fopen(path, "rb");
-	if (!fp)
-		return ERR;
 
 	while ((c = fgetc(fp)) != EOF) {
 		if (len + 1 > cap) {
@@ -5556,7 +5570,6 @@ text_load(Text *t, const char *path)
 			if (!p) {
 				saved_errno = errno;
 				free(data);
-				fclose(fp);
 				errno = saved_errno;
 				return ERR;
 			}
@@ -5568,11 +5581,9 @@ text_load(Text *t, const char *path)
 	if (ferror(fp)) {
 		saved_errno = errno;
 		free(data);
-		fclose(fp);
 		errno = saved_errno;
 		return ERR;
 	}
-	fclose(fp);
 
 	text_clear(t);
 	estack_clear(&t->undo);		/* history does not span a reload */
@@ -5643,40 +5654,138 @@ text_load(Text *t, const char *path)
 	return OK;
 }
 
+/* Load a file by path into t. Opens it read-only and delegates to
+ * text_load_fp. Returns OK, or ERR with errno set (ENOENT for a missing file,
+ * which callers treat as a new buffer). */
 int
-text_save(Text *t, const char *path)
+text_load(Text *t, const char *path)
 {
-	FILE *fp;
+	FILE *fp = fopen(path, "rb");
+	int rc, saved_errno;
+
+	if (!fp)
+		return ERR;
+	rc = text_load_fp(t, fp);
+	saved_errno = errno;
+	fclose(fp);
+	errno = saved_errno;
+	return rc;
+}
+
+/* Write every line of t to fp, with the terminator chosen from t->eol. The
+ * trailing terminator is emitted only when the source carried one. The caller
+ * owns fp. Returns OK, or ERR with errno set on a write failure. */
+int
+text_write_fp(const Text *t, FILE *fp)
+{
 	size_t i;
-	int saved_errno;
 	const char *term = (t->eol == EOL_CRLF) ? "\r\n" :
 	    (t->eol == EOL_NUL) ? "\0" : "\n";
 	size_t termlen = (t->eol == EOL_CRLF) ? 2 : 1;
-
-	fp = fopen(path, "wb");
-	if (!fp)
-		return ERR;
 
 	for (i = 0; i < t->nlines; i++) {
 		if (t->lines[i].len &&
 		    fwrite(t->lines[i].buf, 1, t->lines[i].len, fp)
 		    != t->lines[i].len)
-			goto werr;
+			return ERR;
 		/* a terminator between lines, and after the last only when the
 		 * source carried a trailing terminator */
 		if (i + 1 < t->nlines || t->final_newline) {
 			if (fwrite(term, 1, termlen, fp) != termlen)
-				goto werr;
+				return ERR;
 		}
 	}
-	if (fclose(fp) != 0)
+	return OK;
+}
+
+/* Save t to path atomically: write the bytes to a temporary file in the same
+ * directory, flush them to disk, then rename it over the target so a crash or
+ * a full disk never leaves the file half-written. The target's permissions are
+ * preserved when it already exists. Returns OK, or ERR with errno set. */
+int
+text_save(Text *t, const char *path)
+{
+	char tmp[PATH_MAX];
+	const char *slash = strrchr(path, '/');
+	int fd, saved_errno;
+	FILE *fp;
+	struct stat st;
+	mode_t mode;
+
+	/* The temp file must share the target's directory so the rename stays
+	 * on one filesystem (an atomic replace, never an EXDEV copy). */
+	if (slash) {
+		int dlen = (int)(slash - path);
+
+		if (snprintf(tmp, sizeof(tmp), "%.*s/.vedit-save-XXXXXX",
+		    dlen, path) >= (int)sizeof(tmp)) {
+			errno = ENAMETOOLONG;
+			return ERR;
+		}
+	} else if (snprintf(tmp, sizeof(tmp), ".vedit-save-XXXXXX") >=
+	    (int)sizeof(tmp)) {
+		errno = ENAMETOOLONG;
 		return ERR;
+	}
+	fd = mkstemp(tmp);
+	if (fd < 0) {
+		/* The directory is not writable (so no sibling temp is possible),
+		 * but the file itself might be. Fall back to a direct, in-place
+		 * write: not atomic, but it still saves the common case of a
+		 * writable file in a read-only directory. */
+		fp = fopen(path, "wb");
+		if (!fp)
+			return ERR;
+		if (text_write_fp(t, fp) != OK) {
+			saved_errno = errno;
+			fclose(fp);
+			errno = saved_errno;
+			return ERR;
+		}
+		if (fclose(fp) != 0)
+			return ERR;
+		t->dirty = 0;
+		return OK;
+	}
+	fp = fdopen(fd, "wb");
+	if (!fp) {
+		saved_errno = errno;
+		close(fd);
+		goto fail;
+	}
+	if (text_write_fp(t, fp) != OK) {
+		saved_errno = errno;
+		fclose(fp);
+		goto fail;
+	}
+	if (fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
+		saved_errno = errno;
+		fclose(fp);
+		goto fail;
+	}
+	if (fclose(fp) != 0) {
+		saved_errno = errno;
+		goto fail;
+	}
+	/* Keep the existing file's permission bits; mkstemp made tmp 0600. */
+	if (stat(path, &st) == 0)
+		mode = st.st_mode & 07777;
+	else {
+		mode_t um = umask(0);
+
+		umask(um);
+		mode = 0666 & ~um;
+	}
+	(void)chmod(tmp, mode);
+	if (rename(tmp, path) != 0) {
+		saved_errno = errno;
+		goto fail;
+	}
 	t->dirty = 0;
 	return OK;
 
-werr:
-	saved_errno = errno;
-	fclose(fp);
+fail:
+	unlink(tmp);
 	errno = saved_errno;
 	return ERR;
 }
@@ -10265,6 +10374,317 @@ replace_prompt(Editor *e)
 	    count, count == 1 ? "" : "s");
 }
 
+/****************************************************************
+ * Swap and backup files (optional crash recovery, Vim-style).
+ *
+ * A swap file is a full snapshot of a dirty buffer, rewritten whenever the
+ * editor goes idle (editor_loop's tick), so a crash or a dropped connection
+ * leaves the last idle state on disk. Opening a file that has a swap beside it
+ * offers to recover. A clean save or quit removes the swap. Backups keep the
+ * previous on-disk version as a "~" file across a save. Both are off unless
+ * configured (swap on by default, backup off); both locations are
+ * configurable. The snapshot reuses text_write_fp/text_load_fp, so there is no
+ * second serializer.
+ ****************************************************************/
+
+#define SWAP_MAGIC "VEDIT-SWAP"
+
+enum {
+	SWAP_NONE,		/* no swap file beside the target */
+	SWAP_FOREIGN,		/* a file is there but not ours; leave it alone */
+	SWAP_OPEN,		/* user chose to open the file anyway */
+	SWAP_RECOVERED,		/* user recovered; the buffer now holds the swap */
+	SWAP_DELETED,		/* user deleted the swap; the file is loaded */
+	SWAP_ABORT		/* user declined to open the file at all */
+};
+
+/* Copy a path into out with every '/' turned into '%', for a collision-free
+ * name when swap or backup files share one directory (Vim's convention). */
+static void
+path_mangle(const char *full, char *out, size_t sz)
+{
+	size_t i;
+
+	for (i = 0; full[i] && i + 1 < sz; i++)
+		out[i] = (full[i] == '/') ? '%' : full[i];
+	out[i < sz ? i : sz - 1] = '\0';
+}
+
+/* Resolve the directory named by config key (edit.swapdir / edit.backupdir)
+ * into out. A leading "~/" expands against $HOME. Returns 1 when a usable,
+ * writable directory is set, 0 for "beside the file" (unset, empty, ".", or a
+ * directory that does not exist or cannot be written). */
+static int
+resolve_dir_opt(const char *key, char *out, size_t sz)
+{
+	const char *v = cfg_proj_get(key);
+
+	if (!v || !v[0] || strcmp(v, ".") == 0)
+		return 0;
+	if (v[0] == '~' && v[1] == '/') {
+		const char *home = getenv("HOME");
+
+		if (!home || !home[0])
+			return 0;
+		if ((size_t)snprintf(out, sz, "%s%s", home, v + 1) >= sz)
+			return 0;
+	} else if ((size_t)snprintf(out, sz, "%s", v) >= sz) {
+		return 0;
+	}
+	if (access(out, W_OK | X_OK) != 0)
+		return 0;
+	return 1;
+}
+
+/* Build the swap or backup path for file_path into out. dir_key selects the
+ * directory option; sep is the beside-the-file prefix ('.' for swap, 0 for
+ * backup) and suffix is appended (".swp" or "~"). Returns 1 on success. */
+static int
+aux_path_for(const char *file_path, const char *dir_key, int dotted,
+    const char *suffix, char *out, size_t sz)
+{
+	char dir[PATH_MAX];
+	const char *slash = strrchr(file_path, '/');
+	int n;
+
+	if (resolve_dir_opt(dir_key, dir, sizeof(dir))) {
+		char mangled[PATH_MAX];
+
+		path_mangle(file_path, mangled, sizeof(mangled));
+		n = snprintf(out, sz, "%s/%s%s", dir, mangled, suffix);
+	} else if (dotted && slash) {
+		n = snprintf(out, sz, "%.*s/.%s%s", (int)(slash - file_path),
+		    file_path, slash + 1, suffix);
+	} else if (dotted) {
+		n = snprintf(out, sz, ".%s%s", file_path, suffix);
+	} else {
+		n = snprintf(out, sz, "%s%s", file_path, suffix);
+	}
+	return n > 0 && (size_t)n < sz;
+}
+
+static int
+swap_path_for(const char *file_path, char *out, size_t sz)
+{
+	return aux_path_for(file_path, "edit.swapdir", 1, ".swp", out, sz);
+}
+
+static int
+backup_path_for(const char *file_path, char *out, size_t sz)
+{
+	return aux_path_for(file_path, "edit.backupdir", 0, "~", out, sz);
+}
+
+/* Copy src's bytes to dst, giving dst the mode bits. Returns 0, or -1 with
+ * errno set. Used to keep the previous version as a backup before a save. */
+static int
+file_copy(const char *src, const char *dst, mode_t mode)
+{
+	FILE *in = fopen(src, "rb"), *out;
+	char buf[8192];
+	size_t n;
+	int saved;
+
+	if (!in)
+		return -1;
+	out = fopen(dst, "wb");
+	if (!out) {
+		saved = errno;
+		fclose(in);
+		errno = saved;
+		return -1;
+	}
+	while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+		if (fwrite(buf, 1, n, out) != n) {
+			saved = errno;
+			fclose(in);
+			fclose(out);
+			errno = saved;
+			return -1;
+		}
+	}
+	saved = ferror(in);
+	fclose(in);
+	if (fclose(out) != 0 || saved) {
+		errno = saved ? EIO : errno;
+		return -1;
+	}
+	(void)chmod(dst, mode);
+	return 0;
+}
+
+/* Set e->swap_path from the active buffer's name when swap is enabled and the
+ * buffer has one, otherwise clear it (which makes swap_write a no-op). */
+static void
+swap_set_path(Editor *e)
+{
+	e->swap_path[0] = '\0';
+	if (e->swap_enabled && e->has_name)
+		swap_path_for(e->path, e->swap_path, sizeof(e->swap_path));
+}
+
+/* Write a snapshot of the active buffer to its swap file (atomically, via a
+ * sibling temp and a rename). Best effort: a failure never disturbs editing,
+ * it just leaves the swap stale. */
+static void
+swap_write(Editor *e)
+{
+	char tmp[PATH_MAX];
+	FILE *fp;
+	int ok;
+
+	if (!e->swap_enabled || !e->has_name)
+		return;
+	if (!e->swap_path[0])
+		swap_set_path(e);
+	if (!e->swap_path[0])
+		return;
+	if ((size_t)snprintf(tmp, sizeof(tmp), "%s.new", e->swap_path) >=
+	    sizeof(tmp))
+		return;
+	fp = fopen(tmp, "wb");
+	if (!fp)
+		return;
+	ok = fprintf(fp, "%s\t1\npath\t%s\nmtime\t%ld\neol\t%d\n"
+	    "final_newline\t%d\npid\t%ld\n\n", SWAP_MAGIC, e->path,
+	    (long)e->load_mtime, e->t->eol, e->t->final_newline,
+	    (long)getpid()) >= 0 && text_write_fp(e->t, fp) == OK;
+	if (fflush(fp) != 0 || fsync(fileno(fp)) != 0)
+		ok = 0;
+	if (fclose(fp) != 0)
+		ok = 0;
+	if (!ok || rename(tmp, e->swap_path) != 0) {
+		unlink(tmp);
+		return;
+	}
+	e->swap_on = 1;
+	e->swap_rev = e->t->rev;
+}
+
+/* Remove the active buffer's swap file, if one exists. */
+static void
+swap_remove(Editor *e)
+{
+	if (e->swap_on && e->swap_path[0])
+		unlink(e->swap_path);
+	e->swap_on = 0;
+}
+
+/* The idle tick: refresh the swap only when the buffer is dirty and has
+ * changed since the last snapshot. Called when the event loop goes quiet. */
+static void
+swap_maybe_write(Editor *e)
+{
+	if (e->swap_enabled && e->has_name && text_dirty(e->t) &&
+	    e->t->rev != e->swap_rev)
+		swap_write(e);
+}
+
+/* Record swap state on the active buffer after an open or recovery decision:
+ * the swap path for e->path, whether a swap file is now on disk, and the rev
+ * it reflects. Called once e->path is set to the opened file. */
+static void
+swap_adopt(Editor *e, time_t orig_mtime, int action)
+{
+	swap_set_path(e);
+	e->load_mtime = orig_mtime;
+	e->swap_on = (action == SWAP_RECOVERED || action == SWAP_OPEN);
+	e->swap_rev = e->t->rev;
+	if (action == SWAP_FOREIGN) {	/* someone else's .swp: never touch it */
+		e->swap_path[0] = '\0';
+		e->swap_on = 0;
+	}
+}
+
+/* Check for a swap file beside path. When one of ours is found, prompt and act
+ * on the choice: recover into t (marking it dirty), open anyway, delete the
+ * swap, or abort the open. Returns a SWAP_* action for the caller to adopt. */
+static int
+swap_recover(Editor *e, const char *path, Text *t, time_t orig_mtime)
+{
+	char swap[PATH_MAX], line[PATH_MAX + 64], msg[256];
+	FILE *fp;
+	long body = 0, hdr_mtime = -1, hdr_pid = -1;
+	int other = 0, key;
+
+	if (!e->swap_enabled || !swap_path_for(path, swap, sizeof(swap)))
+		return SWAP_NONE;
+	fp = fopen(swap, "rb");
+	if (!fp)
+		return SWAP_NONE;
+	if (!fgets(line, sizeof(line), fp) ||
+	    strncmp(line, SWAP_MAGIC, strlen(SWAP_MAGIC)) != 0) {
+		fclose(fp);		/* not our file; leave it untouched */
+		return SWAP_FOREIGN;
+	}
+	while (fgets(line, sizeof(line), fp)) {
+		if (line[0] == '\n')
+			break;		/* blank line ends the header */
+		if (strncmp(line, "mtime\t", 6) == 0)
+			hdr_mtime = atol(line + 6);
+		else if (strncmp(line, "pid\t", 4) == 0)
+			hdr_pid = atol(line + 4);
+	}
+	body = ftell(fp);
+	if (hdr_pid > 0 && hdr_pid != (long)getpid() &&
+	    (kill((pid_t)hdr_pid, 0) == 0 || errno == EPERM))
+		other = 1;
+	snprintf(msg, sizeof(msg),
+	    "Swap file found%s%s. (r)ecover (o)pen (d)elete (q)uit? ",
+	    other ? ", maybe open elsewhere" : "",
+	    (hdr_mtime >= 0 && hdr_mtime != (long)orig_mtime) ?
+	    ", file changed since" : "");
+	key = dlg_prompt_key(e, msg);
+	switch (key) {
+	case 'r':
+		if (body >= 0 && fseek(fp, body, SEEK_SET) == 0 &&
+		    text_load_fp(t, fp) == OK) {
+			t->dirty = 1;
+			fclose(fp);
+			snprintf(e->status, sizeof(e->status),
+			    "recovered from swap; not yet saved");
+			return SWAP_RECOVERED;
+		}
+		fclose(fp);
+		snprintf(e->status, sizeof(e->status), "swap recovery failed");
+		return SWAP_OPEN;
+	case 'd':
+		fclose(fp);
+		unlink(swap);
+		return SWAP_DELETED;
+	case 'o':
+		fclose(fp);
+		return SWAP_OPEN;
+	default:			/* q, Esc, Ctrl-C, EOF */
+		fclose(fp);
+		return SWAP_ABORT;
+	}
+}
+
+/* Save the active buffer to e->path, keeping the previous version as a backup
+ * first when backups are enabled. On success the swap becomes redundant and is
+ * removed. Returns OK, or ERR with errno set (as text_save). */
+static int
+ed_save_file(Editor *e)
+{
+	int rc;
+
+	if (e->backup_enabled && e->has_name) {
+		struct stat st;
+		char backup[PATH_MAX];
+
+		if (stat(e->path, &st) == 0 && S_ISREG(st.st_mode) &&
+		    backup_path_for(e->path, backup, sizeof(backup)))
+			(void)file_copy(e->path, backup, st.st_mode & 07777);
+	}
+	rc = text_save(e->t, e->path);
+	if (rc == OK) {
+		swap_remove(e);
+		e->swap_rev = e->t->rev;
+	}
+	return rc;
+}
+
 /* Save the buffer, prompting for a name if it has none. Returns 0 on a
  * successful save, -1 on failure or when the save was cancelled. */
 static int
@@ -10284,7 +10704,7 @@ save_editor(Editor *e)
 		e->hl_valid = 0;
 	}
 
-	if (text_save(e->t, e->path) < 0) {
+	if (ed_save_file(e) < 0) {
 		snprintf(e->status, sizeof(e->status), "save failed: %s",
 		    strerror(errno));
 		return -1;
@@ -11057,6 +11477,10 @@ buf_save(Editor *e, Buf *b)
 	memcpy(b->vi_mark_y, e->vi_mark_y, sizeof(b->vi_mark_y));
 	memcpy(b->vi_mark_x, e->vi_mark_x, sizeof(b->vi_mark_x));
 	b->vi_marks_set = e->vi_marks_set;
+	memcpy(b->swap_path, e->swap_path, sizeof(b->swap_path));
+	b->swap_on = e->swap_on;
+	b->swap_rev = e->swap_rev;
+	b->load_mtime = e->load_mtime;
 }
 
 /* Mirror a slot into the flat editor and drop any in-flight vi command. */
@@ -11083,6 +11507,10 @@ buf_load(Editor *e, const Buf *b)
 	memcpy(e->vi_mark_y, b->vi_mark_y, sizeof(e->vi_mark_y));
 	memcpy(e->vi_mark_x, b->vi_mark_x, sizeof(e->vi_mark_x));
 	e->vi_marks_set = b->vi_marks_set;
+	memcpy(e->swap_path, b->swap_path, sizeof(e->swap_path));
+	e->swap_on = b->swap_on;
+	e->swap_rev = b->swap_rev;
+	e->load_mtime = b->load_mtime;
 	e->vi_visual = 0;
 	e->vi_want_col = e->vi_vert_run = e->vi_vert_prev = 0;
 	e->hex_ascii = 0;
@@ -11124,6 +11552,7 @@ buf_switch(Editor *e, int i)
 {
 	if (i < 0 || i >= e->nbuf || i == e->cur)
 		return;
+	swap_maybe_write(e);		/* flush the outgoing buffer's swap */
 	buf_save(e, &e->bufs[e->cur]);
 	e->cur = i;
 	buf_load(e, &e->bufs[i]);
@@ -11161,7 +11590,8 @@ int
 buf_open(Editor *e, const char *path)
 {
 	Text *nt;
-	int i;
+	int i, swap_action = SWAP_NONE;
+	time_t swap_mtime = 0;
 
 	if (path && path[0]) {			/* already open? just switch */
 		for (i = 0; i < e->nbuf; i++) {
@@ -11186,6 +11616,17 @@ buf_open(Editor *e, const char *path)
 		    strerror(errno));
 		text_free(nt);
 		return -1;
+	}
+	if (path && path[0]) {			/* offer swap recovery */
+		struct stat st;
+		time_t mt = (stat(path, &st) == 0) ? st.st_mtime : 0;
+
+		swap_action = swap_recover(e, path, nt, mt);
+		swap_mtime = mt;
+		if (swap_action == SWAP_ABORT) {
+			text_free(nt);
+			return -1;
+		}
 	}
 	i = buf_slot(e);
 	if (i < 0) {
@@ -11216,9 +11657,18 @@ buf_open(Editor *e, const char *path)
 	e->vi_marks_set = 0;
 	e->vi_visual = 0;
 	vi_reset_pending(e);
+	if (e->has_name)
+		swap_adopt(e, swap_mtime, swap_action);
+	else {
+		e->swap_path[0] = '\0';
+		e->swap_on = 0;
+		e->swap_rev = e->t->rev;
+		e->load_mtime = 0;
+	}
 	buf_save(e, &e->bufs[i]);		/* keep the slot consistent */
-	snprintf(e->status, sizeof(e->status), "%.120s [%d/%d]",
-	    e->has_name ? e->path : "new buffer", e->cur + 1, e->nbuf);
+	if (swap_action != SWAP_RECOVERED)
+		snprintf(e->status, sizeof(e->status), "%.120s [%d/%d]",
+		    e->has_name ? e->path : "new buffer", e->cur + 1, e->nbuf);
 	return i;
 }
 
@@ -11229,16 +11679,16 @@ buf_close(Editor *e, int i)
 		return -1;
 
 	if (i == e->cur) {
-		int target;
-
+		swap_remove(e);			/* closed cleanly: drop its swap */
 		buf_free_fields(e->t, e->line_state);
 		memmove(&e->bufs[i], &e->bufs[i + 1],
 		    (size_t)(e->nbuf - i - 1) * sizeof(*e->bufs));
 		e->nbuf--;
-		target = i < e->nbuf ? i : e->nbuf - 1;
-		e->cur = target;
-		buf_load(e, &e->bufs[target]);
+		e->cur = i < e->nbuf ? i : e->nbuf - 1;
+		buf_load(e, &e->bufs[e->cur]);
 	} else {
+		if (e->bufs[i].swap_on && e->bufs[i].swap_path[0])
+			unlink(e->bufs[i].swap_path);
 		buf_free_fields(e->bufs[i].t, e->bufs[i].line_state);
 		memmove(&e->bufs[i], &e->bufs[i + 1],
 		    (size_t)(e->nbuf - i - 1) * sizeof(*e->bufs));
@@ -13062,14 +13512,28 @@ ed_open(Editor *e)
 		text_free(nt);
 		return;
 	}
-	text_free(e->t);
-	e->t = nt;
-	snprintf(e->path, sizeof(e->path), "%s", path);
-	e->has_name = 1;
-	e->syn = syn_for_ext(file_ext(e->path));
-	buffer_reset(e);
-	buf_save(e, &e->bufs[e->cur]);
-	snprintf(e->status, sizeof(e->status), "opened %.100s", path);
+	{
+		struct stat st;
+		time_t mt = (stat(path, &st) == 0) ? st.st_mtime : 0;
+		int action = swap_recover(e, path, nt, mt);
+
+		if (action == SWAP_ABORT) {	/* keep the current buffer */
+			text_free(nt);
+			return;
+		}
+		swap_remove(e);			/* drop the replaced buffer's swap */
+		text_free(e->t);
+		e->t = nt;
+		snprintf(e->path, sizeof(e->path), "%s", path);
+		e->has_name = 1;
+		e->syn = syn_for_ext(file_ext(e->path));
+		buffer_reset(e);
+		swap_adopt(e, mt, action);
+		buf_save(e, &e->bufs[e->cur]);
+		if (action != SWAP_RECOVERED)
+			snprintf(e->status, sizeof(e->status), "opened %.100s",
+			    path);
+	}
 }
 
 static void
@@ -13080,6 +13544,8 @@ ed_save_as(Editor *e)
 	path[0] = '\0';
 	if (!dlg_save_file(e, path, sizeof(path)))
 		return;
+	swap_remove(e);			/* the old name's swap no longer applies */
+	e->swap_path[0] = '\0';		/* recompute for the new name on next edit */
 	snprintf(e->path, sizeof(e->path), "%s", path);
 	e->has_name = 1;
 	e->syn = syn_for_ext(file_ext(e->path));
@@ -14913,6 +15379,8 @@ editor_init(Editor *e)
 	e->hl_on = 1;		/* highlight when a file type is recognized */
 	e->show_tabs = 1;	/* show hard tabs by default */
 	e->auto_indent = 1;	/* copy the previous line's indent by default */
+	e->swap_enabled = 1;	/* write crash-recovery swap files by default */
+	e->backup_enabled = 0;	/* keep no previous-version backup by default */
 	e->hex_pending = -1;
 	e->hex_cols = 16;
 	e->scheme = SCHEME_DOS;	/* MS-EDIT look by default; View cycles it */
@@ -14938,6 +15406,9 @@ editor_loop(Editor *e)
 		case EVENT_KEY:
 			seq = ev.key;
 			break;
+		case EVENT_IDLE:
+			swap_maybe_write(e);	/* snapshot a dirty buffer */
+			continue;
 		default:
 			continue;
 		}
@@ -15096,10 +15567,15 @@ editor_teardown(Editor *e)
 		e->d = NULL;
 		e->term = NULL;
 	}
+	swap_remove(e);			/* a clean exit leaves no swap behind */
 	if (e->nbuf > 0) {
 		buf_save(e, &e->bufs[e->cur]);
-		for (i = 0; i < e->nbuf; i++)
+		for (i = 0; i < e->nbuf; i++) {
+			if (i != e->cur && e->bufs[i].swap_on &&
+			    e->bufs[i].swap_path[0])
+				unlink(e->bufs[i].swap_path);
 			buf_free_fields(e->bufs[i].t, e->bufs[i].line_state);
+		}
 	} else {
 		buf_free_fields(e->t, e->line_state);
 	}
@@ -15176,10 +15652,13 @@ vedit_new(const struct vedit_io *io)
 int
 vedit_open(struct vedit *v, const char *path)
 {
+	struct stat st;
+
 	snprintf(v->e.path, sizeof(v->e.path), "%s", path);
 	v->e.has_name = 1;
 	if (text_load(v->e.t, v->e.path) < 0 && errno != ENOENT)
 		return -1;
+	v->e.load_mtime = (stat(v->e.path, &st) == 0) ? st.st_mtime : 0;
 	v->e.syn = syn_for_ext(file_ext(v->e.path));
 	v->e.expand_tabs = indent_expand_default(v->e.syn ? v->e.syn->name : NULL);
 	return 0;
@@ -15242,6 +15721,8 @@ ed_apply_config(Editor *e)
 	e->show_lineno = cfg_bool(g_cfg, "ui.number", e->show_lineno);
 	e->show_tabs = cfg_bool(g_cfg, "ui.tabs", e->show_tabs);
 	e->auto_indent = cfg_bool(g_cfg, "edit.autoindent", e->auto_indent);
+	e->swap_enabled = cfg_bool(g_cfg, "edit.swap", e->swap_enabled);
+	e->backup_enabled = cfg_bool(g_cfg, "edit.backup", e->backup_enabled);
 	e->expand_tabs = indent_expand_default(e->syn ? e->syn->name : NULL);
 	e->hl_on = cfg_bool(g_cfg, "syntax.enable", e->hl_on);
 	e->clip_osc52 = cfg_bool(g_cfg, "ui.clipboard", e->clip_osc52);
@@ -15383,6 +15864,18 @@ vedit_run(struct vedit *v)
 	}
 	scr_begin(e->d);
 	snprintf(e->status, sizeof(e->status), "Press F1 for help");
+	/* The screen is up now, so the initial file can prompt for recovery
+	 * if a swap from a previous crashed session sits beside it. */
+	if (e->has_name) {
+		int action = swap_recover(e, e->path, e->t, e->load_mtime);
+
+		if (action == SWAP_ABORT) {
+			scr_end(e->d);
+			return 1;
+		}
+		swap_adopt(e, e->load_mtime, action);
+		buf_save(e, &e->bufs[e->cur]);
+	}
 	ed_render(e, e->d);
 	rc = editor_loop(e);
 	return rc;
@@ -18038,7 +18531,7 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 					    "E32: no file name");
 					return REQ_CONTINUE;
 				}
-				if (text_save(e->t, e->path) < 0) {
+				if (ed_save_file(e) < 0) {
 					snprintf(e->status, sizeof(e->status),
 					    "save failed: %s",
 					    strerror(errno));
@@ -19339,6 +19832,33 @@ ex_set(Editor *e, const char *arg)
 		snprintf(e->status, sizeof(e->status), "indent with %s",
 		    e->expand_tabs ? "spaces" : "tabs");
 		return REQ_CONTINUE;
+	} else if (strcmp(arg, "swapfile") == 0 || strcmp(arg, "swf") == 0 ||
+	    strcmp(arg, "noswapfile") == 0 || strcmp(arg, "noswf") == 0 ||
+	    strcmp(arg, "swapfile!") == 0 || strcmp(arg, "invswapfile") == 0) {
+		if (arg[0] == 'n') {
+			swap_remove(e);		/* turning it off drops the file */
+			e->swap_enabled = 0;
+		} else if (strchr(arg, '!') || arg[0] == 'i') {
+			e->swap_enabled = !e->swap_enabled;
+			if (!e->swap_enabled)
+				swap_remove(e);
+		} else
+			e->swap_enabled = 1;
+		snprintf(e->status, sizeof(e->status), "swap file %s",
+		    e->swap_enabled ? "on" : "off");
+		return REQ_CONTINUE;
+	} else if (strcmp(arg, "backup") == 0 || strcmp(arg, "bk") == 0 ||
+	    strcmp(arg, "nobackup") == 0 || strcmp(arg, "nobk") == 0 ||
+	    strcmp(arg, "backup!") == 0 || strcmp(arg, "invbackup") == 0) {
+		if (arg[0] == 'n')
+			e->backup_enabled = 0;
+		else if (strchr(arg, '!') || arg[0] == 'i')
+			e->backup_enabled = !e->backup_enabled;
+		else
+			e->backup_enabled = 1;
+		snprintf(e->status, sizeof(e->status), "backup %s",
+		    e->backup_enabled ? "on" : "off");
+		return REQ_CONTINUE;
 	} else if (strncmp(arg, "ff=", 3) == 0 ||
 	    strncmp(arg, "fileformat=", 11) == 0) {
 		const char *val = strchr(arg, '=') + 1;
@@ -19496,7 +20016,7 @@ ex_write_current(Editor *e)
 		snprintf(e->status, sizeof(e->status), "E32: no file name");
 		return -1;
 	}
-	if (text_save(e->t, e->path) < 0) {
+	if (ed_save_file(e) < 0) {
 		snprintf(e->status, sizeof(e->status), "save failed: %s",
 		    strerror(errno));
 		return -1;

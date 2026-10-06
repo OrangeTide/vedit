@@ -142,6 +142,10 @@ A gitconfig-style file sets the startup defaults. It is read from the first of
 [edit]
     mode = vi            # vi | modeless
     autoindent = on      # new lines copy the previous indent
+    swap = on            # write a .swp crash-recovery snapshot (on by default)
+    swapdir =            # where swap files go; empty = beside the file
+    backup = off         # keep the previous version as a "~" file on save
+    backupdir =          # where backups go; empty = beside the file
 
 [indent]
     expand = off         # off = indent with tabs, on = with spaces
@@ -172,6 +176,8 @@ and a set, non-empty value wins over the config file:
 | Config key                 | Environment variable       |
 | -------------------------- | -------------------------- |
 | `tags.file`                | `VEDIT_TAGS_FILE`          |
+| `edit.swapdir`             | `VEDIT_EDIT_SWAPDIR`       |
+| `edit.backupdir`           | `VEDIT_EDIT_BACKUPDIR`     |
 | `cc.file`                  | `VEDIT_CC_FILE`            |
 | `command.<lang>.compile`   | `VEDIT_COMMAND_<LANG>_COMPILE` |
 | `command.<lang>.build`     | `VEDIT_COMMAND_<LANG>_BUILD`   |
@@ -375,6 +381,40 @@ The config sets a fresh buffer's indent style, per language or globally:
 
 A per-language `[indent "<lang>"]` (the file's syntax language name) wins over
 the global `[indent] expand`, which wins over the built-in default of tabs.
+
+### Crash recovery (swap and backup files)
+
+While you edit a named file, vedit keeps a swap file beside it, `.name.swp`,
+refreshed whenever input goes quiet. It is a full snapshot of the buffer, so if
+the editor or the connection dies with unsaved changes, the work is still on
+disk. Open the file again and vedit notices the swap and asks: `(r)ecover`
+loads the snapshot into a buffer you can then save, `(o)pen` ignores it, `(d)elete`
+removes it, and `(q)uit` leaves the file unopened. If the swap was left by a
+process that is still running, the prompt says so, in case the file is open in
+another session. A clean save or quit removes the swap; only a crash leaves one
+behind. A file that is not ours (for example a swap from Vim at the same name)
+is never read or overwritten.
+
+Swap files are on by default. `edit.swap = off` turns them off, as does
+`:set noswapfile`, which is the right choice for a host that must not write to
+the filesystem. `edit.swapdir = <dir>` collects them in one directory instead
+of beside each file, naming each after the full path with `/` turned into `%`
+so two files with the same name never collide. A leading `~/` in the directory
+expands against `$HOME`; a directory that does not exist or cannot be written
+falls back to beside-the-file.
+
+Saving is atomic: vedit writes the new contents to a temporary file in the same
+directory and renames it over the target, so a crash or a full disk never
+leaves the file half-written, and the previous version survives until the new
+one is complete. With `edit.backup = on` (or `:set backup`) that previous
+version is also kept afterward as `name~`, or in `edit.backupdir` when set.
+
+The swap is a snapshot taken when the editor is idle, not a continuous journal,
+so a crash loses only edits made since the last quiet moment. There is no
+handler for a hard `SIGKILL` or a segfault; recovery relies on the snapshot
+already being on disk, which is the point of writing it on every idle tick. A
+new buffer that has never been saved has no name yet, so it gets no swap until
+its first save.
 
 ### File browser
 

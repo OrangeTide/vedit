@@ -504,6 +504,140 @@ t_reload_config(Test *t)
 	rmdir(dir);
 }
 
+static int vline_is(struct vedit *v, size_t y, const char *want);
+
+/* Lay down a swap file for path holding body, as a crashed prior session
+ * would have left behind. Uses a throwaway editor so the on-disk format
+ * matches exactly what swap_write produces. */
+static void
+plant_swap(const char *path, const char *body)
+{
+	Editor e;
+
+	editor_init(&e);			/* sets swap_enabled = 1 */
+	e.t = text_new();
+	text_insert(e.t, 0, 0, body, strlen(body));
+	e.t->final_newline = 1;
+	snprintf(e.path, sizeof(e.path), "%s", path);
+	e.has_name = 1;
+	swap_write(&e);				/* writes <dir>/.<base>.swp */
+	text_free(e.t);				/* no teardown: keep the swap */
+}
+
+/* A dirty buffer gets a swap snapshot on the idle tick, and a clean quit
+ * (teardown) removes it. */
+static void
+t_swap_file_created(Test *t)
+{
+	char dir[] = "/tmp/vedit_swcXXXXXX";
+	char path[PATH_MAX], sp[PATH_MAX];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	FILE *f;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/doc.txt", dir);
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("hi\n", f);
+	fclose(f);
+	TAP_ASSERT(t, swap_path_for(path, sp, sizeof(sp)));
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	vedit_run(v);				/* registers; no swap yet (clean) */
+	TAP_CHECK(t, access(sp, F_OK) != 0);
+
+	text_insert(v->e.t, 0, 0, "Z", 1);	/* dirty the buffer */
+	swap_maybe_write(&v->e);		/* the idle tick would do this */
+	TAP_CHECK(t, access(sp, F_OK) == 0);	/* snapshot on disk */
+
+	vedit_free(v);				/* clean exit */
+	TAP_CHECK(t, access(sp, F_OK) != 0);	/* swap removed */
+	memio_free(&m);
+	unlink(path);
+	rmdir(dir);
+}
+
+/* Opening a file with a swap beside it and answering 'r' recovers the swap's
+ * contents into a dirty buffer. */
+static void
+t_swap_recover_key(Test *t)
+{
+	char dir[] = "/tmp/vedit_swrXXXXXX";
+	char path[PATH_MAX], sp[PATH_MAX];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	FILE *f;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/doc.txt", dir);
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("orig\n", f);
+	fclose(f);
+	plant_swap(path, "recovered");
+	TAP_ASSERT(t, swap_path_for(path, sp, sizeof(sp)));
+	TAP_ASSERT(t, access(sp, F_OK) == 0);
+
+	memio_init(&m, "r", 1, 24, 80);	/* answer the recovery prompt */
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	vedit_run(v);
+
+	TAP_CHECK(t, vline_is(v, 0, "recovered"));	/* swap body, not "orig" */
+	TAP_CHECK(t, text_dirty(v->e.t));		/* unsaved recovery */
+
+	vedit_free(v);
+	memio_free(&m);
+	unlink(sp);			/* best effort if teardown kept it */
+	unlink(path);
+	rmdir(dir);
+}
+
+/* Answering 'd' to the recovery prompt deletes the swap and keeps the file. */
+static void
+t_swap_recover_delete(Test *t)
+{
+	char dir[] = "/tmp/vedit_swdXXXXXX";
+	char path[PATH_MAX], sp[PATH_MAX];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	FILE *f;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/doc.txt", dir);
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("orig\n", f);
+	fclose(f);
+	plant_swap(path, "recovered");
+	TAP_ASSERT(t, swap_path_for(path, sp, sizeof(sp)));
+
+	memio_init(&m, "d", 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	vedit_run(v);
+
+	TAP_CHECK(t, vline_is(v, 0, "orig"));	/* original kept */
+	TAP_CHECK(t, access(sp, F_OK) != 0);	/* swap deleted */
+
+	vedit_free(v);
+	memio_free(&m);
+	unlink(path);
+	rmdir(dir);
+}
+
 /* True when line y of the buffer equals the NUL-terminated want. */
 static int
 vline_is(struct vedit *v, size_t y, const char *want)
@@ -789,6 +923,9 @@ const Case tap_cases[] = {
 	{ "gf_header", t_gf_header },
 	{ "buf_dedup", t_buf_dedup },
 	{ "reload_config", t_reload_config },
+	{ "swap_file_created", t_swap_file_created },
+	{ "swap_recover_key", t_swap_recover_key },
+	{ "swap_recover_delete", t_swap_recover_delete },
 	{ "vblock_delete", t_vblock_delete },
 	{ "vblock_insert", t_vblock_insert },
 	{ "vblock_yank_put", t_vblock_yank_put },
