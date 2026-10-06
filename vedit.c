@@ -8965,8 +8965,8 @@ dlg_run(Editor *e, int w, int h, void *ctx,
 
 		render_body(e, e->d);
 		scr_box(e->d, m.x, m.y, m.w, m.h, m.fg, m.bg, m.base);
+		scr_cursor_vis(e->d, 0);	/* hidden unless draw shows it */
 		draw(e, &m, ctx);
-		scr_cursor_vis(e->d, 0);
 		scr_present(e->d);
 
 		switch (scr_wait(e->d, &ev)) {
@@ -9030,6 +9030,7 @@ typedef struct picker {
 	int		 listy;		/* first list row on screen (set by draw) */
 	int		 focus;		/* 0 list, 1 entry */
 	int		 ecurx;		/* entry cursor column on screen (set by draw) */
+	int		 result;	/* 1 chosen, 0 cancelled (set by the key cb) */
 	char		 entry[PATH_MAX];
 } Picker;
 
@@ -9134,8 +9135,9 @@ pick_jump(Picker *pk, int n, int ch)
 }
 
 static void
-pick_draw(Editor *e, const Modal *m, Picker *pk)
+pick_draw(Editor *e, const Modal *m, void *ctx)
 {
+	Picker *pk = ctx;
 	const Picksrc *src = pk->src;
 	Screen *d = e->d;
 	const char *title = src->title ? src->title(src->ctx) : "";
@@ -9233,13 +9235,104 @@ pick_entry_key(Picker *pk, const struct tkbd_seq *k)
 	}
 }
 
-/* Run the picker panel. Returns 1 if a row or entry was chosen (PICK_DONE),
- * 0 if cancelled. */
+/* Handle one picker key. Returns nonzero to close the panel (pk->result says
+ * whether a row or entry was chosen); zero to stay open. */
+static int
+pick_key(Editor *e, const Modal *m, const Event *ev, void *ctx)
+{
+	Picker *pk = ctx;
+	const Picksrc *src = pk->src;
+	const struct tkbd_seq *k;
+	int act = PICK_STAY;
+	int n;
+
+	(void)e;
+	(void)m;
+	if (ev->key.type != TKBD_KEY)
+		return 0;		/* ignore mouse and the like */
+	k = &ev->key;
+	n = src->count(src->ctx);
+
+	if (k->key == TKBD_KEY_ESC) {
+		pk->result = 0;
+		return 1;
+	}
+	if (k->key == TKBD_KEY_TAB && src->entry_label) {
+		pk->focus = !pk->focus;
+		return 0;
+	}
+	if (pk->focus == 1) {		/* entry line has focus */
+		if (k->key == TKBD_KEY_ENTER) {
+			act = src->submit(src->ctx, pk->entry);
+		} else if (k->key == TKBD_KEY_UP || k->key == TKBD_KEY_DOWN) {
+			pk->focus = 0;
+			return 0;
+		} else {
+			pick_entry_key(pk, k);
+			return 0;
+		}
+	} else {			/* list has focus */
+		switch (k->key) {
+		case TKBD_KEY_UP:
+			pk->sel--;
+			pick_clamp(pk, n);
+			return 0;
+		case TKBD_KEY_DOWN:
+			pk->sel++;
+			pick_clamp(pk, n);
+			return 0;
+		case TKBD_KEY_PGUP:
+			pk->sel -= pk->vis > 0 ? pk->vis : 1;
+			pick_clamp(pk, n);
+			return 0;
+		case TKBD_KEY_PGDN:
+			pk->sel += pk->vis > 0 ? pk->vis : 1;
+			pick_clamp(pk, n);
+			return 0;
+		case TKBD_KEY_HOME:
+			pk->sel = 0;
+			pick_clamp(pk, n);
+			return 0;
+		case TKBD_KEY_END:
+			pk->sel = n - 1;
+			pick_clamp(pk, n);
+			return 0;
+		case TKBD_KEY_ENTER:
+			if (n > 0)
+				act = src->choose(src->ctx, pk->sel);
+			break;
+		default:
+			if (!(k->mod & TKBD_MOD_CTRL) &&
+			    k->ch != TKBD_CH_NONE && k->ch >= 0x20 &&
+			    k->ch < 0x7f && n > 0) {
+				pick_jump(pk, n, (int)k->ch);
+				pick_clamp(pk, n);
+			}
+			return 0;
+		}
+	}
+
+	if (act == PICK_DONE) {
+		pk->result = 1;
+		return 1;
+	}
+	if (act == PICK_CANCEL) {
+		pk->result = 0;
+		return 1;
+	}
+	/* PICK_STAY: listing may have changed, reset the view */
+	pk->sel = 0;
+	pk->top = 0;
+	pk->entry[0] = '\0';
+	return 0;
+}
+
+/* Run the picker panel through the shared modal loop. Returns 1 if a row or
+ * entry was chosen, 0 if cancelled. */
 static int
 dlg_pick(Editor *e, const Picksrc *src)
 {
 	Picker pk;
-	Modal m;
 	int boxw, boxh, maxw = 0, n, i;
 
 	memset(&pk, 0, sizeof(pk));
@@ -9277,110 +9370,8 @@ dlg_pick(Editor *e, const Picksrc *src)
 	if (boxh > e->rows - 2)
 		boxh = e->rows - 2;
 
-	dlg_palette(e, &m.fg, &m.bg, &m.base);
-	m.w = boxw;
-	m.h = boxh;
-	dlg_center(e, m.w, m.h, &m.x, &m.y);
-
-	for (;;) {
-		Event ev;
-		struct tkbd_seq *k;
-		int act = PICK_STAY;
-
-		render_body(e, e->d);
-		scr_box(e->d, m.x, m.y, m.w, m.h, m.fg, m.bg, m.base);
-		pick_draw(e, &m, &pk);
-		scr_present(e->d);
-
-		switch (scr_wait(e->d, &ev)) {
-		case EVENT_EOF:
-			return 0;
-		case EVENT_RESIZE:
-		case EVENT_RESUME:
-			scr_size(e->d, &e->rows, &e->cols);
-			if (m.w > e->cols - 2)
-				m.w = e->cols - 2;
-			if (m.h > e->rows - 2)
-				m.h = e->rows - 2;
-			dlg_center(e, m.w, m.h, &m.x, &m.y);
-			continue;
-		case EVENT_KEY:
-			break;
-		default:
-			continue;
-		}
-		if (ev.key.type != TKBD_KEY)
-			continue;
-		k = &ev.key;
-		n = src->count(src->ctx);
-
-		if (k->key == TKBD_KEY_ESC)
-			return 0;
-		if (k->key == TKBD_KEY_TAB && src->entry_label) {
-			pk.focus = !pk.focus;
-			continue;
-		}
-		if (pk.focus == 1) {		/* entry line has focus */
-			if (k->key == TKBD_KEY_ENTER) {
-				act = src->submit(src->ctx, pk.entry);
-			} else if (k->key == TKBD_KEY_UP ||
-			    k->key == TKBD_KEY_DOWN) {
-				pk.focus = 0;
-				continue;
-			} else {
-				pick_entry_key(&pk, k);
-				continue;
-			}
-		} else {			/* list has focus */
-			switch (k->key) {
-			case TKBD_KEY_UP:
-				pk.sel--;
-				pick_clamp(&pk, n);
-				continue;
-			case TKBD_KEY_DOWN:
-				pk.sel++;
-				pick_clamp(&pk, n);
-				continue;
-			case TKBD_KEY_PGUP:
-				pk.sel -= pk.vis > 0 ? pk.vis : 1;
-				pick_clamp(&pk, n);
-				continue;
-			case TKBD_KEY_PGDN:
-				pk.sel += pk.vis > 0 ? pk.vis : 1;
-				pick_clamp(&pk, n);
-				continue;
-			case TKBD_KEY_HOME:
-				pk.sel = 0;
-				pick_clamp(&pk, n);
-				continue;
-			case TKBD_KEY_END:
-				pk.sel = n - 1;
-				pick_clamp(&pk, n);
-				continue;
-			case TKBD_KEY_ENTER:
-				if (n > 0)
-					act = src->choose(src->ctx, pk.sel);
-				break;
-			default:
-				if (!(k->mod & TKBD_MOD_CTRL) &&
-				    k->ch != TKBD_CH_NONE && k->ch >= 0x20 &&
-				    k->ch < 0x7f && n > 0) {
-					pick_jump(&pk, n, (int)k->ch);
-					pick_clamp(&pk, n);
-				}
-				continue;
-			}
-		}
-
-		if (act == PICK_DONE)
-			return 1;
-		if (act == PICK_CANCEL)
-			return 0;
-		/* PICK_STAY: listing may have changed, reset the view */
-		pk.sel = 0;
-		pk.top = 0;
-		pk.entry[0] = '\0';
-	}
+	dlg_run(e, boxw, boxh, &pk, pick_draw, pick_key);
+	return pk.result;
 }
 
 /****************************************************************
