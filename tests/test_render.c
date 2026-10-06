@@ -2012,6 +2012,29 @@ t_menu_narrow(Test *t)
 	memio_free(&m);
 }
 
+/* The key-bindings screen scrolls, so an entry past the first screen is reached
+ * by paging down. Drives F2 (vi keys), F1 (help), then Space to page down on a
+ * short window, and checks a near-bottom vi entry becomes visible. */
+static void
+t_help_scroll(Test *t)
+{
+	const char keys[] = "\033OQ\033OP    ";	/* F2, F1, four page-downs */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, keys, sizeof(keys) - 1, 12, 80);	/* short: must scroll */
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_run(v);
+	/* ":reload" is one of the last vi-help rows, off the first screen at 12
+	 * rows, so seeing it proves both the vi table and the scrolling. */
+	TAP_CHECK(t, strstr(m.out, "Re-read the config") != NULL);
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* A pending termination signal unwinds the run like end-of-input: scr_wait
  * reports EOF while g_sig_quit is set, so vedit_run returns promptly. (The
  * command-line handler, self-pipe, and re-raise are CLI-only and not exercised
@@ -2166,6 +2189,7 @@ const Case tap_cases[] = {
 	{ "menu_col_pack", t_menu_col_pack },
 	{ "menu_narrow", t_menu_narrow },
 	{ "win_too_small", t_win_too_small },
+	{ "help_scroll", t_help_scroll },
 	{ "sig_quit_unwinds", t_sig_quit_unwinds },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_f9_make", t_tool_f9_make },

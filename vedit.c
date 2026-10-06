@@ -11695,6 +11695,8 @@ static const struct {
 	{ "Ctrl-Z / Ctrl-Y",	"Undo / redo" },
 	{ "Ctrl-S",		"Save (asks for a name if none)" },
 	{ "Ctrl-Q",		"Quit (asks if there are unsaved changes)" },
+	{ "Insert",		"Toggle draw mode (press t here for the tutorial)" },
+	{ "F10 / Alt+letter",	"Open the menu bar (View/Edit options live there)" },
 	{ "F1",			"Show this help" },
 	{ "F2",			"Toggle vi keys (modal editing)" },
 	{ "F8 / Shift+F8",	"Next / previous open buffer" },
@@ -11702,6 +11704,7 @@ static const struct {
 	{ "Alt+F9 / F9",	"Compile the file / make the project" },
 	{ "Ctrl+F9 / Alt+F5",	"Run the program / view the last output" },
 	{ "F4 / Shift+F4",	"Next / previous build error (wraps around)" },
+	{ "Edit > Format",	"Run the configured formatter (edit.formatonsave)" },
 #endif
 };
 
@@ -11738,7 +11741,20 @@ static const struct {
 	{ ":N  :cq",		"Go to a line, quit with an error code" },
 	{ "Ctrl-]  :tag",	"Jump to a tag (under cursor / by name)" },
 	{ "Ctrl-T  :pop",	"Pop the tag stack back to the last jump" },
+	{ ":marks  :jumps",	"List marks / the jump list (:delmarks clears)" },
 	{ "gf",			"Open the header or file named under the cursor" },
+	{ ":bn :bp :bd :ls",	"Next / prev / delete / list buffers (also F8)" },
+	{ ":set nu wrap list",	"Toggle line numbers, word wrap, show-tabs" },
+	{ ":set ai et ff=",	"Auto-indent, indent with spaces, line endings" },
+	{ ":retab  :set sw=N",	"Convert tabs <-> spaces; set the shift width" },
+	{ ":set swapfile bk",	"Crash-recovery swap file / keep a ~ backup" },
+#ifndef VEDIT_NO_TOOLS
+	{ ":format  :set fos",	"Run the formatter / format on every save" },
+	{ "F9 Alt+F9 Ctrl+F9",	"Make / compile / run; F4 steps the errors" },
+#endif
+#ifdef VEDIT_TERM
+	{ ":terminal [cmd]",	"Open a terminal buffer (Ctrl-W = control keys)" },
+#endif
 	{ ":reload",		"Re-read the config file (also Options menu)" },
 	{ "F1 / F2",		"Show this help / back to modeless keys" },
 };
@@ -11852,6 +11868,77 @@ static const char *const tut_draw[] = {
 	"trim trailing whitespace when it saves.",
 };
 
+#ifdef VEDIT_TERM
+static const char *const tut_term[] = {
+	"A terminal buffer runs a shell, or any command, inside vedit as",
+	"one more buffer alongside your files. It needs a host that can",
+	"multiplex file descriptors; the command-line vedit provides one.",
+	"",
+	"Opening and switching",
+	"",
+	"  - Terminal > New Terminal, or the vi command :terminal, opens",
+	"    a buffer running your login shell. :terminal CMD runs CMD.",
+	"  - The new terminal becomes the current buffer. F8 and Shift+F8",
+	"    cycle between it and your files like any other buffer.",
+	"  - When the program exits, the buffer stays so you can read its",
+	"    last output. Close it with Ctrl-W q.",
+	"",
+	"Control keys",
+	"",
+	"  Keystrokes go straight to the program, so the editor shortcuts",
+	"  do not apply while a terminal is focused. Ctrl-W is the prefix",
+	"  for terminal control: press it, then one more key.",
+	"",
+	"      Ctrl-W w / W    next / previous buffer",
+	"      Ctrl-W 1 .. 9   switch to buffer 1 through 9",
+	"      Ctrl-W n        open another terminal",
+	"      Ctrl-W c        close this terminal",
+	"      Ctrl-W q        close a terminal whose program has exited",
+	"      Ctrl-W Ctrl-W   send a literal Ctrl-W to the program",
+	"",
+	"The embedded emulator handles colors, cursor movement, and the",
+	"alternate screen, so full-screen programs such as a pager run",
+	"inside the buffer.",
+};
+#endif
+
+static const char *const tut_recover[] = {
+	"vedit guards against losing unsaved work when the editor or the",
+	"connection dies. While you edit a named file it keeps a swap",
+	"file beside it, a full snapshot refreshed whenever typing pauses",
+	"and again if the process is killed by a signal.",
+	"",
+	"Recovering after a crash",
+	"",
+	"  - Reopen the file. If a swap sits beside it, vedit asks:",
+	"      (r)ecover  load the snapshot into a buffer you can save",
+	"      (o)pen     ignore the swap and open the file as saved",
+	"      (d)elete   discard the swap and open the file",
+	"      (q)uit     leave the file unopened",
+	"  - After (r)ecover, save if the snapshot is the version you",
+	"    want. A swap left by a process that is still running is",
+	"    flagged, in case the file is open in another session.",
+	"",
+	"What is kept",
+	"",
+	"  - A clean save or quit removes the swap; only a crash or a",
+	"    kill leaves one behind.",
+	"  - A swap that is not ours, such as a Vim .swp of the same",
+	"    name, is never read or overwritten.",
+	"  - Swap files are on by default. Turn them off with :set",
+	"    noswapfile, or edit.swap = off for a host that must not",
+	"    write to disk.",
+	"",
+	"Backups",
+	"",
+	"  - With :set backup (or edit.backup = on) each save first",
+	"    copies the previous version to name~, so the last saved",
+	"    version survives the next save. edit.backupdir collects",
+	"    the copies elsewhere.",
+	"  - Saving is atomic, so a crash mid-save never leaves a",
+	"    half-written file.",
+};
+
 typedef struct tutorial {
 	const char	*title;
 	const char *const *lines;
@@ -11861,6 +11948,10 @@ typedef struct tutorial {
 #define TUT(arr) (arr), (int)(sizeof(arr) / sizeof((arr)[0]))
 static const Tutorial g_tutorials[] = {
 	{ "Line Draw Mode",	TUT(tut_draw) },
+#ifdef VEDIT_TERM
+	{ "Terminal Buffers",	TUT(tut_term) },
+#endif
+	{ "Crash Recovery",	TUT(tut_recover) },
 };
 #undef TUT
 #define TUTORIAL_COUNT ((int)(sizeof(g_tutorials) / sizeof(g_tutorials[0])))
@@ -11923,43 +12014,108 @@ dlg_tutorial_show(Editor *e, const Tutorial *t)
 	}
 }
 
-/* Open the tutorials. With a single tutorial it opens straight away. */
+static const char *
+tutpick_title(void *ctx)
+{
+	(void)ctx;
+	return " Tutorials ";
+}
+
+static int
+tutpick_count(void *ctx)
+{
+	(void)ctx;
+	return TUTORIAL_COUNT;
+}
+
+static const char *
+tutpick_label(void *ctx, int i)
+{
+	(void)ctx;
+	if (i < 0 || i >= TUTORIAL_COUNT)
+		return "";
+	return g_tutorials[i].title;
+}
+
+static int
+tutpick_choose(void *ctx, int i)
+{
+	int *chosen = ctx;
+
+	if (i < 0 || i >= TUTORIAL_COUNT)
+		return PICK_STAY;
+	*chosen = i;
+	return PICK_DONE;
+}
+
+/* Open the tutorials. With one tutorial it opens straight away; with several it
+ * first lists them in a picker. */
 static void
 dlg_tutorial(Editor *e)
 {
-	dlg_tutorial_show(e, &g_tutorials[0]);
+	int chosen = -1;
+	Picksrc s = {
+		.title = tutpick_title, .count = tutpick_count,
+		.label = tutpick_label, .choose = tutpick_choose,
+		.ctx = &chosen,
+	};
+
+	if (TUTORIAL_COUNT == 1) {
+		dlg_tutorial_show(e, &g_tutorials[0]);
+		return;
+	}
+	if (dlg_pick(e, &s) && chosen >= 0)
+		dlg_tutorial_show(e, &g_tutorials[chosen]);
 }
 
-/* Show the help screen and wait for a key. Any key returns to editing, except
- * 't', which opens the tutorial. */
+/* Show the scrollable key-bindings screen. Up/Down and PgUp/PgDn (or Space)
+ * scroll, Home/End jump, 't' opens the tutorial, and Esc, q, or Enter returns. */
 static void
 dlg_help(Editor *e)
 {
-	const char *hdr = e->mode != MODE_MODELESS ?
-	    " vedit -- vi key bindings" : " vedit -- key bindings";
+	int vi = e->mode != MODE_MODELESS;
+	const char *hdr = vi ? " vedit -- vi key bindings"
+	    : " vedit -- key bindings";
+	int n = vi ? HELP_VI_COUNT : HELP_COUNT;
+	int top = 0;
 
 	for (;;) {
+		int rows = e->rows > 0 ? e->rows : 24;
+		int body = rows - 2;		/* header and footer rows */
+		int maxtop = (n > body) ? n - body : 0;
 		Event ev;
 
+		if (top > maxtop)
+			top = maxtop;
+		if (top < 0)
+			top = 0;
 		ui_scroll_view(e, hdr,
-		    " Press t for the tutorial, any other key to return", 0,
-		    help_line, NULL);
-		switch (scr_wait(e->d, &ev)) {
-		case EVENT_KEY:
-			if (ev.key.type != TKBD_KEY)
-				break;
-			if (ev.key.ch == 't' || ev.key.ch == 'T') {
-				dlg_tutorial(e);
-				break;		/* back to the key list */
-			}
-			return;			/* any other key returns */
-		case EVENT_RESIZE:
-		case EVENT_RESUME:
-			scr_size(e->d, &e->rows, &e->cols);
-			break;
-		case EVENT_EOF:
+		    " Up/Down PgUp/PgDn scroll   t tutorial   Esc returns",
+		    top, help_line, NULL);
+		if (scr_wait(e->d, &ev) == EVENT_EOF)
 			return;
+		if (ev.type == EVENT_RESIZE || ev.type == EVENT_RESUME) {
+			scr_size(e->d, &e->rows, &e->cols);
+			continue;
+		}
+		if (ev.type != EVENT_KEY || ev.key.type != TKBD_KEY)
+			continue;
+		switch (ev.key.key) {
+		case TKBD_KEY_UP:	top -= 1; break;
+		case TKBD_KEY_DOWN:	top += 1; break;
+		case TKBD_KEY_PGUP:	top -= body; break;
+		case TKBD_KEY_PGDN:	top += body; break;
+		case TKBD_KEY_HOME:	top = 0; break;
+		case TKBD_KEY_END:	top = maxtop; break;
+		case TKBD_KEY_ESC:	return;
 		default:
+			if (ev.key.ch == 't' || ev.key.ch == 'T')
+				dlg_tutorial(e);
+			else if (ev.key.ch == ' ')
+				top += body;		/* Space pages down */
+			else if (ev.key.ch == 'q' || ev.key.ch == 'Q' ||
+			    ev.key.ch == '\r' || ev.key.ch == '\n')
+				return;
 			break;
 		}
 	}
@@ -16013,6 +16169,8 @@ usage(void)
 	    "\n"
 	    "A single-file visual text editor for primitive terminals.\n"
 	    "\n"
+	    "  -h, --help    show this help and exit\n"
+	    "  -V, --version show the version and exit\n"
 	    "  --utf8        draw the frame with Unicode box-drawing\n"
 	    "  --dec         draw the frame with DEC VT100 line-drawing\n"
 	    "  -a, --ascii   draw the frame with plain ASCII (+ - |)\n"
@@ -21212,6 +21370,11 @@ main(int argc, char **argv)
 		if (strcmp(argv[i], "-h") == 0 ||
 		    strcmp(argv[i], "--help") == 0) {
 			usage();
+			return 0;
+		}
+		if (strcmp(argv[i], "-V") == 0 ||
+		    strcmp(argv[i], "--version") == 0) {
+			printf("%s\n", VEDIT_VERSION);
 			return 0;
 		}
 		if (strcmp(argv[i], "-a") == 0 ||
