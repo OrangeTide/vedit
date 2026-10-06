@@ -196,6 +196,93 @@ t_syntax_refine(Test *t)
 	    out[1], out[5]);
 }
 
+static void
+t_syntax_md(Test *t)
+{
+	const Syntax *md = syn_for_ext("md");
+	uint8_t out[64];
+	uint16_t st;
+	int head, bold, ital, code, cb, quote, link, url, lm, txt;
+
+	TAP_ASSERT(t, md != NULL && md->fsm != NULL);
+	head = fsm_class(md->fsm, "heading");
+	bold = fsm_class(md->fsm, "bold");
+	ital = fsm_class(md->fsm, "italic");
+	code = fsm_class(md->fsm, "code");
+	cb = fsm_class(md->fsm, "codeblock");
+	quote = fsm_class(md->fsm, "quote");
+	link = fsm_class(md->fsm, "link");
+	url = fsm_class(md->fsm, "url");
+	lm = fsm_class(md->fsm, "listmark");
+	txt = fsm_class(md->fsm, "text");
+	TAP_ASSERT(t, head > 0 && bold > 0 && code > 0 && link > 0);
+
+	/* a heading colors the whole line, '#' included */
+	syn_line(md, md->start, "# Title", 7, out);
+	TAP_CHECKF(t, out[0] == head && out[6] == head, "heading [%d %d]",
+	    out[0], out[6]);
+
+	/* blockquote colors the whole line */
+	syn_line(md, md->start, "> quoted", 8, out);
+	TAP_CHECKF(t, out[0] == quote && out[7] == quote, "quote [%d %d]",
+	    out[0], out[7]);
+
+	/* **bold** paints the markers and the span */
+	syn_line(md, md->start, "a **b** c", 9, out);
+	TAP_CHECKF(t, out[0] == txt, "pre-bold text %d", out[0]);
+	TAP_CHECKF(t, out[2] == bold && out[3] == bold && out[5] == bold &&
+	    out[6] == bold, "bold [%d %d %d %d]", out[2], out[3], out[5],
+	    out[6]);
+	TAP_CHECKF(t, out[8] == txt, "post-bold text %d", out[8]);
+
+	/* *italic* with single stars */
+	syn_line(md, md->start, "a *b* c", 7, out);
+	TAP_CHECKF(t, out[2] == ital && out[3] == ital && out[4] == ital,
+	    "italic [%d %d %d]", out[2], out[3], out[4]);
+
+	/* `code` span, including both backticks */
+	syn_line(md, md->start, "x `y` z", 7, out);
+	TAP_CHECKF(t, out[2] == code && out[3] == code && out[4] == code,
+	    "code span [%d %d %d]", out[2], out[3], out[4]);
+
+	/* a backslash escapes the next byte so '*' stays plain text */
+	syn_line(md, md->start, "a \\*b\\* c", 9, out);
+	TAP_CHECKF(t, out[3] == txt && out[4] == txt, "escaped star [%d %d]",
+	    out[3], out[4]);
+
+	/* [text](url) link */
+	syn_line(md, md->start, "[t](u)", 6, out);
+	TAP_CHECKF(t, out[0] == link && out[1] == link && out[2] == link,
+	    "link text [%d %d %d]", out[0], out[1], out[2]);
+	TAP_CHECKF(t, out[4] == url, "link url %d", out[4]);
+
+	/* a dash bullet colors the marker; the rest is inline */
+	syn_line(md, md->start, "- item", 6, out);
+	TAP_CHECKF(t, out[0] == lm && out[1] == lm, "bullet [%d %d]",
+	    out[0], out[1]);
+
+	/* an ordered-list marker is repainted once the dot and space confirm it */
+	syn_line(md, md->start, "12. item", 8, out);
+	TAP_CHECKF(t, out[0] == lm && out[1] == lm && out[2] == lm,
+	    "ordered [%d %d %d]", out[0], out[1], out[2]);
+
+	/* a plain '-' that is not a bullet is not mis-colored */
+	syn_line(md, md->start, "-x", 2, out);
+	TAP_CHECKF(t, out[0] == txt, "lone dash %d", out[0]);
+
+	/* a fenced code block carries across lines until the closing fence */
+	st = syn_line(md, md->start, "```c", 4, out);
+	TAP_CHECKF(t, out[0] == code && out[3] == code, "fence open [%d %d]",
+	    out[0], out[3]);
+	TAP_CHECKF(t, st != md->start, "fence carries state %u", st);
+	st = syn_line(md, st, "int x;", 6, out);
+	TAP_CHECKF(t, out[0] == cb && out[5] == cb, "code body [%d %d]",
+	    out[0], out[5]);
+	st = syn_line(md, st, "```", 3, out);
+	TAP_CHECKF(t, out[0] == cb, "fence close %d", out[0]);
+	TAP_CHECK(t, st == md->start);		/* block closed on this line */
+}
+
 /* Serialize the whole buffer the way the file on disk would read: each line's
  * bytes in order, joined by '\n', with no trailing newline. Caller frees. */
 static char *
@@ -2066,6 +2153,7 @@ const Case tap_cases[] = {
 	{ "syntax_c", t_syntax_c },
 	{ "syntax_block_comment_carry", t_syntax_block_comment_carry },
 	{ "syntax_refine", t_syntax_refine },
+	{ "syntax_md", t_syntax_md },
 	{ "text_edit_undo", t_text_edit_undo },
 	{ "edit_roundtrip", t_edit_roundtrip },
 	{ "multiline_buffer", t_multiline_buffer },

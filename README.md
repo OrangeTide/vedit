@@ -225,8 +225,8 @@ builds from `vedit_cfg_new()` / `vedit_cfg_load()`.
 
 ### Custom syntax highlighting
 
-Beyond the built-in C and shell highlighters, the config file can define a
-language as a small state machine (the model joe uses), authored in the same
+Beyond the built-in C, shell, and Markdown highlighters, the config file can
+define a language as a small state machine (the model joe uses), authored in the same
 gitconfig format, no separate file. A language is a set of states; each state
 has an ordered list of transition `rule` lines keyed on a character set.
 
@@ -297,7 +297,7 @@ A language whose name matches a file extension is picked up automatically; a
 the rules are config data, loaded through `vedit_set_config()` like everything
 else.
 
-The built-in C and shell highlighters are themselves grammars in this format,
+The built-in C, shell, and Markdown highlighters are themselves grammars in this format,
 compiled into the binary and loaded at startup, so they need no config file.
 Defining a language of the same name in your config replaces the matching
 built-in outright (the two are not merged), so to customize one, copy its whole
