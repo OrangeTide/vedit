@@ -5112,6 +5112,12 @@ struct tkbd_seq;
 
 #define TAB_WIDTH 8
 
+/* Fixed-size text buffers carried on the Editor struct. */
+#define STATUS_MAX	160	/* transient status/message line */
+#define FIND_MAX	256	/* last search and replacement strings */
+#define TOOLTITLE_MAX	64	/* label of the last build/shell command */
+#define HEXPAT_MAX	64	/* last searched byte pattern (hex view) */
+
 /* Editing personality. The default is a modeless (nano-style) editor;
  * MODE_NORMAL/MODE_INSERT are the vi personality, toggled with F2. */
 typedef enum edit_mode {
@@ -5200,18 +5206,18 @@ typedef struct editor {
 	Toolerr	*tool_errs;		/* parsed diagnostics */
 	int		tool_nerr, tool_errs_cap;
 	int		tool_curerr;		/* selected error (F4/Shift+F4), -1 */
-	char	tool_title[64];		/* label of the last command, for the pane */
+	char	tool_title[TOOLTITLE_MAX];	/* label of the last command, for the pane */
 	char	tool_dir[PATH_MAX];	/* directory the last command ran in */
 #endif
 	int		draw_mode;	/* 2D/block draw mode: free cursor + overtype */
-	char		last_find[256];	/* last search string, for repeat */
-	char		last_replace[256]; /* last replacement string */
+	char		last_find[FIND_MAX];	/* last search string, for repeat */
+	char		last_replace[FIND_MAX]; /* last replacement string */
 	int		vi_search_dir;	/* last search direction: 1 fwd, -1 back */
 	int		search_icase;	/* match searches case-insensitively */
 	int		vi_want_col;	/* display column j/k aim for (INT_MAX=EOL) */
 	int		vi_vert_run;	/* this command was a vertical j/k/$ move */
 	int		vi_vert_prev;	/* the previous command was one */
-	char		status[160];
+	char		status[STATUS_MAX];
 	int		scheme;		/* chrome color scheme (SCHEME_*) */
 	int		show_lineno;	/* draw the line-number gutter */
 	int		wrap;		/* soft-wrap long lines to the window width */
@@ -5232,7 +5238,7 @@ typedef struct editor {
 	int		hex_ascii;	/* editing the ascii column, not the hex */
 	int		hex_pending;	/* a typed high nibble 0-15, or -1 */
 	int		hex_insert;	/* insert bytes instead of overwriting */
-	unsigned char	hex_pat[64];	/* last searched byte pattern */
+	unsigned char	hex_pat[HEXPAT_MAX];	/* last searched byte pattern */
 	size_t		hex_pat_len;	/* its length, 0 when none searched yet */
 	int		hex_pat_dir;	/* last search direction: 1 fwd, -1 back */
 	int		hex_cols;	/* dump bytes per row: 8, 16, or 32 */
