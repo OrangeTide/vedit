@@ -3926,6 +3926,11 @@ typedef struct draw_term {
 	unsigned char	inbuf[512];
 	int		inlen;
 
+	/* vi macro recording: the raw bytes of each event decoded while on */
+	unsigned char	*rec;
+	size_t		rec_len, rec_cap;
+	int		rec_on;
+
 	/* pending output bytes awaiting flush */
 	char		*out;
 	size_t		outlen, outcap;
@@ -4661,6 +4666,7 @@ scr_free(Screen *d)
 		free(t->shadow);
 		free(t->rowdirty);
 		free(t->out);
+		free(t->rec);
 		free(t);
 	}
 	free(d);
@@ -4960,6 +4966,30 @@ in_refill(Scrbuf *t, int timeout_ms)
 	return -1;
 }
 
+/* Append the raw bytes of one decoded event to the macro recording, when it is
+ * on. A failed grow just drops bytes, so the recording truncates rather than
+ * aborting the edit. */
+static void
+scr_rec_append(Scrbuf *t, const unsigned char *b, int n)
+{
+	if (!t->rec_on || n <= 0)
+		return;
+	if (t->rec_len + (size_t)n > t->rec_cap) {
+		size_t nc = t->rec_cap ? t->rec_cap * 2 : 64;
+		unsigned char *p;
+
+		while (nc < t->rec_len + (size_t)n)
+			nc *= 2;
+		p = realloc(t->rec, nc);
+		if (!p)
+			return;
+		t->rec = p;
+		t->rec_cap = nc;
+	}
+	memcpy(t->rec + t->rec_len, b, (size_t)n);
+	t->rec_len += (size_t)n;
+}
+
 /* Remove and return the next decoded event. Returns 1 when out is filled,
  * 0 on timeout with no event, or -1 on EOF or error. */
 static int
@@ -4972,6 +5002,7 @@ scr_next_event(Screen *d, int timeout_ms, struct tkbd_seq *out)
 			int n = tkbd_decode(out, t->inbuf, t->inlen);
 
 			if (n > 0) {
+				scr_rec_append(t, t->inbuf, n);
 				memmove(t->inbuf, t->inbuf + n, t->inlen - n);
 				t->inlen -= n;
 				return 1;
@@ -4994,6 +5025,7 @@ scr_next_event(Screen *d, int timeout_ms, struct tkbd_seq *out)
 					out->key = TKBD_KEY_ESC;
 					out->mod = 0;
 					out->ch = TKBD_CH_NONE;
+					scr_rec_append(t, t->inbuf, 1);
 					memmove(t->inbuf, t->inbuf + 1,
 					    t->inlen - 1);
 					t->inlen--;
@@ -5049,6 +5081,26 @@ scr_wait(Screen *d, Event *ev)
 		ev->type = EVENT_IDLE;
 		return EVENT_IDLE;
 	}
+}
+
+/* Begin capturing raw input bytes for a vi macro recording (discarding any
+ * previous capture). Every event decoded by scr_next_event is appended until
+ * scr_record_stop. */
+static void
+scr_record_start(Screen *d)
+{
+	d->t->rec_len = 0;
+	d->t->rec_on = 1;
+}
+
+/* Stop capturing and return the recorded bytes, setting *len. The buffer stays
+ * owned by the screen; the caller copies what it needs before the next event. */
+static const unsigned char *
+scr_record_stop(Screen *d, size_t *len)
+{
+	d->t->rec_on = 0;
+	*len = d->t->rec_len;
+	return d->t->rec;
 }
 
 /****************************************************************
@@ -5271,6 +5323,9 @@ typedef struct editor {
 	char		vi_atpending;	/* @ typed, awaiting the register name */
 	char		vi_last_macro;	/* last register played with @, for @@ */
 	int		vi_macro_depth;	/* @ recursion guard */
+	char		vi_qpending;	/* q typed, awaiting the record register */
+	char		vi_recording;	/* register being recorded (a-z), 0 = none */
+	int		vi_rec_append;	/* recording was armed with A-Z: append */
 	int		vi_overtype;	/* R Replace mode: typing overwrites */
 	size_t		vi_mark_y[26];	/* line of mark 'a'..'z' */
 	size_t		vi_mark_x[26];	/* byte column of the mark */
@@ -11137,6 +11192,7 @@ static const struct {
 	{ "v  V  Ctrl-V",	"Visual char / line / block select" },
 	{ "block: d y I A",	"Delete, yank, insert at left, append at right" },
 	{ "p / P",		"Paste after / before the cursor" },
+	{ "\"a  qa  @a",	"Register a: prefix yank/put, record keys, replay" },
 	{ "u / Ctrl-R",		"Undo / redo" },
 	{ "/ text  n",		"Search forward, repeat the last search" },
 	{ ":w  :q  :wq / :x",	"Write, quit, write and quit" },
@@ -18547,6 +18603,56 @@ vi_search_word(Editor *e, int dir)
 static void vi_dot_replay(Editor *e);
 static void vi_play_register(Editor *e, char reg, int count);
 
+/* Start recording typed keys into a register (vi q). A lowercase name replaces
+ * the register, an uppercase name appends to it. */
+static void
+vi_record_start(Editor *e, char reg)
+{
+	e->vi_rec_append = (reg >= 'A' && reg <= 'Z');
+	e->vi_recording = e->vi_rec_append ? (char)(reg - 'A' + 'a') : reg;
+	scr_record_start(e->d);
+	set_status(e, "recording @%c", e->vi_recording);
+}
+
+/* Stop recording and store the captured keys in the register, dropping the
+ * trailing q that ended it. The bytes are raw input, so @ replays them. */
+static void
+vi_record_stop(Editor *e)
+{
+	char reg = e->vi_recording;
+	Reg *r = &e->vi_regs[reg - 'a'];
+	size_t len;
+	const unsigned char *bytes = scr_record_stop(e->d, &len);
+
+	if (len > 0 && bytes[len - 1] == 'q')	/* the stop key is not recorded */
+		len--;
+	if (e->vi_rec_append && r->len) {
+		size_t nl = r->len + len;
+		char *cat = malloc(nl ? nl : 1);
+
+		if (cat) {
+			memcpy(cat, r->bytes, r->len);
+			memcpy(cat + r->len, bytes, len);
+			free(r->bytes);
+			r->bytes = cat;
+			r->len = nl;
+		}
+	} else {
+		char *dup = malloc(len ? len : 1);
+
+		if (dup) {
+			memcpy(dup, bytes, len);
+			free(r->bytes);
+			r->bytes = dup;
+			r->len = len;
+		}
+	}
+	r->linewise = 0;
+	e->vi_recording = 0;
+	e->vi_rec_append = 0;
+	set_status(e, "recorded %zu bytes into @%c", r->len, reg);
+}
+
 /* Handle one key in vi normal mode. */
 static Req
 vi_normal_key(Editor *e, const struct tkbd_seq *seq)
@@ -18637,6 +18743,18 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 		vi_reset_pending(e);
 		if (reg)
 			vi_play_register(e, reg, cnt);
+		return REQ_CONTINUE;
+	}
+
+	/* A pending q takes the next key as the register to record into: a-z to
+	 * replace it, A-Z to append. Anything else cancels. */
+	if (e->vi_qpending) {
+		e->vi_qpending = 0;
+		if (!ctrl && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')))
+			vi_record_start(e, (char)c);
+		else
+			set_status(e, "bad register for q");
+		vi_reset_pending(e);
 		return REQ_CONTINUE;
 	}
 
@@ -18984,6 +19102,13 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 		return REQ_CONTINUE;
 	case '@':			/* play a register as keystrokes */
 		e->vi_atpending = 1;
+		return REQ_CONTINUE;
+	case 'q':			/* record keystrokes into a register */
+		vi_reset_pending(e);
+		if (e->vi_recording)
+			vi_record_stop(e);
+		else
+			e->vi_qpending = 1;
 		return REQ_CONTINUE;
 	case 'J': {
 		int cnt = e->vi_count > 0 ? e->vi_count : 1;

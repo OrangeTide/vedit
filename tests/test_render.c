@@ -747,6 +747,38 @@ t_macro_play(Test *t)
 	memio_free(&m);
 }
 
+/* q records typed keys into a register (dropping the closing q), and @ replays
+ * them. Record "qax" then stop with "q": register a holds "x"; "@a" deletes the
+ * next character, so two chars are gone overall. */
+static void
+t_macro_record(Test *t)
+{
+	static const char *const L[] = { "abcdef" };
+	const char keys[] = "qaxq@a";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 1);
+	v->e.mode = MODE_NORMAL;
+
+	vedit_run(v);
+
+	/* the register holds exactly the recorded keystroke, not the stop q */
+	TAP_CHECKF(t, v->e.vi_regs[0].len == 1, "reg len %zu",
+	    v->e.vi_regs[0].len);
+	TAP_CHECK(t, v->e.vi_regs[0].bytes && v->e.vi_regs[0].bytes[0] == 'x');
+	/* x while recording removed 'a', @a removed 'b' */
+	TAP_CHECK(t, vline_is(v, 0, "cdef"));
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* gv reselects the previous visual range after leaving visual mode. */
 static void
 t_gv_reselect(Test *t)
@@ -1350,6 +1382,7 @@ const Case tap_cases[] = {
 	{ "search_word", t_search_word },
 	{ "shiftwidth", t_shiftwidth },
 	{ "macro_play", t_macro_play },
+	{ "macro_record", t_macro_record },
 	{ "shell_cmd", t_shell_cmd },
 	{ "exit_cursor", t_exit_cursor },
 	{ "gv_reselect", t_gv_reselect },
