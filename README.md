@@ -35,6 +35,7 @@ make torture            # pseudo-random fuzz of the parsers and regex engine
 make asan               # tests + torture under AddressSanitizer (with leaks)
 make ubsan              # tests + torture under UndefinedBehaviorSanitizer
 make cov                # line coverage of vedit.c from the unit tests
+make cov-term           # line coverage of the terminal-buffer code
 ```
 
 The tests live in `tests/` and run through a vendored copy of the `taptest`
@@ -614,7 +615,9 @@ writes and quits, `ZQ` quits without writing. The `:` line runs `write`, `quit`,
 `delmarks`, `jumps`, `:N`,
 `:set number` / `:set nonumber`, and `:set wrap` / `:set nowrap`. `:!cmd` runs a
 shell command and shows its output in the build pane (through the host's command
-runner, so it is unavailable when none is installed). Command names
+runner, so it is unavailable when none is installed). `:terminal [cmd]` opens a
+terminal buffer, described under
+[Terminal buffers](#terminal-buffers). Command names
 follow the usual vi abbreviation rule: any leading prefix of the full name down
 to its standard short form works, so `:s` is `:substitute`, `:e` is `:edit`,
 `:w` is `:write`, `:bn` is `:bnext`, while `:se` stays `:set` and `:sy` is
@@ -748,6 +751,50 @@ Header navigation (`gf` and the `cc.file` reader) is separate and stays availabl
 An embedding host supplies its own command runner (or none) through
 `vedit_set_tools`; see [Embedding in a host](#embedding-in-a-host-for-example-a-mud).
 
+### Terminal buffers
+
+A buffer can be a live terminal running a shell, a build, or an agentic CLI,
+drawn inside the editor frame. Open one with the ex command `:terminal` (press
+F2 for vi keys first, since the `:` line is a vi-personality feature). With no
+argument it runs your login shell (`$SHELL`, else `/bin/sh`); `:terminal <cmd>`
+runs that command instead, for example `:terminal make` or `:terminal htop`. The
+command is split on whitespace into an argument list and run directly, with no
+shell in between, so shell syntax such as pipes, redirection, or quoting does not
+apply. Wrap those in `sh -c '...'` yourself when you need them. `terminal`
+abbreviates to `:term`.
+
+![A terminal buffer running a colored build, inside the editor frame](docs/shot-term.png)
+
+Each terminal buffer is a real pseudo-terminal with a built-in VT emulator. The
+child's output is parsed into a grid that vedit draws at its own coordinates, so
+the child never writes to your real terminal and the display cannot drift out of
+step with the editor chrome. The emulator honors 16-color, 256-color, and 24-bit
+truecolor SGR, cursor movement, cursor hide and show (DECTCEM), and the window
+title the child sets with OSC 0/2, which becomes the buffer's frame label.
+Scrollback holds twice the visible height.
+
+While a terminal buffer has focus, keystrokes pass straight through to the child.
+**Ctrl-W** is the prefix for editor control, in a mix of GNU screen and vi:
+
+| Key                     | What it does                                        |
+|-------------------------|-----------------------------------------------------|
+| `Ctrl-W w` / `Ctrl-W W` | next / previous buffer                              |
+| `Ctrl-W n`              | open another terminal                               |
+| `Ctrl-W 1`..`9`         | switch to that buffer                               |
+| `Ctrl-W c` / `Ctrl-W q` | close the terminal (quits if it is the last buffer) |
+| `Ctrl-W Ctrl-W`         | send a literal Ctrl-W to the child                  |
+
+When the child exits, the buffer shows `[process exited N]` and waits for
+`Ctrl-W q` to close.
+
+The terminal is compiled in by default. Build with `-DVEDIT_NO_TERM`
+(`make VEDIT_NO_TERM=1`) to drop it, along with all the pseudo-terminal and
+emulator code, for a primitive embedding host that does not want it. The feature
+needs a host that can wait on more than one file descriptor at once: the
+command-line binary does this, but an embedding host must supply the `poll_fds`
+callback in `struct vedit_io`, or `:terminal` reports that it needs a
+multiplexing host.
+
 ## Draw mode (ASCII art and maps)
 
 Draw mode turns vedit into a 2D canvas for maps, box diagrams, and block art,
@@ -846,6 +893,13 @@ In a single-threaded event-loop host, run the editor on its own thread or
 coroutine, or supply a `poll` callback that yields to the host loop. A
 push-style state machine is not provided.
 
+Terminal buffers (`:terminal`) need the host to wait on the input source and the
+child pseudo-terminals together, so they are available only when the host fills
+the optional `io.poll_fds` callback (the command-line binary does). Without it
+the editor runs normally and `:terminal` reports that it needs a multiplexing
+host. A host built with `-DVEDIT_NO_TERM` omits the feature and the callback
+entirely.
+
 ## What it includes and what it leaves out
 
 vedit has a text buffer with undo and redo, the modeless and vi personalities,
@@ -854,7 +908,8 @@ replace, selection and an internal clipboard, goto-line, multiple buffers, a hex
 view, a 2D/block draw mode, per-language build commands with a quickfix error
 list, selectable line endings (LF, CRLF, NUL), tab display with auto-indent and
 tab/space conversion, a symbol picker that merges a buffer scan with a ctags
-tags file, and lightweight syntax highlighting. It draws through a
+tags file, terminal buffers running a shell or a build through a built-in VT
+emulator, and lightweight syntax highlighting. It draws through a
 self-contained ANSI
 renderer over the io vtable, and decodes the keyboard with a compact decoder that
 covers UTF-8 text, control keys, arrows, navigation keys, function keys, CSI
@@ -876,9 +931,11 @@ slow link.
 
 ### Ways to make it smaller or larger
 
-If you want an even leaner build, the hex view and multiple-buffer support are
-the next candidates to remove; each is self-contained. For a smaller input
-surface, drop the vi personality.
+If you want an even leaner build, `-DVEDIT_NO_TERM` drops the terminal buffers
+and all the pseudo-terminal and emulator code, and `-DVEDIT_NO_TOOLS` drops the
+build commands and the output pane. Beyond those, the hex view and
+multiple-buffer support are the next candidates to remove; each is
+self-contained. For a smaller input surface, drop the vi personality.
 
 If you embed over raw telnet rather than a cooked pty, the host (not vedit)
 should handle telnet IAC negotiation and read the window size from NAWS, then

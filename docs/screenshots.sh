@@ -83,6 +83,25 @@ Pipeline
    tokens                          result
 EOF
 
+# A short colored "build log" for the terminal-buffer shot: an OSC title, SGR
+# colors, and a truecolor bar, written as raw bytes so that `cat` prints them
+# verbatim and the embedded VT emulator is what parses them.
+{
+	printf '\033]2;build: ring\007'
+	printf '\033[1;32m==>\033[0m building \033[1mring\033[0m\n'
+	printf '    \033[36mcc\033[0m -Wall -O2 -c ring.c\n'
+	printf '    \033[36mcc\033[0m -o ring ring.o\n'
+	printf '\033[1;32m==>\033[0m \033[32mok\033[0m, no warnings\n\n'
+	printf 'truecolor: '
+	i=0
+	while [ "$i" -lt 36 ]; do
+		r=$((i * 7))
+		printf '\033[48;2;%d;90;%dm \033[0m' "$r" "$((252 - r))"
+		i=$((i + 1))
+	done
+	printf '\n'
+} > "$work/term.txt"
+
 # Run the X server in its own session so its lifetime is not tied to this
 # shell's process group, then wait for the socket to appear.
 setsid Xvfb "$disp" -screen 0 1600x1200x24 >/dev/null 2>&1 &
@@ -141,5 +160,11 @@ render "$here/shot-menu.png" ring.c ctrl+Home alt+e
 render "$here/shot-draw.png" pipeline.txt \
     ctrl+Home Insert \
     "Down Down Down Down Down Down Down Down Down Down"
+
+# A terminal buffer: F2 switches to vi keys, then the ex line :terminal runs
+# cat on the colored log. The built-in VT emulator parses the child's output
+# and the editor draws it in its own frame, with the OSC title as the label.
+render "$here/shot-term.png" ring.c \
+    F2 "colon t e r m i n a l space c a t space t e r m period t x t Return"
 
 exit 0
