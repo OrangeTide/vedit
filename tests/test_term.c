@@ -570,6 +570,33 @@ t_term_loop_digit(Test *t)
 	memio_free(&m);
 }
 
+/* Ctrl-W m opens the menu bar; Esc backs out of it and leaves the terminal
+ * focused, with nothing leaked to the child. */
+static void
+t_term_loop_menu(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child, n;
+	char buf[8];
+
+	v = term_editor_in(&m, &io, "\027m\033", 3, 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_CONT);
+	TAP_CHECK(t, term_is_active(&v->e));
+	TAP_CHECK(t, v->e.term_prefix == 0);
+	n = read_all(child, buf, sizeof(buf));
+	TAP_CHECKF(t, n == 0, "menu command leaked %d bytes to child", n);
+
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* Bytes typed before Ctrl-W are flushed to the child before the command. */
 static void
 t_term_loop_flush(Test *t)
@@ -888,6 +915,7 @@ const Case tap_cases[] = {
 	{ "term_loop_close", t_term_loop_close },
 	{ "term_loop_digit", t_term_loop_digit },
 	{ "term_loop_flush", t_term_loop_flush },
+	{ "term_loop_menu", t_term_loop_menu },
 	{ "term_poll_fallback", t_term_poll_fallback },
 	{ "term_discard", t_term_discard },
 	{ "term_open_nomux", t_term_open_nomux },

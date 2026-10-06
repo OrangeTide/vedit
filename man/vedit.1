@@ -108,6 +108,26 @@ Save and quit; both prompt when needed.
 .BR F10 ", Alt+" letter
 Open the menu bar.
 .TP
+.BR Ctrl\-W " " m
+Open the menu bar from inside a terminal buffer, where the other keys go to
+the running program.
+.B Ctrl\-W
+is the prefix for terminal control:
+.B w
+and
+.B W
+switch to the next and previous buffer,
+.BR 1 ".." 9
+switch to that buffer,
+.B n
+opens another terminal,
+.B c
+or
+.B q
+closes this one, and
+.B Ctrl\-W
+again sends a literal Ctrl\-W to the program.
+.TP
 .BR F1 ", " F2
 Show the key bindings, and toggle the vi personality.
 .SS vi

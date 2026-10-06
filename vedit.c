@@ -5301,6 +5301,24 @@ scr_raw_take(Screen *d, unsigned char *buf, int max)
 	t->inlen -= n;
 	return n;
 }
+
+/* Put raw bytes back at the front of the decode buffer, so a key-event reader
+ * (the menu bar, say) sees them next. Bytes that no longer fit are dropped;
+ * callers hand back part of what scr_raw_take just removed, which always fits. */
+static void
+scr_raw_unread(Screen *d, const unsigned char *buf, int n)
+{
+	Scrbuf *t = d->t;
+	int room = (int)sizeof(t->inbuf) - t->inlen;
+
+	if (n > room)
+		n = room;
+	if (n <= 0)
+		return;
+	memmove(t->inbuf + n, t->inbuf, (size_t)t->inlen);
+	memcpy(t->inbuf, buf, (size_t)n);
+	t->inlen += n;
+}
 #endif /* VEDIT_TERM */
 
 /****************************************************************
@@ -11700,6 +11718,9 @@ static const struct {
 	{ "F1",			"Show this help" },
 	{ "F2",			"Toggle vi keys (modal editing)" },
 	{ "F8 / Shift+F8",	"Next / previous open buffer" },
+#ifdef VEDIT_TERM
+	{ "Ctrl-W m",		"In a terminal buffer: open the menu (F1 for the rest)" },
+#endif
 #ifndef VEDIT_NO_TOOLS
 	{ "Alt+F9 / F9",	"Compile the file / make the project" },
 	{ "Ctrl+F9 / Alt+F5",	"Run the program / view the last output" },
@@ -11753,7 +11774,8 @@ static const struct {
 	{ "F9 Alt+F9 Ctrl+F9",	"Make / compile / run; F4 steps the errors" },
 #endif
 #ifdef VEDIT_TERM
-	{ ":terminal [cmd]",	"Open a terminal buffer (Ctrl-W = control keys)" },
+	{ ":terminal [cmd]",	"Open a terminal buffer (keys go to the program)" },
+	{ "Ctrl-W m / w / c",	"In a terminal: menu / next buffer / close" },
 #endif
 	{ ":reload",		"Re-read the config file (also Options menu)" },
 	{ "F1 / F2",		"Show this help / back to modeless keys" },
@@ -11886,15 +11908,21 @@ static const char *const tut_term[] = {
 	"Control keys",
 	"",
 	"  Keystrokes go straight to the program, so the editor shortcuts",
-	"  do not apply while a terminal is focused. Ctrl-W is the prefix",
+	"  do not apply while a terminal is focused: F1, F8, F10, and",
+	"  Alt+letter all reach the program instead. Ctrl-W is the prefix",
 	"  for terminal control: press it, then one more key.",
 	"",
+	"      Ctrl-W m        open the menu bar (File, Edit, Terminal ...)",
 	"      Ctrl-W w / W    next / previous buffer",
 	"      Ctrl-W 1 .. 9   switch to buffer 1 through 9",
 	"      Ctrl-W n        open another terminal",
 	"      Ctrl-W c        close this terminal",
 	"      Ctrl-W q        close a terminal whose program has exited",
 	"      Ctrl-W Ctrl-W   send a literal Ctrl-W to the program",
+	"",
+	"  Ctrl-W m is the way to the menu bar from a terminal, and from",
+	"  there to every editor command, including this help. The menu",
+	"  closes back into the terminal when it is done.",
 	"",
 	"The embedded emulator handles colors, cursor movement, and the",
 	"alternate screen, so full-screen programs such as a pager run",
@@ -16208,6 +16236,7 @@ usage(void)
 	    "  Ctrl-Q        quit (prompts if the buffer was modified)\n"
 	    "  F8 / Shift+F8 next / previous open buffer\n"
 	    "  F10 or Alt+letter  open the menu bar\n"
+	    "  Ctrl-W m      open the menu bar from inside a terminal buffer\n"
 	    "  F1            show the key bindings\n"
 	    "  F2            toggle vi keys (modal editing)\n"
 	    "\n"
@@ -20697,7 +20726,7 @@ term_render(Editor *e, Screen *d)
 	}
 
 	if (t->dead)
-		set_status(e, "[process exited %d]  Ctrl-W q to close",
+		set_status(e, "[process exited %d]  Ctrl-W q to close, Ctrl-W m for the menu",
 		    t->exit_status);
 
 	ui_menubar(e, p, -1);
@@ -20903,7 +20932,7 @@ term_open(Editor *e, const char *cmd)
 		set_status(e, "out of memory");
 		return -1;
 	}
-	set_status(e, "terminal [%d/%d]  (Ctrl-W w/W/n/c, Ctrl-W Ctrl-W = literal)",
+	set_status(e, "terminal [%d/%d]  Ctrl-W then m = menu, w/W/n/c, Ctrl-W = literal",
 	    e->cur + 1, e->nbuf);
 	return i;
 }
@@ -21033,6 +21062,22 @@ term_loop_step(Editor *e)
 		}
 		if (b >= '1' && b <= '9') {
 			buf_switch(e, b - '1');
+			ed_render(e, e->d);
+			return TERM_CONT;
+		}
+		if (b == 'm' || b == 'M') {
+			/* Ctrl-W m: the menu bar. F10 and Alt+letter go to the
+			 * child like any other key, so this is the only way in.
+			 * The menu decodes key events from the same input
+			 * buffer the raw passthrough drains, so it can run here
+			 * once the rest of this chunk is handed back to it;
+			 * whatever it leaves unread is handled on the next step. */
+			Menuact act;
+
+			scr_raw_unread(e->d, raw + i + 1, n - i - 1);
+			act = menu_bar_run(e, 0, 0);
+			if (run_menu_act(e, act))
+				return TERM_QUIT;
 			ed_render(e, e->d);
 			return TERM_CONT;
 		}

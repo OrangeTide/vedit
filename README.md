@@ -863,11 +863,17 @@ While a terminal buffer has focus, keystrokes pass straight through to the child
 
 | Key                     | What it does                                        |
 |-------------------------|-----------------------------------------------------|
+| `Ctrl-W m`              | open the menu bar (F10 and Alt+letter go to the child) |
 | `Ctrl-W w` / `Ctrl-W W` | next / previous buffer                              |
 | `Ctrl-W n`              | open another terminal                               |
 | `Ctrl-W 1`..`9`         | switch to that buffer                               |
 | `Ctrl-W c` / `Ctrl-W q` | close the terminal (quits if it is the last buffer) |
 | `Ctrl-W Ctrl-W`         | send a literal Ctrl-W to the child                  |
+
+The editor shortcuts, including F1, F8, F10, and Alt+letter, reach the child
+rather than the editor while a terminal has focus. `Ctrl-W m` is the way to
+the menu bar, and from there to every editor command; when the menu closes,
+focus returns to the terminal.
 
 When the child exits, the buffer shows `[process exited N]` and waits for
 `Ctrl-W q` to close.
