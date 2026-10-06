@@ -1718,6 +1718,167 @@ t_resize_reflow(Test *t)
 	memio_free(&m);
 }
 
+/* Index of the menu with this exact title (with the '&' mnemonic), or -1. */
+static int
+find_menu(const char *title)
+{
+	int i;
+
+	for (i = 0; i < MENU_COUNT; i++)
+		if (strcmp(MENUS[i].title, title) == 0)
+			return i;
+	return -1;
+}
+
+/* menu_item_enabled tracks the editor context it reads. */
+static void
+t_menu_item_enabled(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	char *clip;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_NEW) == 1);	/* always on */
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_SEP) == 0);	/* never */
+
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_PASTE) == 0);	/* empty clip */
+	clip = malloc(2);
+	TAP_ASSERT(t, clip != NULL);
+	clip[0] = 'x';
+	clip_set(&v->e, clip, 1);				/* owns clip */
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_PASTE) == 1);
+
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_CUT) == 0);	/* no selection */
+	v->e.sel_active = 1;
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_CUT) == 1);
+
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_FIND_NEXT) == 0);
+	v->e.last_find[0] = 'x';
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_FIND_NEXT) == 1);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
+#ifndef VEDIT_NO_TOOLS
+/* The Compile menu is hidden with no build command and shown once one exists. */
+static void
+t_menu_hide_tools(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Cfg *cfg;
+	int ci, ri;
+
+	ci = find_menu("&Compile");
+	ri = find_menu("&Run");
+	TAP_ASSERT(t, ci >= 0 && ri >= 0);
+
+	/* no tools, no config: both tool menus hidden, their mnemonics dead */
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_CHECK(t, !menu_visible(&v->e, ci));
+	TAP_CHECK(t, !menu_visible(&v->e, ri));
+	TAP_CHECK(t, menu_col(&v->e, ci) == -1);
+	TAP_CHECK(t, menu_title_by_mnemonic(&v->e, 'c') == -1);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* a build command for C makes the Compile menu appear for a .c file */
+	cfg = cfg_from_text("[command \"c\"]\n\tbuild = make\n");
+	TAP_ASSERT(t, cfg != NULL);
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config(v, cfg);
+	vedit_set_tools(v, &fake_tools);
+	vedit_open(v, "test.c");
+	TAP_CHECK(t, menu_visible(&v->e, ci));		/* MA_MAKE is ready */
+	TAP_CHECK(t, menu_title_by_mnemonic(&v->e, 'c') == ci);
+	TAP_CHECK(t, !menu_visible(&v->e, ri));		/* no run cmd/output yet */
+	vedit_free(v);
+	memio_free(&m);
+	g_cfg = NULL;			/* editor borrowed it; drop before free */
+	vedit_cfg_free(cfg);
+}
+#endif
+
+/* With the tool and terminal menus hidden, the bar packs to the same columns as
+ * before this feature, and Help stays right-aligned. */
+static void
+t_menu_col_pack(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+
+	TAP_CHECK(t, menu_col(&v->e, find_menu("&File")) == 1);
+	TAP_CHECK(t, menu_col(&v->e, find_menu("&Edit")) == 7);
+	TAP_CHECK(t, menu_col(&v->e, find_menu("&Search")) == 13);
+	TAP_CHECK(t, menu_col(&v->e, find_menu("&View")) == 21);
+	TAP_CHECK(t, menu_col(&v->e, find_menu("&Options")) == 27);
+	TAP_CHECK(t, menu_col(&v->e, MENU_HELP) == v->e.cols - 5);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
+#ifdef VEDIT_TERM
+/* The Terminal menu follows the host's fd multiplexer, and when shown it packs
+ * into the slot the hidden Compile/Run left open. */
+static void
+t_menu_terminal(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int ti, oi, want;
+
+	ti = find_menu("&Terminal");
+	oi = find_menu("&Options");
+	TAP_ASSERT(t, ti >= 0 && oi >= 0);
+
+	/* no poll_fds: can neither open a terminal nor is one active -> hidden */
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_CHECK(t, !menu_visible(&v->e, ti));
+	TAP_CHECK(t, menu_col(&v->e, ti) == -1);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* with a multiplexing host the menu shows, packed right after Options
+	 * (Compile/Run stay hidden) */
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	memio_enable_fds(&io);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_CHECK(t, menu_visible(&v->e, ti));
+	want = menu_col(&v->e, oi) + menu_disp_w("&Options") + 2;
+	TAP_CHECKF(t, menu_col(&v->e, ti) == want,
+	    "terminal col %d, want %d", menu_col(&v->e, ti), want);
+	vedit_free(v);
+	memio_free(&m);
+}
+#endif
+
 const Case tap_cases[] = {
 	{ "resize_grid", t_resize_grid },
 	{ "resize_signal", t_resize_signal },
@@ -1758,9 +1919,15 @@ const Case tap_cases[] = {
 	{ "pick_symbol_choose", t_pick_symbol_choose },
 	{ "pick_symbol_cancel", t_pick_symbol_cancel },
 	{ "pick_open_entry", t_pick_open_entry },
+	{ "menu_item_enabled", t_menu_item_enabled },
+	{ "menu_col_pack", t_menu_col_pack },
 #ifndef VEDIT_NO_TOOLS
 	{ "tool_f9_make", t_tool_f9_make },
 	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },
+	{ "menu_hide_tools", t_menu_hide_tools },
+#endif
+#ifdef VEDIT_TERM
+	{ "menu_terminal", t_menu_terminal },
 #endif
 	{ NULL, NULL },
 };

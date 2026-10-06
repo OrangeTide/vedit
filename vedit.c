@@ -7526,6 +7526,9 @@ typedef enum menu_act {
 #ifndef VEDIT_NO_TOOLS
 	MA_COMPILE, MA_MAKE, MA_RUN, MA_VIEW_OUTPUT, MA_ERR_NEXT, MA_ERR_PREV,
 #endif
+#ifdef VEDIT_TERM
+	MA_TERM_NEW, MA_TERM_CLOSE,
+#endif
 	MA_HELP, MA_TUTORIAL, MA_ABOUT,
 } Menuact;
 
@@ -7542,7 +7545,6 @@ typedef struct menu_item {
 
 typedef struct menu_def {
 	const char	*title;
-	int		col;		/* start column on the bar (Help: dynamic) */
 	const Menuitem *items;
 	int		n;
 } Menu;
@@ -7611,28 +7613,49 @@ static const Menuitem mi_run[] = {
 	{ "&Prev Error",	"Shift+F4",	"",	MA_ERR_PREV },
 };
 #endif
+#ifdef VEDIT_TERM
+static const Menuitem mi_term[] = {
+	{ "&New Terminal",	"",	"",	MA_TERM_NEW },
+	{ "&Close Terminal",	"",	"",	MA_TERM_CLOSE },
+};
+#endif
 static const Menuitem mi_help[] = {
 	{ "&Key Bindings",	"F1",	"",	MA_HELP },
 	{ "&Tutorial",		"",	"",	MA_TUTORIAL },
 	{ "&About",		"",	"",	MA_ABOUT },
 };
 
+/* Bar columns are computed left-to-right over the visible menus (menu_col), so
+ * the table carries no fixed column. */
 #define MENU_ITEMS(a) (a), (int)(sizeof(a) / sizeof((a)[0]))
 static const Menu MENUS[] = {
-	{ "&File",	1,	MENU_ITEMS(mi_file) },
-	{ "&Edit",	7,	MENU_ITEMS(mi_edit) },
-	{ "&Search",	13,	MENU_ITEMS(mi_search) },
-	{ "&View",	21,	MENU_ITEMS(mi_view) },
-	{ "&Options",	27,	MENU_ITEMS(mi_options) },
+	{ "&File",	MENU_ITEMS(mi_file) },
+	{ "&Edit",	MENU_ITEMS(mi_edit) },
+	{ "&Search",	MENU_ITEMS(mi_search) },
+	{ "&View",	MENU_ITEMS(mi_view) },
+	{ "&Options",	MENU_ITEMS(mi_options) },
 #ifndef VEDIT_NO_TOOLS
-	{ "&Compile",	36,	MENU_ITEMS(mi_compile) },
-	{ "&Run",	45,	MENU_ITEMS(mi_run) },
+	{ "&Compile",	MENU_ITEMS(mi_compile) },
+	{ "&Run",	MENU_ITEMS(mi_run) },
 #endif
-	{ "&Help",	0,	MENU_ITEMS(mi_help) },	/* col set dynamically */
+#ifdef VEDIT_TERM
+	{ "&Terminal",	MENU_ITEMS(mi_term) },
+#endif
+	{ "&Help",	MENU_ITEMS(mi_help) },
 };
 #undef MENU_ITEMS
 #define MENU_COUNT ((int)(sizeof(MENUS) / sizeof(MENUS[0])))
 #define MENU_HELP (MENU_COUNT - 1)
+
+/* Per-item context state (menu_item_enabled) and whole-menu visibility
+ * (menu_visible), defined below after the toggle-state helper; the menu layout
+ * and navigation above consult them. The command-template helper they need is
+ * defined much later. */
+static int menu_item_enabled(const Editor *e, Menuact act);
+static int menu_visible(const Editor *e, int i);
+#ifndef VEDIT_NO_TOOLS
+static const char *tool_template(const Editor *e, const char *which);
+#endif
 
 /* A menu title or item label may mark its mnemonic with '&' before the chosen
  * letter (DOS style: the highlighted key that selects the entry). A literal
@@ -7694,39 +7717,52 @@ ui_menu_label(Screen *d, int r, int c, const char *s,
 	return c;
 }
 
-/* Top-level menu whose title mnemonic is lc (a lowercased letter), or -1. */
+/* Top-level menu whose title mnemonic is lc (a lowercased letter), or -1.
+ * A hidden menu never matches. */
 static int
-menu_title_by_mnemonic(int lc)
+menu_title_by_mnemonic(const Editor *e, int lc)
 {
 	int i;
 
 	for (i = 0; i < MENU_COUNT; i++)
-		if (menu_mnemonic(MENUS[i].title) == lc)
+		if (menu_visible(e, i) && menu_mnemonic(MENUS[i].title) == lc)
 			return i;
 	return -1;
 }
 
-/* Selectable item of menu m whose mnemonic is lc, or -1. Separators never
- * match. */
+/* Selectable item of menu m whose mnemonic is lc, or -1. Separators and
+ * disabled items never match. */
 static int
-menu_item_by_mnemonic(int m, int lc)
+menu_item_by_mnemonic(const Editor *e, int m, int lc)
 {
 	int i;
 
 	for (i = 0; i < MENUS[m].n; i++)
 		if (MENUS[m].items[i].act != MA_SEP &&
+		    menu_item_enabled(e, MENUS[m].items[i].act) &&
 		    menu_mnemonic(MENUS[m].items[i].label) == lc)
 			return i;
 	return -1;
 }
 
-/* Bar column of menu i; Help is right-aligned. */
+/* Bar column of menu i, packing the visible menus left to right from column 1
+ * with a two-cell gap; Help is right-aligned. A hidden menu returns -1 so the
+ * bar draw and the hit test skip it. */
 static int
 menu_col(const Editor *e, int i)
 {
+	int x = 1, j;
+
 	if (i == MENU_HELP)
 		return e->cols - 5;
-	return MENUS[i].col;
+	if (!menu_visible(e, i))
+		return -1;
+	for (j = 0; j < i; j++) {
+		if (j == MENU_HELP || !menu_visible(e, j))
+			continue;
+		x += menu_disp_w(MENUS[j].title) + 2;
+	}
+	return x;
 }
 
 /* Which top-level menu title column x falls on, or -1. */
@@ -7736,8 +7772,11 @@ menu_hit(const Editor *e, int x)
 	int i;
 
 	for (i = 0; i < MENU_COUNT; i++) {
-		int c = menu_col(e, i);
+		int c;
 
+		if (!menu_visible(e, i))
+			continue;
+		c = menu_col(e, i);
 		if (x >= c && x < c + menu_disp_w(MENUS[i].title))
 			return i;
 	}
@@ -7829,6 +7868,86 @@ menu_checked(const Editor *e, Menuact act)
 	}
 }
 
+#ifndef VEDIT_NO_TOOLS
+/* Whether a build/run command can actually run now: a tool runner is installed
+ * and a command.<lang>.<which> is configured for this file. Mirrors the two
+ * no-op checks ed_tool_run makes at execution time. */
+static int
+tool_cmd_ready(const Editor *e, const char *which)
+{
+	const char *t;
+
+	if (!e->tools || (!e->tools->run_capture && !e->tools->run_foreground))
+		return 0;
+	t = tool_template(e, which);
+	return t && t[0];
+}
+#endif
+
+/* Whether a menu action is meaningful in the current context. Drives graying an
+ * item in the drop-down and, through menu_visible, hiding a whole menu whose
+ * every item is disabled. The counterpart of menu_checked for a different
+ * attribute. Actions not listed are always available. */
+static int
+menu_item_enabled(const Editor *e, Menuact act)
+{
+	switch (act) {
+	case MA_NONE:
+	case MA_SEP:
+		return 0;		/* never selectable */
+	case MA_UNDO:
+		return text_can_undo(e->t);
+	case MA_REDO:
+		return text_can_redo(e->t);
+	case MA_CUT:
+		return e->sel_active;
+	case MA_PASTE:
+		return e->clip && e->clip_len > 0;
+	case MA_OSC_COPY_FILE:
+		return text_lines(e->t) > 0;
+	case MA_FIND_NEXT:
+		return e->last_find[0] != '\0';
+	case MA_TAG_POP:
+		return e->tag_sp > 0;
+#ifndef VEDIT_NO_TOOLS
+	case MA_COMPILE:
+		return tool_cmd_ready(e, "compile");
+	case MA_MAKE:
+		return tool_cmd_ready(e, "build");
+	case MA_RUN:
+		return tool_cmd_ready(e, "run");
+	case MA_VIEW_OUTPUT:
+		return e->tool_nlines > 0;
+	case MA_ERR_NEXT:
+	case MA_ERR_PREV:
+		return e->tool_nerr > 0;
+#endif
+#ifdef VEDIT_TERM
+	case MA_TERM_NEW:
+		return e->d->t->io.poll_fds != NULL;
+	case MA_TERM_CLOSE:
+		return term_is_active(e);
+#endif
+	default:
+		return 1;
+	}
+}
+
+/* A top-level menu is shown on the bar only when at least one of its items is
+ * enabled now. Help is always shown. */
+static int
+menu_visible(const Editor *e, int i)
+{
+	int k;
+
+	if (i == MENU_HELP)
+		return 1;
+	for (k = 0; k < MENUS[i].n; k++)
+		if (menu_item_enabled(e, MENUS[i].items[k].act))
+			return 1;
+	return 0;
+}
+
 static void
 ui_dropdown(Editor *e, int mi, int sel)
 {
@@ -7858,6 +7977,7 @@ ui_dropdown(Editor *e, int mi, int sel)
 		const char *accel;
 		int row = y + 1 + i;
 		uint16_t at = base;
+		int enabled;
 
 		scr_cell(d, row, x, GL_V, fg, bg, base);
 		scr_cell(d, row, x + boxw - 1, GL_V, fg, bg, base);
@@ -7869,8 +7989,11 @@ ui_dropdown(Editor *e, int mi, int sel)
 				    base);
 			continue;
 		}
-		if (i == sel)
+		enabled = menu_item_enabled(e, it->act);
+		if (i == sel && enabled)
 			at = base ^ ATTR_REVERSE;	/* highlight bar */
+		else if (!enabled)
+			at = base | ATTR_DIM;		/* grayed, not selectable */
 		scr_fill(d, row, x + 1, w, ' ', fg, bg, at);
 		if (menu_checked(e, it->act) == 1)
 			scr_cell(d, row, x + 1, GL_CHECK, fg, bg, at);
@@ -14351,7 +14474,7 @@ dlg_about(Editor *e)
 
 /* The syntax language name that keys [command "<lang>"], or NULL. */
 static const char *
-tool_lang(Editor *e)
+tool_lang(const Editor *e)
 {
 	if (e->syn && e->syn->name && e->syn->name[0])
 		return e->syn->name;
@@ -14360,7 +14483,7 @@ tool_lang(Editor *e)
 
 /* command.<lang>.<which> from the config, or NULL. */
 static const char *
-tool_template(Editor *e, const char *which)
+tool_template(const Editor *e, const char *which)
 {
 	const char *lang = tool_lang(e);
 	char key[128];
@@ -15328,6 +15451,19 @@ run_menu_act(Editor *e, Menuact act)
 		run_tool_cmd(e, CMD_ERR_PREV);
 		break;
 #endif
+#ifdef VEDIT_TERM
+	case MA_TERM_NEW:
+		term_open(e, NULL);		/* re-checks the fd multiplexer */
+		break;
+	case MA_TERM_CLOSE:
+		if (!term_is_active(e))
+			break;
+		if (e->nbuf > 1)
+			buf_close(e, e->cur);
+		else
+			set_status(e, "cannot close the last buffer");
+		break;
+#endif
 	case MA_HELP:
 		dlg_help(e);
 		break;
@@ -15345,31 +15481,55 @@ run_menu_act(Editor *e, Menuact act)
 }
 
 
-/* First selectable item in menu m (skips a leading separator). */
+/* Whether item i of menu m can be selected (not a separator, enabled now). */
 static int
-menu_first(int m)
+menu_item_sel_ok(const Editor *e, int m, int i)
+{
+	Menuact act = MENUS[m].items[i].act;
+
+	return act != MA_SEP && menu_item_enabled(e, act);
+}
+
+/* First selectable item in menu m (skips separators and disabled items). */
+static int
+menu_first(const Editor *e, int m)
 {
 	int i;
 
 	for (i = 0; i < MENUS[m].n; i++)
-		if (MENUS[m].items[i].act != MA_SEP)
+		if (menu_item_sel_ok(e, m, i))
 			return i;
 	return 0;
 }
 
-/* Step the selection within menu m by dir, skipping separators and wrapping. */
+/* Step the selection within menu m by dir, skipping separators and disabled
+ * items and wrapping. */
 static int
-menu_step(int m, int sel, int dir)
+menu_step(const Editor *e, int m, int sel, int dir)
 {
 	int n = MENUS[m].n;
 	int i;
 
 	for (i = 0; i < n; i++) {
 		sel = (sel + dir + n) % n;
-		if (MENUS[m].items[sel].act != MA_SEP)
+		if (menu_item_sel_ok(e, m, sel))
 			break;
 	}
 	return sel;
+}
+
+/* Next/previous VISIBLE top menu from cur, wrapping. */
+static int
+menu_nav(const Editor *e, int cur, int dir)
+{
+	int i;
+
+	for (i = 0; i < MENU_COUNT; i++) {
+		cur = (cur + dir + MENU_COUNT) % MENU_COUNT;
+		if (menu_visible(e, cur))
+			break;
+	}
+	return cur;
 }
 
 /* Run the menu bar with menu `start` open. Returns the chosen action, or
@@ -15386,7 +15546,9 @@ menu_bar_run(Editor *e, int start, int open)
 		cur = 0;
 	if (cur >= MENU_COUNT)
 		cur = MENU_COUNT - 1;
-	sel = menu_first(cur);
+	if (!menu_visible(e, cur))		/* land on a shown menu */
+		cur = menu_nav(e, cur, 1);
+	sel = menu_first(e, cur);
 
 	for (;;) {
 		Event ev;
@@ -15422,7 +15584,7 @@ menu_bar_run(Editor *e, int start, int open)
 				if (m < 0)
 					return MA_NONE;	/* off a title: close */
 				cur = m;
-				sel = menu_first(cur);
+				sel = menu_first(e, cur);
 				continue;
 			}
 			/* click inside the open drop-down selects an item */
@@ -15432,7 +15594,7 @@ menu_bar_run(Editor *e, int start, int open)
 			item = ev.key.y - (y0 + 1);
 			if (ev.key.x > x0 && ev.key.x < x0 + boxw - 1 &&
 			    item >= 0 && item < MENUS[cur].n &&
-			    MENUS[cur].items[item].act != MA_SEP)
+			    menu_item_sel_ok(e, cur, item))
 				return MENUS[cur].items[item].act;
 			return MA_NONE;		/* click elsewhere closes */
 		}
@@ -15443,11 +15605,11 @@ menu_bar_run(Editor *e, int start, int open)
 		ch = ev.key.ch;
 		if ((ev.key.mod & TKBD_MOD_ALT) && ch != TKBD_CH_NONE &&
 		    ch < 128) {
-			int m = menu_title_by_mnemonic(tolower((int)ch));
+			int m = menu_title_by_mnemonic(e, tolower((int)ch));
 
 			if (m >= 0) {
 				cur = m;
-				sel = menu_first(cur);
+				sel = menu_first(e, cur);
 				menu_open = 1;
 			}
 			continue;
@@ -15461,32 +15623,32 @@ menu_bar_run(Editor *e, int start, int open)
 			}
 			return MA_NONE;		/* armed bar: Esc leaves the menu */
 		case TKBD_KEY_LEFT:
-			cur = (cur - 1 + MENU_COUNT) % MENU_COUNT;
-			sel = menu_first(cur);
+			cur = menu_nav(e, cur, -1);
+			sel = menu_first(e, cur);
 			break;
 		case TKBD_KEY_RIGHT:
-			cur = (cur + 1) % MENU_COUNT;
-			sel = menu_first(cur);
+			cur = menu_nav(e, cur, 1);
+			sel = menu_first(e, cur);
 			break;
 		case TKBD_KEY_UP:
 			if (menu_open)
-				sel = menu_step(cur, sel, -1);
+				sel = menu_step(e, cur, sel, -1);
 			else
 				menu_open = 1;	/* open the armed menu */
 			break;
 		case TKBD_KEY_DOWN:
 			if (menu_open)
-				sel = menu_step(cur, sel, 1);
+				sel = menu_step(e, cur, sel, 1);
 			else {
 				menu_open = 1;	/* open the armed menu */
-				sel = menu_first(cur);
+				sel = menu_first(e, cur);
 			}
 			break;
 		case TKBD_KEY_ENTER:
 			if (!menu_open) {
 				menu_open = 1;	/* open the armed menu */
-				sel = menu_first(cur);
-			} else if (MENUS[cur].items[sel].act != MA_SEP) {
+				sel = menu_first(e, cur);
+			} else if (menu_item_sel_ok(e, cur, sel)) {
 				return MENUS[cur].items[sel].act;
 			}
 			break;
@@ -15498,15 +15660,16 @@ menu_bar_run(Editor *e, int start, int open)
 			    (ev.key.mod & (TKBD_MOD_CTRL | TKBD_MOD_ALT)))
 				break;
 			if (!menu_open) {
-				int m = menu_title_by_mnemonic(tolower((int)ch));
+				int m = menu_title_by_mnemonic(e,
+				    tolower((int)ch));
 
 				if (m >= 0) {
 					cur = m;
-					sel = menu_first(cur);
+					sel = menu_first(e, cur);
 					menu_open = 1;
 				}
 			} else {
-				int it = menu_item_by_mnemonic(cur,
+				int it = menu_item_by_mnemonic(e, cur,
 				    tolower((int)ch));
 
 				if (it >= 0)
@@ -15520,7 +15683,7 @@ menu_bar_run(Editor *e, int start, int open)
 /* Which menu a keypress opens, or -1 for none. F10 opens the bar; Alt+letter
  * opens the matching menu. */
 static int
-menu_trigger(const struct tkbd_seq *seq)
+menu_trigger(const Editor *e, const struct tkbd_seq *seq)
 {
 	uint32_t ch;
 
@@ -15530,7 +15693,7 @@ menu_trigger(const struct tkbd_seq *seq)
 		return 0;
 	ch = seq->ch;
 	if ((seq->mod & TKBD_MOD_ALT) && ch != TKBD_CH_NONE && ch < 128)
-		return menu_title_by_mnemonic(tolower((int)ch));
+		return menu_title_by_mnemonic(e, tolower((int)ch));
 	return -1;
 }
 
@@ -16161,7 +16324,7 @@ editor_loop(Editor *e)
 		/* F10 or Alt+letter opens the menu bar. It takes over input
 		 * until an item is chosen or Esc backs out. */
 		{
-			int mi = menu_trigger(&seq);
+			int mi = menu_trigger(e, &seq);
 
 			if (mi >= 0) {
 				/* F10 arms the bar (a letter then opens a menu);
