@@ -25887,15 +25887,25 @@ art_new(int rows, int cols)
 	return a;
 }
 
-/* Replay file bytes into the grid. */
+/* Replay file bytes into the grid. A bare LF counts as a newline, as it
+ * does in any text file (and in what the export writes), where the emulator
+ * alone would only move down: it is fed as CR LF. */
 static int
 art_import(Art *a, const char *bytes, size_t n)
 {
 	struct vt_parse *p = vt_parse_new(vt_ops_default(), a->vt);
+	size_t i, run = 0;
 
 	if (!p)
 		return -1;
-	vt_parse_feed(p, bytes, n);
+	for (i = 0; i < n; i++) {
+		if (bytes[i] != '\n' || (i > 0 && bytes[i - 1] == '\r'))
+			continue;
+		vt_parse_feed(p, bytes + run, i - run);
+		vt_parse_feed(p, "\r\n", 2);
+		run = i + 1;
+	}
+	vt_parse_feed(p, bytes + run, n - run);
 	vt_parse_free(p);
 	return 0;
 }

@@ -102,6 +102,34 @@ EOF
 	printf '\n'
 } > "$work/term.txt"
 
+# A spreadsheet-ish CSV for the table view: a header row, quoted fields with
+# commas inside, and columns of different widths for :colwidth fit to size.
+cat > "$work/parts.csv" <<'EOF'
+sku,part,qty,unit,supplier,notes
+RB-1024,"Ring buffer, 1K",12,4.50,Acme Metals,"spare, boxed"
+RB-4096,"Ring buffer, 4K",3,9.75,Acme Metals,
+LX-0001,Lexer,1,120.00,"Parsers, Inc.",prototype
+PS-0002,Parser,1,180.00,"Parsers, Inc.","needs lexer"
+EV-0003,Evaluator,2,95.00,Northwind,
+CB-0100,Cable,40,1.20,Northwind,"1 m, black"
+CB-0300,Cable,15,2.40,Northwind,"3 m, black"
+SW-0010,Switch,8,3.10,Acme Metals,momentary
+LD-0020,LED,100,0.08,Lumen Co,red
+LD-0021,LED,100,0.08,Lumen Co,green
+PB-0007,Power brick,4,22.00,Northwind,"12 V, 2 A"
+EOF
+
+# A small piece of coloured text art for the art view, written as the SGR
+# sequences a .ans file carries (UTF-8 glyphs, since the view edits Unicode).
+{
+	printf '\033[1;33m\342\225\224\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\227\033[0m\n'
+	printf '\033[1;33m\342\225\221\033[0m \033[1;36m\342\226\210\342\226\200\342\226\210 \342\226\210\342\226\200\342\226\200 \342\226\210\342\226\200\342\226\204 \342\226\210 \342\226\200\342\226\210\342\226\200\033[0m \033[1;33m\342\225\221\033[0m\n'
+	printf '\033[1;33m\342\225\221\033[0m \033[36m\342\226\200\342\226\204\342\226\200 \342\226\210\342\226\204\342\226\204 \342\226\210\342\226\204\342\226\200 \342\226\210  \342\226\210 \033[0m \033[1;33m\342\225\221\033[0m\n'
+	printf '\033[1;33m\342\225\232\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\235\033[0m\n'
+	printf '\033[41m  \033[43m  \033[42m  \033[46m  \033[44m  \033[45m  \033[47m  \033[0m \033[1;31mr\033[1;33me\033[1;32md\033[1;36m \033[1;34mb\033[1;35mo\033[1;37mx\033[0m\n'
+	printf '\033[2m\342\226\221\342\226\221\033[0m\342\226\222\342\226\222\033[1m\342\226\223\342\226\223\342\226\210\342\226\210\033[0m shades\n'
+} > "$work/logo.ans"
+
 # A build command for C, so the context-sensitive Compile and Run menus are
 # present in the shots (they hide when no command is configured for the file).
 cat > "$work/veditrc" <<'EOF'
@@ -121,7 +149,9 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 
 export DISPLAY=$disp
-export TERM=xterm-256color COLORTERM=truecolor
+# xterm sets TERM itself (see -tn below) and strips COLORTERM, so the editor's
+# colour depth comes from its own VEDIT_COLORS, which xterm passes through.
+export VEDIT_COLORS=256
 export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 export VEDIT_CONFIG=$work/veditrc
 
@@ -135,6 +165,7 @@ render() {
 	    -xrm 'XTerm*allowSendEvents: true' \
 	    -xrm 'XTerm*metaSendsEscape: true' \
 	    -xrm 'XTerm*cursorBlink: false' \
+	    -tn xterm-256color \
 	    -e "$vedit" "$(basename "$file")" &
 	xterm_pid=$!
 	sleep 2
@@ -176,5 +207,20 @@ render "$here/shot-draw.png" pipeline.txt \
 # and the editor draws it in its own frame, with the OSC title as the label.
 render "$here/shot-term.png" ring.c \
     F2 "colon t e r m i n a l space c a t space t e r m period t x t Return"
+
+# The pane: the same build log runs under the text with :split cat term.txt.
+# A new pane leaves the focus in the file, so the cursor stays on line 1.
+render "$here/shot-pane.png" ring.c \
+    F2 "colon s p l i t space c a t space t e r m period t x t Return"
+
+# The table view: a .csv opens as a grid. :colwidth fit all sizes every column
+# to its cells, then the cursor moves to the quoted supplier on row 4.
+render "$here/shot-table.png" parts.csv \
+    F2 "colon c o l w i d t h space f i t space a l l Return" \
+    "Down Down Down Right Right Right Right"
+
+# The art view: a .ans opens as a cell grid; the status line shows the pen.
+render "$here/shot-art.png" logo.ans \
+    "Down Down Down Down Right Right Right Right"
 
 exit 0

@@ -1373,6 +1373,18 @@ t_art_roundtrip(Test *t)
 	TAP_CHECK(t, c->codepoint == ' ' && c->bg.type == COLOR_INDEXED &&
 	    c->bg.index == 4);
 
+	/* a bare LF starts the next row at column 0, as CR LF does */
+	{
+		Art *lf = art_new(4, 8);
+
+		TAP_ASSERT(t, lf != NULL);
+		TAP_CHECK(t, art_import(lf, "ab\ncd\r\nef\n", 11) == 0);
+		TAP_CHECK(t, art_cell(lf, 1, 0)->codepoint == 'c' &&
+		    art_cell(lf, 2, 0)->codepoint == 'e' &&
+		    art_cell(lf, 1, 2)->codepoint == ' ');
+		art_free(lf);
+	}
+
 	/* the frame shows the cells with their colours */
 	ed_render(&v->e, v->e.d);
 	sb = v->e.d->t;

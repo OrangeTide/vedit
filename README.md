@@ -999,7 +999,9 @@ from the text and from a terminal in the pane. Open a shell there with `Ctrl-W s
 Split Terminal, or the vi command `:split`; `:split cmd` runs `cmd` in the pane
 instead, as `:terminal cmd` would (`tail -f build.log`, say). A new pane leaves
 the focus in the file, so the keys you type next still edit it; `Ctrl-W w` (or
-`Ctrl-W s` again) moves into the shell. The build commands
+`Ctrl-W s` again) moves into the shell.
+
+![A build log in the pane under the file being edited](docs/shot-pane.png) The build commands
 put their output there by default. `Ctrl-W b`, Terminal > Buffer in Pane, or
 `:sbuffer [N]` shows the current text buffer (or buffer N) in the pane, with the
 buffer last on top, else the previous one, above it.
@@ -1084,7 +1086,11 @@ background and attributes, so coloured art renders the way a terminal would
 show it. Saving writes the grid back as UTF-8 with the SGR colour sequences
 that reproduce it, one line per row, so `cat file.ans` still shows the picture.
 The art view needs the terminal emulator (it is not in a `VEDIT_NO_TERM` build)
-and the status line shows `-- ART --` while it is active.
+and the status line shows `-- ART --` while it is active. A file that ends its
+lines with a bare LF, as the editor's own files do, replays the same as one with
+CR LF.
+
+![Coloured text art in the art view, with the pen's colours on the status line](docs/shot-art.png)
 
 The editing model is draw mode's, applied to cells:
 
@@ -1134,6 +1140,8 @@ delimiter, doubled quotes and newlines; a record whose quoted field spans
 several lines of the file is joined into one buffer line on open (the newline
 is just a byte in the line) and saved back as it was. A UTF-8 byte order mark
 at the start of the file is kept and is not part of cell A1.
+
+![A CSV file in the table view, columns fitted to their cells](docs/shot-table.png)
 
 The delimiter comes from the extension (`.tsv` and `.tab` are tab files, which
 never quote) or, for `.csv`, from sniffing the first lines for the most
@@ -1314,10 +1322,12 @@ entirely.
 vedit has a text buffer with undo and redo, the modeless and vi personalities,
 the MS-EDIT chrome (menu bar, frame, scrollbars, dialogs), regex find and
 replace, selection and an internal clipboard, goto-line, multiple buffers, a hex
-view, a 2D/block draw mode, an art view for coloured .ans files, a table view
-for CSV and TSV, per-language build commands with a quickfix error list,
-selectable line endings (LF, CRLF, NUL), tab display with auto-indent and
-tab/space conversion, a symbol picker that merges a buffer scan with a ctags
+view, a 2D/block draw mode with glyph and colour palettes, an art view for
+coloured .ans files, a table view for CSV and TSV with sorting, per-language
+build commands with a quickfix error list, a pane under the text for a shell,
+a build or a second buffer, selectable line endings (LF, CRLF, NUL), tab
+display with a per-buffer ruler of tab stops, auto-indent and tab/space
+conversion, a symbol picker that merges a buffer scan with a ctags
 tags file, terminal buffers running a shell or a build through a built-in VT
 emulator, and lightweight syntax highlighting. It draws through a
 self-contained ANSI renderer over the io vtable, and decodes the keyboard with
