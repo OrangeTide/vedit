@@ -6392,6 +6392,7 @@ typedef struct ebuf {
 	size_t		vi_mark_x[MARK_SLOTS];
 	uint64_t	vi_marks_set;
 	char		swap_path[PATH_MAX];	/* this buffer's swap file, or "" */
+	char		vcs[48];	/* "name:branch*" from the VCS, or "" */
 	int		swap_on;	/* a swap file exists on disk for it */
 	size_t		swap_rev;	/* text rev at the last swap write */
 	time_t		load_mtime;	/* file mtime at load (swap staleness check) */
@@ -6548,6 +6549,7 @@ typedef struct editor {
 	int		backup_enabled;	/* keep the previous version on save */
 	int		format_on_save;	/* run the format command before each save */
 	char		swap_path[PATH_MAX];	/* active buffer's swap file, or "" */
+	char		vcs[48];	/* active buffer's "name:branch*", or "" */
 	int		swap_on;	/* a swap file exists on disk for it */
 	size_t		swap_rev;	/* text rev at the last swap write */
 	time_t		load_mtime;	/* file mtime at load (swap staleness check) */
@@ -8921,6 +8923,7 @@ static int glyph_alt_key(Editor *e, const struct tkbd_seq *seq);
 static int ed_reload_config(Editor *e);
 static void ed_edit_config(Editor *e);
 static void ed_insert_date(Editor *e);
+static void vcs_refresh(Editor *e);
 static void ed_insert_file(Editor *e);
 static Req vi_ex_read_file(Editor *e, size_t at, const char *fn);
 
@@ -9717,6 +9720,9 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 		scr_text(e->d, row, 1, mode, p->bar_fg, p->bar_bg, at);
 		scr_text(e->d, row, 1 + (int)strlen(mode), "F1=Help",
 		    p->bar_fg, p->bar_bg, at);
+		if (e->vcs[0])
+			scr_text(e->d, row, 1 + (int)strlen(mode) + 9, e->vcs,
+			    p->bar_fg, p->bar_bg, at);
 		}
 #ifdef VEDIT_TERM
 		if (e->art)		/* a swatch of the pen */
@@ -15258,6 +15264,7 @@ save_named(Editor *e)
 		return -1;
 	}
 	set_status(e, "wrote %.120s", e->path);
+	vcs_refresh(e);
 	if (e->cfg_path[0] && buf_same_file(e->path, e->cfg_path) &&
 	    ed_reload_config(e) == 0)
 		set_status(e, "wrote %.100s, config reloaded", e->path);
@@ -16382,7 +16389,7 @@ buffer_reset(Editor *e)
 	X(load_mtime) X(kind) X(vterm) X(in_pane) X(top_last) X(art) X(tbl) X(tabs) \
 	BUF_MAIL_SCALARS(X)
 #define BUF_STATE_ARRAYS(X) \
-	X(path) X(vi_mark_y) X(vi_mark_x) X(swap_path)
+	X(path) X(vi_mark_y) X(vi_mark_x) X(swap_path) X(vcs)
 
 /* Copy the active buffer's per-file fields into a slot. */
 static void
@@ -16453,6 +16460,7 @@ buf_switch(Editor *e, int i)
 	buf_save(e, &e->bufs[e->cur]);
 	e->cur = i;
 	buf_load(e, &e->bufs[i]);
+	vcs_refresh(e);
 }
 
 int
@@ -16560,6 +16568,7 @@ buf_open(Editor *e, const char *path)
 	art_sync_file(e);
 #endif
 	tbl_sync_file(e);
+	vcs_refresh(e);
 	e->sel_active = 0;
 	e->line_state = NULL;
 	e->line_state_cap = 0;
@@ -19873,6 +19882,7 @@ ed_open(Editor *e)
 		art_sync_file(e);
 #endif
 		tbl_sync_file(e);
+		vcs_refresh(e);
 		mail_detach(e);
 		swap_adopt(e, mt, action);
 		buf_save(e, &e->bufs[e->cur]);
@@ -20989,6 +20999,151 @@ tool_build_dir(Editor *e, char *out, size_t outsz)
 		snprintf(out, outsz, "%s", dir);
 }
 
+
+/****************************************************************
+ * Version control status: the branch and a changed mark for the
+ * active file in the status bar, found by asking the VCS through
+ * the tool runner. A [vcs "<name>"] section holds two command
+ * templates: branch prints the branch (or fails outside a working
+ * copy) and status prints a porcelain line for the file (nothing
+ * when it is clean, "??" for untracked). git is built in; another
+ * system needs only its two lines in the config. The configured
+ * systems are tried in file order, then git, and the first whose
+ * branch command succeeds wins. The lookup runs on open, save and
+ * buffer switch, never on a timer, so a slow repository cannot
+ * stall typing. vcs.enable = off turns it off.
+ ****************************************************************/
+
+#define VCS_NAMES_MAX 8
+
+struct vcsbuf {
+	char	s[160];
+	size_t	len;
+};
+
+static void
+vcs_emit(void *sink, const char *buf, size_t n)
+{
+	struct vcsbuf *b = sink;
+
+	if (n > sizeof(b->s) - 1 - b->len)
+		n = sizeof(b->s) - 1 - b->len;
+	memcpy(b->s + b->len, buf, n);
+	b->len += n;
+	b->s[b->len] = '\0';
+}
+
+/* Run a template for the active file and keep the first output line,
+ * trimmed. Returns the exit status, or -1 when it could not run. */
+static int
+vcs_run(Editor *e, const char *tmpl, const char *dir, char *out, size_t outsz)
+{
+	struct vcsbuf b;
+	char *cmd = tool_expand(tmpl, e->path);
+	size_t n;
+	int rc;
+
+	out[0] = '\0';
+	if (!cmd)
+		return -1;
+	b.len = 0;
+	b.s[0] = '\0';
+	rc = e->tools->run_capture(e->tools->ctx, cmd, dir, vcs_emit, &b);
+	free(cmd);
+	n = strcspn(b.s, "\r\n");
+	while (n > 0 && isspace((unsigned char)b.s[n - 1]))
+		n--;
+	if (n >= outsz)
+		n = outsz - 1;
+	memcpy(out, b.s, n);
+	out[n] = '\0';
+	return rc;
+}
+
+/* The template for vcs.<name>.<which>: the config, else git's built-in. */
+static const char *
+vcs_template(const char *name, const char *which)
+{
+	char key[128];
+	const char *s;
+
+	snprintf(key, sizeof(key), "vcs.%s.%s", name, which);
+	s = cfg_proj_get(key);
+	if (s && s[0])
+		return s;
+	if (strcmp(name, "git") != 0)
+		return NULL;
+	if (strcmp(which, "branch") == 0)
+		return "git symbolic-ref --short -q HEAD || "
+		    "git rev-parse --short HEAD";
+	if (strcmp(which, "status") == 0)
+		return "git status --porcelain -- $(file)";
+	return NULL;
+}
+
+/* The configured [vcs "<name>"] sections in file order, then git. */
+static int
+vcs_names(const char *names[VCS_NAMES_MAX], char store[VCS_NAMES_MAX][32])
+{
+	int n = 0, i, k, have_git = 0;
+
+	for (i = 0; g_cfg && i < g_cfg->count && n < VCS_NAMES_MAX - 1; i++) {
+		const char *key = g_cfg->entries[i].key;
+		size_t kl = strlen(key);
+
+		if (strncmp(key, "vcs.", 4) != 0 || kl < 4 + 1 + 7 ||
+		    strcmp(key + kl - 7, ".branch") != 0 ||
+		    kl - 4 - 7 >= sizeof(store[0]))
+			continue;
+		memcpy(store[n], key + 4, kl - 4 - 7);
+		store[n][kl - 4 - 7] = '\0';
+		for (k = 0; k < n; k++)
+			if (strcmp(store[k], store[n]) == 0)
+				break;
+		if (k < n)
+			continue;
+		if (strcmp(store[n], "git") == 0)
+			have_git = 1;
+		names[n] = store[n];
+		n++;
+	}
+	if (!have_git)
+		names[n++] = "git";
+	return n;
+}
+
+/* Refresh e->vcs for the active buffer: "<name>:<branch>" with "*" after a
+ * changed file or "?" after an untracked one, or "" when no system claims
+ * the file, it has no name, or there is no tool runner. */
+static void
+vcs_refresh(Editor *e)
+{
+	const char *names[VCS_NAMES_MAX];
+	char store[VCS_NAMES_MAX][32];
+	char dir[PATH_MAX], branch[80], st[80];
+	int n, i;
+
+	e->vcs[0] = '\0';
+	if (!e->has_name || e->kind != BUF_TEXT || !e->tools ||
+	    !e->tools->run_capture || !cfg_bool(g_cfg, "vcs.enable", 1))
+		return;
+	tool_build_dir(e, dir, sizeof(dir));
+	n = vcs_names(names, store);
+	for (i = 0; i < n; i++) {
+		const char *bt = vcs_template(names[i], "branch");
+		const char *stt = vcs_template(names[i], "status");
+		const char *mark = "";
+
+		if (!bt || vcs_run(e, bt, dir, branch, sizeof(branch)) != 0 ||
+		    !branch[0])
+			continue;
+		if (stt && vcs_run(e, stt, dir, st, sizeof(st)) == 0 && st[0])
+			mark = strncmp(st, "??", 2) == 0 ? "?" : "*";
+		snprintf(e->vcs, sizeof(e->vcs), "%.8s:%.36s%s", names[i], branch,
+		    mark);
+		return;
+	}
+}
 /* A growable byte sink the filter emit callback appends to. */
 struct fmtbuf {
 	char	*buf;
@@ -21442,6 +21597,12 @@ tool_free(Editor *e)
 	tool_clear_output(e);
 }
 
+#else
+static void
+vcs_refresh(Editor *e)
+{
+	e->vcs[0] = '\0';
+}
 #endif /* VEDIT_NO_TOOLS */
 
 /* Carry out a chosen menu action. Returns 1 when the editor should quit. */
@@ -23302,6 +23463,7 @@ vedit_open(struct vedit *v, const char *path)
 	art_sync_file(&v->e);
 #endif
 	tbl_sync_file(&v->e);
+	vcs_refresh(&v->e);
 	return 0;
 }
 
@@ -23537,6 +23699,13 @@ static const char g_config_template[] =
 	"\n"
 	"[syntax]\n"
 	"#	enable = on          # highlight recognized file types\n"
+	"\n"
+	"[vcs]\n"
+	"#	enable = on          # branch and change mark in the status bar\n"
+	"\n"
+	"[vcs \"git\"]\n"
+	"#	branch = git symbolic-ref --short -q HEAD || git rev-parse --short HEAD\n"
+	"#	status = git status --porcelain -- $(file)\n"
 	"\n"
 	"[insert]\n"
 	"#	dateformat = %Y-%m-%d # strftime pattern Insert > Date starts on\n"
@@ -34750,6 +34919,7 @@ vi_ex_exec(Editor *e, char *buf)
 			art_sync_file(e);
 #endif
 			tbl_sync_file(e);
+			vcs_refresh(e);
 			set_status(e, "reloaded %.100s",
 			    e->path);
 		}

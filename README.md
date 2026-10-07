@@ -240,6 +240,13 @@ XDG layout (`-DVEDIT_NO_XDG`) uses `~/.veditrc` instead.
 [insert]
     dateformat = %Y-%m-%d  # strftime pattern Insert > Date starts on
 
+[vcs]
+    enable = on          # branch and change mark in the status bar
+
+[vcs "git"]              # built in; shown here as the pattern for others
+    branch = git symbolic-ref --short -q HEAD || git rev-parse --short HEAD
+    status = git status --porcelain -- $(file)
+
 [gitcommit]
     subject = 50         # mark a commit subject past this column
     body = 72            # and body lines past this one
@@ -999,6 +1006,31 @@ The build commands are compiled in by default and can be dropped by building wit
 Header navigation (`gf` and the `cc.file` reader) is separate and stays available.
 An embedding host supplies its own command runner (or none) through
 `vedit_set_tools`; see [Embedding in a host](#embedding-in-a-host-for-example-a-mud).
+
+### Version control status
+
+When the file you are editing sits in a git working copy, the status bar
+shows its branch after the help hint, as `git:main`, with `*` added when the
+file has uncommitted changes and `?` when git does not track it yet. The
+editor asks git through the same tool runner the build commands use, so a
+host without tools shows nothing. It asks when a file is opened, saved, or
+switched to, never on a timer, so a slow repository cannot interrupt typing.
+`vcs.enable = off` turns it off.
+
+Another system needs only two command lines in a `[vcs "<name>"]` section:
+`branch` must print the branch and fail (exit non-zero) outside a working
+copy, and `status` must print one porcelain-style line for `$(file)` when it
+has changed, `??` first when it is untracked, and nothing when it is clean.
+The configured systems are tried in the order they appear, then git, and
+the first whose `branch` command succeeds names the file. For Mercurial:
+
+```
+[vcs "hg"]
+    branch = hg branch
+    status = hg status $(file)
+```
+
+The same `[vcs "git"]` keys override the built-in git commands.
 
 ### Terminal buffers
 

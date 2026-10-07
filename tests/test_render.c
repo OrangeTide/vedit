@@ -2030,6 +2030,89 @@ t_shell_cmd(Test *t)
 	memio_free(&m);
 }
 
+/* Opening a named file asks the VCS for its branch and status through the
+ * tool runner and shows "name:branch" with a change mark in the status bar.
+ * A configured [vcs "<name>"] section is tried before the built-in git, a
+ * failing branch command means no VCS, and vcs.enable = off asks nothing. */
+static void
+t_vcs_status(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Cfg *cfg;
+
+	/* built-in git: branch "main", a modified status line */
+	g_fake_output = "main\n";
+	g_fake_rc = 0;
+	g_fake_cmd[0] = '\0';
+	memio_init(&m, "\033[C", 3, 24, 80);	/* one key, so a frame is drawn */
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_tools(v, &fake_tools);
+	vedit_open(v, "test.c");
+	TAP_CHECKF(t, strcmp(v->e.vcs, "git:main*") == 0, "vcs '%s'", v->e.vcs);
+	TAP_CHECKF(t, strcmp(g_fake_cmd, "git status --porcelain -- ./test.c") == 0,
+	    "ran '%s'", g_fake_cmd);
+	vedit_run(v);
+	TAP_CHECK(t, m.out && strstr(m.out, "git:main*") != NULL);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* untracked: "??" becomes "?"; a failing branch command: no VCS */
+	g_fake_output = "?? test.c\n";
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_tools(v, &fake_tools);
+	vedit_open(v, "test.c");
+	TAP_CHECKF(t, strcmp(v->e.vcs, "git:?? test.c?") == 0, "vcs '%s'",
+	    v->e.vcs);
+	g_fake_rc = 128;
+	vedit_open(v, "other.c");
+	TAP_CHECK(t, v->e.vcs[0] == '\0');
+	vedit_free(v);
+	memio_free(&m);
+
+	/* a configured system comes first; vcs.enable = off asks nothing */
+	g_fake_output = "default\n";
+	g_fake_rc = 0;
+	cfg = cfg_from_text("[vcs \"hg\"]\n\tbranch = hg branch\n");
+	TAP_ASSERT(t, cfg != NULL);
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config(v, cfg);
+	vedit_set_tools(v, &fake_tools);
+	vedit_open(v, "test.c");
+	TAP_CHECKF(t, strcmp(v->e.vcs, "hg:default") == 0, "vcs '%s'", v->e.vcs);
+	TAP_CHECKF(t, strcmp(g_fake_cmd, "hg branch") == 0, "ran '%s'",
+	    g_fake_cmd);
+	vedit_free(v);
+	memio_free(&m);
+	g_cfg = NULL;
+	vedit_cfg_free(cfg);
+
+	cfg = cfg_from_text("[vcs]\n\tenable = off\n");
+	TAP_ASSERT(t, cfg != NULL);
+	g_fake_cmd[0] = '\0';
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config(v, cfg);
+	vedit_set_tools(v, &fake_tools);
+	vedit_open(v, "test.c");
+	TAP_CHECK(t, v->e.vcs[0] == '\0' && g_fake_cmd[0] == '\0');
+	vedit_free(v);
+	memio_free(&m);
+	g_cfg = NULL;
+	vedit_cfg_free(cfg);
+}
+
 /* F9 (Make): the whole path end to end. The key reaches the dispatcher, the
  * per-language build command is expanded and run, the captured output is parsed
  * into the quickfix list, and the output pane renders it. The pane and then the
@@ -2051,7 +2134,8 @@ t_tool_f9_make(Test *t)
 	g_fake_cmd[0] = '\0';
 	g_fake_fg = 0;
 
-	cfg = cfg_from_text("[command \"c\"]\n\tbuild = make $(filenoext)\n");
+	cfg = cfg_from_text("[command \"c\"]\n\tbuild = make $(filenoext)\n"
+	    "[vcs]\n\tenable = off\n");	/* the save before the build would ask the VCS */
 	TAP_ASSERT(t, cfg != NULL);
 
 	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
@@ -3670,6 +3754,7 @@ const Case tap_cases[] = {
 	{ "help_scroll", t_help_scroll },
 	{ "sig_quit_unwinds", t_sig_quit_unwinds },
 #ifndef VEDIT_NO_TOOLS
+	{ "vcs_status", t_vcs_status },
 	{ "tool_f9_make", t_tool_f9_make },
 	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },
 	{ "menu_hide_tools", t_menu_hide_tools },
