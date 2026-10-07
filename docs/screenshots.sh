@@ -121,11 +121,23 @@ EOF
 
 # A small piece of coloured text art for the art view, written as the SGR
 # sequences a .ans file carries (UTF-8 glyphs, since the view edits Unicode).
+# The letters are three cells wide and three rows tall with one cell between
+# them (19 cells), so the double-line box is 23 cells across with its borders.
 {
-	printf '\033[1;33m\342\225\224\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\227\033[0m\n'
-	printf '\033[1;33m\342\225\221\033[0m \033[1;36m\342\226\210\342\226\200\342\226\210 \342\226\210\342\226\200\342\226\200 \342\226\210\342\226\200\342\226\204 \342\226\210 \342\226\200\342\226\210\342\226\200\033[0m \033[1;33m\342\225\221\033[0m\n'
-	printf '\033[1;33m\342\225\221\033[0m \033[36m\342\226\200\342\226\204\342\226\200 \342\226\210\342\226\204\342\226\204 \342\226\210\342\226\204\342\226\200 \342\226\210  \342\226\210 \033[0m \033[1;33m\342\225\221\033[0m\n'
-	printf '\033[1;33m\342\225\232\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\220\342\225\235\033[0m\n'
+	Y='\033[1;33m' C='\033[1;36m' c='\033[36m' R='\033[0m'
+	TL='\342\225\224' TR='\342\225\227' BL='\342\225\232' BR='\342\225\235'
+	H='\342\225\220' V='\342\225\221'
+	F='\342\226\210' U='\342\226\200' L='\342\226\204'	# full, upper, lower block
+	HH="$H$H$H$H$H$H$H$H$H$H$H$H$H$H$H$H$H$H$H$H$H"		# 21 of them
+	#        V         E         D         I         T
+	r1="$F $F $F$U$U $F$U$L $U$F$U $U$F$U"
+	r2="$F $F $F$U$U $F $F  $F   $F "
+	r3=" $U  $U$U$U $U$U  $U$U$U  $U "
+	printf "$Y$TL$HH$TR$R\n"
+	printf "$Y$V$R $C$r1$R $Y$V$R\n"
+	printf "$Y$V$R $C$r2$R $Y$V$R\n"
+	printf "$Y$V$R $c$r3$R $Y$V$R\n"
+	printf "$Y$BL$HH$BR$R\n"
 	printf '\033[41m  \033[43m  \033[42m  \033[46m  \033[44m  \033[45m  \033[47m  \033[0m \033[1;31mr\033[1;33me\033[1;32md\033[1;36m \033[1;34mb\033[1;35mo\033[1;37mx\033[0m\n'
 	printf '\033[2m\342\226\221\342\226\221\033[0m\342\226\222\342\226\222\033[1m\342\226\223\342\226\223\342\226\210\342\226\210\033[0m shades\n'
 } > "$work/logo.ans"
@@ -258,7 +270,7 @@ render "$here/shot-table.png" parts.csv \
 
 # The art view: a .ans opens as a cell grid; the status line shows the pen.
 render "$here/shot-art.png" logo.ans \
-    "Down Down Down Down Right Right Right Right"
+    "Down Down Down Down Down Right Right"
 
 
 # Version control: a copy of ring.c committed twice in its own repository, so
@@ -268,7 +280,10 @@ if command -v git >/dev/null 2>&1; then
 	cp ring.c "$work/repo/ring.c"
 	(
 		cd "$work/repo"
-		git init -q
+		# fixed dates, so the hashes and the shot are the same on every run
+		export GIT_AUTHOR_DATE="2026-10-07T12:00:00+0000"
+		export GIT_COMMITTER_DATE="2026-10-07T12:00:00+0000"
+		git init -q -b main
 		git -c user.name=Jon -c user.email=jon@example.org add ring.c
 		git -c user.name=Jon -c user.email=jon@example.org commit -q \
 		    -m "Ring buffer: first cut"
