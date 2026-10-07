@@ -3616,6 +3616,8 @@ static const char g_default_grammar[] =
 	"	start = bol\n"
 	"[language \"gitcommit\"]\n"
 	"	start = sbol\n"
+	"[language \"diff\"]\n"
+	"	start = bol\n"
 	"\n"
 	"[syntax]\n"
 	"	h = c\n"
@@ -3648,6 +3650,9 @@ static const char g_default_grammar[] =
 	"	SQUASH_MSG = gitcommit\n"
 	"	TAG_EDITMSG = gitcommit\n"
 	"	gitmessage = gitcommit\n"
+	"	diff = diff\n"
+	"	patch = diff\n"
+	"	rej = diff\n"
 	"\n"
 	"[color \"c\"]\n"
 	"	comment = 14\n"
@@ -4304,6 +4309,38 @@ static const char g_default_grammar[] =
 	 * past gitcommit.body (72). '#' lines are comments, and a scissors
 	 * line (">8") turns the rest of the file, the diff git appends, into
 	 * comment too. Widths come from the config through the col rules. */
+	"[color \"diff\"]\n"
+	"	add = 10\n"
+	"	del = 9\n"
+	"	hunk = 14\n"
+	"	header = 15 bold\n"
+	"[state \"diff.bol\"]\n"
+	"	color = text\n"
+	"	rule = \"+\" add recolor\n"
+	"	rule = \"-\" del recolor\n"
+	"	rule = \"@\" hunk recolor\n"
+	"	rule = \" \\n\" text\n"
+	"	rule = * header recolor\n"
+	"[state \"diff.text\"]\n"
+	"	color = text\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * text\n"
+	"[state \"diff.add\"]\n"
+	"	color = add\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * add\n"
+	"[state \"diff.del\"]\n"
+	"	color = del\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * del\n"
+	"[state \"diff.hunk\"]\n"
+	"	color = hunk\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * hunk\n"
+	"[state \"diff.header\"]\n"
+	"	color = header\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * header\n"
 	"[color \"gitcommit\"]\n"
 	"	subject = 15 bold\n"
 	"	over = 9 reverse\n"
@@ -6393,6 +6430,7 @@ typedef struct ebuf {
 	uint64_t	vi_marks_set;
 	char		swap_path[PATH_MAX];	/* this buffer's swap file, or "" */
 	char		vcs[48];	/* "name:branch*" from the VCS, or "" */
+	char		label[64];	/* title of an unnamed buffer, or "" */
 	int		swap_on;	/* a swap file exists on disk for it */
 	size_t		swap_rev;	/* text rev at the last swap write */
 	time_t		load_mtime;	/* file mtime at load (swap staleness check) */
@@ -6550,6 +6588,7 @@ typedef struct editor {
 	int		format_on_save;	/* run the format command before each save */
 	char		swap_path[PATH_MAX];	/* active buffer's swap file, or "" */
 	char		vcs[48];	/* active buffer's "name:branch*", or "" */
+	char		label[64];	/* active buffer's title when unnamed, or "" */
 	int		swap_on;	/* a swap file exists on disk for it */
 	size_t		swap_rev;	/* text rev at the last swap write */
 	time_t		load_mtime;	/* file mtime at load (swap staleness check) */
@@ -6871,6 +6910,7 @@ struct text {
 	int		eol;		/* enum eol: the line-ending style */
 	int		dirty;
 	size_t		rev;		/* bumped on every primitive mutation */
+	int		readonly;	/* every mutation is refused */
 
 	Estack	undo;
 	Estack	redo;
@@ -7565,7 +7605,7 @@ text_insert(Text *t, size_t line, size_t col,
 {
 	Erec in, inv;
 
-	if (line >= t->nlines || col > t->lines[line].len)
+	if (t->readonly || line >= t->nlines || col > t->lines[line].len)
 		return ERR;
 	if (n == 0)
 		return OK;
@@ -7587,7 +7627,7 @@ text_delete(Text *t, size_t line, size_t col, size_t n)
 {
 	Erec in, inv;
 
-	if (line >= t->nlines || col > t->lines[line].len)
+	if (t->readonly || line >= t->nlines || col > t->lines[line].len)
 		return ERR;
 	if (n == 0 || col == t->lines[line].len)
 		return OK;
@@ -7609,7 +7649,7 @@ text_split(Text *t, size_t line, size_t col)
 {
 	Erec in, inv;
 
-	if (line >= t->nlines || col > t->lines[line].len)
+	if (t->readonly || line >= t->nlines || col > t->lines[line].len)
 		return ERR;
 
 	in.op = OP_SPLIT;
@@ -7629,7 +7669,7 @@ text_join(Text *t, size_t line)
 {
 	Erec in, inv;
 
-	if (line + 1 >= t->nlines)
+	if (t->readonly || line + 1 >= t->nlines)
 		return ERR;
 
 	in.op = OP_JOIN;
@@ -8875,6 +8915,7 @@ typedef enum menu_act {
 #ifndef VEDIT_NO_TOOLS
 	MA_FORMAT,
 	MA_COMPILE, MA_MAKE, MA_RUN, MA_VIEW_OUTPUT, MA_ERR_NEXT, MA_ERR_PREV,
+	MA_VCS_LOG,
 #endif
 #ifdef VEDIT_TERM
 	MA_TERM_NEW, MA_TERM_CLOSE, MA_TERM_SPLIT, MA_PANE_BUFFER, MA_PANE_CLOSE,
@@ -9030,6 +9071,11 @@ static const Menuitem mi_run[] = {
 };
 #endif
 #ifdef VEDIT_TERM
+#ifndef VEDIT_NO_TOOLS
+static const Menuitem mi_vcs[] = {
+	{ "&History...",	"",	":log",	MA_VCS_LOG },
+};
+#endif
 static const Menuitem mi_term[] = {
 	{ "&New Terminal",	"",	":terminal",	MA_TERM_NEW },
 	{ "&Close Terminal",	"",	"",		MA_TERM_CLOSE },
@@ -9073,6 +9119,7 @@ static const Menu MENUS[] = {
 #ifndef VEDIT_NO_TOOLS
 	{ "&Compile",	MENU_ITEMS(mi_compile) },
 	{ "&Run",	MENU_ITEMS(mi_run) },
+	{ "VCS&%",	MENU_ITEMS(mi_vcs) },
 #endif
 #ifdef VEDIT_TERM
 	{ "&Terminal",	MENU_ITEMS(mi_term) },
@@ -9421,6 +9468,8 @@ menu_item_enabled(const Editor *e, Menuact act)
 	case MA_ERR_NEXT:
 	case MA_ERR_PREV:
 		return e->tool_nerr > 0;
+	case MA_VCS_LOG:
+		return e->vcs[0] != '\0';
 #endif
 #ifdef VEDIT_TERM
 	case MA_TERM_NEW:
@@ -9605,6 +9654,8 @@ ui_frame(Editor *e, const Pal *p)
 #else
 	const char *name = e->has_name ? e->path : "Untitled";
 #endif
+	if (!e->has_name && e->label[0])
+		name = e->label;
 #ifdef VEDIT_MAIL
 	if (!e->has_name && mail_label(e->mref))
 		name = mail_label(e->mref);
@@ -9686,6 +9737,8 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 		strcat(flags, "WRAP ");
 	if (e->show_lineno)
 		strcat(flags, "NUM ");
+	if (e->t->readonly)
+		strcat(flags, "RO ");
 	strcat(flags, eol_name(text_eol(e->t)));
 	strcat(flags, "  ");
 
@@ -15677,6 +15730,7 @@ static const struct {
 	{ ":set swapfile bk",	"Crash-recovery swap file / keep a ~ backup" },
 #ifndef VEDIT_NO_TOOLS
 	{ ":format  :set fos",	"Run the formatter / format on every save" },
+	{ ":log",		"File history: pick a commit, see its diff (VCS menu)" },
 	{ "F9 Alt+F9 Ctrl+F9",	"Make / compile / run; F4 steps the errors" },
 #endif
 #ifdef VEDIT_TERM
@@ -16389,7 +16443,7 @@ buffer_reset(Editor *e)
 	X(load_mtime) X(kind) X(vterm) X(in_pane) X(top_last) X(art) X(tbl) X(tabs) \
 	BUF_MAIL_SCALARS(X)
 #define BUF_STATE_ARRAYS(X) \
-	X(path) X(vi_mark_y) X(vi_mark_x) X(swap_path) X(vcs)
+	X(path) X(vi_mark_y) X(vi_mark_x) X(swap_path) X(vcs) X(label)
 
 /* Copy the active buffer's per-file fields into a slot. */
 static void
@@ -16549,6 +16603,7 @@ buf_open(Editor *e, const char *path)
 #endif
 	e->tbl = NULL;
 	e->tabs = NULL;
+	e->label[0] = '\0';
 #ifdef VEDIT_MAIL
 	e->mref = NULL;
 #endif
@@ -16704,6 +16759,9 @@ bufpick_label(void *ctx, int i)
 	 * read correctly from either. */
 	name = active ? (e->has_name ? e->path : "[No Name]")
 	    : (e->bufs[i].has_name ? e->bufs[i].path : "[No Name]");
+	if (!(active ? e->has_name : e->bufs[i].has_name) &&
+	    (active ? e->label : e->bufs[i].label)[0])
+		name = active ? e->label : e->bufs[i].label;
 #ifdef VEDIT_MAIL
 	if (mail_label(active ? e->mref : e->bufs[i].mref) &&
 	    !(active ? e->has_name : e->bufs[i].has_name))
@@ -21078,6 +21136,10 @@ vcs_template(const char *name, const char *which)
 		    "git rev-parse --short HEAD";
 	if (strcmp(which, "status") == 0)
 		return "git status --porcelain -- $(file)";
+	if (strcmp(which, "log") == 0)
+		return "git log --format='%h %as %s' -n 200 -- $(file)";
+	if (strcmp(which, "show") == 0)
+		return "git show $(rev) -- $(file)";
 	return NULL;
 }
 
@@ -21597,6 +21659,244 @@ tool_free(Editor *e)
 	tool_clear_output(e);
 }
 
+
+/* VCS > History and :log. vcs.<name>.log prints one line per commit that
+ * touched the file, the revision first (git: "abc1234 2026-10-07 Subject");
+ * the picker lists them newest first as printed. Choosing one runs
+ * vcs.<name>.show with $(rev) and $(file) and opens its output in a new
+ * read-only buffer named file@rev with the diff grammar. */
+
+/* The system that claimed the active file: the part of e->vcs before ":". */
+static int
+vcs_name(const Editor *e, char *out, size_t outsz)
+{
+	const char *colon = strchr(e->vcs, ':');
+	size_t n;
+
+	if (!e->vcs[0] || !colon)
+		return -1;
+	n = (size_t)(colon - e->vcs);
+	if (n >= outsz)
+		return -1;
+	memcpy(out, e->vcs, n);
+	out[n] = '\0';
+	return 0;
+}
+
+/* Replace $(rev) in tmpl; tool_expand handles the rest. Returns malloc'd. */
+static char *
+vcs_expand(const char *tmpl, const char *rev, const char *path)
+{
+	char *out = NULL, *res;
+	size_t olen = 0, ocap = 0;
+	const char *p = tmpl;
+
+	while (*p) {
+		const char *at = strstr(p, "$(rev)");
+		size_t n = at ? (size_t)(at - p) : strlen(p);
+
+		if (sb_append(&out, &olen, &ocap, p, n) < 0) {
+			free(out);
+			return NULL;
+		}
+		if (!at)
+			break;
+		if (sb_append(&out, &olen, &ocap, rev, strlen(rev)) < 0) {
+			free(out);
+			return NULL;
+		}
+		p = at + 6;
+	}
+	if (!out)
+		return strdup("");
+	res = tool_expand(out, path);
+	free(out);
+	return res;
+}
+
+/* Run a template with $(rev) for the active file and collect all of its
+ * output. Returns the exit status, or -1 when it could not run. */
+static int
+vcs_capture(Editor *e, const char *tmpl, const char *rev, struct fmtbuf *b)
+{
+	char dir[PATH_MAX];
+	char *cmd = vcs_expand(tmpl, rev ? rev : "", e->path);
+	int rc;
+
+	memset(b, 0, sizeof(*b));
+	if (!cmd)
+		return -1;
+	tool_build_dir(e, dir, sizeof(dir));
+	rc = e->tools->run_capture(e->tools->ctx, cmd, dir, fmt_emit, b);
+	free(cmd);
+	if (b->oom) {
+		free(b->buf);
+		b->buf = NULL;
+		b->len = 0;
+		return -1;
+	}
+	return rc;
+}
+
+typedef struct vcslog {
+	char	*text;			/* the log output, lines NUL-split */
+	char	**line;			/* each line */
+	int	n;
+	int	chosen;
+} Vcslog;
+
+static const char *
+vcslog_title(void *ctx)
+{
+	(void)ctx;
+	return "History";
+}
+
+static int
+vcslog_count(void *ctx)
+{
+	return ((Vcslog *)ctx)->n;
+}
+
+static const char *
+vcslog_label(void *ctx, int i)
+{
+	Vcslog *l = ctx;
+
+	return (i >= 0 && i < l->n) ? l->line[i] : "";
+}
+
+static int
+vcslog_choose(void *ctx, int i)
+{
+	Vcslog *l = ctx;
+
+	if (i < 0 || i >= l->n)
+		return PICK_STAY;
+	l->chosen = i;
+	return PICK_DONE;
+}
+
+/* Open text as a read-only buffer titled label with the named grammar. */
+static int
+vcs_open_text(Editor *e, const char *text, size_t len, const char *label,
+    const char *lang)
+{
+	int i = buf_open(e, NULL);
+
+	if (i < 0)
+		return -1;
+	if (len > 0) {
+		FILE *in = fmemopen((void *)text, len, "rb");
+
+		if (in) {
+			text_load_fp(e->t, in);
+			fclose(in);
+		}
+	}
+	e->t->dirty = 0;
+	e->t->readonly = 1;
+	snprintf(e->label, sizeof(e->label), "%s", label);
+	e->syn = syn_for_ext(lang);
+	e->hl_valid = 0;
+	e->cy = e->cx = e->top = e->left = 0;
+	buf_save(e, &e->bufs[e->cur]);
+	return i;
+}
+
+static int
+vcs_history(Editor *e)
+{
+	Picksrc s = {
+		.title = vcslog_title, .count = vcslog_count,
+		.label = vcslog_label, .choose = vcslog_choose,
+	};
+	Vcslog l;
+	struct fmtbuf b;
+	char name[32], rev[80], label[64];
+	const char *tmpl, *base;
+	size_t i, n;
+	int rc;
+
+	if (vcs_name(e, name, sizeof(name)) < 0) {
+		set_status(e, "no version control for this file");
+		return -1;
+	}
+	tmpl = vcs_template(name, "log");
+	if (!tmpl) {
+		set_status(e, "vcs.%s.log is not set", name);
+		return -1;
+	}
+	rc = vcs_capture(e, tmpl, NULL, &b);
+	if (rc != 0 || !b.buf || b.len == 0) {
+		set_status(e, rc < 0 ? "could not run the log command" :
+		    "no history for this file");
+		free(b.buf);
+		return -1;
+	}
+
+	/* split the output into lines */
+	memset(&l, 0, sizeof(l));
+	l.text = b.buf;
+	l.chosen = -1;
+	for (i = 0, n = 0; i < b.len; i++)
+		if (b.buf[i] == '\n')
+			n++;
+	if (b.buf[b.len - 1] != '\n')
+		n++;
+	l.line = calloc(n ? n : 1, sizeof(*l.line));
+	if (!l.line) {
+		free(b.buf);
+		set_status(e, "out of memory");
+		return -1;
+	}
+	for (i = 0; i < b.len && (size_t)l.n < n; ) {
+		size_t j = i;
+
+		while (j < b.len && b.buf[j] != '\n')
+			j++;
+		b.buf[j] = '\0';
+		if (j > i)
+			l.line[l.n++] = b.buf + i;
+		i = j + 1;
+	}
+	s.ctx = &l;
+	dlg_pick(e, &s);
+	rc = -1;
+	if (l.chosen >= 0) {
+		const char *ln = l.line[l.chosen];
+		size_t rl = strcspn(ln, " \t");
+
+		if (rl >= sizeof(rev))
+			rl = sizeof(rev) - 1;
+		memcpy(rev, ln, rl);
+		rev[rl] = '\0';
+		tmpl = vcs_template(name, "show");
+		if (!tmpl) {
+			set_status(e, "vcs.%s.show is not set", name);
+		} else {
+			struct fmtbuf d;
+
+			rc = vcs_capture(e, tmpl, rev, &d);
+			if (rc < 0 || !d.buf) {
+				set_status(e, "could not run the show command");
+				rc = -1;
+			} else {
+				base = strrchr(e->path, '/');
+				base = base ? base + 1 : e->path;
+				snprintf(label, sizeof(label), "%.40s@%.20s", base,
+				    rev);
+				rc = vcs_open_text(e, d.buf, d.len, label, "diff");
+				if (rc >= 0)
+					set_status(e, "%s (read-only)", label);
+			}
+			free(d.buf);
+		}
+	}
+	free(l.line);
+	free(l.text);
+	return rc;
+}
 #else
 static void
 vcs_refresh(Editor *e)
@@ -21868,6 +22168,9 @@ run_menu_act(Editor *e, Menuact act)
 		break;
 	case MA_ERR_PREV:
 		run_tool_cmd(e, CMD_ERR_PREV);
+		break;
+	case MA_VCS_LOG:
+		vcs_history(e);
 		break;
 #endif
 #ifdef VEDIT_TERM
@@ -23706,6 +24009,8 @@ static const char g_config_template[] =
 	"[vcs \"git\"]\n"
 	"#	branch = git symbolic-ref --short -q HEAD || git rev-parse --short HEAD\n"
 	"#	status = git status --porcelain -- $(file)\n"
+	"#	log = git log --format='%h %as %s' -n 200 -- $(file)\n"
+	"#	show = git show $(rev) -- $(file)\n"
 	"\n"
 	"[insert]\n"
 	"#	dateformat = %Y-%m-%d # strftime pattern Insert > Date starts on\n"
@@ -34657,7 +34962,7 @@ enum excmd {
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
 	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD, EX_CONFIG,
 	EX_MAIL, EX_COMPOSE, EX_REPLY, EX_SEND,
-	EX_DATE,
+	EX_DATE, EX_LOG,
 	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH, EX_CELL, EX_SORT, EX_TABSTOPS,
 	EX_ROWADD, EX_ROWDEL, EX_COLADD, EX_COLDEL,
 };
@@ -34704,6 +35009,7 @@ static const struct excmd_name {
 	{ "cell",	4, EX_CELL },
 	{ "sort",	3, EX_SORT },
 	{ "date",	4, EX_DATE },
+	{ "log",	3, EX_LOG },
 	{ "tabstops",	4, EX_TABSTOPS },
 	{ "rowadd",	4, EX_ROWADD },
 	{ "rowdel",	4, EX_ROWDEL },
@@ -35099,6 +35405,13 @@ vi_ex_exec(Editor *e, char *buf)
 		return REQ_CONTINUE;
 	case EX_DATE:
 		return ex_date(e, rest);
+	case EX_LOG:
+#ifndef VEDIT_NO_TOOLS
+		vcs_history(e);
+#else
+		set_status(e, "version control is not available");
+#endif
+		return REQ_CONTINUE;
 #ifdef VEDIT_MAIL
 	case EX_MAIL:			/* :mail [folder|.] */
 		if (strcmp(rest, ".") == 0 && e->mail_folder[0])

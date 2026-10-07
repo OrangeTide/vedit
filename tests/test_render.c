@@ -2113,6 +2113,69 @@ t_vcs_status(Test *t)
 	vedit_cfg_free(cfg);
 }
 
+/* :log lists the commits the log template printed; choosing one runs the
+ * show template with $(rev) and opens its output as a read-only diff buffer
+ * named file@rev. The VCS menu is reachable by its % mnemonic only while
+ * the file has a VCS. */
+static void
+t_vcs_history(Test *t)
+{
+	const char keys[] = "\033OQ:log\r\r";	/* F2, :log, Enter on row 0 */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	size_t len = 0;
+	const char *line;
+
+	g_fake_output = "abc1234 2026-10-07 First\ndef5678 2026-10-06 Second\n";
+	g_fake_rc = 0;
+	g_fake_cmd[0] = '\0';
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_tools(v, &fake_tools);
+	TAP_CHECK(t, menu_title_by_mnemonic(&v->e, '%') < 0);	/* no VCS yet */
+	vedit_open(v, "test.c");
+	TAP_CHECK(t, menu_title_by_mnemonic(&v->e, '%') >= 0);
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_VCS_LOG) == 1);
+	vedit_run(v);
+
+	TAP_CHECKF(t, strcmp(g_fake_cmd, "git show abc1234 -- ./test.c") == 0,
+	    "ran '%s'", g_fake_cmd);
+	TAP_CHECKF(t, v->e.nbuf == 2 && !v->e.has_name, "nbuf %d", v->e.nbuf);
+	TAP_CHECKF(t, strcmp(v->e.label, "test.c@abc1234") == 0, "label '%s'",
+	    v->e.label);
+	TAP_CHECK(t, v->e.t->readonly && !text_dirty(v->e.t));
+	TAP_CHECK(t, v->e.syn != NULL && strcmp(v->e.syn->name, "diff") == 0);
+	TAP_CHECK(t, vline_is(v, 0, "abc1234 2026-10-07 First"));
+	TAP_CHECK(t, m.out && strstr(m.out, "test.c@abc1234") != NULL);
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_VCS_LOG) == 0);	/* unnamed */
+
+	/* read-only: an insert is refused, a line stays as it was */
+	TAP_CHECK(t, text_insert(v->e.t, 0, 0, "x", 1) != 0);
+	line = text_line(v->e.t, 0, &len);
+	TAP_CHECK(t, line && len == 24);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* an empty log: a status message, no picker, no new buffer */
+	g_fake_output = "main\n";
+	g_fake_cmd[0] = '\0';
+	memio_init(&m, keys, sizeof(keys) - 2, 24, 80);	/* without the last Enter */
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_tools(v, &fake_tools);
+	vedit_open(v, "test.c");		/* the branch lookup sees "main" */
+	g_fake_output = "";			/* the log prints nothing */
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.nbuf == 1 && strstr(v->e.status, "no history") != NULL,
+	    "nbuf %d status '%s'", v->e.nbuf, v->e.status);
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* F9 (Make): the whole path end to end. The key reaches the dispatcher, the
  * per-language build command is expanded and run, the captured output is parsed
  * into the quickfix list, and the output pane renders it. The pane and then the
@@ -3755,6 +3818,7 @@ const Case tap_cases[] = {
 	{ "sig_quit_unwinds", t_sig_quit_unwinds },
 #ifndef VEDIT_NO_TOOLS
 	{ "vcs_status", t_vcs_status },
+	{ "vcs_history", t_vcs_history },
 	{ "tool_f9_make", t_tool_f9_make },
 	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },
 	{ "menu_hide_tools", t_menu_hide_tools },

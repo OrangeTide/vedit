@@ -260,6 +260,24 @@ render "$here/shot-table.png" parts.csv \
 render "$here/shot-art.png" logo.ans \
     "Down Down Down Down Right Right Right Right"
 
+
+# Version control: a copy of ring.c committed twice in its own repository, so
+# the bar carries the VCS menu; :log lists the commits over the file.
+if command -v git >/dev/null 2>&1; then
+	mkdir -p "$work/repo"
+	cp ring.c "$work/repo/ring.c"
+	(
+		cd "$work/repo"
+		git init -q
+		git -c user.name=Jon -c user.email=jon@example.org add ring.c
+		git -c user.name=Jon -c user.email=jon@example.org commit -q \
+		    -m "Ring buffer: first cut"
+		sed -i 's/ring/ringbuf/' ring.c
+		git -c user.name=Jon -c user.email=jon@example.org commit -q -a \
+		    -m "Rename ring to ringbuf"
+		render "$here/shot-history.png" ring.c F2 "colon l o g Return"
+	)
+fi
 # The mail config goes in only now, so the shots above have no Mail menu.
 cat >> "$work/veditrc" <<EOF2
 [mail]

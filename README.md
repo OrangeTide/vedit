@@ -246,6 +246,8 @@ XDG layout (`-DVEDIT_NO_XDG`) uses `~/.veditrc` instead.
 [vcs "git"]              # built in; shown here as the pattern for others
     branch = git symbolic-ref --short -q HEAD || git rev-parse --short HEAD
     status = git status --porcelain -- $(file)
+    log = git log --format='%h %as %s' -n 200 -- $(file)
+    show = git show $(rev) -- $(file)
 
 [gitcommit]
     subject = 50         # mark a commit subject past this column
@@ -1017,17 +1019,30 @@ host without tools shows nothing. It asks when a file is opened, saved, or
 switched to, never on a timer, so a slow repository cannot interrupt typing.
 `vcs.enable = off` turns it off.
 
-Another system needs only two command lines in a `[vcs "<name>"]` section:
+A VCS menu appears in the bar while the file has one (its mnemonic is `%`,
+so `Alt+%` or `F10` then `%` opens it). **History** (also `:log`) lists the
+commits that touched the file, newest first, in a picker. Choosing one opens
+that commit's diff of the file in a new buffer named `file@rev`, read-only
+(the status bar shows `RO`, and every edit is refused) with diff
+highlighting; close it with `:bd` or the buffer list like any other.
+
+![The history picker over a file in this repository](docs/shot-history.png)
+
+Another system needs only its command lines in a `[vcs "<name>"]` section:
 `branch` must print the branch and fail (exit non-zero) outside a working
-copy, and `status` must print one porcelain-style line for `$(file)` when it
-has changed, `??` first when it is untracked, and nothing when it is clean.
-The configured systems are tried in the order they appear, then git, and
-the first whose `branch` command succeeds names the file. For Mercurial:
+copy; `status` must print one porcelain-style line for `$(file)` when it has
+changed, `??` first when it is untracked, and nothing when it is clean; `log`
+prints one line per commit, the revision first and the rest as the picker
+shows it; and `show` prints the diff for `$(rev)` and `$(file)`. The
+configured systems are tried in the order they appear, then git, and the
+first whose `branch` command succeeds names the file. For Mercurial:
 
 ```
 [vcs "hg"]
     branch = hg branch
     status = hg status $(file)
+    log = hg log --template "{node|short} {date|shortdate} {desc|firstline}\n" $(file)
+    show = hg diff -c $(rev) $(file)
 ```
 
 The same `[vcs "git"]` keys override the built-in git commands.

@@ -183,6 +183,10 @@ ignores case and
 reverses. In a table the key is the cursor column's cell. Edit > Sort Lines
 asks the same in a dialog.
 .TP
+.TP
+.B :log
+List the commits that touched the file (VCS > History) and open the chosen
+one's diff in a read-only buffer.
 .BI :date " [YYYY-MM-DD]"
 Insert today, or the given day, at the cursor in the format last chosen in
 the calendar of Insert > Date (ISO by default,
@@ -274,8 +278,8 @@ start on),
 .B [vcs]
 (enable) and
 .BI [vcs\ """name"""]
-(branch and status, the commands that name the branch and report the
-file's state in the status bar; git is built in),
+(branch, status, log and show, the commands behind the status bar mark and
+the VCS menu's History; git is built in),
 and per-language
 .BI [command\  """lang"""]
 sections for the compile, build, run, and format commands. See
