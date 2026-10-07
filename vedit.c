@@ -8863,7 +8863,7 @@ typedef enum menu_act {
 	MA_GOTO,
 	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_HEX, MA_TABLE, MA_DRAW,
 	MA_TBL_ROWADD, MA_TBL_ROWDEL, MA_TBL_COLADD, MA_TBL_COLDEL, MA_TBL_FIT,
-	MA_SORT,
+	MA_SORT, MA_INS_DATE, MA_INS_FILE,
 	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS, MA_MOUSE,
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS,
 	MA_VI_MODE, MA_EDIT_CONFIG, MA_RELOAD_CONFIG, MA_GLYPHS, MA_COLORS,
@@ -8918,6 +8918,9 @@ static void tbl_cell_status(const Editor *e, char *buf, size_t n);
 static int glyph_alt_key(Editor *e, const struct tkbd_seq *seq);
 static int ed_reload_config(Editor *e);
 static void ed_edit_config(Editor *e);
+static void ed_insert_date(Editor *e);
+static void ed_insert_file(Editor *e);
+static Req vi_ex_read_file(Editor *e, size_t at, const char *fn);
 
 typedef struct menu_item {
 	const char	*label;
@@ -8968,6 +8971,10 @@ static const Menuitem mi_edit[] = {
 	{ "",		"",		"",		MA_SEP },
 	{ "&Format",	"",		":format",	MA_FORMAT },
 #endif
+};
+static const Menuitem mi_insert[] = {
+	{ "&Date...",	"",	":date",	MA_INS_DATE },
+	{ "&File...",	"",	":read",	MA_INS_FILE },
 };
 static const Menuitem mi_search[] = {
 	{ "&Find...",		"Ctrl+F",	"/",	MA_FIND },
@@ -9054,6 +9061,7 @@ static const Menuitem mi_help[] = {
 static const Menu MENUS[] = {
 	{ "&File",	MENU_ITEMS(mi_file) },
 	{ "&Edit",	MENU_ITEMS(mi_edit) },
+	{ "&Insert",	MENU_ITEMS(mi_insert) },
 	{ "&Search",	MENU_ITEMS(mi_search) },
 	{ "&View",	MENU_ITEMS(mi_view) },
 	{ "&Options",	MENU_ITEMS(mi_options) },
@@ -9370,6 +9378,15 @@ menu_item_enabled(const Editor *e, Menuact act)
 	case MA_TBL_COLDEL:
 	case MA_TBL_FIT:
 		return e->tbl != NULL;
+	case MA_INS_DATE:
+	case MA_INS_FILE:
+		if (e->kind != BUF_TEXT || e->tbl || e->draw_mode)
+			return 0;
+#ifdef VEDIT_TERM
+		if (e->art)
+			return 0;
+#endif
+		return 1;
 	case MA_PASTE:
 		return e->clip && e->clip_len > 0;
 	case MA_OSC_COPY_FILE:
@@ -15672,6 +15689,7 @@ static const struct {
 	{ ":coladd[!] [N]",	"Table view: insert N columns left (! right); :coldel" },
 #endif
 	{ ":config  :reload",	"Edit the config file / re-read it (Options menu too)" },
+	{ ":date [YYYY-MM-DD]",	"Insert today or a day; Insert menu has the calendar" },
 #ifdef VEDIT_MAIL
 	{ ":mail [folder|.]",	"Mail: pick a folder, or list one (. = the last)" },
 	{ ":compose [to]  :reply",	"Start a message / answer the one shown" },
@@ -19969,6 +19987,267 @@ dlg_about(Editor *e)
 }
 
 /****************************************************************
+ * Insert menu: a date from a calendar picker, or a file's lines.
+ *
+ * Insert > Date opens a month grid on today's date; the arrows move a
+ * day, PgUp/PgDn a month, Home/End a year, t returns to today, Tab (or
+ * f) cycles the output format shown under the grid, and Enter inserts
+ * the date at the cursor. The chosen format is kept for the session,
+ * and :date [YYYY-MM-DD] inserts today (or the given day) in it without
+ * the dialog. Insert > File browses for a file and reads it below the
+ * cursor line like :read.
+ ****************************************************************/
+
+static const char *const date_formats[] = {
+	"%Y-%m-%d",
+	"%Y-%m-%d %H:%M",
+	"%d %b %Y",
+	"%B %d, %Y",
+	"%A, %B %d, %Y",
+	"%m/%d/%Y",
+	"%d/%m/%Y",
+};
+#define DATE_FORMATS ((int)(sizeof(date_formats) / sizeof(date_formats[0])))
+
+static int g_date_fmt;			/* the format picked last, for the session */
+
+typedef struct datectx {
+	struct tm	tm;		/* the highlighted day, normalised */
+	int		pick;		/* Enter pressed */
+} Datectx;
+
+/* Normalise tm after a field was stepped out of range; a date too far for
+ * mktime is left as it was. */
+static void
+date_norm(struct tm *tm)
+{
+	struct tm t = *tm;
+
+	t.tm_isdst = -1;
+	if (mktime(&t) != (time_t)-1)
+		*tm = t;
+}
+
+/* Format a day with the session's format. The clock fields are now's. */
+static void
+date_text(const struct tm *day, char *out, size_t outsz)
+{
+	time_t now = time(NULL);
+	struct tm tm;
+
+	localtime_r(&now, &tm);
+	tm.tm_year = day->tm_year;
+	tm.tm_mon = day->tm_mon;
+	tm.tm_mday = day->tm_mday;
+	date_norm(&tm);
+	if (strftime(out, outsz, date_formats[g_date_fmt], &tm) == 0)
+		out[0] = '\0';
+}
+
+/* Insert text at the cursor as one undo step and leave the cursor after it. */
+static void
+insert_text_at_cursor(Editor *e, const char *s)
+{
+	text_undo_group_begin(e->t);
+	insert_bytes(e, s, strlen(s));
+	text_undo_group_end(e->t);
+	e->hl_valid = 0;
+	e->sel_active = 0;
+	if (e->mode != MODE_MODELESS)
+		vi_clamp(e);
+}
+
+#define DATE_W 50
+
+static void
+dlg_date_draw(Editor *e, const Modal *m, void *ctx)
+{
+	static const char *const wd = "Mo Tu We Th Fr Sa Su";
+	Datectx *c = ctx;
+	Screen *d = e->d;
+	int gx = m->x + (m->w - 20) / 2;	/* the 7 by 3 grid, centred */
+	int first, ndays, i, cx = gx, cy = m->y + 3;
+	struct tm t;
+	char line[64];
+
+	scr_text(d, m->y, m->x + 2, " Insert Date ", m->fg, m->bg, m->base);
+
+	t = c->tm;			/* the month's first day: its weekday */
+	t.tm_mday = 1;
+	date_norm(&t);
+	first = (t.tm_wday + 6) % 7;	/* Monday first */
+	t = c->tm;			/* day 0 of next month = this month's last */
+	t.tm_mon++;
+	t.tm_mday = 0;
+	date_norm(&t);
+	ndays = t.tm_mday;
+
+	if (strftime(line, sizeof(line), "%B %Y", &c->tm) == 0)
+		line[0] = '\0';
+	scr_text(d, m->y + 1, m->x + (m->w - (int)strlen(line)) / 2, line,
+	    m->fg, m->bg, m->base | ATTR_BOLD);
+	scr_text(d, m->y + 2, gx, wd, m->fg, m->bg, m->base | ATTR_BOLD);
+	for (i = 1; i <= ndays; i++) {
+		int cell = first + i - 1, row = m->y + 3 + cell / 7;
+		int col = gx + (cell % 7) * 3;
+
+		snprintf(line, sizeof(line), "%2d", i);
+		scr_text(d, row, col, line, m->fg, m->bg,
+		    i == c->tm.tm_mday ? (m->base | ATTR_REVERSE) : m->base);
+		if (i == c->tm.tm_mday) {
+			cx = col + 1;
+			cy = row;
+		}
+	}
+
+	date_text(&c->tm, line, sizeof(line));
+	scr_text(d, m->y + 9, m->x + 2, "Format:", m->fg, m->bg,
+	    m->base | ATTR_BOLD);
+	scr_text(d, m->y + 9, m->x + 10, line, m->fg, m->bg, m->base);
+	scr_text(d, m->y + 10, m->x + 2,
+	    "Arrows: day  PgUp/PgDn: month  Home/End: year", m->fg, m->bg,
+	    m->base);
+	scr_text(d, m->y + 11, m->x + 2,
+	    "Enter: insert  Tab: format  t: today  Esc", m->fg, m->bg,
+	    m->base);
+	scr_cursor_vis(d, 1);
+	scr_cursor(d, cy, cx);
+}
+
+static int
+dlg_date_key(Editor *e, const Modal *m, const Event *ev, void *ctx)
+{
+	Datectx *c = ctx;
+	const struct tkbd_seq *k = &ev->key;
+	time_t now;
+
+	(void)e;
+	(void)m;
+	if (k->type != TKBD_KEY)
+		return 0;
+	switch (k->key) {
+	case TKBD_KEY_LEFT:
+		c->tm.tm_mday--;
+		break;
+	case TKBD_KEY_RIGHT:
+		c->tm.tm_mday++;
+		break;
+	case TKBD_KEY_UP:
+		c->tm.tm_mday -= 7;
+		break;
+	case TKBD_KEY_DOWN:
+		c->tm.tm_mday += 7;
+		break;
+	case TKBD_KEY_PGUP:
+		c->tm.tm_mon--;
+		break;
+	case TKBD_KEY_PGDN:
+		c->tm.tm_mon++;
+		break;
+	case TKBD_KEY_HOME:
+		c->tm.tm_year--;
+		break;
+	case TKBD_KEY_END:
+		c->tm.tm_year++;
+		break;
+	case TKBD_KEY_TAB:
+		g_date_fmt = (g_date_fmt + 1) % DATE_FORMATS;
+		return 0;
+	case TKBD_KEY_ENTER:
+		c->pick = 1;
+		return 1;
+	case TKBD_KEY_ESC:
+		return 1;
+	default:
+		if (k->ch == 'f')
+			g_date_fmt = (g_date_fmt + 1) % DATE_FORMATS;
+		else if (k->ch == 'F')
+			g_date_fmt = (g_date_fmt + DATE_FORMATS - 1) % DATE_FORMATS;
+		else if (k->ch == 't') {
+			now = time(NULL);
+			localtime_r(&now, &c->tm);
+		}
+		return 0;
+	}
+	/* a month step from the 31st lands in the next month: clamp first */
+	if (k->key == TKBD_KEY_PGUP || k->key == TKBD_KEY_PGDN ||
+	    k->key == TKBD_KEY_HOME || k->key == TKBD_KEY_END) {
+		struct tm t = c->tm;
+
+		t.tm_mon++;
+		t.tm_mday = 0;
+		date_norm(&t);
+		if (c->tm.tm_mday > t.tm_mday)
+			c->tm.tm_mday = t.tm_mday;
+	}
+	date_norm(&c->tm);
+	return 0;
+}
+
+/* Insert > Date: the calendar picker, starting on today. */
+static void
+ed_insert_date(Editor *e)
+{
+	Datectx c;
+	time_t now = time(NULL);
+	char text[64];
+
+	memset(&c, 0, sizeof(c));
+	localtime_r(&now, &c.tm);
+	dlg_run(e, DATE_W, 13, &c, dlg_date_draw, dlg_date_key);
+	if (!c.pick)
+		return;
+	date_text(&c.tm, text, sizeof(text));
+	insert_text_at_cursor(e, text);
+}
+
+/* :date [YYYY-MM-DD]: insert today, or the given day, in the session's
+ * format. A malformed or impossible date is refused. */
+static Req
+ex_date(Editor *e, const char *arg)
+{
+	time_t now = time(NULL);
+	struct tm tm, chk;
+	char text[64];
+
+	localtime_r(&now, &tm);
+	if (*arg) {
+		int y, mo, d;
+		char tail;
+
+		if (sscanf(arg, "%d-%d-%d%c", &y, &mo, &d, &tail) != 3 ||
+		    y < 1900 || mo < 1 || mo > 12 || d < 1 || d > 31) {
+			set_status(e, "date: expected YYYY-MM-DD");
+			return REQ_CONTINUE;
+		}
+		tm.tm_year = y - 1900;
+		tm.tm_mon = mo - 1;
+		tm.tm_mday = d;
+		chk = tm;
+		date_norm(&chk);
+		if (chk.tm_mday != d || chk.tm_mon != mo - 1) {
+			set_status(e, "date: no such day");
+			return REQ_CONTINUE;
+		}
+	}
+	date_text(&tm, text, sizeof(text));
+	insert_text_at_cursor(e, text);
+	return REQ_CONTINUE;
+}
+
+/* Insert > File: browse for a file and read it below the cursor line. */
+static void
+ed_insert_file(Editor *e)
+{
+	char path[PATH_MAX];
+
+	path[0] = '\0';
+	if (!dlg_file(e, "Insert File", NULL, NULL, 0, path, sizeof(path)))
+		return;
+	vi_ex_read_file(e, e->cy, path);
+}
+
+/****************************************************************
  * External tool commands: a per-language compile / make / run
  * layer. The command strings come from the config ([command
  * "<lang>"]); the editor expands their $(...) variables and hands
@@ -21341,6 +21620,12 @@ run_menu_act(Editor *e, Menuact act)
 		break;
 	case MA_EDIT_CONFIG:
 		ed_edit_config(e);
+		break;
+	case MA_INS_DATE:
+		ed_insert_date(e);
+		break;
+	case MA_INS_FILE:
+		ed_insert_file(e);
 		break;
 	case MA_RELOAD_CONFIG:
 		ed_reload_config(e);
@@ -34153,6 +34438,7 @@ enum excmd {
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
 	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD, EX_CONFIG,
 	EX_MAIL, EX_COMPOSE, EX_REPLY, EX_SEND,
+	EX_DATE,
 	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH, EX_CELL, EX_SORT, EX_TABSTOPS,
 	EX_ROWADD, EX_ROWDEL, EX_COLADD, EX_COLDEL,
 };
@@ -34198,6 +34484,7 @@ static const struct excmd_name {
 	{ "colwidth",	4, EX_COLWIDTH },
 	{ "cell",	4, EX_CELL },
 	{ "sort",	3, EX_SORT },
+	{ "date",	4, EX_DATE },
 	{ "tabstops",	4, EX_TABSTOPS },
 	{ "rowadd",	4, EX_ROWADD },
 	{ "rowdel",	4, EX_ROWDEL },
@@ -34590,6 +34877,8 @@ vi_ex_exec(Editor *e, char *buf)
 	case EX_CONFIG:
 		ed_edit_config(e);
 		return REQ_CONTINUE;
+	case EX_DATE:
+		return ex_date(e, rest);
 #ifdef VEDIT_MAIL
 	case EX_MAIL:			/* :mail [folder|.] */
 		if (strcmp(rest, ".") == 0 && e->mail_folder[0])

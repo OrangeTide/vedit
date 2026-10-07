@@ -91,7 +91,8 @@ Everything else lives in the menu bar. Press `F10`, or `Alt` plus the underlined
 letter of a menu (for example `Alt+V` for View), then use the arrows and `Enter`,
 or the underlined letter of an item. The View menu toggles line numbers, word
 wrap, the color scheme, and syntax highlighting; the Edit menu has formatting and
-tab conversions; the Search menu has find, replace, and go-to.
+tab conversions; the Insert menu puts a date or a file at the cursor; the Search
+menu has find, replace, and go-to.
 
 Two keys are worth knowing early:
 
@@ -923,6 +924,21 @@ named after the command (`:sort n C`, `:sort 3`), and the default range is
 the data rows under the header, so the header stays put. Edit > Sort Lines
 does the same with the dialog.
 
+
+### Inserting a date or a file
+
+Insert > Date opens a calendar on today. The arrows move a day at a time,
+PgUp and PgDn a month, Home and End a year, and `t` returns to today. The
+line under the grid shows how the day will be written; Tab (or `f`, and `F`
+backwards) cycles the formats, from the ISO `2026-10-07` through `07 Oct
+2026`, `October 07, 2026`, the weekday form, and the slashed `10/07/2026` and
+`07/10/2026`. Enter inserts the text at the cursor and Esc closes the picker.
+The format chosen is kept for the rest of the session, and `:date` inserts
+today in it without the dialog, or a given day with `:date 2026-12-25`.
+
+Insert > File browses for a file and reads its lines below the cursor line,
+the same as the vi `:read file` command. Both items are grayed in the table
+and art views and in draw mode, where text does not land at a cursor.
 
 ### Formatting
 

@@ -230,6 +230,87 @@ t_mouse_click_wheel(Test *t)
 	vedit_cfg_free(cfg);
 }
 
+static int vline_is(struct vedit *v, size_t y, const char *want);
+
+/* :date inserts today in ISO form, or the given day, and refuses a day that
+ * does not exist. The calendar picker starts on today: two Left steps and a
+ * Tab (next format) insert the day before yesterday as "DD Mon YYYY". Insert
+ * > File reads the chosen file below the cursor line. */
+static void
+t_insert_date_file(Test *t)
+{
+	/* F2 for vi keys, then a day by hand */
+	const char keys[] = "\033OQ:date 2026-03-15\r";
+	const char cal[] = "\033[D\033[D\t\t\r";	/* Left Left Tab Tab Enter */
+	char tmpf[] = "/tmp/vedit_insXXXXXX";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	time_t now;
+	struct tm tm;
+	char want[64], exbuf[64];
+	int fd;
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_run(v);
+	TAP_CHECK(t, vline_is(v, 0, "2026-03-15"));
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "date 2026-02-30")) ==
+	    REQ_CONTINUE);
+	TAP_CHECKF(t, strstr(v->e.status, "no such day") != NULL,
+	    "status: %s", v->e.status);
+	TAP_CHECK(t, vline_is(v, 0, "2026-03-15"));
+	v->e.cx = 10;			/* append today after the first date */
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "date")) == REQ_CONTINUE);
+	now = time(NULL);
+	localtime_r(&now, &tm);
+	strftime(want, sizeof(want), "2026-03-15%Y-%m-%d", &tm);
+	TAP_CHECKF(t, vline_is(v, 0, want), "line 0 is not \"%s\"", want);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* the picker, driven directly: the keys above are its input */
+	memio_init(&m, cal, sizeof(cal) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	g_date_fmt = 0;
+	ed_insert_date(&v->e);
+	now = time(NULL);
+	localtime_r(&now, &tm);
+	tm.tm_mday -= 2;
+	tm.tm_isdst = -1;
+	mktime(&tm);
+	strftime(want, sizeof(want), "%d %b %Y", &tm);
+	TAP_CHECKF(t, vline_is(v, 0, want), "picked \"%s\", want \"%s\"",
+	    text_line(v->e.t, 0, NULL), want);
+	TAP_CHECK(t, g_date_fmt == 2);
+	TAP_CHECK(t, v->e.cx == strlen(want));
+	TAP_CHECK(t, strstr(m.out, "Insert Date") != NULL);	/* the dialog drew */
+	g_date_fmt = 0;
+	vedit_free(v);
+	memio_free(&m);
+
+	/* :read through the same path as Insert > File */
+	fd = mkstemp(tmpf);
+	TAP_ASSERT(t, fd >= 0);
+	TAP_CHECK(t, write(fd, "one\ntwo\n", 8) == 8);
+	close(fd);
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_run(v);
+	snprintf(exbuf, sizeof(exbuf), "read %s", tmpf);
+	TAP_CHECK(t, vi_ex_exec(&v->e, exbuf) == REQ_CONTINUE);
+	TAP_CHECK(t, vline_is(v, 1, "one") && vline_is(v, 2, "two"));
+	vedit_free(v);
+	memio_free(&m);
+	unlink(tmpf);
+}
+
 /* Under soft wrap a click on the second row of a wrapped line lands in that
  * segment, and a click below the last line goes to its end. */
 static void
@@ -2442,6 +2523,12 @@ t_menu_item_enabled(Test *t)
 	v->e.last_find[0] = 'x';
 	TAP_CHECK(t, menu_item_enabled(&v->e, MA_FIND_NEXT) == 1);
 
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_INS_DATE) == 1);
+	v->e.draw_mode = 1;
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_INS_DATE) == 0);
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_INS_FILE) == 0);
+	v->e.draw_mode = 0;
+
 	vedit_free(v);
 	memio_free(&m);
 }
@@ -2509,9 +2596,10 @@ t_menu_col_pack(Test *t)
 
 	TAP_CHECK(t, menu_col(&v->e, find_menu("&File")) == 1);
 	TAP_CHECK(t, menu_col(&v->e, find_menu("&Edit")) == 7);
-	TAP_CHECK(t, menu_col(&v->e, find_menu("&Search")) == 13);
-	TAP_CHECK(t, menu_col(&v->e, find_menu("&View")) == 21);
-	TAP_CHECK(t, menu_col(&v->e, find_menu("&Options")) == 27);
+	TAP_CHECK(t, menu_col(&v->e, find_menu("&Insert")) == 13);
+	TAP_CHECK(t, menu_col(&v->e, find_menu("&Search")) == 21);
+	TAP_CHECK(t, menu_col(&v->e, find_menu("&View")) == 29);
+	TAP_CHECK(t, menu_col(&v->e, find_menu("&Options")) == 35);
 	TAP_CHECK(t, menu_col(&v->e, MENU_HELP) == v->e.cols - 5);
 
 	vedit_free(v);
@@ -3472,6 +3560,7 @@ const Case tap_cases[] = {
 	{ "mouse_click_wheel", t_mouse_click_wheel },
 	{ "mouse_click_wrap", t_mouse_click_wrap },
 #endif
+	{ "insert_date_file", t_insert_date_file },
 	{ "status_flags", t_status_flags },
 	{ "tab_key_expand", t_tab_key_expand },
 	{ "tag_jump", t_tag_jump },

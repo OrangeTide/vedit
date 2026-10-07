@@ -183,6 +183,13 @@ ignores case and
 reverses. In a table the key is the cursor column's cell. Edit > Sort Lines
 asks the same in a dialog.
 .TP
+.BI :date " [YYYY-MM-DD]"
+Insert today, or the given day, at the cursor in the format last chosen in
+the calendar of Insert > Date (ISO by default). Insert > File reads a chosen
+file below the cursor line, as
+.B :read
+does.
+.TP
 .BI :tabstops " [COLS...|off]"
 Set the buffer's ruler of tab stops at the listed columns, show it, or clear
 it. Past the last stop they continue every
