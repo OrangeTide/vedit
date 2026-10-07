@@ -6461,6 +6461,7 @@ typedef struct ebuf {
 	char		vcs[48];	/* "name:branch*" from the VCS, or "" */
 	char		label[64];	/* title of an unnamed buffer, or "" */
 	char		vcs_src[PATH_MAX];	/* blame: "name:path" it annotates, or "" */
+	int		vcs_kind;	/* 1 blame buffer, 2 commit message, else 0 */
 	int		swap_on;	/* a swap file exists on disk for it */
 	size_t		swap_rev;	/* text rev at the last swap write */
 	time_t		load_mtime;	/* file mtime at load (swap staleness check) */
@@ -6620,6 +6621,7 @@ typedef struct editor {
 	char		vcs[48];	/* active buffer's "name:branch*", or "" */
 	char		label[64];	/* active buffer's title when unnamed, or "" */
 	char		vcs_src[PATH_MAX];	/* active blame buffer's "name:path", or "" */
+	int		vcs_kind;	/* active buffer: 1 blame, 2 commit message */
 	int		swap_on;	/* a swap file exists on disk for it */
 	size_t		swap_rev;	/* text rev at the last swap write */
 	time_t		load_mtime;	/* file mtime at load (swap staleness check) */
@@ -8946,7 +8948,7 @@ typedef enum menu_act {
 #ifndef VEDIT_NO_TOOLS
 	MA_FORMAT,
 	MA_COMPILE, MA_MAKE, MA_RUN, MA_VIEW_OUTPUT, MA_ERR_NEXT, MA_ERR_PREV,
-	MA_VCS_LOG, MA_VCS_BLAME,
+	MA_VCS_LOG, MA_VCS_BLAME, MA_VCS_COMMIT,
 #endif
 #ifdef VEDIT_TERM
 	MA_TERM_NEW, MA_TERM_CLOSE, MA_TERM_SPLIT, MA_PANE_BUFFER, MA_PANE_CLOSE,
@@ -9106,6 +9108,7 @@ static const Menuitem mi_run[] = {
 static const Menuitem mi_vcs[] = {
 	{ "&History...",	"",	":log",	MA_VCS_LOG },
 	{ "&Blame",	"",	":blame",	MA_VCS_BLAME },
+	{ "&Commit...",	"",	":commit",	MA_VCS_COMMIT },
 };
 #endif
 static const Menuitem mi_term[] = {
@@ -9503,6 +9506,8 @@ menu_item_enabled(const Editor *e, Menuact act)
 	case MA_VCS_LOG:
 	case MA_VCS_BLAME:
 		return e->vcs[0] != '\0';
+	case MA_VCS_COMMIT:
+		return e->vcs[0] != '\0' || e->vcs_kind == 2;
 #endif
 #ifdef VEDIT_TERM
 	case MA_TERM_NEW:
@@ -15765,6 +15770,7 @@ static const struct {
 	{ ":format  :set fos",	"Run the formatter / format on every save" },
 	{ ":log",		"File history: pick a commit, see its diff (VCS menu)" },
 	{ ":blame",		"Who changed each line; Enter there shows the commit" },
+	{ ":commit",		"Commit this file: write the message, :commit again sends" },
 	{ "F9 Alt+F9 Ctrl+F9",	"Make / compile / run; F4 steps the errors" },
 #endif
 #ifdef VEDIT_TERM
@@ -16475,6 +16481,7 @@ buffer_reset(Editor *e)
 	X(syn) X(line_state) X(line_state_cap) X(hl_valid) X(hex_view) \
 	X(hex_top) X(expand_tabs) X(vi_marks_set) X(swap_on) X(swap_rev) \
 	X(load_mtime) X(kind) X(vterm) X(in_pane) X(top_last) X(art) X(tbl) X(tabs) \
+	X(vcs_kind) \
 	BUF_MAIL_SCALARS(X)
 #define BUF_STATE_ARRAYS(X) \
 	X(path) X(vi_mark_y) X(vi_mark_x) X(swap_path) X(vcs) X(label) X(vcs_src)
@@ -16639,6 +16646,7 @@ buf_open(Editor *e, const char *path)
 	e->tabs = NULL;
 	e->label[0] = '\0';
 	e->vcs_src[0] = '\0';
+	e->vcs_kind = 0;
 #ifdef VEDIT_MAIL
 	e->mref = NULL;
 #endif
@@ -16710,6 +16718,7 @@ buf_close(Editor *e, int i)
 		e->nbuf--;
 		e->cur = i < e->nbuf ? i : e->nbuf - 1;
 		buf_load(e, &e->bufs[e->cur]);
+		vcs_refresh(e);
 	} else {
 		if (e->bufs[i].swap_on && e->bufs[i].swap_path[0])
 			unlink(e->bufs[i].swap_path);
@@ -21177,6 +21186,8 @@ vcs_template(const char *name, const char *which)
 		return "git show $(rev) -- $(file)";
 	if (strcmp(which, "blame") == 0)
 		return "git blame --date=short -- $(file)";
+	if (strcmp(which, "commit") == 0)
+		return "git commit --only -F $(msg) -- $(file)";
 	return NULL;
 }
 
@@ -21720,16 +21731,18 @@ vcs_name(const Editor *e, char *out, size_t outsz)
 	return 0;
 }
 
-/* Replace $(rev) in tmpl; tool_expand handles the rest. Returns malloc'd. */
+/* Replace var (such as "$(rev)") with val in tmpl; tool_expand handles the
+ * rest. Returns malloc'd. */
 static char *
-vcs_expand(const char *tmpl, const char *rev, const char *path)
+vcs_expand(const char *tmpl, const char *var, const char *val,
+    const char *path)
 {
 	char *out = NULL, *res;
-	size_t olen = 0, ocap = 0;
+	size_t olen = 0, ocap = 0, vl = strlen(var);
 	const char *p = tmpl;
 
 	while (*p) {
-		const char *at = strstr(p, "$(rev)");
+		const char *at = strstr(p, var);
 		size_t n = at ? (size_t)(at - p) : strlen(p);
 
 		if (sb_append(&out, &olen, &ocap, p, n) < 0) {
@@ -21738,11 +21751,11 @@ vcs_expand(const char *tmpl, const char *rev, const char *path)
 		}
 		if (!at)
 			break;
-		if (sb_append(&out, &olen, &ocap, rev, strlen(rev)) < 0) {
+		if (sb_append(&out, &olen, &ocap, val, strlen(val)) < 0) {
 			free(out);
 			return NULL;
 		}
-		p = at + 6;
+		p = at + vl;
 	}
 	if (!out)
 		return strdup("");
@@ -21753,12 +21766,12 @@ vcs_expand(const char *tmpl, const char *rev, const char *path)
 
 /* Run a template with $(rev) for path and collect all of its output. Returns the exit status, or -1 when it could not run. */
 static int
-vcs_capture(Editor *e, const char *tmpl, const char *rev, const char *path,
-    struct fmtbuf *b)
+vcs_capture(Editor *e, const char *tmpl, const char *var, const char *val,
+    const char *path, struct fmtbuf *b)
 {
 	char dir[PATH_MAX], base[PATH_MAX], stem[PATH_MAX], ext[PATH_MAX];
 	char real[PATH_MAX];
-	char *cmd = vcs_expand(tmpl, rev ? rev : "", path);
+	char *cmd = vcs_expand(tmpl, var, val ? val : "", path);
 	int rc;
 
 	memset(b, 0, sizeof(*b));
@@ -21859,7 +21872,7 @@ vcs_show_rev(Editor *e, const char *name, const char *path, const char *rev)
 		set_status(e, "vcs.%s.show is not set", name);
 		return -1;
 	}
-	rc = vcs_capture(e, tmpl, rev, path, &d);
+	rc = vcs_capture(e, tmpl, "$(rev)", rev, path, &d);
 	if (rc < 0 || !d.buf) {
 		set_status(e, "could not run the show command");
 		free(d.buf);
@@ -21898,7 +21911,7 @@ vcs_history(Editor *e)
 		set_status(e, "vcs.%s.log is not set", name);
 		return -1;
 	}
-	rc = vcs_capture(e, tmpl, NULL, e->path, &b);
+	rc = vcs_capture(e, tmpl, "$(rev)", NULL, e->path, &b);
 	if (rc != 0 || !b.buf || b.len == 0) {
 		set_status(e, rc < 0 ? "could not run the log command" :
 		    "no history for this file");
@@ -21971,7 +21984,7 @@ vcs_blame(Editor *e)
 		set_status(e, "vcs.%s.blame is not set", name);
 		return -1;
 	}
-	rc = vcs_capture(e, tmpl, NULL, e->path, &b);
+	rc = vcs_capture(e, tmpl, "$(rev)", NULL, e->path, &b);
 	if (rc != 0 || !b.buf || b.len == 0) {
 		set_status(e, rc < 0 ? "could not run the blame command" :
 		    "no blame for this file");
@@ -21993,6 +22006,7 @@ vcs_blame(Editor *e)
 	if (rc < 0)
 		return -1;
 	snprintf(e->vcs_src, sizeof(e->vcs_src), "%s", src);
+	e->vcs_kind = 1;
 	if (cy < text_lines(e->t))
 		e->cy = cy;
 	buf_save(e, &e->bufs[e->cur]);
@@ -22027,6 +22041,169 @@ vcs_blame_follow(Editor *e)
 		return -1;
 	}
 	return vcs_show_rev(e, name, colon + 1, rev);
+}
+
+/* VCS > Commit and :commit. From a file under version control (saved, or
+ * the request is refused) they open a message buffer named file@commit with
+ * the gitcommit grammar and the file named in # comments. From that buffer
+ * they send it: the lines that are not comments go to a temporary file and
+ * vcs.<name>.commit runs with $(msg) naming it and $(file) the source; on
+ * success the message buffer closes and the source buffer is shown again
+ * with its status refreshed. :bd! abandons a message. */
+
+/* The index of the buffer holding path, or -1. */
+static int
+buf_find_path(const Editor *e, const char *path)
+{
+	int i;
+
+	for (i = 0; i < e->nbuf; i++) {
+		const char *p = (i == e->cur) ? e->path : e->bufs[i].path;
+		int named = (i == e->cur) ? e->has_name : e->bufs[i].has_name;
+
+		if (named && buf_same_file(p, path))
+			return i;
+	}
+	return -1;
+}
+
+static int
+vcs_commit_send(Editor *e)
+{
+	const char *colon = strchr(e->vcs_src, ':');
+	const char *tmpdir = getenv("TMPDIR"), *tmpl;
+	char name[32], msgpath[PATH_MAX], path[PATH_MAX];
+	struct fmtbuf b;
+	size_t i, n, last = 0;
+	FILE *fp;
+	int fd, rc, src;
+
+	if (!colon || (size_t)(colon - e->vcs_src) >= sizeof(name))
+		return -1;
+	memcpy(name, e->vcs_src, (size_t)(colon - e->vcs_src));
+	name[colon - e->vcs_src] = '\0';
+	snprintf(path, sizeof(path), "%s", colon + 1);
+	tmpl = vcs_template(name, "commit");
+	if (!tmpl) {
+		set_status(e, "vcs.%s.commit is not set", name);
+		return -1;
+	}
+
+	/* the message: every non-comment line up to the last non-blank one */
+	n = text_lines(e->t);
+	for (i = 0; i < n; i++) {
+		size_t len = 0;
+		const char *ln = text_line(e->t, i, &len);
+
+		if (ln && len > 0 && ln[0] != '#' && strspn(ln, " \t") < len)
+			last = i + 1;
+	}
+	if (last == 0) {
+		set_status(e, "empty commit message; nothing committed");
+		return -1;
+	}
+	if (!tmpdir || !tmpdir[0])
+		tmpdir = "/tmp";
+	if (snprintf(msgpath, sizeof(msgpath), "%s/vedit-msg.XXXXXX", tmpdir) >=
+	    (int)sizeof(msgpath)) {
+		set_status(e, "commit: TMPDIR too long");
+		return -1;
+	}
+	fd = mkstemp(msgpath);
+	if (fd < 0 || !(fp = fdopen(fd, "w"))) {
+		if (fd >= 0)
+			close(fd);
+		set_status(e, "commit: %s", strerror(errno));
+		return -1;
+	}
+	for (i = 0; i < last; i++) {
+		size_t len = 0;
+		const char *ln = text_line(e->t, i, &len);
+
+		if (!ln || (len > 0 && ln[0] == '#'))
+			continue;
+		fwrite(ln, 1, len, fp);
+		fputc('\n', fp);
+	}
+	if (fclose(fp) != 0) {
+		unlink(msgpath);
+		set_status(e, "commit: %s", strerror(errno));
+		return -1;
+	}
+
+	rc = vcs_capture(e, tmpl, "$(msg)", msgpath, path, &b);
+	unlink(msgpath);
+	if (rc != 0) {
+		size_t fl = b.buf ? strcspn(b.buf, "\r\n") : 0;
+
+		set_status(e, rc < 0 ? "could not run the commit command" :
+		    "commit failed: %.*s", (int)fl, b.buf ? b.buf : "");
+		free(b.buf);
+		return -1;
+	}
+
+	/* done: drop the message buffer, show the source with a fresh mark */
+	e->t->dirty = 0;
+	if (buf_close(e, e->cur) < 0)
+		e->vcs_kind = 0;
+	src = buf_find_path(e, path);
+	if (src >= 0)
+		buf_switch(e, src);
+	{
+		size_t fl = b.buf ? strcspn(b.buf, "\r\n") : 0;
+
+		if (fl > 0)
+			set_status(e, "committed: %.*s", (int)fl, b.buf);
+		else
+			set_status(e, "committed");
+	}
+	free(b.buf);
+	return 0;
+}
+
+static int
+vcs_commit(Editor *e)
+{
+	char name[32], src[PATH_MAX], label[64], head[PATH_MAX + 160];
+	const char *base;
+	int i;
+
+	if (e->vcs_kind == 2)
+		return vcs_commit_send(e);
+	if (vcs_name(e, name, sizeof(name)) < 0) {
+		set_status(e, "no version control for this file");
+		return -1;
+	}
+	if (!vcs_template(name, "commit")) {
+		set_status(e, "vcs.%s.commit is not set", name);
+		return -1;
+	}
+	if (text_dirty(e->t)) {
+		set_status(e, "save the file first, then commit");
+		return -1;
+	}
+	if (snprintf(src, sizeof(src), "%s:%s", name, e->path) >=
+	    (int)sizeof(src)) {
+		set_status(e, "commit: path too long");
+		return -1;
+	}
+	base = strrchr(e->path, '/');
+	base = base ? base + 1 : e->path;
+	snprintf(label, sizeof(label), "%.40s@commit", base);
+	snprintf(head, sizeof(head),
+	    "\n# Commit %.200s (%.47s)\n"
+	    "# Lines starting with # are left out. :commit (or VCS > Commit)\n"
+	    "# sends the message; :bd! abandons it.\n", e->path, e->vcs);
+	i = vcs_open_text(e, head, strlen(head), label, "gitcommit");
+	if (i < 0)
+		return -1;
+	e->t->readonly = 0;
+	snprintf(e->vcs_src, sizeof(e->vcs_src), "%s", src);
+	e->vcs_kind = 2;
+	e->cy = e->cx = 0;
+	buf_save(e, &e->bufs[e->cur]);
+	set_status(e, "write the message, then :commit sends it");
+	return i;
 }
 #else
 static void
@@ -22305,6 +22482,9 @@ run_menu_act(Editor *e, Menuact act)
 		break;
 	case MA_VCS_BLAME:
 		vcs_blame(e);
+		break;
+	case MA_VCS_COMMIT:
+		vcs_commit(e);
 		break;
 #endif
 #ifdef VEDIT_TERM
@@ -23594,7 +23774,7 @@ editor_loop(Editor *e)
 
 #ifndef VEDIT_NO_TOOLS
 		/* Enter in a blame buffer opens the line's commit. */
-		if (e->t->readonly && e->vcs_src[0] && seq.type == TKBD_KEY &&
+		if (e->vcs_kind == 1 && seq.type == TKBD_KEY &&
 		    seq.key == TKBD_KEY_ENTER) {
 			vcs_blame_follow(e);
 			ed_render(e, e->d);
@@ -24156,6 +24336,7 @@ static const char g_config_template[] =
 	"#	log = git log --format='%h %as %s' -n 200 -- $(file)\n"
 	"#	show = git show $(rev) -- $(file)\n"
 	"#	blame = git blame --date=short -- $(file)\n"
+	"#	commit = git commit --only -F $(msg) -- $(file)\n"
 	"\n"
 	"[insert]\n"
 	"#	dateformat = %Y-%m-%d # strftime pattern Insert > Date starts on\n"
@@ -35107,7 +35288,7 @@ enum excmd {
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
 	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD, EX_CONFIG,
 	EX_MAIL, EX_COMPOSE, EX_REPLY, EX_SEND,
-	EX_DATE, EX_LOG, EX_BLAME,
+	EX_DATE, EX_LOG, EX_BLAME, EX_COMMIT,
 	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH, EX_CELL, EX_SORT, EX_TABSTOPS,
 	EX_ROWADD, EX_ROWDEL, EX_COLADD, EX_COLDEL,
 };
@@ -35156,6 +35337,7 @@ static const struct excmd_name {
 	{ "date",	4, EX_DATE },
 	{ "log",	3, EX_LOG },
 	{ "blame",	2, EX_BLAME },
+	{ "commit",	4, EX_COMMIT },
 	{ "tabstops",	4, EX_TABSTOPS },
 	{ "rowadd",	4, EX_ROWADD },
 	{ "rowdel",	4, EX_ROWDEL },
@@ -35561,6 +35743,13 @@ vi_ex_exec(Editor *e, char *buf)
 	case EX_BLAME:
 #ifndef VEDIT_NO_TOOLS
 		vcs_blame(e);
+#else
+		set_status(e, "version control is not available");
+#endif
+		return REQ_CONTINUE;
+	case EX_COMMIT:
+#ifndef VEDIT_NO_TOOLS
+		vcs_commit(e);
 #else
 		set_status(e, "version control is not available");
 #endif

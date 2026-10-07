@@ -1916,6 +1916,8 @@ t_vblock_yank_put(Test *t)
 static const char *g_fake_output;	/* bytes run_capture emits */
 static int g_fake_rc;			/* exit status it returns */
 static char g_fake_cmd[256];		/* the command line it was handed */
+static char g_fake_msg[256];		/* contents of the file after "-F " */
+static char g_fake_commit[256];		/* the last "git commit" command line */
 static char g_fake_dir[PATH_MAX];	/* the directory it was handed */
 static int g_fake_fg;			/* run_foreground was called */
 
@@ -1926,6 +1928,30 @@ fake_capture(void *ctx, const char *cmd, const char *dir,
 	(void)ctx;
 	snprintf(g_fake_cmd, sizeof(g_fake_cmd), "%s", cmd);
 	snprintf(g_fake_dir, sizeof(g_fake_dir), "%s", dir ? dir : "");
+	if (strncmp(cmd, "git commit", 10) == 0)
+		snprintf(g_fake_commit, sizeof(g_fake_commit), "%s", cmd);
+	{
+		const char *f = strstr(cmd, "-F ");
+
+		if (f) {
+			char fpath[256];
+			size_t fl = strcspn(f + 3, " ");
+			FILE *fp;
+
+			if (fl < sizeof(fpath)) {
+				memcpy(fpath, f + 3, fl);
+				fpath[fl] = '\0';
+				fp = fopen(fpath, "r");
+				if (fp) {
+					size_t n = fread(g_fake_msg, 1,
+					    sizeof(g_fake_msg) - 1, fp);
+
+					g_fake_msg[n] = '\0';
+					fclose(fp);
+				}
+			}
+		}
+	}
 	if (g_fake_output)
 		emit(sink, g_fake_output, strlen(g_fake_output));
 	return g_fake_rc;
@@ -2216,6 +2242,76 @@ t_vcs_blame(Test *t)
 	TAP_CHECK(t, v->e.bufs[1].syn && strcmp(v->e.bufs[1].syn->name, "blame") == 0);
 	vedit_free(v);
 	memio_free(&m);
+}
+
+/* :commit on a saved file opens a message buffer; :commit there writes the
+ * non-comment lines to a file handed to the commit template as $(msg),
+ * closes the message and returns to the source. An unsaved file is refused,
+ * as is an empty message. */
+static void
+t_vcs_commit(Test *t)
+{
+	/* F2, :commit (refused: dirty), then after the save the message buffer;
+	 * the message is typed in directly and a last :commit sends it */
+	const char keys[] = "\033OQ:commit\r:w\r:commit\r";
+	char exbuf[32];
+	char tmpf[] = "/tmp/vedit_cmXXXXXX";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int fd;
+
+	fd = mkstemp(tmpf);
+	TAP_ASSERT(t, fd >= 0);
+	close(fd);
+	g_fake_output = "main\n";
+	g_fake_rc = 0;
+	g_fake_cmd[0] = '\0';
+	g_fake_msg[0] = '\0';
+	g_fake_commit[0] = '\0';
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_tools(v, &fake_tools);
+	vedit_open(v, tmpf);
+	text_insert(v->e.t, 0, 0, "x", 1);	/* dirty: the first :commit is refused */
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.nbuf == 2 && v->e.vcs_kind == 2, "nbuf %d kind %d",
+	    v->e.nbuf, v->e.vcs_kind);
+	insert_bytes(&v->e, "Fix the thing\n\nA body line.\n", 28);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "commit")) == REQ_CONTINUE);
+
+	TAP_CHECKF(t, strncmp(g_fake_commit,
+	    "git commit --only -F /tmp/vedit-msg.", 36) == 0 &&
+	    strstr(g_fake_commit, "-- /tmp/vedit_cm") != NULL, "ran '%s'",
+	    g_fake_commit);
+	TAP_CHECKF(t, strcmp(g_fake_msg, "Fix the thing\n\nA body line.\n") == 0,
+	    "message '%s'", g_fake_msg);
+	TAP_CHECKF(t, v->e.nbuf == 1 && v->e.has_name, "nbuf %d", v->e.nbuf);
+	TAP_CHECKF(t, strncmp(v->e.status, "committed", 9) == 0, "status '%s'",
+	    v->e.status);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* an empty message is refused and the buffer stays */
+	g_fake_cmd[0] = '\0';
+	g_fake_commit[0] = '\0';
+	memio_init(&m, "\033OQ:commit\r:commit\r", 19, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_tools(v, &fake_tools);
+	vedit_open(v, tmpf);
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.nbuf == 2 && v->e.vcs_kind == 2 &&
+	    strstr(v->e.status, "empty commit message") != NULL,
+	    "nbuf %d kind %d status '%s'", v->e.nbuf, v->e.vcs_kind, v->e.status);
+	TAP_CHECK(t, g_fake_commit[0] == '\0');
+	TAP_CHECK(t, v->e.syn && strcmp(v->e.syn->name, "gitcommit") == 0);
+	vedit_free(v);
+	memio_free(&m);
+	unlink(tmpf);
 }
 
 /* F9 (Make): the whole path end to end. The key reaches the dispatcher, the
@@ -3862,6 +3958,7 @@ const Case tap_cases[] = {
 	{ "vcs_status", t_vcs_status },
 	{ "vcs_history", t_vcs_history },
 	{ "vcs_blame", t_vcs_blame },
+	{ "vcs_commit", t_vcs_commit },
 	{ "tool_f9_make", t_tool_f9_make },
 	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },
 	{ "menu_hide_tools", t_menu_hide_tools },

@@ -191,6 +191,10 @@ one's diff in a read-only buffer.
 .B :blame
 Open the blame of the file (VCS > Blame) read-only; Enter on a line opens
 the diff of the commit that changed it.
+.TP
+.B :commit
+From a saved file: open a commit message buffer for it (VCS > Commit). From
+that buffer: commit the file with the message.
 .BI :date " [YYYY-MM-DD]"
 Insert today, or the given day, at the cursor in the format last chosen in
 the calendar of Insert > Date (ISO by default,
@@ -282,8 +286,8 @@ start on),
 .B [vcs]
 (enable) and
 .BI [vcs\ """name"""]
-(branch, status, log, show and blame, the commands behind the status bar
-mark and the VCS menu; git is built in),
+(branch, status, log, show, blame and commit, the commands behind the
+status bar mark and the VCS menu; git is built in),
 and per-language
 .BI [command\  """lang"""]
 sections for the compile, build, run, and format commands. See

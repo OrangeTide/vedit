@@ -1031,6 +1031,15 @@ revision that last changed it, read-only as `file@blame` with the cursor on
 the line you were on. Enter there opens the diff of the commit that leads the
 cursor line, the same way History does.
 
+**Commit** (also `:commit`) commits the current file on its own. The file
+must be saved first. It opens a message buffer named `file@commit` with the
+gitcommit highlighting and the file named in `#` comments; write the message
+there, then choose Commit again (or `:commit`) to send it. The lines that
+are not comments go to a temporary file that the commit template receives as
+`$(msg)`; on success the message buffer closes, the source buffer returns
+with its mark refreshed, and the status line shows the commit's first output
+line. `:bd!` abandons a message.
+
 ![The history picker over a file in this repository](docs/shot-history.png)
 
 Another system needs only its command lines in a `[vcs "<name>"]` section:
@@ -1038,8 +1047,9 @@ Another system needs only its command lines in a `[vcs "<name>"]` section:
 copy; `status` must print one porcelain-style line for `$(file)` when it has
 changed, `??` first when it is untracked, and nothing when it is clean; `log`
 prints one line per commit, the revision first and the rest as the picker
-shows it; `show` prints the diff for `$(rev)` and `$(file)`; and `blame`
-prints the file with each line led by its revision. The
+shows it; `show` prints the diff for `$(rev)` and `$(file)`; `blame` prints
+the file with each line led by its revision; and `commit` records `$(file)`
+with the message in the file `$(msg)`. The
 configured systems are tried in the order they appear, then git, and the
 first whose `branch` command succeeds names the file. For Mercurial:
 
@@ -1050,6 +1060,7 @@ first whose `branch` command succeeds names the file. For Mercurial:
     log = hg log --template "{node|short} {date|shortdate} {desc|firstline}\n" $(file)
     show = hg diff -c $(rev) $(file)
     blame = hg annotate -c -u -d $(file)
+    commit = hg commit -l $(msg) $(file)
 ```
 
 The same `[vcs "git"]` keys override the built-in git commands.
