@@ -1,4 +1,5 @@
 /vedit
+/_out/
 *.o
 /tests/taptest
 /tests/test_unit

@@ -11,6 +11,33 @@ PROG = vedit
 SRC  = vedit.c
 HDR  = vedit.h
 
+# Every build lands in its own directory under OUT, keyed by the target
+# triple, so a native, a static musl, and a cross build never overwrite each
+# other and each stays up to date on its own. TARGET defaults to what the
+# compiler reports (the static mode below sets its own). A `vedit` symlink at
+# the top level always points at the most recent build, for the scripts and
+# docs that run ./vedit.
+OUT    ?= _out
+TARGET ?= $(shell $(CC) -dumpmachine)
+OUTBIN  = $(OUT)/$(TARGET)/bin
+BIN     = $(OUTBIN)/$(PROG)
+
+# Static build against musl, handy for dropping the binary onto a server:
+#   make static            (or: make STATIC=1)
+#   make static install    installs that binary
+# Naming `static` among the goals turns the mode on for the whole run, so the
+# other goals on the same line (install, screenshots) see the same binary.
+# The target is named explicitly because musl-gcc reports the host triple.
+ifneq ($(filter static,$(MAKECMDGOALS)),)
+STATIC = 1
+endif
+ifdef STATIC
+CC      = musl-gcc
+TARGET  = $(shell $(CC) -dumpmachine | cut -d- -f1)-linux-musl
+LDFLAGS += -static
+RELEASE = 1
+endif
+
 ifdef RELEASE
 CFLAGS += -O2 -DNDEBUG
 else
@@ -50,20 +77,23 @@ TORTURE_ROUNDS ?= 20000
 # Shared flags for the sanitizer builds of the tests and the torture suite.
 SANCFLAGS = -std=gnu11 -Wall -Wextra -g -O1 -fno-omit-frame-pointer
 
-.PHONY: all clean install uninstall test torture asan ubsan cov cov-term screenshots
+.PHONY: all link clean install uninstall test torture asan ubsan cov cov-term \
+    screenshots static
 
-all: $(PROG)
+all: $(BIN) link
 
-$(PROG): $(SRC) $(HDR)
+$(BIN): $(SRC) $(HDR) | $(OUTBIN)
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
 
-# Static build against musl, handy for dropping the binary onto a server:
-#   make static
-# The binary is removed first because the flags are not a prerequisite, so an
-# up-to-date native build would otherwise be left in place.
-static:
-	rm -f $(PROG)
-	$(MAKE) CC=musl-gcc LDFLAGS=-static RELEASE=1
+$(OUTBIN):
+	mkdir -p $@
+
+# Point the top-level symlink at this target's binary. Always rerun, so
+# `make static` and a plain `make` each leave ./vedit on the build just made.
+link: $(BIN)
+	ln -sfn $(BIN) $(PROG)
+
+static: all
 
 # Unit and integration tests, run through the vendored taptest driver.
 $(TESTDIR)/taptest: $(TESTDIR)/taptest.c $(TESTDIR)/taptest_selftest.c \
@@ -166,10 +196,11 @@ cov-term:
 
 # Regenerate the README screenshots (docs/shot-*.png) from the built binary.
 # Needs Xvfb, xterm, xdotool, and ImageMagick's import on PATH.
-screenshots: $(PROG)
+screenshots: all
 	docs/screenshots.sh ./$(PROG)
 
 clean:
+	rm -rf $(OUT)
 	rm -f $(PROG) $(TESTDIR)/taptest $(TESTBINS) $(TERMTESTBIN) \
 	    $(TERMFAULTBIN) $(TESTDIR)/test_termfault-cov \
 	    $(TESTDIR)/torturet \
@@ -180,9 +211,9 @@ clean:
 	    $(TESTDIR)/*.gcno $(TESTDIR)/*.gcda $(TESTDIR)/*.gcov \
 	    $(TESTDIR)/vedit.c.gcov.term $(TESTDIR)/vedit.c.gcov.fault
 
-install: $(PROG)
+install: $(BIN)
 	mkdir -p $(DESTDIR)$(BINDIR)
-	install -m 0755 $(PROG) $(DESTDIR)$(BINDIR)/$(PROG)
+	install -m 0755 $(BIN) $(DESTDIR)$(BINDIR)/$(PROG)
 	mkdir -p $(DESTDIR)$(MANDIR)/man1
 	install -m 0644 man/vedit.1 $(DESTDIR)$(MANDIR)/man1/vedit.1
 

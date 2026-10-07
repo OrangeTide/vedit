@@ -18,9 +18,10 @@ the unified palette), with mockups drawn from vedit's real output.
 ## Building
 
 ```sh
-make                    # build ./vedit
+make                    # build _out/<triple>/bin/vedit, linked as ./vedit
 make RELEASE=1          # optimized build
 make static             # static musl build, for dropping onto a server
+make static install     # install that one instead
 make install            # install to ~/.local/bin (override PREFIX)
 ```
 
