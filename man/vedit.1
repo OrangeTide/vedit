@@ -187,6 +187,10 @@ asks the same in a dialog.
 .B :log
 List the commits that touched the file (VCS > History) and open the chosen
 one's diff in a read-only buffer.
+.TP
+.B :blame
+Open the blame of the file (VCS > Blame) read-only; Enter on a line opens
+the diff of the commit that changed it.
 .BI :date " [YYYY-MM-DD]"
 Insert today, or the given day, at the cursor in the format last chosen in
 the calendar of Insert > Date (ISO by default,
@@ -278,8 +282,8 @@ start on),
 .B [vcs]
 (enable) and
 .BI [vcs\ """name"""]
-(branch, status, log and show, the commands behind the status bar mark and
-the VCS menu's History; git is built in),
+(branch, status, log, show and blame, the commands behind the status bar
+mark and the VCS menu; git is built in),
 and per-language
 .BI [command\  """lang"""]
 sections for the compile, build, run, and format commands. See

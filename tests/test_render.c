@@ -2176,6 +2176,48 @@ t_vcs_history(Test *t)
 	memio_free(&m);
 }
 
+/* :blame opens the blame output read-only as file@blame with the cursor on
+ * the line it was on, and Enter there opens the diff of the revision that
+ * leads the cursor line (a git boundary "^" is dropped). */
+static void
+t_vcs_blame(Test *t)
+{
+	static const char *const L[] = { "int x;", "int y;" };
+	const char keys[] = "\033OQj:blame\r\r";	/* F2, down, :blame, Enter */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	g_fake_output = "abc1234 (Jon 2026-10-07 1) int x;\n"
+	    "^def5678 (Jon 2026-10-06 2) int y;\n";
+	g_fake_rc = 0;
+	g_fake_cmd[0] = '\0';
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_tools(v, &fake_tools);
+	vedit_open(v, "test.c");
+	fill_lines(v->e.t, L, 2);
+	vedit_run(v);
+
+	/* the Enter followed line 2 (the cursor had moved down) to its diff */
+	TAP_CHECKF(t, strcmp(g_fake_cmd, "git show def5678 -- ./test.c") == 0,
+	    "ran '%s'", g_fake_cmd);
+	TAP_CHECKF(t, v->e.nbuf == 3, "nbuf %d", v->e.nbuf);
+	TAP_CHECKF(t, strcmp(v->e.label, "test.c@def5678") == 0, "label '%s'",
+	    v->e.label);
+	TAP_CHECK(t, v->e.t->readonly && v->e.vcs_src[0] == '\0');
+	/* the blame buffer in between */
+	TAP_CHECKF(t, strcmp(v->e.bufs[1].label, "test.c@blame") == 0,
+	    "label '%s'", v->e.bufs[1].label);
+	TAP_CHECK(t, strcmp(v->e.bufs[1].vcs_src, "git:test.c") == 0);
+	TAP_CHECK(t, v->e.bufs[1].t->readonly && v->e.bufs[1].cy == 1);
+	TAP_CHECK(t, v->e.bufs[1].syn && strcmp(v->e.bufs[1].syn->name, "blame") == 0);
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* F9 (Make): the whole path end to end. The key reaches the dispatcher, the
  * per-language build command is expanded and run, the captured output is parsed
  * into the quickfix list, and the output pane renders it. The pane and then the
@@ -3819,6 +3861,7 @@ const Case tap_cases[] = {
 #ifndef VEDIT_NO_TOOLS
 	{ "vcs_status", t_vcs_status },
 	{ "vcs_history", t_vcs_history },
+	{ "vcs_blame", t_vcs_blame },
 	{ "tool_f9_make", t_tool_f9_make },
 	{ "tool_ctrl_f9_run", t_tool_ctrl_f9_run },
 	{ "menu_hide_tools", t_menu_hide_tools },

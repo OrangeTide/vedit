@@ -1026,6 +1026,11 @@ that commit's diff of the file in a new buffer named `file@rev`, read-only
 (the status bar shows `RO`, and every edit is refused) with diff
 highlighting; close it with `:bd` or the buffer list like any other.
 
+**Blame** (also `:blame`) opens the blame output, each line led by the
+revision that last changed it, read-only as `file@blame` with the cursor on
+the line you were on. Enter there opens the diff of the commit that leads the
+cursor line, the same way History does.
+
 ![The history picker over a file in this repository](docs/shot-history.png)
 
 Another system needs only its command lines in a `[vcs "<name>"]` section:
@@ -1033,7 +1038,8 @@ Another system needs only its command lines in a `[vcs "<name>"]` section:
 copy; `status` must print one porcelain-style line for `$(file)` when it has
 changed, `??` first when it is untracked, and nothing when it is clean; `log`
 prints one line per commit, the revision first and the rest as the picker
-shows it; and `show` prints the diff for `$(rev)` and `$(file)`. The
+shows it; `show` prints the diff for `$(rev)` and `$(file)`; and `blame`
+prints the file with each line led by its revision. The
 configured systems are tried in the order they appear, then git, and the
 first whose `branch` command succeeds names the file. For Mercurial:
 
@@ -1043,6 +1049,7 @@ first whose `branch` command succeeds names the file. For Mercurial:
     status = hg status $(file)
     log = hg log --template "{node|short} {date|shortdate} {desc|firstline}\n" $(file)
     show = hg diff -c $(rev) $(file)
+    blame = hg annotate -c -u -d $(file)
 ```
 
 The same `[vcs "git"]` keys override the built-in git commands.

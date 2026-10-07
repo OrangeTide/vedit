@@ -2900,7 +2900,7 @@ typedef struct syntax {
 #define JSF_CLASS_MAX	32
 #define JSF_STATE_MAX	128
 #define JSF_NAME	48
-#define JSF_LANG_MAX	8
+#define JSF_LANG_MAX	12
 
 enum {
 	JSF_F_NOEAT = 1,	/* do not consume the byte; re-dispatch in next */
@@ -3618,6 +3618,8 @@ static const char g_default_grammar[] =
 	"	start = sbol\n"
 	"[language \"diff\"]\n"
 	"	start = bol\n"
+	"[language \"blame\"]\n"
+	"	start = bol\n"
 	"\n"
 	"[syntax]\n"
 	"	h = c\n"
@@ -3653,6 +3655,7 @@ static const char g_default_grammar[] =
 	"	diff = diff\n"
 	"	patch = diff\n"
 	"	rej = diff\n"
+	"	blame = blame\n"
 	"\n"
 	"[color \"c\"]\n"
 	"	comment = 14\n"
@@ -4341,6 +4344,32 @@ static const char g_default_grammar[] =
 	"	color = header\n"
 	"	rule = \"\\n\" bol\n"
 	"	rule = * header\n"
+	"[color \"blame\"]\n"
+	"	rev = 11\n"
+	"	meta = 14\n"
+	"[state \"blame.bol\"]\n"
+	"	color = text\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * rev recolor\n"
+	"[state \"blame.rev\"]\n"
+	"	color = rev\n"
+	"	rule = \" \" gap\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * rev\n"
+	"[state \"blame.gap\"]\n"
+	"	color = text\n"
+	"	rule = \"(\" meta recolor\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * gap\n"
+	"[state \"blame.meta\"]\n"
+	"	color = meta\n"
+	"	rule = \")\" code\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * meta\n"
+	"[state \"blame.code\"]\n"
+	"	color = text\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * code\n"
 	"[color \"gitcommit\"]\n"
 	"	subject = 15 bold\n"
 	"	over = 9 reverse\n"
@@ -6431,6 +6460,7 @@ typedef struct ebuf {
 	char		swap_path[PATH_MAX];	/* this buffer's swap file, or "" */
 	char		vcs[48];	/* "name:branch*" from the VCS, or "" */
 	char		label[64];	/* title of an unnamed buffer, or "" */
+	char		vcs_src[PATH_MAX];	/* blame: "name:path" it annotates, or "" */
 	int		swap_on;	/* a swap file exists on disk for it */
 	size_t		swap_rev;	/* text rev at the last swap write */
 	time_t		load_mtime;	/* file mtime at load (swap staleness check) */
@@ -6589,6 +6619,7 @@ typedef struct editor {
 	char		swap_path[PATH_MAX];	/* active buffer's swap file, or "" */
 	char		vcs[48];	/* active buffer's "name:branch*", or "" */
 	char		label[64];	/* active buffer's title when unnamed, or "" */
+	char		vcs_src[PATH_MAX];	/* active blame buffer's "name:path", or "" */
 	int		swap_on;	/* a swap file exists on disk for it */
 	size_t		swap_rev;	/* text rev at the last swap write */
 	time_t		load_mtime;	/* file mtime at load (swap staleness check) */
@@ -8915,7 +8946,7 @@ typedef enum menu_act {
 #ifndef VEDIT_NO_TOOLS
 	MA_FORMAT,
 	MA_COMPILE, MA_MAKE, MA_RUN, MA_VIEW_OUTPUT, MA_ERR_NEXT, MA_ERR_PREV,
-	MA_VCS_LOG,
+	MA_VCS_LOG, MA_VCS_BLAME,
 #endif
 #ifdef VEDIT_TERM
 	MA_TERM_NEW, MA_TERM_CLOSE, MA_TERM_SPLIT, MA_PANE_BUFFER, MA_PANE_CLOSE,
@@ -9074,6 +9105,7 @@ static const Menuitem mi_run[] = {
 #ifndef VEDIT_NO_TOOLS
 static const Menuitem mi_vcs[] = {
 	{ "&History...",	"",	":log",	MA_VCS_LOG },
+	{ "&Blame",	"",	":blame",	MA_VCS_BLAME },
 };
 #endif
 static const Menuitem mi_term[] = {
@@ -9469,6 +9501,7 @@ menu_item_enabled(const Editor *e, Menuact act)
 	case MA_ERR_PREV:
 		return e->tool_nerr > 0;
 	case MA_VCS_LOG:
+	case MA_VCS_BLAME:
 		return e->vcs[0] != '\0';
 #endif
 #ifdef VEDIT_TERM
@@ -15731,6 +15764,7 @@ static const struct {
 #ifndef VEDIT_NO_TOOLS
 	{ ":format  :set fos",	"Run the formatter / format on every save" },
 	{ ":log",		"File history: pick a commit, see its diff (VCS menu)" },
+	{ ":blame",		"Who changed each line; Enter there shows the commit" },
 	{ "F9 Alt+F9 Ctrl+F9",	"Make / compile / run; F4 steps the errors" },
 #endif
 #ifdef VEDIT_TERM
@@ -16443,7 +16477,7 @@ buffer_reset(Editor *e)
 	X(load_mtime) X(kind) X(vterm) X(in_pane) X(top_last) X(art) X(tbl) X(tabs) \
 	BUF_MAIL_SCALARS(X)
 #define BUF_STATE_ARRAYS(X) \
-	X(path) X(vi_mark_y) X(vi_mark_x) X(swap_path) X(vcs) X(label)
+	X(path) X(vi_mark_y) X(vi_mark_x) X(swap_path) X(vcs) X(label) X(vcs_src)
 
 /* Copy the active buffer's per-file fields into a slot. */
 static void
@@ -16604,6 +16638,7 @@ buf_open(Editor *e, const char *path)
 	e->tbl = NULL;
 	e->tabs = NULL;
 	e->label[0] = '\0';
+	e->vcs_src[0] = '\0';
 #ifdef VEDIT_MAIL
 	e->mref = NULL;
 #endif
@@ -21140,6 +21175,8 @@ vcs_template(const char *name, const char *which)
 		return "git log --format='%h %as %s' -n 200 -- $(file)";
 	if (strcmp(which, "show") == 0)
 		return "git show $(rev) -- $(file)";
+	if (strcmp(which, "blame") == 0)
+		return "git blame --date=short -- $(file)";
 	return NULL;
 }
 
@@ -21714,19 +21751,22 @@ vcs_expand(const char *tmpl, const char *rev, const char *path)
 	return res;
 }
 
-/* Run a template with $(rev) for the active file and collect all of its
- * output. Returns the exit status, or -1 when it could not run. */
+/* Run a template with $(rev) for path and collect all of its output. Returns the exit status, or -1 when it could not run. */
 static int
-vcs_capture(Editor *e, const char *tmpl, const char *rev, struct fmtbuf *b)
+vcs_capture(Editor *e, const char *tmpl, const char *rev, const char *path,
+    struct fmtbuf *b)
 {
-	char dir[PATH_MAX];
-	char *cmd = vcs_expand(tmpl, rev ? rev : "", e->path);
+	char dir[PATH_MAX], base[PATH_MAX], stem[PATH_MAX], ext[PATH_MAX];
+	char real[PATH_MAX];
+	char *cmd = vcs_expand(tmpl, rev ? rev : "", path);
 	int rc;
 
 	memset(b, 0, sizeof(*b));
 	if (!cmd)
 		return -1;
-	tool_build_dir(e, dir, sizeof(dir));
+	tool_split_path(path, dir, base, stem, ext);
+	if (realpath(dir, real))
+		snprintf(dir, sizeof(dir), "%s", real);
 	rc = e->tools->run_capture(e->tools->ctx, cmd, dir, fmt_emit, b);
 	free(cmd);
 	if (b->oom) {
@@ -21804,6 +21844,37 @@ vcs_open_text(Editor *e, const char *text, size_t len, const char *label,
 	return i;
 }
 
+/* Open rev's diff of path (vcs.<name>.show) as a read-only buffer named
+ * file@rev. Returns the buffer index, or -1 with a status. */
+static int
+vcs_show_rev(Editor *e, const char *name, const char *path, const char *rev)
+{
+	const char *tmpl = vcs_template(name, "show");
+	const char *base;
+	struct fmtbuf d;
+	char label[64];
+	int rc;
+
+	if (!tmpl) {
+		set_status(e, "vcs.%s.show is not set", name);
+		return -1;
+	}
+	rc = vcs_capture(e, tmpl, rev, path, &d);
+	if (rc < 0 || !d.buf) {
+		set_status(e, "could not run the show command");
+		free(d.buf);
+		return -1;
+	}
+	base = strrchr(path, '/');
+	base = base ? base + 1 : path;
+	snprintf(label, sizeof(label), "%.40s@%.20s", base, rev);
+	rc = vcs_open_text(e, d.buf, d.len, label, "diff");
+	if (rc >= 0)
+		set_status(e, "%s (read-only)", label);
+	free(d.buf);
+	return rc;
+}
+
 static int
 vcs_history(Editor *e)
 {
@@ -21813,8 +21884,8 @@ vcs_history(Editor *e)
 	};
 	Vcslog l;
 	struct fmtbuf b;
-	char name[32], rev[80], label[64];
-	const char *tmpl, *base;
+	char name[32], rev[80];
+	const char *tmpl;
 	size_t i, n;
 	int rc;
 
@@ -21827,7 +21898,7 @@ vcs_history(Editor *e)
 		set_status(e, "vcs.%s.log is not set", name);
 		return -1;
 	}
-	rc = vcs_capture(e, tmpl, NULL, &b);
+	rc = vcs_capture(e, tmpl, NULL, e->path, &b);
 	if (rc != 0 || !b.buf || b.len == 0) {
 		set_status(e, rc < 0 ? "could not run the log command" :
 		    "no history for this file");
@@ -21871,31 +21942,91 @@ vcs_history(Editor *e)
 			rl = sizeof(rev) - 1;
 		memcpy(rev, ln, rl);
 		rev[rl] = '\0';
-		tmpl = vcs_template(name, "show");
-		if (!tmpl) {
-			set_status(e, "vcs.%s.show is not set", name);
-		} else {
-			struct fmtbuf d;
-
-			rc = vcs_capture(e, tmpl, rev, &d);
-			if (rc < 0 || !d.buf) {
-				set_status(e, "could not run the show command");
-				rc = -1;
-			} else {
-				base = strrchr(e->path, '/');
-				base = base ? base + 1 : e->path;
-				snprintf(label, sizeof(label), "%.40s@%.20s", base,
-				    rev);
-				rc = vcs_open_text(e, d.buf, d.len, label, "diff");
-				if (rc >= 0)
-					set_status(e, "%s (read-only)", label);
-			}
-			free(d.buf);
-		}
+		rc = vcs_show_rev(e, name, e->path, rev);
 	}
 	free(l.line);
 	free(l.text);
 	return rc;
+}
+
+/* VCS > Blame and :blame. vcs.<name>.blame prints the file with each line
+ * led by its revision (git blame); the output opens read-only, named
+ * file@blame, with the cursor on the line it was on. Enter there takes the
+ * revision at the start of the cursor line to its diff, as History does. */
+static int
+vcs_blame(Editor *e)
+{
+	struct fmtbuf b;
+	char name[32], label[64], src[PATH_MAX];
+	const char *tmpl, *base;
+	size_t cy = e->cy;
+	int rc;
+
+	if (vcs_name(e, name, sizeof(name)) < 0) {
+		set_status(e, "no version control for this file");
+		return -1;
+	}
+	tmpl = vcs_template(name, "blame");
+	if (!tmpl) {
+		set_status(e, "vcs.%s.blame is not set", name);
+		return -1;
+	}
+	rc = vcs_capture(e, tmpl, NULL, e->path, &b);
+	if (rc != 0 || !b.buf || b.len == 0) {
+		set_status(e, rc < 0 ? "could not run the blame command" :
+		    "no blame for this file");
+		free(b.buf);
+		return -1;
+	}
+	if (snprintf(src, sizeof(src), "%s:%s", name, e->path) >=
+	    (int)sizeof(src)) {
+		free(b.buf);
+		errno = ENAMETOOLONG;
+		set_status(e, "blame: %s", strerror(errno));
+		return -1;
+	}
+	base = strrchr(e->path, '/');
+	base = base ? base + 1 : e->path;
+	snprintf(label, sizeof(label), "%.40s@blame", base);
+	rc = vcs_open_text(e, b.buf, b.len, label, "blame");
+	free(b.buf);
+	if (rc < 0)
+		return -1;
+	snprintf(e->vcs_src, sizeof(e->vcs_src), "%s", src);
+	if (cy < text_lines(e->t))
+		e->cy = cy;
+	buf_save(e, &e->bufs[e->cur]);
+	set_status(e, "%s (read-only; Enter shows a line's commit)", label);
+	return rc;
+}
+
+/* Enter in a blame buffer: the diff of the revision that leads the line. */
+static int
+vcs_blame_follow(Editor *e)
+{
+	const char *line, *colon = strchr(e->vcs_src, ':');
+	size_t len = 0, n;
+	char name[32], rev[80];
+
+	if (!colon || (size_t)(colon - e->vcs_src) >= sizeof(name))
+		return -1;
+	memcpy(name, e->vcs_src, (size_t)(colon - e->vcs_src));
+	name[colon - e->vcs_src] = '\0';
+	line = text_line(e->t, e->cy, &len);
+	if (!line)
+		return -1;
+	if (len > 0 && line[0] == '^') {	/* git: a boundary commit */
+		line++;
+		len--;
+	}
+	for (n = 0; n < len && n < sizeof(rev) - 1 && !isspace((unsigned char)line[n]); n++)
+		rev[n] = line[n];
+	rev[n] = '\0';
+	if (n == 0) {
+		set_status(e, "no revision on this line");
+		return -1;
+	}
+	return vcs_show_rev(e, name, colon + 1, rev);
 }
 #else
 static void
@@ -22171,6 +22302,9 @@ run_menu_act(Editor *e, Menuact act)
 		break;
 	case MA_VCS_LOG:
 		vcs_history(e);
+		break;
+	case MA_VCS_BLAME:
+		vcs_blame(e);
 		break;
 #endif
 #ifdef VEDIT_TERM
@@ -23458,6 +23592,16 @@ editor_loop(Editor *e)
 			}
 		}
 
+#ifndef VEDIT_NO_TOOLS
+		/* Enter in a blame buffer opens the line's commit. */
+		if (e->t->readonly && e->vcs_src[0] && seq.type == TKBD_KEY &&
+		    seq.key == TKBD_KEY_ENTER) {
+			vcs_blame_follow(e);
+			ed_render(e, e->d);
+			continue;
+		}
+#endif
+
 		/* In the hex view, keys drive the hex navigator. It shares the
 		 * request handling, so Ctrl-S and Ctrl-Q behave as usual. */
 		if (e->hex_view) {
@@ -24011,6 +24155,7 @@ static const char g_config_template[] =
 	"#	status = git status --porcelain -- $(file)\n"
 	"#	log = git log --format='%h %as %s' -n 200 -- $(file)\n"
 	"#	show = git show $(rev) -- $(file)\n"
+	"#	blame = git blame --date=short -- $(file)\n"
 	"\n"
 	"[insert]\n"
 	"#	dateformat = %Y-%m-%d # strftime pattern Insert > Date starts on\n"
@@ -34962,7 +35107,7 @@ enum excmd {
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
 	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD, EX_CONFIG,
 	EX_MAIL, EX_COMPOSE, EX_REPLY, EX_SEND,
-	EX_DATE, EX_LOG,
+	EX_DATE, EX_LOG, EX_BLAME,
 	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH, EX_CELL, EX_SORT, EX_TABSTOPS,
 	EX_ROWADD, EX_ROWDEL, EX_COLADD, EX_COLDEL,
 };
@@ -35010,6 +35155,7 @@ static const struct excmd_name {
 	{ "sort",	3, EX_SORT },
 	{ "date",	4, EX_DATE },
 	{ "log",	3, EX_LOG },
+	{ "blame",	2, EX_BLAME },
 	{ "tabstops",	4, EX_TABSTOPS },
 	{ "rowadd",	4, EX_ROWADD },
 	{ "rowdel",	4, EX_ROWDEL },
@@ -35408,6 +35554,13 @@ vi_ex_exec(Editor *e, char *buf)
 	case EX_LOG:
 #ifndef VEDIT_NO_TOOLS
 		vcs_history(e);
+#else
+		set_status(e, "version control is not available");
+#endif
+		return REQ_CONTINUE;
+	case EX_BLAME:
+#ifndef VEDIT_NO_TOOLS
+		vcs_blame(e);
 #else
 		set_status(e, "version control is not available");
 #endif
