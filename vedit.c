@@ -8310,7 +8310,8 @@ typedef enum menu_act {
 	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_TAG_POP, MA_OPEN_HEADER,
 	MA_GOTO,
 	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_HEX, MA_TABLE, MA_DRAW,
-	MA_TBL_ROWADD, MA_TBL_ROWDEL, MA_TBL_COLADD, MA_TBL_COLDEL, MA_SORT,
+	MA_TBL_ROWADD, MA_TBL_ROWDEL, MA_TBL_COLADD, MA_TBL_COLDEL, MA_TBL_FIT,
+	MA_SORT,
 	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS,
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS,
 	MA_VI_MODE, MA_RELOAD_CONFIG, MA_GLYPHS, MA_COLORS,
@@ -8397,6 +8398,7 @@ static const Menuitem mi_edit[] = {
 	{ "&Delete Row",	"",	":rowdel",	MA_TBL_ROWDEL },
 	{ "Insert Colu&mn",	"",	":coladd",	MA_TBL_COLADD },
 	{ "De&lete Column",	"",	":coldel",	MA_TBL_COLDEL },
+	{ "Fit Column Widt&hs",	"",	":colwidth fit all",	MA_TBL_FIT },
 	{ "S&ort Lines...",	"",	":sort",	MA_SORT },
 	{ "",		"",		"",		MA_SEP },
 	{ "Copy to T&erminal",	 "",	"",	MA_OSC_COPY },
@@ -8784,6 +8786,7 @@ menu_item_enabled(const Editor *e, Menuact act)
 	case MA_TBL_ROWDEL:
 	case MA_TBL_COLADD:
 	case MA_TBL_COLDEL:
+	case MA_TBL_FIT:
 		return e->tbl != NULL;
 	case MA_PASTE:
 		return e->clip && e->clip_len > 0;
@@ -11391,6 +11394,32 @@ tbl_cell_goto(Editor *e, const char *arg)
 	e->tbl->pending = 0;
 }
 
+/* Fit column c to its widest cell (a newline inside a value counts as one
+ * column), at least its label's width, at most TBL_WIDTH_MAX. */
+static int
+tbl_fit_width(Editor *e, int c)
+{
+	char label[TBL_LABEL_MAX];
+	char *val = malloc(TBL_CELL_MAX);
+	size_t nl = text_lines(e->t), y;
+	int w = (int)strlen(tbl_label(c, label, sizeof(label)));
+
+	if (!val)
+		return -1;
+	for (y = 0; y < nl; y++) {
+		int cw;
+
+		tbl_cell_value(e, y, c, val, TBL_CELL_MAX);
+		cw = disp_cols(val, strlen(val));
+		if (cw > w)
+			w = cw;
+		if (w >= TBL_WIDTH_MAX)
+			break;
+	}
+	free(val);
+	return tbl_set_width(e->tbl, c, w);
+}
+
 /* :colwidth N [all] -- set the current column's width, or every column's. */
 static void
 tbl_colwidth(Editor *e, const char *arg)
@@ -11403,9 +11432,26 @@ tbl_colwidth(Editor *e, const char *arg)
 		set_status(e, "not a table (:table turns the view on)");
 		return;
 	}
+	if (strncmp(arg, "fit", 3) == 0 && (arg[3] == '\0' || arg[3] == ' ')) {
+		end = (char *)arg + 3;
+		while (*end == ' ')
+			end++;
+		if (strcmp(end, "all") == 0) {
+			for (c = 0; c < e->tbl->ncols; c++)
+				if (tbl_fit_width(e, c) < 0)
+					break;
+			set_status(e, "every column fitted to its contents");
+		} else if (tbl_fit_width(e, e->tbl->cx) < 0) {
+			set_status(e, "out of memory");
+		} else {
+			set_status(e, "column %d fitted: %d wide", e->tbl->cx + 1,
+			    tbl_width(e->tbl, e->tbl->cx));
+		}
+		return;
+	}
 	w = strtol(arg, &end, 10);
 	if (end == arg || w < TBL_WIDTH_MIN || w > TBL_WIDTH_MAX) {
-		set_status(e, "E474: :colwidth N [all], N from %d to %d",
+		set_status(e, "E474: :colwidth N|fit [all], N from %d to %d",
 		    TBL_WIDTH_MIN, TBL_WIDTH_MAX);
 		return;
 	}
@@ -14783,7 +14829,7 @@ static const struct {
 	{ "Ctrl-W m / w / c",	"In a terminal: menu / next buffer / close" },
 	{ ":repost [art]",	"Copy a terminal's output to a new buffer" },
 	{ ":table [off|,|;|tab]",	"CSV/TSV grid view on this buffer (View menu too)" },
-	{ ":colwidth N [all]",	"Table view: width of this column, or every column" },
+	{ ":colwidth N|fit [all]",	"Table view: set or fit this column's width, or all" },
 	{ ":cell C7",		"Table view: go to a cell by label and row" },
 	{ ":rowadd[!] [N]",	"Table view: insert N rows above (! below); :rowdel" },
 	{ ":coladd[!] [N]",	"Table view: insert N columns left (! right); :coldel" },
@@ -15039,8 +15085,8 @@ static const char *const tut_table[] = {
 	"    a row and p or P pastes rows below or above.",
 	"  - :coladd and :coladd! insert a column left or right of the",
 	"    cursor; :coldel deletes one. A count follows any of them.",
-	"  - :colwidth N sets the column's width; :colwidth N all every",
-	"    column's. Widths are fixed, not fitted to the text.",
+	"  - :colwidth N sets the column's width, :colwidth fit fits it to",
+	"    its cells; add \"all\" for every column (also in the Edit menu).",
 	"  - Ctrl+Z and Ctrl+Y (vi u and Ctrl+R) undo and redo.",
 	"",
 	"Searching",
@@ -19306,6 +19352,10 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_TBL_COLDEL:
 		if (e->tbl)
 			tbl_col_del(e, 1);
+		break;
+	case MA_TBL_FIT:
+		if (e->tbl)
+			tbl_colwidth(e, "fit all");
 		break;
 	case MA_SORT:
 		dlg_sort(e);

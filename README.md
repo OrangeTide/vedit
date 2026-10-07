@@ -1192,8 +1192,10 @@ Commands:
   `:table off` leaves the view; `:table header` and `:table noheader` say
   whether line 1 is a frozen header row.
 - `:colwidth N` sets the current column's display width, `:colwidth N all`
-  every column's. Widths are fixed, not fitted to the content; the default is
-  10 columns.
+  every column's. `:colwidth fit` fits the current column to its widest cell
+  (at least its label, at most 200 columns) and `:colwidth fit all`, or Edit >
+  Fit Column Widths, fits every column. Widths otherwise stay fixed; the
+  default is 10 columns.
 
 Config, under `[table]`: `view` (on by default) opens these files in the view,
 `header` (on) treats line 1 as a header, `width` sets the default column width.

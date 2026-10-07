@@ -2210,6 +2210,13 @@ t_tbl_attach(Test *t)
 	TAP_CHECK(t, tbl_width(v->e.tbl, 0) == 7 && tbl_width(v->e.tbl, 1) == 7);
 	tbl_colwidth(&v->e, "0");
 	TAP_CHECK(t, strncmp(v->e.status, "E474", 4) == 0);
+	tbl_colwidth(&v->e, "fit");		/* A: "id" vs "1", "2": 2 wide */
+	TAP_CHECKF(t, tbl_width(v->e.tbl, 0) == 2, "fitted A to %d", tbl_width(v->e.tbl, 0));
+	tbl_colwidth(&v->e, "fit all");
+	TAP_CHECKF(t, tbl_width(v->e.tbl, 1) == 4 && tbl_width(v->e.tbl, 2) == 10 &&
+	    tbl_width(v->e.tbl, 3) == 5, "fitted widths %d %d %d", tbl_width(v->e.tbl, 1),
+	    tbl_width(v->e.tbl, 2), tbl_width(v->e.tbl, 3));
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_TBL_FIT) == 1);
 	tbl_command(&v->e, "off");
 	TAP_CHECK(t, v->e.tbl == NULL);
 	tbl_colwidth(&v->e, "5");
