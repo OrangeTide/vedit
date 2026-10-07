@@ -5892,6 +5892,7 @@ typedef struct tbl {
 	int	width_default;		/* table.width */
 	int	cx;			/* cell cursor column (the row is e->cy) */
 	int	left;			/* first visible column */
+	int	pending;		/* vi: a 'g' waiting for its second key */
 } Tbl;
 
 /* One open file. The editor keeps a list of these; the active buffer's fields
@@ -8169,7 +8170,7 @@ pane_height(const Editor *e)
 static int
 pane_shown(const Editor *e)
 {
-	if (e->kind != BUF_TEXT || e->hex_view || e->art)
+	if (e->kind != BUF_TEXT || e->hex_view || e->art || e->tbl)
 		return 0;
 	if (text_height_full(e) < PANE_MIN_TOTAL)
 		return 0;
@@ -8307,7 +8308,7 @@ typedef enum menu_act {
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE, MA_OSC_COPY, MA_OSC_COPY_FILE,
 	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_TAG_POP, MA_OPEN_HEADER,
 	MA_GOTO,
-	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_HEX, MA_DRAW,
+	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_HEX, MA_TABLE, MA_DRAW,
 	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS,
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS,
 	MA_VI_MODE, MA_RELOAD_CONFIG, MA_GLYPHS, MA_COLORS,
@@ -8330,6 +8331,9 @@ static void tbl_detach(Editor *e);
 static void tbl_free(Tbl *tb);
 static void tbl_command(Editor *e, const char *arg);	/* :table */
 static void tbl_colwidth(Editor *e, const char *arg);	/* :colwidth */
+static void toggle_vi(Editor *e);		/* F2: vi <-> modeless */
+static int tbl_cell_off(const Editor *e, size_t row, int col, size_t *off,
+    size_t *len);
 static void tbl_cell_status(const Editor *e, char *buf, size_t n);
 static int glyph_alt_key(Editor *e, const struct tkbd_seq *seq);
 static void ed_reload_config(Editor *e);
@@ -8396,6 +8400,7 @@ static const Menuitem mi_view[] = {
 	{ "&Auto Indent",	"",	":set ai",	MA_AUTO_INDENT },
 	{ "&Indent with Spaces","",	":set et",	MA_EXPAND_TABS },
 	{ "&Hex Dump",		"",	"",	MA_HEX },
+	{ "Ta&ble View",	"",	":table",	MA_TABLE },
 };
 static const Menuitem mi_options[] = {
 	{ "&Draw Mode",		"Ins",	"",		MA_DRAW },
@@ -8693,6 +8698,8 @@ menu_checked(const Editor *e, Menuact act)
 		return e->wrap ? 1 : 0;
 	case MA_DRAW:
 		return e->draw_mode ? 1 : 0;
+	case MA_TABLE:
+		return e->tbl ? 1 : 0;
 	case MA_VI_MODE:
 		return e->mode != MODE_MODELESS ? 1 : 0;
 	default:
@@ -9089,6 +9096,7 @@ scr_line(Screen *d, int row, int col0, const char *s, size_t len,
 	int col = 0;		/* display column at the start of this rune */
 	int drawn = 0;		/* columns emitted into the window */
 	uint32_t tabmark = 0;	/* guide glyph for a hard tab, 0 when hidden */
+	uint32_t nlmark = (d->t->box_mode == VEDIT_BOX_UTF8) ? 0x21b5 : '~';
 
 	if (show_tabs)
 		tabmark = (d->t->box_mode == VEDIT_BOX_UTF8) ? 0x2192 : '>';
@@ -9149,7 +9157,11 @@ scr_line(Screen *d, int row, int col0, const char *s, size_t len,
 					continue;
 				if (drawn >= width)
 					break;
-				if (r == '\t' && tabmark && c == 0) {
+				if (r == '\n') {	/* a joined CSV record */
+					ch = nlmark;
+					if (!rev)
+						a |= ATTR_DIM;
+				} else if (r == '\t' && tabmark && c == 0) {
 					ch = tabmark;
 					if (!rev)
 						a |= ATTR_DIM;
@@ -10250,6 +10262,20 @@ tbl_sync_file(Editor *e)
 	}
 }
 
+/* Drop the view, leaving the text cursor on the cell it was on. */
+static void
+tbl_leave(Editor *e)
+{
+	size_t off, len;
+
+	if (!e->tbl)
+		return;
+	tbl_cell_off(e, e->cy, e->tbl->cx, &off, &len);
+	tbl_detach(e);
+	e->cx = off;
+	e->top = 0;			/* the text view re-scrolls to the cursor */
+}
+
 /* :table [off | , | ; | tab | pipe | noheader | header] -- toggle the view
  * on the current buffer, force a delimiter, or set the header flag. */
 static void
@@ -10259,7 +10285,7 @@ tbl_command(Editor *e, const char *arg)
 	int header = e->tbl ? e->tbl->header : e->tbl_header;
 
 	if (strcmp(arg, "off") == 0) {
-		tbl_detach(e);
+		tbl_leave(e);
 		set_status(e, "text view");
 		return;
 	}
@@ -10286,7 +10312,7 @@ tbl_command(Editor *e, const char *arg)
 		return;
 	}
 	if (e->tbl && !arg[0]) {		/* a bare :table toggles */
-		tbl_detach(e);
+		tbl_leave(e);
 		set_status(e, "text view");
 		return;
 	}
@@ -10302,38 +10328,406 @@ tbl_command(Editor *e, const char *arg)
 		    e->tbl->delim == '|' ? "pipe" : "other");
 }
 
+
+/* ---- the grid ---- */
+
+/* The byte range of cell (row, col): *off and *len cover the field's raw
+ * bytes, quotes included. A column past the row's last field reports an
+ * empty range at the end of the line. Returns the field count of the row. */
+static int
+tbl_cell_off(const Editor *e, size_t row, int col, size_t *off, size_t *len)
+{
+	size_t llen = 0;
+	const char *s = text_line(e->t, row, &llen);
+	Tblfield *f;
+	int nf;
+
+	*off = llen;
+	*len = 0;
+	if (!s)
+		return 0;
+	nf = tbl_fields(e->tbl->delim, s, llen, NULL, 0);
+	f = malloc((size_t)nf * sizeof(*f));
+	if (!f)
+		return nf;
+	tbl_fields(e->tbl->delim, s, llen, f, nf);
+	if (col < nf) {
+		*off = f[col].off;
+		*len = f[col].len;
+		if (row == 0 && col == 0 && e->tbl->bom &&
+		    *len >= (size_t)e->tbl->bom) {
+			*off += (size_t)e->tbl->bom;
+			*len -= (size_t)e->tbl->bom;
+		}
+	}
+	free(f);
+	return nf;
+}
+
+/* The decoded value of cell (row, col) into buf, control characters shown
+ * as blanks except a newline, which stays for the caller to mark. */
+static void
+tbl_cell_value(const Editor *e, size_t row, int col, char *buf, size_t n)
+{
+	Tblfield f;
+	size_t llen = 0;
+	const char *s = text_line(e->t, row, &llen);
+	int quoting = tbl_quoting(e->tbl->delim);
+
+	buf[0] = '\0';
+	if (!s)
+		return;
+	tbl_cell_off(e, row, col, &f.off, &f.len);
+	f.quoted = quoting && f.len > 0 && s[f.off] == '"';
+	tbl_unquote(&f, s, buf, n);
+}
+
+/* Row-number gutter width: the digits of the line count, at least two, plus
+ * a space. */
+static int
+tbl_gutter(const Editor *e)
+{
+	size_t n = text_lines(e->t);
+	int w = 1;
+
+	while (n >= 10) {
+		n /= 10;
+		w++;
+	}
+	if (w < 2)
+		w = 2;
+	return w + 1;
+}
+
+/* First data row: 1 under a header, else 0. */
+static size_t
+tbl_first_row(const Editor *e)
+{
+	return e->tbl->header && text_lines(e->t) > 1 ? 1 : 0;
+}
+
+/* Keep the cell cursor inside the table and on screen: the row scrolls by
+ * lines, the column by whole columns. */
+static void
+tbl_scroll(Editor *e, int text_h, int text_w)
+{
+	Tbl *tb = e->tbl;
+	size_t nl = text_lines(e->t), first = tbl_first_row(e);
+	int body = text_h - 1 - (first ? 1 : 0);
+	int aw = text_w - tbl_gutter(e), w, c;
+
+	if (e->cy >= nl)
+		e->cy = nl ? nl - 1 : 0;
+	if (tb->cx >= tb->ncols)
+		tb->cx = tb->ncols - 1;
+	if (tb->cx < 0)
+		tb->cx = 0;
+	if (body < 1)
+		body = 1;
+	if (e->top < first)
+		e->top = first;
+	if (e->cy >= first) {
+		if (e->cy < e->top)
+			e->top = e->cy;
+		else if (e->cy >= e->top + (size_t)body)
+			e->top = e->cy - (size_t)body + 1;
+	}
+	if (tb->cx < tb->left)
+		tb->left = tb->cx;
+	for (;;) {			/* widen the window from the left */
+		w = 0;
+		for (c = tb->left; c <= tb->cx; c++)
+			w += tbl_width(tb, c) + 1;
+		if (w <= aw || tb->left >= tb->cx)
+			break;
+		tb->left++;
+	}
+}
+
+/* Paint one cell's text into a field of width w at (row, col), truncated
+ * with a marker; a newline inside the value shows as a marker too. */
+static void
+tbl_paint_cell(Screen *d, int row, int col, int w, const char *val,
+    Color fg, Color bg, uint16_t at)
+{
+	int utf8 = d->t->box_mode == VEDIT_BOX_UTF8;
+	uint32_t more = utf8 ? 0x2026 : '>', nl = utf8 ? 0x21b5 : '~';
+	const unsigned char *p = (const unsigned char *)val;
+	size_t len = strlen(val), i = 0;
+	int x = 0;
+
+	scr_fill(d, row, col, w, ' ', fg, bg, at);
+	while (i < len && x < w) {
+		uint32_t cp;
+		int n = utf8_decode(&cp, p + i, len - i), cw;
+
+		if (n <= 0) {
+			n = 1;
+			cp = '?';
+		}
+		if (cp == '\n')
+			cp = nl;
+		else if (cp == '\r')
+			cp = ' ';
+		else if (cp < 0x20 || cp == 0x7f)
+			cp = ' ';
+		cw = rune_width(cp);
+		if (cw < 1)
+			cw = 1;
+		if (x + cw > w)
+			break;
+		scr_cell(d, row, col + x, cp, fg, bg, at);
+		x += cw;
+		i += (size_t)n;
+	}
+	if (i < len && w > 0)		/* did not fit: mark the cut */
+		scr_cell(d, row, col + w - 1, more, fg, bg, at | ATTR_DIM);
+}
+
+static void
+tbl_render(Editor *e, Screen *d)
+{
+	const Pal *p = ed_chrome(e);
+	Tbl *tb = e->tbl;
+	uint16_t barat = p->reverse_bars ? ATTR_REVERSE : 0;
+	int text_h = text_height(e), text_w = text_width(e);
+	int gw, r, c, x, x0 = CHROME_LEFT, y0 = CHROME_TOP;
+	size_t nl = text_lines(e->t), first, row;
+	char buf[256], label[TBL_LABEL_MAX];
+	char gut[32];
+
+	tbl_scroll(e, text_h, text_w);
+	gw = tbl_gutter(e);
+	first = tbl_first_row(e);
+	scr_clear(d);
+	scr_fill(d, y0, x0, text_w, ' ', p->bar_fg, p->bar_bg, barat);
+	x = gw;
+	for (c = tb->left; c < tb->ncols && x < text_w; c++) {
+		int w = tbl_width(tb, c);
+
+		if (x + w > text_w)
+			w = text_w - x;
+		tbl_paint_cell(d, y0, x0 + x, w, tbl_label(c, label,
+		    sizeof(label)), p->bar_fg, p->bar_bg,
+		    c == tb->cx ? barat | ATTR_BOLD : barat);
+		x += w + 1;
+	}
+	for (r = 1; r < text_h; r++) {
+		int y = y0 + r;
+
+		if (first && r == 1)
+			row = 0;		/* the frozen header */
+		else
+			row = e->top + (size_t)(r - 1 - (first ? 1 : 0));
+		if (row >= nl) {
+			scr_fill(d, y, x0, text_w, ' ', p->content_fg,
+			    p->content_bg, 0);
+			continue;
+		}
+		snprintf(gut, sizeof(gut), "%*zu", gw - 1 < 20 ? gw - 1 : 20,
+		    row + 1);
+		ui_field(d, y, x0, gw, gut, p->bar_fg, p->bar_bg,
+		    row == e->cy ? barat | ATTR_BOLD : barat);
+		scr_fill(d, y, x0 + gw, text_w - gw, ' ', p->content_fg,
+		    p->content_bg, 0);
+		x = gw;
+		for (c = tb->left; c < tb->ncols && x < text_w; c++) {
+			int w = tbl_width(tb, c);
+			uint16_t at = 0;
+
+			if (x + w > text_w)
+				w = text_w - x;
+			if (row == 0 && first)
+				at |= ATTR_BOLD;
+			if (row == e->cy && c == tb->cx)
+				at |= ATTR_REVERSE;
+			tbl_cell_value(e, row, c, buf, sizeof(buf));
+			tbl_paint_cell(d, y, x0 + x, w, buf, p->content_fg,
+			    p->content_bg, at);
+			x += w + 1;
+		}
+	}
+	ui_menubar(e, p, -1);
+	ui_frame(e, p);
+	ui_statusbar(e, p, tb->cx);
+
+	/* the cursor sits on the current cell's first column */
+	x = gw;
+	for (c = tb->left; c < tb->cx; c++)
+		x += tbl_width(tb, c) + 1;
+	if (first && e->cy == 0)
+		r = 1;
+	else
+		r = 1 + (first ? 1 : 0) + (int)(e->cy - e->top);
+	scr_cursor_shape(d, CURSOR_DEFAULT);
+	scr_cursor_vis(d, 1);
+	scr_cursor(d, y0 + r, x0 + (x < text_w ? x : text_w - 1));
+}
+
+/* ---- keys ---- */
+
+static void
+tbl_move(Editor *e, long dy, int dx)
+{
+	Tbl *tb = e->tbl;
+	size_t nl = text_lines(e->t);
+	long y = (long)e->cy + dy;
+
+	if (y < 0)
+		y = 0;
+	if (nl && y >= (long)nl)
+		y = (long)nl - 1;
+	e->cy = (size_t)y;
+	tb->cx += dx;
+	if (tb->cx < 0)
+		tb->cx = 0;
+	if (tb->cx >= tb->ncols)
+		tb->cx = tb->ncols - 1;
+	tb->pending = 0;
+}
+
+/* Handle one key in the table view. Both personalities move by cell; vi
+ * adds h j k l, 0, $, gg, G, Ctrl-B/F and the : and / prompts. Returns a
+ * request for the main loop. */
+static Req
+tbl_key(Editor *e, const struct tkbd_seq *seq)
+{
+	Tbl *tb = e->tbl;
+	int ctrl = seq->mod & TKBD_MOD_CTRL;
+	int shift = seq->mod & TKBD_MOD_SHIFT;
+	int vi = e->mode != MODE_MODELESS;
+	int page = text_height(e) - 2 - (tbl_first_row(e) ? 1 : 0);
+	uint16_t k = seq->key;
+	uint32_t ch = seq->ch;
+
+	if (seq->type != TKBD_KEY)
+		return REQ_CONTINUE;
+	if (page < 1)
+		page = 1;
+
+	if (ctrl) {
+		switch (k) {
+		case TKBD_KEY_S:
+			return REQ_SAVE;
+		case TKBD_KEY_Q:
+			return REQ_QUIT;
+		case TKBD_KEY_HOME:
+			tbl_move(e, -(long)e->cy, -tb->cx);
+			return REQ_CONTINUE;
+		case TKBD_KEY_END:
+			tbl_move(e, (long)text_lines(e->t), -tb->cx);
+			return REQ_CONTINUE;
+		case TKBD_KEY_B:
+			if (vi)
+				tbl_move(e, -page, 0);
+			return REQ_CONTINUE;
+		case TKBD_KEY_F:
+			if (vi)
+				tbl_move(e, page, 0);
+			return REQ_CONTINUE;
+		default:
+			return REQ_CONTINUE;
+		}
+	}
+
+	switch (k) {
+	case TKBD_KEY_LEFT:
+		tbl_move(e, 0, -1);
+		return REQ_CONTINUE;
+	case TKBD_KEY_RIGHT:
+		tbl_move(e, 0, 1);
+		return REQ_CONTINUE;
+	case TKBD_KEY_UP:
+		tbl_move(e, -1, 0);
+		return REQ_CONTINUE;
+	case TKBD_KEY_DOWN:
+		tbl_move(e, 1, 0);
+		return REQ_CONTINUE;
+	case TKBD_KEY_TAB:
+		tbl_move(e, 0, shift ? -1 : 1);
+		return REQ_CONTINUE;
+	case TKBD_KEY_HOME:
+		tbl_move(e, 0, -tb->cx);
+		return REQ_CONTINUE;
+	case TKBD_KEY_END:
+		tbl_move(e, 0, tb->ncols);
+		return REQ_CONTINUE;
+	case TKBD_KEY_PGUP:
+		tbl_move(e, -page, 0);
+		return REQ_CONTINUE;
+	case TKBD_KEY_PGDN:
+		tbl_move(e, page, 0);
+		return REQ_CONTINUE;
+	case TKBD_KEY_F1:
+		return REQ_HELP;
+	case TKBD_KEY_F2:
+		toggle_vi(e);
+		return REQ_CONTINUE;
+	case TKBD_KEY_F8:
+		buf_cycle(e, shift ? -1 : 1);
+		return REQ_CONTINUE;
+	case TKBD_KEY_ESC:
+		tb->pending = 0;
+		return REQ_CONTINUE;
+	default:
+		break;
+	}
+
+	if (!vi || ch == TKBD_CH_NONE)
+		return REQ_CONTINUE;
+	if (tb->pending == 'g') {		/* gg: the first row */
+		tb->pending = 0;
+		if (ch == 'g')
+			tbl_move(e, -(long)e->cy, 0);
+		return REQ_CONTINUE;
+	}
+	switch (ch) {
+	case 'h':
+		tbl_move(e, 0, -1);
+		break;
+	case 'l':
+		tbl_move(e, 0, 1);
+		break;
+	case 'k':
+		tbl_move(e, -1, 0);
+		break;
+	case 'j':
+		tbl_move(e, 1, 0);
+		break;
+	case '0':
+		tbl_move(e, 0, -tb->cx);
+		break;
+	case '$':
+		tbl_move(e, 0, tb->ncols);
+		break;
+	case 'g':
+		tb->pending = 'g';
+		break;
+	case 'G':
+		tbl_move(e, (long)text_lines(e->t), 0);
+		break;
+	case ':':
+		return REQ_VI_COLON;
+	default:
+		break;
+	}
+	return REQ_CONTINUE;
+}
+
 /* "-- TABLE --  C7: value" for the status line: the cell under the cursor
- * and its decoded value, cut to fit. */
+ * and its decoded value on one line. */
 static void
 tbl_cell_status(const Editor *e, char *buf, size_t n)
 {
-	Tblfield f[1];
 	char label[TBL_LABEL_MAX], val[80];
-	size_t len;
-	const char *s = text_line(e->t, e->cy, &len);
-	int nf, c = e->tbl->cx;
+	size_t i;
 
-	val[0] = '\0';
-	if (s) {
-		Tblfield *all;
-
-		nf = tbl_fields(e->tbl->delim, s, len, f, 0);
-		all = c < nf ? malloc((size_t)nf * sizeof(*all)) : NULL;
-		if (all) {
-			tbl_fields(e->tbl->delim, s, len, all, nf);
-			if (e->cy == 0 && c == 0 && e->tbl->bom) {
-				all[0].off += (size_t)e->tbl->bom;
-				all[0].len -= (size_t)e->tbl->bom;
-			}
-			tbl_unquote(&all[c], s, val, sizeof(val));
-			free(all);
-		}
-	}
-	for (len = 0; val[len]; len++)	/* one line for the bar */
-		if ((unsigned char)val[len] < 0x20)
-			val[len] = ' ';
+	tbl_cell_value(e, e->cy, e->tbl->cx, val, sizeof(val));
+	for (i = 0; val[i]; i++)
+		if ((unsigned char)val[i] < 0x20)
+			val[i] = ' ';
 	snprintf(buf, n, "-- TABLE --  %s%zu: %s",
-	    tbl_label(c, label, sizeof(label)), e->cy + 1, val);
+	    tbl_label(e->tbl->cx, label, sizeof(label)), e->cy + 1, val);
 }
 
 /* :colwidth N [all] -- set the current column's width, or every column's. */
@@ -10804,6 +11198,11 @@ render_body(Editor *e, Screen *d)
 	if (e->hex_view) {
 		e->prev_text_view = 0;	/* hex uses hex_top, not e->top */
 		hex_render(e, d);
+		return;
+	}
+	if (e->tbl) {
+		e->prev_text_view = 0;	/* a grid, not the text view */
+		tbl_render(e, d);
 		return;
 	}
 
@@ -13203,6 +13602,8 @@ static const struct {
 	{ "Ctrl-W s / b / w / c",	"Pane below: a shell / this buffer / focus / close" },
 	{ "Ctrl-W m / w / c",	"In a terminal: menu / next buffer / close" },
 	{ ":repost [art]",	"Copy a terminal's output to a new buffer" },
+	{ ":table [off|,|;|tab]",	"CSV/TSV grid view on this buffer (View menu too)" },
+	{ ":colwidth N [all]",	"Table view: width of this column, or every column" },
 #endif
 	{ ":reload",		"Re-read the config file (also Options menu)" },
 	{ "F1 / F2",		"Show this help / back to modeless keys" },
@@ -17644,6 +18045,9 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_DRAW:
 		draw_toggle(e);
 		break;
+	case MA_TABLE:
+		tbl_command(e, "");
+		break;
 	case MA_VI_MODE:
 		toggle_vi(e);
 		break;
@@ -18818,6 +19222,33 @@ editor_loop(Editor *e)
 		if (e->hex_view) {
 			if (run_req(e, hex_key(e, &seq)))
 				return 0;
+			ed_render(e, e->d);
+			continue;
+		}
+
+		/* The table view takes every key; its : prompt is vi's. */
+		if (e->tbl) {
+			switch (tbl_key(e, &seq)) {
+			case REQ_VI_COLON:
+				switch (vi_colon(e)) {
+				case REQ_FORCE_QUIT:
+					return 0;
+				case REQ_QUIT_ERR:
+					return 1;
+				default:
+					break;
+				}
+				break;
+			case REQ_VI_SEARCH:
+				vi_search(e);
+				break;
+			case REQ_FORCE_QUIT:
+				return 0;
+			default:
+				if (run_req(e, REQ_CONTINUE))
+					return 0;
+				break;
+			}
 			ed_render(e, e->d);
 			continue;
 		}

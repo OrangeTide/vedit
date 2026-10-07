@@ -1100,6 +1100,27 @@ consistent of comma, semicolon, tab and pipe. Columns are labelled A, B .. Z,
 AA, AB like a spreadsheet, and the status line shows the cell under the cursor
 with its decoded value: `-- TABLE --  C7: value`.
 
+The grid has a label row on top, a row-number gutter on the left, and the
+header row (line 1) frozen under the labels while the rows scroll. Cells are
+cut to their column's width with a marker; a newline inside a cell shows as a
+return mark, and the text view shows the same byte with a dim mark. The cell
+under the cursor is highlighted and the status line gives its address and full
+value. View > Table View toggles the view like `:table` does.
+
+Moving in the grid:
+
+| Action | EDIT style | vi style |
+|---|---|---|
+| by cell | arrows, Tab, Shift+Tab | h j k l, Tab, Shift+Tab |
+| row start, row end | Home, End | 0, $ |
+| first row, last row | Ctrl+Home, Ctrl+End | gg, G |
+| page | PgUp, PgDn | Ctrl+B, Ctrl+F |
+| save, quit | Ctrl+S, Ctrl+Q | :w, :q |
+| ex command | | : |
+
+F1, F2 and F8 work as in the text view. Leaving the view with `:table off`
+puts the text cursor on the cell you were on.
+
 Commands:
 
 - `:table` turns the view on for any buffer (sniffing the delimiter), or off

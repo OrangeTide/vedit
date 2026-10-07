@@ -2270,6 +2270,146 @@ t_tbl_attach(Test *t)
 	rmdir(dir);
 }
 
+/* The grid: a label row, a row-number gutter, the frozen header, cells
+ * truncated with a marker, the current cell reversed; keys move by cell in
+ * both personalities and the columns scroll as whole columns. */
+static void
+t_tbl_grid(Test *t)
+{
+	char dir[] = "/tmp/vedit-tbl-XXXXXX";
+	char path[PATH_MAX];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	FILE *f;
+	Scrbuf *sb;
+	struct tkbd_seq seq;
+	int r0 = CHROME_TOP, c0 = CHROME_LEFT, gw, i;
+	char row[81];
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/g.csv", dir);
+	f = fopen(path, "wb");
+	TAP_ASSERT(t, f != NULL);
+	fputs("id,name,note,amount,e,f\n1,Ann,\"two\nlines\",10.50,,\n", f);
+	for (i = 2; i <= 30; i++)
+		fprintf(f, "%d,Bob,a rather long note that will not fit,7,,\n", i);
+	fclose(f);
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	TAP_ASSERT(t, v->e.tbl != NULL && v->e.tbl->ncols == 6);
+	gw = tbl_gutter(&v->e);
+	TAP_CHECKF(t, gw == 3, "gutter %d", gw);
+
+	ed_render(&v->e, v->e.d);
+	sb = v->e.d->t;
+#define ROW(y) do { int x_; for (x_ = 0; x_ < 80; x_++) \
+	row[x_] = (char)(sb->cur[(size_t)(y) * sb->cols + x_].codepoint < 128 ? \
+	    sb->cur[(size_t)(y) * sb->cols + x_].codepoint : '#'); row[80] = '\0'; } while (0)
+#define CELL(y, x) (sb->cur[(size_t)(y) * sb->cols + (x)])
+	ROW(r0);
+	TAP_CHECKF(t, strncmp(row + c0 + gw, "A          B", 12) == 0, "labels [%s]", row);
+	ROW(r0 + 1);
+	TAP_CHECKF(t, strncmp(row + c0, " 1 id         name", 18) == 0, "header [%s]", row);
+	TAP_CHECK(t, CELL(r0 + 1, c0 + gw).attrs & ATTR_BOLD);
+	TAP_CHECK(t, CELL(r0 + 1, c0 + gw).attrs & ATTR_REVERSE);	/* A1 current */
+	ROW(r0 + 2);
+	TAP_CHECKF(t, strncmp(row + c0 + gw + 22, "two#lines", 9) == 0, "row 2 [%s]", row);
+	TAP_CHECK(t, CELL(r0 + 2, c0 + gw + 25).codepoint == 0x21b5);	/* the newline */
+	ROW(r0 + 3);
+	TAP_CHECKF(t, strncmp(row + c0 + gw + 22, "a rather #", 10) == 0, "row 3 [%s]", row);
+	TAP_CHECK(t, CELL(r0 + 3, c0 + gw + 31).codepoint == 0x2026);	/* truncated */
+	TAP_CHECK(t, sb->cursor_r == r0 + 1 && sb->cursor_c == c0 + gw);
+
+	/* modeless keys */
+	memset(&seq, 0, sizeof(seq));
+	seq.type = TKBD_KEY;
+	seq.ch = TKBD_CH_NONE;
+	seq.key = TKBD_KEY_RIGHT;
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	seq.key = TKBD_KEY_DOWN;
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	TAP_CHECK(t, v->e.cy == 1 && v->e.tbl->cx == 1);
+	seq.key = TKBD_KEY_TAB;
+	seq.mod = TKBD_MOD_SHIFT;
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	seq.mod = 0;
+	TAP_CHECK(t, v->e.tbl->cx == 0);
+	seq.key = TKBD_KEY_END;
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	TAP_CHECK(t, v->e.tbl->cx == 5);
+	seq.key = TKBD_KEY_PGDN;
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	TAP_CHECKF(t, v->e.cy == 18, "PgDn to row %zu", v->e.cy);
+	seq.key = TKBD_KEY_END;
+	seq.mod = TKBD_MOD_CTRL;
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	TAP_CHECKF(t, v->e.cy == 30 && v->e.tbl->cx == 0, "Ctrl+End: row %zu col %d", v->e.cy, v->e.tbl->cx);
+	seq.key = TKBD_KEY_HOME;
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	seq.mod = 0;
+	TAP_CHECK(t, v->e.cy == 0);
+
+	/* the header stays while the rows scroll */
+	v->e.cy = 25;
+	ed_render(&v->e, v->e.d);
+	ROW(r0 + 1);
+	TAP_CHECKF(t, strncmp(row + c0, " 1 id", 5) == 0, "frozen header [%s]", row);
+	ROW(r0 + 2);
+	TAP_CHECKF(t, v->e.top > 1 && atoi(row + c0) == (int)v->e.top + 1, "first row [%s] top %zu",
+	    row, v->e.top);
+	TAP_CHECK(t, sb->cursor_r == r0 + 2 + (int)(v->e.cy - v->e.top));
+
+	/* wide columns scroll by whole columns; the gutter and label row stay */
+	tbl_colwidth(&v->e, "30 all");
+	v->e.tbl->cx = 3;
+	ed_render(&v->e, v->e.d);
+	TAP_CHECKF(t, v->e.tbl->left == 2, "left column %d", v->e.tbl->left);
+	ROW(r0);
+	TAP_CHECKF(t, strncmp(row + c0 + gw, "C", 1) == 0, "labels [%s]", row);
+	TAP_CHECK(t, sb->cursor_c == c0 + gw + 31);
+
+	/* vi keys */
+	v->e.mode = MODE_NORMAL;
+	seq.key = TKBD_KEY_H;
+	seq.ch = 'h';
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	seq.key = TKBD_KEY_K;
+	seq.ch = 'k';
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	TAP_CHECK(t, v->e.cy == 24 && v->e.tbl->cx == 2);
+	seq.key = TKBD_KEY_G;
+	seq.ch = 'g';
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	TAP_CHECK(t, v->e.tbl->pending == 'g');
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	TAP_CHECK(t, v->e.cy == 0 && v->e.tbl->pending == 0);
+	seq.ch = '$';
+	seq.key = '$';
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	TAP_CHECK(t, v->e.tbl->cx == 5);
+	seq.ch = ':';
+	seq.key = ':';
+	TAP_CHECK(t, tbl_key(&v->e, &seq) == REQ_VI_COLON);
+
+	/* leaving the view puts the text cursor on the cell */
+	v->e.tbl->cx = 2;
+	v->e.cy = 1;
+	tbl_command(&v->e, "off");
+	TAP_CHECK(t, v->e.tbl == NULL && v->e.cx == 6 && v->e.top == 0);
+#undef ROW
+#undef CELL
+
+	vedit_free(v);
+	memio_free(&m);
+	unlink(path);
+	rmdir(dir);
+}
+
 const Case tap_cases[] = {
 	{ "resize_grid", t_resize_grid },
 	{ "resize_signal", t_resize_signal },
@@ -2326,6 +2466,7 @@ const Case tap_cases[] = {
 #ifdef VEDIT_TERM
 	{ "menu_terminal", t_menu_terminal },
 	{ "tbl_attach", t_tbl_attach },
+	{ "tbl_grid", t_tbl_grid },
 #endif
 	{ NULL, NULL },
 };
