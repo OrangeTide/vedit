@@ -77,8 +77,9 @@ can just type, and the arrow keys, `Home`, `End`, `PgUp`, and `PgDn` move around
 
 A first session covers only a handful of keys:
 
-- `Ctrl-S` saves (it asks for a name if the buffer has none), and `Ctrl-Q` quits,
-  prompting when there are unsaved changes.
+- `Ctrl-S` saves (it asks for a name if the buffer has none, and offers to
+  create a directory that does not exist yet), and `Ctrl-Q` quits, prompting
+  when there are unsaved changes.
 - `Ctrl-C`, `Ctrl-X`, and `Ctrl-V` copy, cut, and paste. With nothing selected,
   `Ctrl-C` copies the whole line.
 - `Ctrl-Z` and `Ctrl-Y` undo and redo.
@@ -256,8 +257,14 @@ and a set, non-empty value wins over the config file:
 Only these per-project keys read the environment; editor preferences such as the
 theme or key mode stay in the config file.
 
-After editing the config file, reload it without restarting: the `:reload` ex
-command, or Options > Reload Config. It re-reads the file named at startup and
+Options > Edit Config (or the `:config` ex command) opens the config file in a
+buffer. When no file exists yet, the buffer starts from a commented template of
+every key and nothing is written until you save; the file goes to
+`$XDG_CONFIG_HOME/vedit/config` (`~/.config/vedit/config` when the variable is
+unset). Saving the config file re-applies it at once.
+
+After editing the config file by other means, reload it without restarting: the
+`:reload` ex command, or Options > Reload Config. It re-reads the file named at startup and
 re-applies everything (the scheme and themes, box mode and colors, syntax
 grammars, and the editor toggles). A session started with `--no-config`, or one
 embedded in a host that supplies its own config, has no file to reload and says
@@ -301,8 +308,8 @@ builds from `vedit_cfg_new()` / `vedit_cfg_load()`.
 
 ### Custom syntax highlighting
 
-Beyond the built-in C, shell, Markdown, JavaScript, and HTML highlighters, the
-config file can
+Beyond the built-in C, shell, Markdown, JavaScript, HTML, and INI highlighters,
+the config file can
 define a language as a small state machine (the model joe uses), authored in the same
 gitconfig format, no separate file. A language is a set of states; each state
 has an ordered list of transition `rule` lines keyed on a character set.
@@ -1251,10 +1258,15 @@ spans lines; a regular expression literal, which needs parser context, reads as
 operators and text. The HTML grammar colors tags, attribute names and quoted
 values, comments, the doctype, and entities, and hands the body of a `<script>`
 tag to the JavaScript grammar until `</script>`; a `<style>` body stays plain.
+The INI grammar colors `[section]` headers, keys, values, quoted strings, and
+`;` or `#` comments, which also covers gitconfig files and vedit's own config.
 
 The language is chosen from the file extension: `.c .h .cc .cpp .cxx .hpp .hh
 .lpc .i` use the C grammar, `.sh .bash` the shell grammar, `.md .markdown .mdown
-.mkd` Markdown, `.js .mjs .cjs` JavaScript, and `.html .htm .xhtml` HTML. Highlighting
+.mkd` Markdown, `.js .mjs .cjs` JavaScript, `.html .htm .xhtml` HTML, and `.ini
+.cfg .conf .gitconfig .editorconfig .veditrc .desktop .service` INI. A file with
+no extension is matched by its name instead, so `config` (as in `.git/config`)
+is INI too; a `[syntax]` mapping in the config can add more names. Highlighting
 is on by default when the type is recognized, and files with no match are left
 plain. Toggle it from the View menu, or with the vi `:syntax` command: `:syntax
 off`, `:syntax on`, or `:syntax c` / `:syntax sh` to force a language. The

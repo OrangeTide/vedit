@@ -455,6 +455,100 @@ t_syntax_html(Test *t)
 	TAP_CHECKF(t, SYN_GID(st) == gid, "md js fence gid %d", SYN_GID(st));
 }
 
+/* The built-in INI grammar: section headers, keys, values, strings, and
+ * comments, each line standing alone. */
+static void
+t_syntax_ini(Test *t)
+{
+	const Syntax *ini = syn_for_ext("ini");
+	uint16_t out[64];
+	int sec, key, val, str, com, txt;
+
+	TAP_ASSERT(t, ini != NULL && ini->fsm != NULL);
+	sec = fsm_class(ini->fsm, "section");
+	key = fsm_class(ini->fsm, "key");
+	val = fsm_class(ini->fsm, "value");
+	str = fsm_class(ini->fsm, "string");
+	com = fsm_class(ini->fsm, "comment");
+	txt = fsm_class(ini->fsm, "text");
+	TAP_ASSERT(t, sec > 0 && key > 0 && val > 0 && str > 0 && com > 0);
+
+	syn_line(ini, ini->start, "[ui \"sub\"]", 10, out);
+	TAP_CHECKF(t, out[0] == sec && out[9] == sec, "section [%d %d]",
+	    out[0], out[9]);
+
+	/* key = value: key, separator as text, value */
+	syn_line(ini, ini->start, "wrap = on", 9, out);
+	TAP_CHECKF(t, out[0] == key && out[3] == key, "key [%d %d]",
+	    out[0], out[3]);
+	TAP_CHECKF(t, out[5] == txt, "separator %d", out[5]);
+	TAP_CHECKF(t, out[7] == val && out[8] == val, "value [%d %d]",
+	    out[7], out[8]);
+
+	/* both comment leaders, also after leading blanks */
+	syn_line(ini, ini->start, "; note", 6, out);
+	TAP_CHECKF(t, out[0] == com && out[5] == com, "; comment [%d %d]",
+	    out[0], out[5]);
+	syn_line(ini, ini->start, "  # note", 8, out);
+	TAP_CHECKF(t, out[2] == com && out[7] == com, "# comment [%d %d]",
+	    out[2], out[7]);
+
+	/* a quoted value and a trailing comment */
+	syn_line(ini, ini->start, "k = \"a;b\" # c", 13, out);
+	TAP_CHECKF(t, out[4] == str && out[6] == str && out[8] == str,
+	    "string [%d %d %d]", out[4], out[6], out[8]);
+	TAP_CHECKF(t, out[10] == com && out[12] == com, "trailing [%d %d]",
+	    out[10], out[12]);
+
+	/* a key alone (a gitconfig boolean) stays a key */
+	syn_line(ini, ini->start, "bare", 4, out);
+	TAP_CHECKF(t, out[0] == key && out[3] == key, "bare [%d %d]",
+	    out[0], out[3]);
+
+	/* the extension and basename mappings */
+	TAP_CHECK(t, syn_for_ext("cfg") == ini);
+	TAP_CHECK(t, syn_for_ext("gitconfig") == ini);
+	TAP_CHECK(t, syn_for_path("/home/u/.veditrc") == ini);
+	TAP_CHECK(t, syn_for_path("/home/u/.config/vedit/config") == ini);
+	TAP_CHECK(t, syn_for_path(".git/config") == ini);
+	TAP_CHECK(t, syn_for_path("config") == ini);
+	TAP_CHECK(t, syn_for_path("/x/Makefile") == NULL);
+	TAP_CHECK(t, syn_for_path("/x/main.c") == syn_for_ext("c"));
+}
+
+/* mkdir_p creates nested directories, accepts existing ones, and refuses a
+ * path through a regular file. */
+static void
+t_mkdir_p(Test *t)
+{
+	char dir[] = "/tmp/vedit_mkXXXXXX";
+	char path[PATH_MAX], file[PATH_MAX], bad[PATH_MAX];
+	struct stat st;
+	FILE *f;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/a/b/c", dir);
+	TAP_CHECK(t, mkdir_p(path) == 0);
+	TAP_CHECK(t, stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+	TAP_CHECK(t, mkdir_p(path) == 0);		/* already there */
+
+	snprintf(file, sizeof(file), "%s/a/file", dir);
+	f = fopen(file, "w");
+	TAP_ASSERT(t, f != NULL);
+	fclose(f);
+	snprintf(bad, sizeof(bad), "%s/a/file/sub", dir);
+	TAP_CHECK(t, mkdir_p(bad) != 0);
+	TAP_CHECK(t, mkdir_p(file) != 0 && errno == ENOTDIR);
+
+	unlink(file);
+	rmdir(path);
+	snprintf(path, sizeof(path), "%s/a/b", dir);
+	rmdir(path);
+	snprintf(path, sizeof(path), "%s/a", dir);
+	rmdir(path);
+	rmdir(dir);
+}
+
 /* Serialize the whole buffer the way the file on disk would read: each line's
  * bytes in order, joined by '\n', with no trailing newline. Caller frees. */
 static char *
@@ -2929,6 +3023,8 @@ const Case tap_cases[] = {
 	{ "syntax_md_embed", t_syntax_md_embed },
 	{ "syntax_js", t_syntax_js },
 	{ "syntax_html", t_syntax_html },
+	{ "syntax_ini", t_syntax_ini },
+	{ "mkdir_p", t_mkdir_p },
 	{ "entry_scroll", t_entry_scroll },
 	{ "text_fp_roundtrip", t_text_fp_roundtrip },
 	{ "tbl_fields", t_tbl_fields },

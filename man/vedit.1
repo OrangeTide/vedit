@@ -218,6 +218,14 @@ Keys are dotted and may be grouped under section headers. Booleans accept
 .BR true / false ,
 or
 .BR 1 / 0 .
+Options > Edit Config (or
+.BR :config )
+opens the file for editing, starting a missing one from a commented template,
+and
+.B :reload
+(Options > Reload Config) re-reads it; saving the file from the editor reloads
+it as well.
+.PP
 The main sections are
 .B [ui]
 (scheme, line numbers, word wrap, box mode, colors),
@@ -274,10 +282,17 @@ the scroll-region fast path.
 Per-key overrides for the project-varying config keys (see CONFIGURATION).
 .SH FILES
 .TP
+.B $XDG_CONFIG_HOME/vedit/config
+Configuration file, read when it exists and created there (or under
+.BR ~/.config )
+by Options > Edit Config or the
+.B :config
+command when no config file exists yet.
+.TP
 .B ~/.veditrc
-Default configuration file (after
-.B $VEDIT_CONFIG
-and the XDG path).
+Alternative configuration file, read when the XDG one is absent (both rank
+after
+.BR $VEDIT_CONFIG ).
 .TP
 .BI . name .swp
 Crash-recovery swap file written beside an edited file, unless relocated with

@@ -3487,6 +3487,8 @@ static const char g_default_grammar[] =
 	"	start = idle\n"
 	"[language \"html\"]\n"
 	"	start = idle\n"
+	"[language \"ini\"]\n"
+	"	start = bol\n"
 	"\n"
 	"[syntax]\n"
 	"	h = c\n"
@@ -3506,6 +3508,14 @@ static const char g_default_grammar[] =
 	"	cjs = javascript\n"
 	"	htm = html\n"
 	"	xhtml = html\n"
+	"	cfg = ini\n"
+	"	conf = ini\n"
+	"	gitconfig = ini\n"
+	"	editorconfig = ini\n"
+	"	veditrc = ini\n"
+	"	desktop = ini\n"
+	"	service = ini\n"
+	"	config = ini\n"
 	"\n"
 	"[color \"c\"]\n"
 	"	comment = 14\n"
@@ -4104,7 +4114,59 @@ static const char g_default_grammar[] =
 	"[state \"md.afterbullet\"]\n"
 	"	color = listmark\n"
 	"	rule = \"\\n\" bol\n"
-	"	rule = * inline noeat\n";
+	"	rule = * inline noeat\n"
+	/* ini: the INI family (ini, conf, gitconfig, editorconfig, and vedit's own
+	 * config). A line is a [section] header, a comment starting with ';' or
+	 * '#', or a key with an optional "= value" or ": value". Each state
+	 * returns to bol on the newline so no state carries across lines. */
+	"[color \"ini\"]\n"
+	"	section = 11 bold\n"
+	"	key = 10\n"
+	"	value = 13\n"
+	"	string = 13\n"
+	"	comment = 14\n"
+	"[state \"ini.bol\"]\n"
+	"	color = text\n"
+	"	rule = \"\\x20\\t\" bol\n"
+	"	rule = \";#\" comment recolor\n"
+	"	rule = \"[\" section recolor\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * key noeat\n"
+	"[state \"ini.comment\"]\n"
+	"	color = comment\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * comment\n"
+	"[state \"ini.section\"]\n"
+	"	color = section\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * section\n"
+	"[state \"ini.key\"]\n"
+	"	color = key\n"
+	"	rule = \"=:\" sep recolor\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * key\n"
+	"[state \"ini.sep\"]\n"
+	"	color = text\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * value noeat\n"
+	/* value: the rest of the line; a quoted span is a string, and a ';' or
+	 * '#' after the value starts a trailing comment. */
+	"[state \"ini.value\"]\n"
+	"	color = value\n"
+	"	rule = \"\\\"\" string recolor\n"
+	"	rule = \";#\" comment recolor\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * value\n"
+	"[state \"ini.string\"]\n"
+	"	color = string\n"
+	"	rule = \"\\\"\" value\n"
+	"	rule = \"\\\\\" string_esc\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * string\n"
+	"[state \"ini.string_esc\"]\n"
+	"	color = string\n"
+	"	rule = \"\\n\" bol\n"
+	"	rule = * string\n";
 
 /* The config that backs the default grammars; kept for the lifetime of the
  * process because the grammars' word slices point into it. */
@@ -4168,6 +4230,23 @@ syn_for_ext(const char *ext)
 	if (mapped)
 		return syn_reg_find(mapped);
 	return NULL;
+}
+
+static const char *file_ext(const char *path);
+
+/* The grammar for a file path: by extension, or for a file without one by its
+ * basename (so a "syntax.config = ini" mapping covers .git/config and the
+ * editor's own config file). */
+static const Syntax *
+syn_for_path(const char *path)
+{
+	const char *ext = file_ext(path);
+	const char *slash;
+
+	if (ext[0])
+		return syn_for_ext(ext);
+	slash = strrchr(path, '/');
+	return syn_for_ext(slash ? slash + 1 : path);
 }
 
 
@@ -6375,11 +6454,13 @@ void ed_find_dir(Editor *e, const char *q, int dir);
 /* Multi-buffer management (edit.c). The active buffer's per-file state lives
  * in the flat struct editor; these swap it with the saved buffers. */
 int buf_open(Editor *e, const char *path);	/* open/switch; index or -1 */
+static int buf_same_file(const char *a, const char *b);
 void buf_switch(Editor *e, int i);
 int buf_cycle(Editor *e, int dir);		/* next/prev; new index */
 int buf_close(Editor *e, int i);			/* 0 ok, -1 refused */
 void buf_list(Editor *e);			/* summarize into status */
 static int dlg_save_file(Editor *e, char *out, size_t outsz);
+static int dlg_confirm_yesno(Editor *e, const char *msg);
 static void dlg_symbol_pick(Editor *e);
 void insert_clip(Editor *e);
 void insert_bytes(Editor *e, const char *bytes, size_t len);
@@ -8473,7 +8554,8 @@ typedef enum menu_act {
 	MA_SORT,
 	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS,
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS,
-	MA_VI_MODE, MA_RELOAD_CONFIG, MA_GLYPHS, MA_COLORS, MA_TABSTOPS,
+	MA_VI_MODE, MA_EDIT_CONFIG, MA_RELOAD_CONFIG, MA_GLYPHS, MA_COLORS,
+	MA_TABSTOPS,
 #ifndef VEDIT_NO_TOOLS
 	MA_FORMAT,
 	MA_COMPILE, MA_MAKE, MA_RUN, MA_VIEW_OUTPUT, MA_ERR_NEXT, MA_ERR_PREV,
@@ -8519,7 +8601,8 @@ static int prompt_edit(Editor *e, const char *q, char *buf, size_t bufsz,
     int allow_empty, size_t pos, int allow_nl);
 static void tbl_cell_status(const Editor *e, char *buf, size_t n);
 static int glyph_alt_key(Editor *e, const struct tkbd_seq *seq);
-static void ed_reload_config(Editor *e);
+static int ed_reload_config(Editor *e);
+static void ed_edit_config(Editor *e);
 
 typedef struct menu_item {
 	const char	*label;
@@ -8600,6 +8683,7 @@ static const Menuitem mi_options[] = {
 #endif
 	{ "&Tab Stops...",	"",	":tabstops",	MA_TABSTOPS },
 	{ "&Vi Keys",		"F2",	"",		MA_VI_MODE },
+	{ "&Edit Config...",	"",	":config",	MA_EDIT_CONFIG },
 	{ "&Reload Config",	"",	":reload",	MA_RELOAD_CONFIG },
 };
 #ifndef VEDIT_NO_TOOLS
@@ -14718,6 +14802,89 @@ ed_save_file(Editor *e)
 	return rc;
 }
 
+/* Create dir and every missing parent, like mkdir -p. The mode is 0777 so the
+ * umask applies. Returns 0 when dir is a directory on return, else -1 with
+ * errno set (ENOTDIR or EEXIST when a component is not a directory). */
+static int
+mkdir_p(const char *dir)
+{
+	char buf[PATH_MAX];
+	char *p;
+	struct stat st;
+
+	if (snprintf(buf, sizeof(buf), "%s", dir) >= (int)sizeof(buf)) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	for (p = buf + 1; *p; p++) {
+		if (*p != '/')
+			continue;
+		*p = '\0';
+		if (mkdir(buf, 0777) != 0 && errno != EEXIST)
+			return -1;
+		*p = '/';
+	}
+	if (mkdir(buf, 0777) != 0 && errno != EEXIST)
+		return -1;
+	if (stat(buf, &st) != 0)
+		return -1;
+	if (!S_ISDIR(st.st_mode)) {
+		errno = ENOTDIR;
+		return -1;
+	}
+	return 0;
+}
+
+/* Make sure the directory that e->path saves into exists, asking before it is
+ * created. Returns 1 to go ahead with the save, 0 when the user declined. Any
+ * problem other than a missing directory is left for the save to report. */
+static int
+save_ensure_dir(Editor *e)
+{
+	char dir[PATH_MAX], msg[PATH_MAX + 32];
+	const char *slash = strrchr(e->path, '/');
+	struct stat st;
+	int room, dlen;
+
+	if (!slash || slash == e->path)
+		return 1;			/* the cwd or the root: exists */
+	snprintf(dir, sizeof(dir), "%.*s", (int)(slash - e->path), e->path);
+	if (stat(dir, &st) == 0 || errno != ENOENT)
+		return 1;
+	/* keep the tail of a long path: its last components are what matter */
+	room = e->cols > 30 ? e->cols - 30 : 30;
+	dlen = (int)strlen(dir);
+	snprintf(msg, sizeof(msg), "Create directory %s%s?",
+	    dlen > room ? "..." : "", dlen > room ? dir + dlen - room : dir);
+	if (!dlg_confirm_yesno(e, msg))
+		return 0;
+	if (mkdir_p(dir) != 0)
+		set_status(e, "cannot create %.80s: %s", dir, strerror(errno));
+	return 1;			/* let the save report the failure */
+}
+
+/* Save the named buffer e->path, offering to create a missing directory first.
+ * Saving the config file re-applies it. Sets the status either way and returns
+ * 0 on success, -1 on failure or when the user declined. Shared by Ctrl-S, the
+ * File menu, and the ex :w family. */
+static int
+save_named(Editor *e)
+{
+	if (!save_ensure_dir(e)) {
+		set_status(e, "save cancelled");
+		return -1;
+	}
+	if (ed_save_file(e) < 0) {
+		set_status(e, "save failed: %s", strerror(errno));
+		return -1;
+	}
+	set_status(e, "wrote %.120s", e->path);
+	if (e->cfg_path[0] && buf_same_file(e->path, e->cfg_path) &&
+	    ed_reload_config(e) == 0)
+		set_status(e, "wrote %.100s, config reloaded", e->path);
+	return 0;
+}
+
 /* Save the buffer, prompting for a name if it has none. Returns 0 on a
  * successful save, -1 on failure or when the save was cancelled. */
 static int
@@ -14733,17 +14900,11 @@ save_editor(Editor *e)
 		}
 		snprintf(e->path, sizeof(e->path), "%s", name);
 		e->has_name = 1;
-		e->syn = syn_for_ext(file_ext(e->path));
+		e->syn = syn_for_path(e->path);
 		e->hl_valid = 0;
 	}
 
-	if (ed_save_file(e) < 0) {
-		set_status(e, "save failed: %s",
-		    strerror(errno));
-		return -1;
-	}
-	set_status(e, "wrote %.120s", e->path);
-	return 0;
+	return save_named(e);
 }
 
 /* Search for the regex q from the cursor in direction dir (1 forward, -1
@@ -15149,7 +15310,7 @@ static const struct {
 	{ ":rowadd[!] [N]",	"Table view: insert N rows above (! below); :rowdel" },
 	{ ":coladd[!] [N]",	"Table view: insert N columns left (! right); :coldel" },
 #endif
-	{ ":reload",		"Re-read the config file (also Options menu)" },
+	{ ":config  :reload",	"Edit the config file / re-read it (Options menu too)" },
 	{ "F1 / F2",		"Show this help / back to modeless keys" },
 };
 
@@ -15658,6 +15819,7 @@ static const char *const dlg_confirm_btn[3] = {
 /* State of the save-confirm dialog across its modal frames. */
 typedef struct confirm_ctx {
 	const char	*msg;
+	int		nbtn;		/* 3 for Yes/No/Cancel, 2 for Yes/No */
 	int		focus;		/* 0 Yes, 1 No, 2 Cancel */
 	Dlgresult	result;		/* what to return; Cancel by default */
 	int		bx[3];		/* button columns, set by the draw pass */
@@ -15670,16 +15832,16 @@ dlg_confirm_draw(Editor *e, const Modal *m, void *ctx)
 	Confirmctx *c = ctx;
 	Screen *d = e->d;
 	int msglen = (int)strlen(c->msg);
-	int brow_w = 4;			/* two 2-space gaps between 3 buttons */
+	int brow_w = 2 * (c->nbtn - 1);	/* 2-space gaps between buttons */
 	int i, cx;
 
-	for (i = 0; i < 3; i++)
+	for (i = 0; i < c->nbtn; i++)
 		brow_w += menu_disp_w(dlg_confirm_btn[i]);
 	c->brow = m->y + m->h - 2;
 	cx = m->x + (m->w - brow_w) / 2;
 	scr_text(d, m->y + 1, m->x + (m->w - msglen) / 2, c->msg,
 	    m->fg, m->bg, m->base);
-	for (i = 0; i < 3; i++) {
+	for (i = 0; i < c->nbtn; i++) {
 		uint16_t at = (i == c->focus) ?
 		    m->base ^ ATTR_REVERSE : m->base;
 
@@ -15702,7 +15864,7 @@ dlg_confirm_key(Editor *e, const Modal *m,
 	if (ev->key.type == TKBD_MOUSE) {
 		if (ev->key.key == TKBD_MOUSE_LEFT &&
 		    !(ev->key.mod & TKBD_MOD_MOTION) && ev->key.y == c->brow)
-			for (i = 0; i < 3; i++)
+			for (i = 0; i < c->nbtn; i++)
 				if (ev->key.x >= c->bx[i] && ev->key.x <
 				    c->bx[i] + menu_disp_w(dlg_confirm_btn[i])) {
 					c->result = dlg_btn_result(i);
@@ -15715,7 +15877,7 @@ dlg_confirm_key(Editor *e, const Modal *m,
 	if (ev->key.ch != TKBD_CH_NONE && ev->key.ch < 128) {
 		int lc = tolower((int)ev->key.ch);
 
-		for (i = 0; i < 3; i++)
+		for (i = 0; i < c->nbtn; i++)
 			if (menu_mnemonic(dlg_confirm_btn[i]) == lc) {
 				c->result = dlg_btn_result(i);
 				return 1;
@@ -15726,11 +15888,11 @@ dlg_confirm_key(Editor *e, const Modal *m,
 		c->result = DLG_CANCEL;
 		return 1;
 	case TKBD_KEY_LEFT:
-		c->focus = (c->focus + 2) % 3;
+		c->focus = (c->focus + c->nbtn - 1) % c->nbtn;
 		return 0;
 	case TKBD_KEY_RIGHT:
 	case TKBD_KEY_TAB:
-		c->focus = (c->focus + 1) % 3;
+		c->focus = (c->focus + 1) % c->nbtn;
 		return 0;
 	case TKBD_KEY_ENTER:
 		c->result = dlg_btn_result(c->focus);
@@ -15740,23 +15902,38 @@ dlg_confirm_key(Editor *e, const Modal *m,
 	}
 }
 
-/* A centered modal asking whether to save, with Yes/No/Cancel buttons. The
- * arrow keys or Tab move focus, Enter picks the focused button, an underlined
- * mnemonic letter (Y/N/C) chooses directly, Esc cancels, and a click selects a
- * button. */
+/* A centered modal question with the first nbtn of the Yes/No/Cancel buttons.
+ * The arrow keys or Tab move focus, Enter picks the focused button, an
+ * underlined mnemonic letter (Y/N/C) chooses directly, Esc cancels, and a click
+ * selects a button. */
 static Dlgresult
-dlg_confirm_save_dialog(Editor *e, const char *msg)
+dlg_confirm_dialog(Editor *e, const char *msg, int nbtn)
 {
-	Confirmctx c = { msg, 0, DLG_CANCEL, { 0, 0, 0 }, 0 };
+	Confirmctx c = { msg, nbtn, 0, DLG_CANCEL, { 0, 0, 0 }, 0 };
 	int msglen = (int)strlen(msg);
-	int brow_w = 4;			/* two 2-space gaps between 3 buttons */
+	int brow_w = 2 * (nbtn - 1);	/* 2-space gaps between buttons */
 	int i, boxw;
 
-	for (i = 0; i < 3; i++)
+	for (i = 0; i < nbtn; i++)
 		brow_w += menu_disp_w(dlg_confirm_btn[i]);
 	boxw = (msglen > brow_w ? msglen : brow_w) + 4 + 2;
 	dlg_run(e, boxw, 5, &c, dlg_confirm_draw, dlg_confirm_key);
 	return c.result;
+}
+
+/* The three-button form: asks whether to save before the buffer goes away. */
+static Dlgresult
+dlg_confirm_save_dialog(Editor *e, const char *msg)
+{
+	return dlg_confirm_dialog(e, msg, 3);
+}
+
+/* A centered Yes/No question (the same dialog without the Cancel button).
+ * Returns 1 for Yes; No and Esc both return 0. */
+static int
+dlg_confirm_yesno(Editor *e, const char *msg)
+{
+	return dlg_confirm_dialog(e, msg, 2) == DLG_YES;
 }
 
 /* Offer to save a dirty buffer before it is replaced or the editor exits.
@@ -15972,7 +16149,7 @@ buf_open(Editor *e, const char *path)
 	if (path && path[0]) {
 		snprintf(e->path, sizeof(e->path), "%s", path);
 		e->has_name = 1;
-		e->syn = syn_for_ext(file_ext(e->path));
+		e->syn = syn_for_path(e->path);
 	} else {
 		e->path[0] = '\0';
 		e->has_name = 0;
@@ -18214,7 +18391,7 @@ ed_open(Editor *e)
 		e->t = nt;
 		snprintf(e->path, sizeof(e->path), "%s", path);
 		e->has_name = 1;
-		e->syn = syn_for_ext(file_ext(e->path));
+		e->syn = syn_for_path(e->path);
 		buffer_reset(e);
 #ifdef VEDIT_TERM
 		art_sync_file(e);
@@ -18240,7 +18417,7 @@ ed_save_as(Editor *e)
 	e->swap_path[0] = '\0';		/* recompute for the new name on next edit */
 	snprintf(e->path, sizeof(e->path), "%s", path);
 	e->has_name = 1;
-	e->syn = syn_for_ext(file_ext(e->path));
+	e->syn = syn_for_path(e->path);
 	e->hl_valid = 0;
 	(void)save_editor(e);
 }
@@ -19705,6 +19882,9 @@ run_menu_act(Editor *e, Menuact act)
 		dlg_colors(e);
 #endif
 		break;
+	case MA_EDIT_CONFIG:
+		ed_edit_config(e);
+		break;
 	case MA_RELOAD_CONFIG:
 		ed_reload_config(e);
 		break;
@@ -20025,7 +20205,8 @@ usage(void)
 	    "  --config FILE read settings from FILE (gitconfig style)\n"
 	    "  --no-config   skip the config file\n"
 	    "                Default: $VEDIT_CONFIG, else $XDG_CONFIG_HOME/vedit/\n"
-	    "                config, else ~/.veditrc.\n"
+	    "                config, else ~/.veditrc. Options > Edit Config opens\n"
+	    "                it, creating a new file at the XDG location.\n"
 	    "\n"
 	    "Modeless (MS-EDIT) keys:\n"
 	    "  arrows        move the cursor\n"
@@ -21166,7 +21347,7 @@ vedit_open(struct vedit *v, const char *path)
 	if (text_load(v->e.t, v->e.path) < 0 && errno != ENOENT)
 		return -1;
 	v->e.load_mtime = (stat(v->e.path, &st) == 0) ? st.st_mtime : 0;
-	v->e.syn = syn_for_ext(file_ext(v->e.path));
+	v->e.syn = syn_for_path(v->e.path);
 	v->e.expand_tabs = indent_expand_default(v->e.syn ? v->e.syn->name : NULL);
 	tabs_config(&v->e);
 #ifdef VEDIT_TERM
@@ -21294,13 +21475,13 @@ ed_refresh_syntax(Editor *e)
 {
 	int i;
 
-	e->syn = e->has_name ? syn_for_ext(file_ext(e->path)) : NULL;
+	e->syn = e->has_name ? syn_for_path(e->path) : NULL;
 	e->hl_valid = 0;
 	for (i = 0; i < e->nbuf; i++) {
 		if (i == e->cur)
 			continue;	/* the active buffer lives in the flat fields */
 		e->bufs[i].syn = e->bufs[i].has_name
-		    ? syn_for_ext(file_ext(e->bufs[i].path)) : NULL;
+		    ? syn_for_path(e->bufs[i].path) : NULL;
 		e->bufs[i].hl_valid = 0;
 	}
 }
@@ -21309,26 +21490,27 @@ ed_refresh_syntax(Editor *e)
  * the scheme and themes, box mode and colors, syntax grammars, and the editor
  * toggles, with a repaint on return. Env variables still rank above the file, as
  * at startup. A no-op with a message when no config file backs this session (an
- * embedding host, --no-config, or built-in defaults only). */
-static void
+ * embedding host, --no-config, or built-in defaults only). Returns 0 when the
+ * file was applied, -1 otherwise. */
+static int
 ed_reload_config(Editor *e)
 {
 	Cfg *nc;
 
 	if (e->cfg_path[0] == '\0') {
 		set_status(e, "no config file to reload");
-		return;
+		return -1;
 	}
 	nc = vedit_cfg_new();
 	if (!nc) {
 		set_status(e, "out of memory");
-		return;
+		return -1;
 	}
 	if (vedit_cfg_load(nc, e->cfg_path) != 0) {
 		vedit_cfg_free(nc);
 		set_status(e, "cannot read config: %.80s",
 		    e->cfg_path);
-		return;
+		return -1;
 	}
 	g_cfg = nc;
 	themes_load_cfg(nc);		/* before ed_apply_config resolves scheme */
@@ -21344,6 +21526,101 @@ ed_reload_config(Editor *e)
 	vedit_cfg_free(e->cfg_owned);	/* free the previous reload, if any */
 	e->cfg_owned = nc;
 	set_status(e, "config reloaded");
+	return 0;
+}
+
+/* The starting content of a config file that does not exist yet: every common
+ * key, commented out with its default, so the file documents itself. Options >
+ * Edit Config loads it into the buffer; nothing is written until the user
+ * saves. Keep it in step with the CONFIGURATION section of the README. */
+static const char g_config_template[] =
+	"# vedit configuration (gitconfig style). Remove the leading '#' from a\n"
+	"# line to set it. ':reload' or Options > Reload Config applies changes.\n"
+	"\n"
+	"[ui]\n"
+	"#	scheme = dos         # dos | black | plain\n"
+	"#	number = off         # line-number gutter\n"
+	"#	wrap = off           # word wrap\n"
+	"#	box = utf8           # utf8 | dec | ascii\n"
+	"#	colors = 256         # 256 | 16\n"
+	"#	scroll = on          # VT100 scroll-region fast path\n"
+	"#	clipboard = off      # mirror every copy/yank to the terminal (OSC 52)\n"
+	"#	tabs = on            # mark hard tabs with a guide glyph\n"
+	"#	paneheight = 0       # rows for the pane under the text; 0 = a third\n"
+	"\n"
+	"[art]\n"
+	"#	view = on            # open .ans files in the art view\n"
+	"#	width = 0            # grid columns, 80 to 1024; 0 = from the file\n"
+	"\n"
+	"[table]\n"
+	"#	view = on            # open .csv/.tsv/.tab files in the table view\n"
+	"#	header = on          # line 1 is a frozen header row\n"
+	"#	width = 10           # default column width\n"
+	"\n"
+	"[edit]\n"
+	"#	mode = modeless      # vi | modeless\n"
+	"#	autoindent = on      # new lines copy the previous indent\n"
+	"#	ignorecase = off     # on = searches match regardless of case\n"
+	"#	shiftwidth = 0       # >> / << indent width; 0 = one tab stop\n"
+	"#	tabstop = 8          # the interval between tab stops\n"
+	"#	tabstops =           # a ruler of stops, e.g. \"5 9 17\"\n"
+	"#	swap = on            # write a .swp crash-recovery snapshot\n"
+	"#	swapdir =            # where swap files go; empty = beside the file\n"
+	"#	backup = off         # keep the previous version as a \"~\" file\n"
+	"#	backupdir =          # where backups go; empty = beside the file\n"
+	"#	formatonsave = off   # run command.<lang>.format before each save\n"
+	"\n"
+	"[indent]\n"
+	"#	expand = off         # off = indent with tabs, on = with spaces\n"
+	"\n"
+	"[tags]\n"
+	"#	file = /path/to/tags # ctags index; else a \"tags\" file beside the buffer\n"
+	"\n"
+	"[cc]\n"
+	"#	file = /path/to/compile_commands.json # include paths for Open Header\n"
+	"\n"
+	"[command]\n"
+	"#	terminal = on        # run Compile / Make / Run in a terminal buffer\n"
+	"#	split = on           # ... shown in a pane under the file\n"
+	"\n"
+	"[syntax]\n"
+	"#	enable = on          # highlight recognized file types\n";
+
+/* Options > Edit Config and :config. Opens the config file in a buffer, the
+ * one named at startup or the default location the front end chose. A file
+ * that does not exist yet starts from g_config_template, unsaved, so the first
+ * save (which offers to create the directory) is what creates it. The buffer
+ * gets the ini grammar whatever the file is called. */
+static void
+ed_edit_config(Editor *e)
+{
+	struct stat st;
+	int existed;
+
+	if (e->cfg_path[0] == '\0') {
+		set_status(e, "no config file for this session (see --config)");
+		return;
+	}
+	existed = stat(e->cfg_path, &st) == 0;
+	if (buf_open(e, e->cfg_path) < 0)
+		return;				/* buf_open set the status */
+	if (!existed && text_lines(e->t) == 1 && e->t->lines[0].len == 0) {
+		FILE *in = fmemopen((void *)g_config_template,
+		    sizeof(g_config_template) - 1, "rb");
+
+		if (in) {
+			if (text_load_fp(e->t, in) == OK)
+				e->t->dirty = 1;
+			fclose(in);
+		}
+		e->hl_valid = 0;
+	}
+	if (!e->syn) {
+		e->syn = syn_reg_find("ini");
+		e->hl_valid = 0;
+	}
+	set_status(e, existed ? "editing %.100s" : "new config %.100s",
+	    e->cfg_path);
 }
 
 /* Hand the editor a parsed configuration (see vedit_cfg_load). It is borrowed,
@@ -27198,7 +27475,11 @@ static const struct vedit_tool_api cli_tools = {
 
 /* Pick the config file path. An explicit --config (opt) or $VEDIT_CONFIG is
  * used as given; otherwise the first of $XDG_CONFIG_HOME/vedit/config and
- * ~/.veditrc that exists. Writes buf and returns 1, or returns 0 for none. */
+ * ~/.veditrc that exists. When neither exists the XDG location (with
+ * ~/.config standing in for an unset $XDG_CONFIG_HOME) is chosen anyway, so
+ * Options > Edit Config knows where to create the file. Writes buf and
+ * returns 1 when the file should be read (as given, or found), 0 when the path
+ * is a default that does not exist yet, and -1 when no path can be formed. */
 static int
 cli_config_path(const char *opt, char *buf, size_t bufsz)
 {
@@ -27213,6 +27494,7 @@ cli_config_path(const char *opt, char *buf, size_t bufsz)
 		snprintf(buf, bufsz, "%s", env);
 		return 1;
 	}
+	buf[0] = '\0';
 	env = getenv("XDG_CONFIG_HOME");
 	if (env && env[0]) {
 		snprintf(buf, bufsz, "%s/vedit/config", env);
@@ -27221,11 +27503,17 @@ cli_config_path(const char *opt, char *buf, size_t bufsz)
 	}
 	env = getenv("HOME");
 	if (env && env[0]) {
-		snprintf(buf, bufsz, "%s/.veditrc", env);
-		if (access(buf, R_OK) == 0)
+		char rc[PATH_MAX];
+
+		snprintf(rc, sizeof(rc), "%s/.veditrc", env);
+		if (access(rc, R_OK) == 0) {
+			snprintf(buf, bufsz, "%s", rc);
 			return 1;
+		}
+		if (buf[0] == '\0')
+			snprintf(buf, bufsz, "%s/.config/vedit/config", env);
 	}
-	return 0;
+	return buf[0] ? 0 : -1;
 }
 
 #ifdef VEDIT_TERM
@@ -27421,18 +27709,24 @@ main(int argc, char **argv)
 #ifndef VEDIT_NO_TOOLS
 	vedit_set_tools(v, &cli_tools);		/* the default shell spawner */
 #endif
-	if (!no_config && cli_config_path(cfg_opt, cfg_path, sizeof(cfg_path))) {
-		cfg = vedit_cfg_new();
-		if (cfg && vedit_cfg_load(cfg, cfg_path) == 0) {
-			vedit_set_config(v, cfg);
-			vedit_set_config_path(v, cfg_path);	/* enable :reload */
-		} else {
-			if (cfg_opt)		/* an explicit path should exist */
-				fprintf(stderr, "%s: %s: cannot read config\n",
-				    progname, cfg_path);
-			vedit_cfg_free(cfg);
-			cfg = NULL;
+	if (!no_config) {
+		int have = cli_config_path(cfg_opt, cfg_path, sizeof(cfg_path));
+
+		if (have > 0) {
+			cfg = vedit_cfg_new();
+			if (cfg && vedit_cfg_load(cfg, cfg_path) == 0) {
+				vedit_set_config(v, cfg);
+			} else {
+				if (cfg_opt)	/* an explicit path should exist */
+					fprintf(stderr,
+					    "%s: %s: cannot read config\n",
+					    progname, cfg_path);
+				vedit_cfg_free(cfg);
+				cfg = NULL;
+			}
 		}
+		if (have >= 0)		/* enable :reload and :config */
+			vedit_set_config_path(v, cfg_path);
 	}
 	if (file && vedit_open(v, file) < 0) {
 		fprintf(stderr, "%s: %s: %s\n", progname, file,
@@ -31515,7 +31809,7 @@ enum excmd {
 	EX_NONE, EX_SUBST, EX_GLOBAL, EX_VGLOBAL, EX_DELETE, EX_YANK, EX_READ,
 	EX_EDIT, EX_ENEW, EX_WRITE, EX_WQ, EX_XIT, EX_QUIT, EX_QALL, EX_WQALL,
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
-	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD,
+	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD, EX_CONFIG,
 	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH, EX_CELL, EX_SORT, EX_TABSTOPS,
 	EX_ROWADD, EX_ROWDEL, EX_COLADD, EX_COLDEL,
 };
@@ -31567,6 +31861,7 @@ static const struct excmd_name {
 	{ "coladd",	4, EX_COLADD },
 	{ "coldel",	4, EX_COLDEL },
 	{ "reload",	3, EX_RELOAD },
+	{ "config",	4, EX_CONFIG },
 	{ "marks",	3, EX_MARKS },
 	{ "delmarks",	4, EX_DELMARKS },
 	{ "jumps",	2, EX_JUMPS },
@@ -31617,8 +31912,8 @@ ex_lookup(const char *word)
 	return EX_NONE;
 }
 
-/* Save the current buffer to e->path. Returns -1 and sets the status on error,
- * or 0 on success. */
+/* Save the current buffer to e->path (see save_named). Returns -1 and sets the
+ * status on error, or 0 on success. */
 static int
 ex_write_current(Editor *e)
 {
@@ -31626,12 +31921,7 @@ ex_write_current(Editor *e)
 		set_status(e, "E32: no file name");
 		return -1;
 	}
-	if (ed_save_file(e) < 0) {
-		set_status(e, "save failed: %s",
-		    strerror(errno));
-		return -1;
-	}
-	return 0;
+	return save_named(e);
 }
 
 /* Run an already-entered ex command line. Returns REQ_FORCE_QUIT when the
@@ -31786,9 +32076,7 @@ vi_ex_exec(Editor *e, char *buf)
 			snprintf(e->path, sizeof(e->path), "%s", rest);
 			e->has_name = 1;
 		}
-		if (ex_write_current(e) == 0)
-			set_status(e, "wrote %.120s",
-			    e->path);
+		(void)ex_write_current(e);	/* sets the status */
 		return REQ_CONTINUE;
 	case EX_WQ:
 	case EX_XIT:
@@ -31949,6 +32237,9 @@ vi_ex_exec(Editor *e, char *buf)
 		return REQ_CONTINUE;
 	case EX_RELOAD:
 		ed_reload_config(e);
+		return REQ_CONTINUE;
+	case EX_CONFIG:
+		ed_edit_config(e);
 		return REQ_CONTINUE;
 	default:
 		break;

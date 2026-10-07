@@ -441,6 +441,7 @@ t_buf_dedup(Test *t)
 	unlink(a);
 	rmdir(dir);
 }
+static int vline_is(struct vedit *v, size_t y, const char *want);
 
 /* Runtime config reload: re-reading the file picks up a changed setting, keeps a
  * valid syntax pointer, and reports no config when none backs the session. */
@@ -504,7 +505,157 @@ t_reload_config(Test *t)
 	rmdir(dir);
 }
 
-static int vline_is(struct vedit *v, size_t y, const char *want);
+/* :config on a session without a config path says so. With a path to a file
+ * that does not exist, it opens a buffer holding the commented template
+ * (unsaved), styled as INI, and :w then offers to create the directory: 'y'
+ * creates it and writes the file, which reloads the config. */
+static void
+t_edit_config_new(Test *t)
+{
+	char dir[] = "/tmp/vedit_ecXXXXXX";
+	char cfgp[PATH_MAX], sub[PATH_MAX], exbuf[32];
+	/* F2 for vi keys, :config, :w, then 'y' to the directory prompt */
+	const char keys[] = "\033OQ:config\r:w\r" "y";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	struct stat st;
+	FILE *f;
+	char line[256];
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(sub, sizeof(sub), "%s/vedit", dir);
+	snprintf(cfgp, sizeof(cfgp), "%s/config", sub);
+
+	/* no path: a reported no-op */
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_run(v);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "config")) == REQ_CONTINUE);
+	TAP_CHECKF(t, strstr(v->e.status, "no config") != NULL,
+	    "status: %s", v->e.status);
+	vedit_free(v);
+	memio_free(&m);
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config_path(v, cfgp);
+	vedit_run(v);
+
+	TAP_CHECK(t, v->e.has_name && strcmp(v->e.path, cfgp) == 0);
+	TAP_CHECK(t, v->e.syn != NULL && strcmp(v->e.syn->name, "ini") == 0);
+	TAP_CHECK(t, vline_is(v, 3, "[ui]"));	/* the template landed */
+	TAP_CHECKF(t, strstr(v->e.status, "config reloaded") != NULL,
+	    "status: %s", v->e.status);
+	TAP_CHECK(t, !text_dirty(v->e.t));
+	TAP_CHECK(t, stat(sub, &st) == 0 && S_ISDIR(st.st_mode));
+	f = fopen(cfgp, "r");
+	TAP_ASSERT(t, f != NULL);
+	TAP_CHECK(t, fgets(line, sizeof(line), f) != NULL &&
+	    strncmp(line, "# vedit configuration", 21) == 0);
+	fclose(f);
+	vedit_free(v);
+	memio_free(&m);
+
+	unlink(cfgp);
+	rmdir(sub);
+	rmdir(dir);
+}
+
+/* Declining the directory prompt cancels the save and creates nothing. An
+ * existing config file opens as it is, with no template. */
+static void
+t_edit_config_decline(Test *t)
+{
+	char dir[] = "/tmp/vedit_edXXXXXX";
+	char cfgp[PATH_MAX], sub[PATH_MAX];
+	const char keys[] = "\033OQ:config\r:w\r" "n";
+	const char keys2[] = "\033OQ:config\r";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	struct stat st;
+	FILE *f;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(sub, sizeof(sub), "%s/deep", dir);
+	snprintf(cfgp, sizeof(cfgp), "%s/config", sub);
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config_path(v, cfgp);
+	vedit_run(v);
+	TAP_CHECKF(t, strstr(v->e.status, "save cancelled") != NULL,
+	    "status: %s", v->e.status);
+	TAP_CHECK(t, text_dirty(v->e.t));
+	TAP_CHECK(t, stat(sub, &st) != 0);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* an existing file: its own content, clean */
+	snprintf(cfgp, sizeof(cfgp), "%s/config", dir);
+	f = fopen(cfgp, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("[ui]\nwrap = on\n", f);
+	fclose(f);
+	memio_init(&m, keys2, sizeof(keys2) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config_path(v, cfgp);
+	vedit_run(v);
+	TAP_CHECK(t, vline_is(v, 0, "[ui]") && vline_is(v, 1, "wrap = on"));
+	TAP_CHECK(t, !text_dirty(v->e.t));
+	TAP_CHECK(t, v->e.syn != NULL && strcmp(v->e.syn->name, "ini") == 0);
+	vedit_free(v);
+	memio_free(&m);
+
+	unlink(cfgp);
+	rmdir(dir);
+}
+
+/* Save As into a directory that does not exist offers to create it, for any
+ * file, not only the config. */
+static void
+t_save_creates_dir(Test *t)
+{
+	char dir[] = "/tmp/vedit_sdXXXXXX";
+	char path[PATH_MAX], sub[PATH_MAX];
+	char keys[PATH_MAX + 32];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	struct stat st;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(sub, sizeof(sub), "%s/new/dir", dir);
+	snprintf(path, sizeof(path), "%s/f.txt", sub);
+	snprintf(keys, sizeof(keys), "\033OQ:w %s\ry", path);
+
+	memio_init(&m, keys, strlen(keys), 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_run(v);
+	TAP_CHECKF(t, strstr(v->e.status, "wrote") != NULL,
+	    "status: %s", v->e.status);
+	TAP_CHECK(t, stat(path, &st) == 0 && S_ISREG(st.st_mode));
+	vedit_free(v);
+	memio_free(&m);
+
+	unlink(path);
+	rmdir(sub);
+	snprintf(sub, sizeof(sub), "%s/new", dir);
+	rmdir(sub);
+	rmdir(dir);
+}
+
 
 /* Lay down a swap file for path holding body, as a crashed prior session
  * would have left behind. Uses a throwaway editor so the on-disk format
@@ -2106,7 +2257,7 @@ t_help_scroll(Test *t)
 	vedit_run(v);
 	/* ":reload" is one of the last vi-help rows, off the first screen at 12
 	 * rows, so seeing it proves both the vi table and the scrolling. */
-	TAP_CHECK(t, strstr(m.out, "Re-read the config") != NULL);
+	TAP_CHECK(t, strstr(m.out, "Edit the config file") != NULL);
 	vedit_free(v);
 	memio_free(&m);
 }
@@ -2998,6 +3149,9 @@ const Case tap_cases[] = {
 	{ "gf_header", t_gf_header },
 	{ "buf_dedup", t_buf_dedup },
 	{ "reload_config", t_reload_config },
+	{ "edit_config_new", t_edit_config_new },
+	{ "edit_config_decline", t_edit_config_decline },
+	{ "save_creates_dir", t_save_creates_dir },
 	{ "swap_file_created", t_swap_file_created },
 	{ "swap_recover_key", t_swap_recover_key },
 	{ "swap_recover_delete", t_swap_recover_delete },
