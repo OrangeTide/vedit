@@ -234,6 +234,10 @@ XDG layout (`-DVEDIT_NO_XDG`) uses `~/.veditrc` instead.
 
 [syntax]
     enable = on          # highlight recognized file types
+
+[mail]
+    dir = ~/Maildir      # a Maildir++ tree; enables the Mail menu
+    from = Jon <jon@example.org>  # the From: line of new messages
 ```
 
 Keys are dotted, so `ui.scheme = black` without a section header works too.
@@ -1282,6 +1286,121 @@ colored by that language's grammar; other blocks keep the code-block color.
 
 To add or change a language, define a grammar in your config (see "Custom syntax
 highlighting"); a language named like a built-in replaces it.
+
+## Mail (an alpine-style reader and composer)
+
+![The INBOX message list over an open message, unread and answered marked](docs/shot-mail.png)
+
+vedit reads and writes a Maildir, the one-file-per-message mailbox format.
+It does not fetch mail from a server or deliver it: a fetcher fills the
+Maildir, vedit reads it and drops outgoing messages in an `Outbox` folder, and
+a small script submits those. The editor never speaks IMAP or SMTP.
+
+### Setting up
+
+1. **Get a Maildir.** If a local delivery agent, Dovecot, or a fetcher already
+   keeps one, point at it. Otherwise create one and fill it with any of:
+   - `mbsync` (isync) or `offlineimap`, which mirror an IMAP account into a
+     Maildir and sync flags both ways;
+   - `fetchmail` or `getmail`, which pull POP or IMAP mail and deliver into a
+     Maildir;
+   - `procmail` or `maildrop`, which deliver local mail into one.
+
+   The tree must be Maildir++: the root holds `cur`, `new`, and `tmp` and is
+   INBOX; each other folder is a dot-directory beside them with its own three
+   subdirectories (`.Sent`, `.Drafts`, `.lists.vedit` for `lists/vedit`). That
+   is what Dovecot, Courier, and `mbsync` with `SubFolders Maildir++` write. A
+   missing folder is created on first use.
+
+2. **Tell vedit about it** in the config (see "Configuration file"):
+
+   ```ini
+   [mail]
+       dir  = ~/Maildir
+       from = Jon Mayo <jon@example.org>
+   ```
+
+   `mail.dir` enables the Mail menu and the `:mail`, `:compose`, `:reply`, and
+   `:send` commands; without it they are hidden. `mail.from` is the From line
+   of every message you write.
+
+3. **Arrange delivery** for the `Outbox` folder (see "Sending" below).
+
+### Reading
+
+- **Mail > Folders** (`:mail`) lists the folders. Choosing one lists its
+  messages newest first, with `N` on unread ones and `A` on answered ones.
+  **Mail > Messages** (`:mail .`) returns to the last folder, and
+  `:mail Sent` lists a folder by name.
+- Choosing a message opens it: the text part in a buffer headed by From, To,
+  Cc, Date, and Subject, and every other MIME part (an attachment, an HTML
+  alternative) as its own buffer named by part number and type, reachable
+  through File > Buffer List. Save As writes a part to a file. Quoted-printable
+  and base64 are decoded. Opening a message marks it read.
+- The message buffers are ordinary buffers: search, copy, and the vi keys all
+  work in them, and `:bd` closes one.
+
+### Writing
+
+- **Mail > Compose** (`:compose`, or `:compose address` to fill in To) opens
+  a buffer with the header lines to complete, a blank line, and the body:
+
+  ```
+  From: Jon Mayo <jon@example.org>
+  To:
+  Cc:
+  Subject:
+
+  ```
+
+  Edit it like any text. A header you leave empty is dropped when the message
+  is sent; you can add others, such as `Bcc:` or `Reply-To:`.
+- **Mail > Reply** (`:reply`) does the same for the message shown, addressed
+  to its Reply-To or From, with the subject prefixed `Re:`, In-Reply-To and
+  References set for threading, and the text quoted with `> `.
+- **Mail > Send** (`:send`) turns the compose buffer into a complete message
+  (adding Date, Message-ID, and the MIME headers for a UTF-8 text body) and
+  hands it to the backend, which stores it under `Outbox/new`. The buffer is
+  then clean, and a replied-to message is marked answered. Sending needs a
+  `To:` line.
+
+### Sending
+
+The Maildir backend only queues. Something has to submit each file under
+`Outbox/new` and move it to `Sent`. Any MTA or submission client that accepts
+a message on standard input works: `sendmail -t` (Postfix, Exim, OpenSMTPD),
+`msmtp -t`, or `ssmtp -t`. This script drains the queue and can run from cron
+or after `:send`:
+
+```sh
+#!/bin/sh
+# Submit every queued message, then file it under Sent as read.
+md=${MAILDIR:-$HOME/Maildir}
+mkdir -p "$md/.Sent/cur" "$md/.Sent/new" "$md/.Sent/tmp"
+for f in "$md"/.Outbox/new/*; do
+    [ -f "$f" ] || continue
+    if msmtp -t < "$f"; then
+        mv "$f" "$md/.Sent/cur/$(basename "$f"):2,S"
+    fi
+done
+```
+
+A message that fails to submit stays in the Outbox to be retried. Run the
+script from a terminal buffer (`:terminal ./drain-outbox`) to watch it.
+
+### How it fits together
+
+The editor core never touches a mailbox. It talks to a small vtable shaped
+like IMAP (folders, message lists, flags, fetch, store, move, append, send),
+`struct vedit_mail_api` in `vedit.h`, and the Maildir backend is one
+implementation of it, installed by the standalone binary when `mail.dir` is
+set. An embedding host can install its own with `vedit_set_mail()` to serve
+its server's mail through the same menu and commands. The whole subsystem
+compiles out with `-DVEDIT_NO_MAIL`.
+
+Not yet: reply-all, attachments on outgoing mail, decoding of encoded-word
+(`=?utf-8?...?=`) header values, deleting or moving messages from the editor,
+and submitting from the editor itself.
 
 ## Embedding in a host (for example a MUD)
 

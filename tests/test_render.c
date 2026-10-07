@@ -656,6 +656,188 @@ t_save_creates_dir(Test *t)
 	rmdir(dir);
 }
 
+#ifdef VEDIT_MAIL
+typedef struct sumacc2 { int n; char uid[256]; } Sumacc2;
+
+static int
+sum2_emit(void *sink, const struct vedit_mail_summary *m)
+{
+	Sumacc2 *a = sink;
+
+	a->n++;
+	snprintf(a->uid, sizeof(a->uid), "%s", m->uid);
+	return 0;
+}
+#endif
+
+#ifdef VEDIT_MAIL
+/* Reading a two-part message opens a buffer per part with the text part
+ * active and labelled; reply starts a compose buffer addressed and quoted;
+ * :send queues the message and marks the original answered. */
+static void
+t_mail_flow(Test *t)
+{
+	char root[] = "/tmp/vedit_mfXXXXXX";
+	char path[PATH_MAX], exbuf[64], *data;
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	size_t len, ll;
+	const char *line;
+	FILE *f;
+	struct stat st;
+	int i, found;
+
+	TAP_ASSERT(t, mkdtemp(root) != NULL);
+	snprintf(path, sizeof(path), "%s/new", root);
+	mkdir_p(path);
+	snprintf(path, sizeof(path), "%s/new/1700000005.q.host", root);
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("From: Ann <ann@example.org>\nTo: me@example.org\n"
+	    "Subject: lunch\nDate: Tue, 7 Oct 2026 10:00:00 +0000\n"
+	    "Message-ID: <m1@example.org>\n"
+	    "Content-Type: multipart/mixed; boundary=bb\n\n"
+	    "--bb\nContent-Type: text/plain\n\nsoup?\nnoodles?\n"
+	    "--bb\nContent-Type: text/csv; name=menu.csv\n\na,b\n--bb--\n", f);
+	fclose(f);
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_mail(v, cli_mail_setup(root));
+	vedit_run(v);
+
+	/* read: two new buffers, the text part active with headers on top */
+	TAP_CHECK(t, mail_open_message(&v->e, "INBOX", "1700000005.q.host") == 0);
+	TAP_CHECKF(t, v->e.nbuf == 3, "nbuf %d", v->e.nbuf);
+	TAP_CHECK(t, v->e.mref && v->e.mref->kind == MREF_MESSAGE &&
+	    strcmp(v->e.mref->label, "[mail] lunch") == 0);
+	TAP_CHECK(t, vline_is(v, 0, "From: Ann <ann@example.org>"));
+	TAP_CHECK(t, vline_is(v, 3, "Subject: lunch"));
+	TAP_CHECK(t, vline_is(v, 6, "soup?") && vline_is(v, 7, "noodles?"));
+	TAP_CHECK(t, !text_dirty(v->e.t));
+	found = 0;
+	for (i = 0; i < v->e.nbuf; i++)
+		if (i != v->e.cur && v->e.bufs[i].mref &&
+		    strstr(v->e.bufs[i].mref->label, "part 2: text/csv menu.csv"))
+			found = 1;
+	TAP_CHECK(t, found);
+	snprintf(path, sizeof(path), "%s/cur/1700000005.q.host:2,S", root);
+	TAP_CHECK(t, stat(path, &st) == 0);	/* marked seen */
+
+	/* reply: addressed, Re:, threaded, quoted */
+	TAP_CHECK(t, mail_reply(&v->e) == 0);
+	TAP_CHECK(t, v->e.mref && v->e.mref->kind == MREF_COMPOSE);
+	TAP_CHECK(t, vline_is(v, 1, "To: Ann <ann@example.org>"));
+	TAP_CHECK(t, vline_is(v, 3, "Subject: Re: lunch"));
+	TAP_CHECK(t, vline_is(v, 4, "In-Reply-To: <m1@example.org>"));
+	TAP_CHECK(t, vline_is(v, 5, "References: <m1@example.org>"));
+	TAP_CHECK(t, vline_is(v, 7, "On Tue, 7 Oct 2026 10:00:00 +0000, Ann wrote:"));
+	TAP_CHECK(t, vline_is(v, 8, "> soup?") && vline_is(v, 9, "> noodles?"));
+	TAP_CHECKF(t, v->e.cy == 7, "cursor row %zu", v->e.cy);
+
+	/* send: the Outbox gets the message with the added headers */
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "send")) == REQ_CONTINUE);
+	TAP_CHECKF(t, strstr(v->e.status, "handed to") != NULL, "status: %s",
+	    v->e.status);
+	TAP_CHECK(t, !text_dirty(v->e.t));
+	{
+		Sumacc2 acc = { 0, "" };
+
+		TAP_CHECK(t, v->e.mail->list(v->e.mail->ctx, "Outbox", sum2_emit,
+		    &acc) == 0 && acc.n == 1);
+		TAP_ASSERT(t, v->e.mail->fetch(v->e.mail->ctx, "Outbox", acc.uid,
+		    &data, &len) == 0);
+	}
+	TAP_CHECK(t, strstr(data, "To: Ann <ann@example.org>\n") != NULL);
+	TAP_CHECK(t, strstr(data, "Cc:") == NULL);	/* empty header dropped */
+	TAP_CHECK(t, strstr(data, "\nMessage-ID: <") != NULL);
+	TAP_CHECK(t, strstr(data, "\nDate: ") != NULL);
+	TAP_CHECK(t, strstr(data, "\n\nOn Tue, 7 Oct") != NULL);
+	free(data);
+	snprintf(path, sizeof(path), "%s/cur/1700000005.q.host:2,RS", root);
+	TAP_CHECK(t, stat(path, &st) == 0);	/* answered */
+
+	/* compose with an address lands the cursor on the body; without, on
+	 * the To line; sending without a To is refused */
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "compose bob@x")) ==
+	    REQ_CONTINUE);
+	TAP_CHECK(t, vline_is(v, 1, "To: bob@x") && v->e.cy == 5);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "compose")) == REQ_CONTINUE);
+	line = text_line(v->e.t, 1, &ll);
+	TAP_CHECK(t, line && ll == 4 && v->e.cy == 1 && v->e.cx == 4);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "send")) == REQ_CONTINUE &&
+	    strstr(v->e.status, "no To") != NULL);
+	TAP_CHECK(t, text_dirty(v->e.t));
+
+	/* :mail . lists through the editor's own folder field: it must survive */
+	snprintf(v->e.mail_folder, sizeof(v->e.mail_folder), "INBOX");
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "mail .")) == REQ_CONTINUE);
+	TAP_CHECKF(t, strcmp(v->e.mail_folder, "INBOX") == 0, "folder [%s]",
+	    v->e.mail_folder);
+
+	/* a message buffer is not a compose buffer */
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "reply")) == REQ_CONTINUE &&
+	    strstr(v->e.status, "not a mail message") != NULL);
+
+	vedit_free(v);
+	memio_free(&m);
+	snprintf(path, sizeof(path), "rm -rf %s", root);
+	(void)system(path);
+}
+
+#ifdef VEDIT_MAIL
+/* The Mail menu is hidden without a backend. With one, Folders and Compose
+ * are enabled, Messages waits for a listed folder, Reply for a message
+ * buffer, and Send for a compose buffer. */
+static void
+t_mail_menu(Test *t)
+{
+	char root[] = "/tmp/vedit_mmXXXXXX";
+	char path[PATH_MAX];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int i, mail_i = -1;
+
+	TAP_ASSERT(t, mkdtemp(root) != NULL);
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_run(v);
+	for (i = 0; i < MENU_COUNT; i++)
+		if (strcmp(MENUS[i].title, "&Mail") == 0)
+			mail_i = i;
+	TAP_ASSERT(t, mail_i >= 0);
+	TAP_CHECK(t, !menu_visible(&v->e, mail_i));
+	TAP_CHECK(t, !menu_item_enabled(&v->e, MA_MAIL_COMPOSE));
+
+	vedit_set_mail(v, cli_mail_setup(root));
+	TAP_CHECK(t, menu_visible(&v->e, mail_i));
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_MAIL_FOLDERS));
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_MAIL_COMPOSE));
+	TAP_CHECK(t, !menu_item_enabled(&v->e, MA_MAIL_INDEX));
+	TAP_CHECK(t, !menu_item_enabled(&v->e, MA_MAIL_REPLY));
+	TAP_CHECK(t, !menu_item_enabled(&v->e, MA_MAIL_SEND));
+
+	snprintf(v->e.mail_folder, sizeof(v->e.mail_folder), "INBOX");
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_MAIL_INDEX));
+	TAP_CHECK(t, mail_compose(&v->e, "a@b", NULL, NULL, NULL, NULL, NULL,
+	    NULL) == 0);
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_MAIL_SEND));
+	TAP_CHECK(t, !menu_item_enabled(&v->e, MA_MAIL_REPLY));
+
+	vedit_free(v);
+	memio_free(&m);
+	snprintf(path, sizeof(path), "rm -rf %s", root);
+	(void)system(path);
+}
+#endif
+#endif /* VEDIT_MAIL */
+
 
 /* Lay down a swap file for path holding body, as a crashed prior session
  * would have left behind. Uses a throwaway editor so the on-disk format
@@ -3152,6 +3334,10 @@ const Case tap_cases[] = {
 	{ "edit_config_new", t_edit_config_new },
 	{ "edit_config_decline", t_edit_config_decline },
 	{ "save_creates_dir", t_save_creates_dir },
+#ifdef VEDIT_MAIL
+	{ "mail_flow", t_mail_flow },
+	{ "mail_menu", t_mail_menu },
+#endif
 	{ "swap_file_created", t_swap_file_created },
 	{ "swap_recover_key", t_swap_recover_key },
 	{ "swap_recover_delete", t_swap_recover_delete },

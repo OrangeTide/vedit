@@ -139,6 +139,38 @@ cat > "$work/veditrc" <<'EOF'
     run     = ./$(filenoext)
 EOF
 
+# A small Maildir++ tree for the mail shot: INBOX with three messages (one
+# unread, one answered) and a Sent folder. mail.dir points the editor at it.
+mkdir -p "$work/Maildir/new" "$work/Maildir/cur" "$work/Maildir/tmp" \
+    "$work/Maildir/.Sent/cur" "$work/Maildir/.Sent/new" "$work/Maildir/.Sent/tmp"
+cat > "$work/Maildir/new/1791300000.a.host" <<'EOF2'
+From: Ann Example <ann@example.org>
+To: jon@example.org
+Subject: lunch tomorrow?
+Date: Tue, 7 Oct 2026 10:00:00 +0000
+Message-ID: <m1@example.org>
+
+Soup or noodles? The place on the corner has both now.
+
+Ann
+EOF2
+cat > "$work/Maildir/cur/1791200000.b.host:2,RS" <<'EOF2'
+From: Bob Builder <bob@example.org>
+To: jon@example.org
+Subject: Re: build is green again
+Date: Mon, 6 Oct 2026 09:30:00 +0000
+
+All targets pass on the arm runner now.
+EOF2
+cat > "$work/Maildir/new/1791100000.c.host" <<'EOF2'
+From: lists <vedit@lists.example.org>
+To: vedit@lists.example.org
+Subject: [vedit] 1.3.0 released
+Date: Sun, 5 Oct 2026 18:12:00 +0000
+
+The 1.3.0 release is up: pane, table view, art view.
+EOF2
+
 # Run the X server in its own session so its lifetime is not tied to this
 # shell's process group, then wait for the socket to appear.
 setsid Xvfb "$disp" -screen 0 1600x1200x24 >/dev/null 2>&1 &
@@ -227,5 +259,19 @@ render "$here/shot-table.png" parts.csv \
 # The art view: a .ans opens as a cell grid; the status line shows the pen.
 render "$here/shot-art.png" logo.ans \
     "Down Down Down Down Right Right Right Right"
+
+# The mail config goes in only now, so the shots above have no Mail menu.
+cat >> "$work/veditrc" <<EOF2
+[mail]
+    dir = $work/Maildir
+    from = Jon Mayo <jon@example.org>
+EOF2
+
+# Mail: :mail picks INBOX from the folder list and opens the newest message
+# into a buffer (headers on top); :mail . then lists the folder again, so the
+# index shows over the message with its unread and answered markers.
+render "$here/shot-mail.png" ring.c \
+    F2 "colon m a i l Return" Return Return \
+    "colon m a i l space period Return"
 
 exit 0

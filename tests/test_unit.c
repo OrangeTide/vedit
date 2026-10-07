@@ -636,6 +636,249 @@ t_cli_config_path(Test *t)
 		unsetenv("VEDIT_CONFIG");
 }
 
+#ifdef VEDIT_MAIL
+/* Header unfolding, content-type parsing, the two transfer decoders, and
+ * splitting a nested multipart message into its leaf parts. */
+static void
+t_mail_parse(Test *t)
+{
+	static const char msg[] =
+	    "From: Ann <ann@example.org>\r\n"
+	    "subject: hello\r\n"
+	    "  there\r\n"
+	    "Content-Type: Multipart/Mixed;\r\n"
+	    " boundary=\"outer\"\r\n"
+	    "\r\n"
+	    "preamble\r\n"
+	    "--outer\r\n"
+	    "Content-Type: multipart/alternative; boundary=inner\r\n"
+	    "\r\n"
+	    "--inner\r\n"
+	    "Content-Type: text/html\r\n"
+	    "\r\n"
+	    "<b>hi</b>\r\n"
+	    "--inner\r\n"
+	    "Content-Type: text/plain; charset=utf-8\r\n"
+	    "Content-Transfer-Encoding: quoted-printable\r\n"
+	    "\r\n"
+	    "a=3Db=\r\n"
+	    "c\r\n"
+	    "--inner--\r\n"
+	    "--outer\r\n"
+	    "Content-Type: image/png; name=\"p.png\"\r\n"
+	    "Content-Transfer-Encoding: base64\r\n"
+	    "Content-Disposition: attachment; filename=\"photo.png\"\r\n"
+	    "\r\n"
+	    "aGVs\r\nbG8=\r\n"
+	    "--outer--\r\n"
+	    "epilogue\r\n";
+	size_t len = sizeof(msg) - 1, hlen, n;
+	char val[256], type[64], par[64], buf[64];
+	Mailpart parts[MAIL_PARTS_MAX];
+	int np, main_i;
+	char *dec;
+
+	hlen = mail_body_off(msg, len);
+	TAP_CHECK(t, hlen > 0 && msg[hlen - 2] == '\r' && msg[hlen - 1] == '\n');
+	TAP_CHECK(t, mail_header(msg, hlen, "Subject", val, sizeof(val)) &&
+	    strcmp(val, "hello there") == 0);
+	TAP_CHECK(t, mail_header(msg, hlen, "FROM", val, sizeof(val)) &&
+	    strcmp(val, "Ann <ann@example.org>") == 0);
+	TAP_CHECK(t, !mail_header(msg, hlen, "Cc", val, sizeof(val)) &&
+	    val[0] == '\0');
+	mail_header(msg, hlen, "Content-Type", val, sizeof(val));
+	mail_ct_type(val, type, sizeof(type));
+	TAP_CHECKF(t, strcmp(type, "multipart/mixed") == 0, "type %s", type);
+	TAP_CHECK(t, mail_ct_param(val, "boundary", par, sizeof(par)) &&
+	    strcmp(par, "outer") == 0);
+	TAP_CHECK(t, !mail_ct_param(val, "charset", par, sizeof(par)));
+	mail_ct_type("", type, sizeof(type));
+	TAP_CHECK(t, strcmp(type, "text/plain") == 0);
+
+	n = mail_qp_decode("a=3Db=\r\nc=zz", 12, buf);
+	TAP_CHECKF(t, n == 7 && memcmp(buf, "a=bc=zz", 7) == 0, "qp %zu", n);
+	n = mail_b64_decode("aGVs\r\nbG8=", 10, buf);
+	TAP_CHECKF(t, n == 5 && memcmp(buf, "hello", 5) == 0, "b64 %zu", n);
+
+	np = mail_parts(msg, len, parts);
+	TAP_CHECKF(t, np == 3, "parts %d", np);
+	TAP_ASSERT(t, np == 3);
+	TAP_CHECK(t, strcmp(parts[0].type, "text/html") == 0);
+	TAP_CHECK(t, strcmp(parts[1].type, "text/plain") == 0 &&
+	    strcmp(parts[1].enc, "quoted-printable") == 0);
+	TAP_CHECK(t, strcmp(parts[2].type, "image/png") == 0 &&
+	    strcmp(parts[2].name, "photo.png") == 0);
+	main_i = mail_main_part(parts, np);
+	TAP_CHECK(t, main_i == 1);
+	dec = mail_part_decode(&parts[1], &n);
+	TAP_ASSERT(t, dec != NULL);
+	TAP_CHECKF(t, strcmp(dec, "a=bc") == 0, "decoded [%s]", dec);
+	free(dec);
+	dec = mail_part_decode(&parts[2], &n);
+	TAP_ASSERT(t, dec != NULL);
+	TAP_CHECK(t, n == 5 && memcmp(dec, "hello", 5) == 0);
+	free(dec);
+
+	/* a plain single-part message is one part: its whole body */
+	np = mail_parts("Subject: s\n\nbody\n", 17, parts);
+	TAP_CHECK(t, np == 1 && parts[0].blen == 5 &&
+	    strcmp(parts[0].type, "text/plain") == 0);
+}
+
+/* Write a message file into a Maildir subdirectory. */
+static void
+maildir_plant(const char *dir, const char *sub, const char *name,
+    const char *body)
+{
+	char path[PATH_MAX];
+	FILE *f;
+
+	snprintf(path, sizeof(path), "%s/%s", dir, sub);
+	mkdir_p(path);
+	snprintf(path, sizeof(path), "%s/%s/%s", dir, sub, name);
+	f = fopen(path, "w");
+	if (f) {
+		fputs(body, f);
+		fclose(f);
+	}
+}
+
+static int
+names_emit(void *sink, const char *name)
+{
+	char *acc = sink;
+
+	if (acc[0])
+		strcat(acc, ",");
+	strcat(acc, name);
+	return 0;
+}
+
+typedef struct sumacc {
+	int		n;
+	unsigned	flags;
+	char		uid[256];
+	char		from[128];
+	char		subject[128];
+} Sumacc;
+
+static int
+sum_emit(void *sink, const struct vedit_mail_summary *m)
+{
+	Sumacc *a = sink;
+
+	a->n++;
+	a->flags = m->flags;
+	snprintf(a->uid, sizeof(a->uid), "%s", m->uid);
+	snprintf(a->from, sizeof(a->from), "%s", m->from);
+	snprintf(a->subject, sizeof(a->subject), "%s", m->subject);
+	return 0;
+}
+
+/* The Maildir++ backend through the vtable: folders, list, fetch, flag
+ * changes (new/ to cur/), move, append, and send into the Outbox. */
+static void
+t_maildir(Test *t)
+{
+	char root[] = "/tmp/vedit_mdXXXXXX";
+	char names[512], path[PATH_MAX], *data;
+	const struct vedit_mail_api *api;
+	Sumacc acc;
+	size_t len;
+	struct stat st;
+	DIR *d;
+	struct dirent *de;
+	int found;
+
+	TAP_ASSERT(t, mkdtemp(root) != NULL);
+	maildir_plant(root, "new", "1700000002.a.host",
+	    "From: Bob <bob@example.org>\nSubject: second\nDate: Tue, 7 Oct "
+	    "2026 10:00:00 +0000\n\nbody two\n");
+	maildir_plant(root, "cur", "1700000001.b.host:2,S",
+	    "From: Ann <ann@example.org>\nSubject: first\n\nbody one\n");
+	maildir_plant(root, ".Sent/cur", "1600000000.c.host:2,S",
+	    "From: me\nSubject: sent\n\nx\n");
+	maildir_plant(root, ".lists.vedit/cur", "1600000001.d.host:2,S",
+	    "From: me\nSubject: nested\n\nx\n");
+
+	api = cli_mail_setup(root);
+	TAP_ASSERT(t, api != NULL);
+	names[0] = '\0';
+	TAP_CHECK(t, api->folders(api->ctx, names_emit, names) == 0);
+	TAP_CHECKF(t, strcmp(names, "INBOX,Sent,lists/vedit") == 0, "folders %s",
+	    names);
+
+	memset(&acc, 0, sizeof(acc));
+	TAP_CHECK(t, api->list(api->ctx, "INBOX", sum_emit, &acc) == 0);
+	TAP_CHECKF(t, acc.n == 2, "rows %d", acc.n);
+	memset(&acc, 0, sizeof(acc));
+	TAP_CHECK(t, api->list(api->ctx, "lists/vedit", sum_emit, &acc) == 0 &&
+	    acc.n == 1 && strcmp(acc.subject, "nested") == 0);
+	TAP_CHECK(t, api->list(api->ctx, "Nope", sum_emit, &acc) != 0 &&
+	    errno == ENOENT);
+
+	/* fetch by uid regardless of the flag suffix */
+	TAP_CHECK(t, api->fetch(api->ctx, "INBOX", "1700000001.b.host", &data,
+	    &len) == 0 && strstr(data, "body one") != NULL);
+	free(data);
+	TAP_CHECK(t, api->fetch(api->ctx, "INBOX", "1700000002.a.host", &data,
+	    &len) == 0 && strstr(data, "body two") != NULL);
+	free(data);
+	TAP_CHECK(t, api->fetch(api->ctx, "INBOX", "nothing", &data, &len) != 0 &&
+	    errno == ENOENT);
+
+	/* marking the new message seen moves it into cur/ with the S flag */
+	TAP_CHECK(t, api->store(api->ctx, "INBOX", "1700000002.a.host",
+	    VEDIT_MAIL_SEEN | VEDIT_MAIL_ANSWERED, 0) == 0);
+	snprintf(path, sizeof(path), "%s/cur/1700000002.a.host:2,RS", root);
+	TAP_CHECKF(t, stat(path, &st) == 0, "stored name missing: %s", path);
+	snprintf(path, sizeof(path), "%s/new/1700000002.a.host", root);
+	TAP_CHECK(t, stat(path, &st) != 0);
+	TAP_CHECK(t, api->store(api->ctx, "INBOX", "1700000002.a.host", 0,
+	    VEDIT_MAIL_ANSWERED) == 0);
+	snprintf(path, sizeof(path), "%s/cur/1700000002.a.host:2,S", root);
+	TAP_CHECK(t, stat(path, &st) == 0);
+
+	/* move keeps the file name, in the destination's cur/ */
+	TAP_CHECK(t, api->move(api->ctx, "INBOX", "1700000001.b.host",
+	    "Archive/2026") == 0);
+	snprintf(path, sizeof(path), "%s/.Archive.2026/cur/1700000001.b.host:2,S",
+	    root);
+	TAP_CHECK(t, stat(path, &st) == 0);
+	memset(&acc, 0, sizeof(acc));
+	TAP_CHECK(t, api->list(api->ctx, "INBOX", sum_emit, &acc) == 0 &&
+	    acc.n == 1 && acc.flags == VEDIT_MAIL_SEEN &&
+	    strcmp(acc.from, "Bob <bob@example.org>") == 0);
+
+	/* append with a flag lands in cur/, send queues in Outbox/new */
+	TAP_CHECK(t, api->append(api->ctx, "Drafts", "Subject: d\n\nx\n", 15,
+	    VEDIT_MAIL_DRAFT) == 0);
+	snprintf(path, sizeof(path), "%s/.Drafts/cur", root);
+	d = opendir(path);
+	found = 0;
+	TAP_ASSERT(t, d != NULL);
+	while ((de = readdir(d)) != NULL)
+		if (strstr(de->d_name, ":2,D"))
+			found++;
+	closedir(d);
+	TAP_CHECK(t, found == 1);
+	TAP_CHECK(t, api->send(api->ctx, "To: x\n\ny\n", 10) == 0);
+	memset(&acc, 0, sizeof(acc));
+	TAP_CHECK(t, api->list(api->ctx, "Outbox", sum_emit, &acc) == 0 &&
+	    acc.n == 1 && acc.flags == 0);
+	TAP_CHECK(t, api->fetch(api->ctx, "Outbox", acc.uid, &data, &len) == 0 &&
+	    len == 10 && memcmp(data, "To: x\n\ny\n", 10) == 0);
+	free(data);
+
+	{
+		char cmd[PATH_MAX + 16];
+
+		snprintf(cmd, sizeof(cmd), "rm -rf %s", root);
+		(void)system(cmd);
+	}
+}
+#endif /* VEDIT_MAIL */
+
 /* Serialize the whole buffer the way the file on disk would read: each line's
  * bytes in order, joined by '\n', with no trailing newline. Caller frees. */
 static char *
@@ -3113,6 +3356,10 @@ const Case tap_cases[] = {
 	{ "syntax_ini", t_syntax_ini },
 	{ "mkdir_p", t_mkdir_p },
 	{ "cli_config_path", t_cli_config_path },
+#ifdef VEDIT_MAIL
+	{ "mail_parse", t_mail_parse },
+	{ "maildir", t_maildir },
+#endif
 	{ "entry_scroll", t_entry_scroll },
 	{ "text_fp_roundtrip", t_text_fp_roundtrip },
 	{ "tbl_fields", t_tbl_fields },

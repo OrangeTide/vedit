@@ -33,6 +33,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -50,6 +51,12 @@
  * guards unchanged. */
 #if !defined(VEDIT_NO_TERM) && !defined(VEDIT_TERM)
 #define VEDIT_TERM 1
+#endif
+
+/* The mail reader and composer is built by default; -DVEDIT_NO_MAIL drops it.
+ * Its code is guarded by VEDIT_MAIL. */
+#if !defined(VEDIT_NO_MAIL) && !defined(VEDIT_MAIL)
+#define VEDIT_MAIL 1
 #endif
 
 /****************************************************************
@@ -6133,7 +6140,26 @@ typedef struct ebuf {
 	Art		*art;		/* art view grid for a .ans file, or NULL */
 	Tbl		*tbl;		/* table view state for a CSV/TSV, or NULL */
 	Widths		*tabs;		/* the ruler of tab stops, or NULL */
+#ifdef VEDIT_MAIL
+	struct mailref	*mref;		/* what mail this buffer shows, or NULL */
+#endif
 } Buf;
+
+#ifdef VEDIT_MAIL
+enum { MREF_MESSAGE = 1, MREF_COMPOSE };
+
+/* What a mail buffer shows: a part of a fetched message, or a draft being
+ * composed (with the message it answers, for the Answered flag). */
+typedef struct mailref {
+	int	kind;
+	char	folder[128];
+	char	uid[256];
+	int	part;			/* MIME part index shown */
+	char	label[160];		/* title-bar name of the buffer */
+	char	rfolder[128];		/* a compose buffer: what it replies to */
+	char	ruid[256];
+} Mailref;
+#endif
 
 /* Referenced only by pointer here; the users include the real headers. */
 struct tkbd_seq;
@@ -6362,6 +6388,12 @@ typedef struct editor {
 	/* table view. tbl mirrors the active buffer. */
 	Tbl		*tbl;		/* active buffer's table state, or NULL */
 	Widths		*tabs;		/* active buffer's tab stops, or NULL */
+#ifdef VEDIT_MAIL
+	/* mail. mref mirrors the active buffer; mail is the backend vtable. */
+	struct mailref	*mref;		/* active buffer's mail reference, or NULL */
+	const struct vedit_mail_api *mail;	/* borrowed; NULL = no mail */
+	char		mail_folder[128];	/* the folder last listed */
+#endif
 	int		tbl_on;		/* table.view: open .csv/.tsv files as a table */
 	int		tbl_header;	/* table.header: line 1 is a header row */
 	int		tbl_width;	/* table.width: default column width; 0 = built-in */
@@ -6461,6 +6493,15 @@ int buf_close(Editor *e, int i);			/* 0 ok, -1 refused */
 void buf_list(Editor *e);			/* summarize into status */
 static int dlg_save_file(Editor *e, char *out, size_t outsz);
 static int dlg_confirm_yesno(Editor *e, const char *msg);
+#ifdef VEDIT_MAIL
+struct mailref;
+static void mail_detach(Editor *e);		/* free the active buffer's mail ref */
+static void mail_ref_free(Buf *b);		/* free a parked buffer's */
+static const char *mail_label(const struct mailref *m);
+#else
+#define mail_detach(e) ((void)0)
+#define mail_ref_free(b) ((void)0)
+#endif
 static void dlg_symbol_pick(Editor *e);
 void insert_clip(Editor *e);
 void insert_bytes(Editor *e, const char *bytes, size_t len);
@@ -8565,6 +8606,9 @@ typedef enum menu_act {
 	MA_PANE_GROW, MA_PANE_SHRINK,
 	MA_TERM_REPOST_TEXT, MA_TERM_REPOST_ART,
 #endif
+#ifdef VEDIT_MAIL
+	MA_MAIL_FOLDERS, MA_MAIL_INDEX, MA_MAIL_COMPOSE, MA_MAIL_REPLY, MA_MAIL_SEND,
+#endif
 	MA_HELP, MA_TUTORIAL, MA_ABOUT,
 } Menuact;
 
@@ -8714,6 +8758,16 @@ static const Menuitem mi_term[] = {
 	{ "Repost as &Art",	"Ctrl-W R",	":repost art",	MA_TERM_REPOST_ART },
 };
 #endif
+#ifdef VEDIT_MAIL
+static const Menuitem mi_mail[] = {
+	{ "&Folders...",	"",	":mail",	MA_MAIL_FOLDERS },
+	{ "&Messages...",	"",	":mail .",	MA_MAIL_INDEX },
+	{ "",			"",	"",		MA_SEP },
+	{ "&Compose",		"",	":compose",	MA_MAIL_COMPOSE },
+	{ "&Reply",		"",	":reply",	MA_MAIL_REPLY },
+	{ "&Send",		"",	":send",	MA_MAIL_SEND },
+};
+#endif
 static const Menuitem mi_help[] = {
 	{ "&Key Bindings",	"F1",	"",	MA_HELP },
 	{ "&Tutorial",		"",	"",	MA_TUTORIAL },
@@ -8735,6 +8789,9 @@ static const Menu MENUS[] = {
 #endif
 #ifdef VEDIT_TERM
 	{ "&Terminal",	MENU_ITEMS(mi_term) },
+#endif
+#ifdef VEDIT_MAIL
+	{ "&Mail",	MENU_ITEMS(mi_mail) },
 #endif
 	{ "&Help",	MENU_ITEMS(mi_help) },
 };
@@ -9083,6 +9140,18 @@ menu_item_enabled(const Editor *e, Menuact act)
 	case MA_TERM_REPOST_ART:
 		return term_repost_src(e) != NULL;
 #endif
+#ifdef VEDIT_MAIL
+	case MA_MAIL_FOLDERS:
+	case MA_MAIL_COMPOSE:
+		return e->mail != NULL;
+	case MA_MAIL_INDEX:
+		return e->mail != NULL && e->mail_folder[0] != '\0';
+	case MA_MAIL_REPLY:
+		return e->mail != NULL && e->mref && e->mref->kind == MREF_MESSAGE;
+	case MA_MAIL_SEND:
+		return e->mail != NULL && e->mail->send && e->mref &&
+		    e->mref->kind == MREF_COMPOSE;
+#endif
 	default:
 		return 1;
 	}
@@ -9235,6 +9304,10 @@ ui_frame(Editor *e, const Pal *p)
 	    : (e->has_name ? e->path : "Untitled");
 #else
 	const char *name = e->has_name ? e->path : "Untitled";
+#endif
+#ifdef VEDIT_MAIL
+	if (!e->has_name && mail_label(e->mref))
+		name = mail_label(e->mref);
 #endif
 	char title[80];
 	int tlen, tstart;
@@ -15311,6 +15384,11 @@ static const struct {
 	{ ":coladd[!] [N]",	"Table view: insert N columns left (! right); :coldel" },
 #endif
 	{ ":config  :reload",	"Edit the config file / re-read it (Options menu too)" },
+#ifdef VEDIT_MAIL
+	{ ":mail [folder|.]",	"Mail: pick a folder, or list one (. = the last)" },
+	{ ":compose [to]  :reply",	"Start a message / answer the one shown" },
+	{ ":send",		"Hand the compose buffer to the mail backend" },
+#endif
 	{ "F1 / F2",		"Show this help / back to modeless keys" },
 };
 
@@ -15984,11 +16062,17 @@ buffer_reset(Editor *e)
  * once so buf_save and buf_load cannot fall out of sync. Adding a mirrored
  * field means declaring it in both struct ebuf and struct editor, then adding
  * one line here (scalars assign; fixed-size arrays copy by value). */
+#ifdef VEDIT_MAIL
+#define BUF_MAIL_SCALARS(X) X(mref)
+#else
+#define BUF_MAIL_SCALARS(X)
+#endif
 #define BUF_STATE_SCALARS(X) \
 	X(t) X(has_name) X(cy) X(cx) X(top) X(left) X(sel_active) X(ay) X(ax) \
 	X(syn) X(line_state) X(line_state_cap) X(hl_valid) X(hex_view) \
 	X(hex_top) X(expand_tabs) X(vi_marks_set) X(swap_on) X(swap_rev) \
-	X(load_mtime) X(kind) X(vterm) X(in_pane) X(top_last) X(art) X(tbl) X(tabs)
+	X(load_mtime) X(kind) X(vterm) X(in_pane) X(top_last) X(art) X(tbl) X(tabs) \
+	BUF_MAIL_SCALARS(X)
 #define BUF_STATE_ARRAYS(X) \
 	X(path) X(vi_mark_y) X(vi_mark_x) X(swap_path)
 
@@ -16149,6 +16233,9 @@ buf_open(Editor *e, const char *path)
 #endif
 	e->tbl = NULL;
 	e->tabs = NULL;
+#ifdef VEDIT_MAIL
+	e->mref = NULL;
+#endif
 	if (path && path[0]) {
 		snprintf(e->path, sizeof(e->path), "%s", path);
 		e->has_name = 1;
@@ -16209,6 +16296,7 @@ buf_close(Editor *e, int i)
 #endif
 		tbl_detach(e);
 		tabs_detach(e);
+		mail_detach(e);
 		buf_free_fields(e->t, e->line_state);
 		memmove(&e->bufs[i], &e->bufs[i + 1],
 		    (size_t)(e->nbuf - i - 1) * sizeof(*e->bufs));
@@ -16223,6 +16311,7 @@ buf_close(Editor *e, int i)
 		art_free(e->bufs[i].art);
 #endif
 		tbl_free(e->bufs[i].tbl);
+		mail_ref_free(&e->bufs[i]);
 		buf_free_fields(e->bufs[i].t, e->bufs[i].line_state);
 		memmove(&e->bufs[i], &e->bufs[i + 1],
 		    (size_t)(e->nbuf - i - 1) * sizeof(*e->bufs));
@@ -16298,6 +16387,11 @@ bufpick_label(void *ctx, int i)
 	 * read correctly from either. */
 	name = active ? (e->has_name ? e->path : "[No Name]")
 	    : (e->bufs[i].has_name ? e->bufs[i].path : "[No Name]");
+#ifdef VEDIT_MAIL
+	if (mail_label(active ? e->mref : e->bufs[i].mref) &&
+	    !(active ? e->has_name : e->bufs[i].has_name))
+		name = mail_label(active ? e->mref : e->bufs[i].mref);
+#endif
 	slash = strrchr(name, '/');
 	if (slash)
 		name = slash + 1;
@@ -18101,10 +18195,1081 @@ ed_new(Editor *e)
 	art_detach(e);
 #endif
 	tbl_detach(e);
+	mail_detach(e);
 	tabs_config(e);
 	buf_save(e, &e->bufs[e->cur]);
 	set_status(e, "new buffer");
 }
+
+#ifdef VEDIT_MAIL
+/****************************************************************
+ * Mail: an alpine-style reader and composer. The core speaks to a
+ * vedit_mail_api vtable (folders, message lists, flags, fetch, store, move,
+ * append, send) and never to a mailbox directly; the standalone binary's
+ * Maildir++ backend lives with the CLI code at the end of the file.
+ *
+ * A message opens as one buffer per MIME part: the first text part (with the
+ * interesting headers on top) and then one sibling per other part, all
+ * reachable through the buffer list. A compose buffer is the headers the user
+ * edits (From, To, Cc, Subject), a blank line, and the body; :send turns it
+ * into an RFC 5322 message and hands it to the backend.
+ ****************************************************************/
+
+static void
+mail_ref_free(Buf *b)
+{
+	free(b->mref);
+	b->mref = NULL;
+}
+
+static void
+mail_detach(Editor *e)
+{
+	free(e->mref);
+	e->mref = NULL;
+}
+
+/* The buffer's display name when it is a mail buffer, else NULL. */
+static const char *
+mail_label(const Mailref *m)
+{
+	return m ? m->label : NULL;
+}
+
+/* ---- RFC 5322 headers ---- */
+
+/* The offset where the body starts: past the first blank line, or len. */
+static size_t
+mail_body_off(const char *msg, size_t len)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		if (msg[i] != '\n')
+			continue;
+		if (i + 1 < len && msg[i + 1] == '\n')
+			return i + 2;
+		if (i + 2 < len && msg[i + 1] == '\r' && msg[i + 2] == '\n')
+			return i + 3;
+	}
+	return len;
+}
+
+/* Copy the unfolded, trimmed value of the first header called name within
+ * msg[0..hlen) into out. Returns 1 when found, 0 (and an empty out) when not.
+ * Header names compare case-insensitively; continuation lines (starting with
+ * a space or tab) join with a single space. */
+static int
+mail_header(const char *msg, size_t hlen, const char *name, char *out,
+    size_t outsz)
+{
+	size_t n = strlen(name), i = 0, o = 0;
+
+	out[0] = '\0';
+	while (i < hlen) {
+		size_t eol = i;
+
+		while (eol < hlen && msg[eol] != '\n')
+			eol++;
+		if (eol - i > n && msg[i + n] == ':' &&
+		    strncasecmp(msg + i, name, n) == 0) {
+			size_t p = i + n + 1;
+
+			for (;;) {
+				size_t stop = eol;
+
+				while (stop > p && (msg[stop - 1] == '\r' ||
+				    msg[stop - 1] == ' ' || msg[stop - 1] == '\t'))
+					stop--;
+				while (p < stop && (msg[p] == ' ' || msg[p] == '\t'))
+					p++;
+				if (o > 0 && p < stop && o + 1 < outsz)
+					out[o++] = ' ';
+				while (p < stop && o + 1 < outsz)
+					out[o++] = msg[p++];
+				/* a continuation line folds into the value */
+				if (eol + 1 < hlen &&
+				    (msg[eol + 1] == ' ' || msg[eol + 1] == '\t')) {
+					i = eol + 1;
+					eol = i;
+					while (eol < hlen && msg[eol] != '\n')
+						eol++;
+					p = i;
+					continue;
+				}
+				break;
+			}
+			out[o] = '\0';
+			return 1;
+		}
+		i = eol + 1;
+	}
+	return 0;
+}
+
+/* The media type of a Content-Type value, lowercased, without parameters:
+ * "text/plain; charset=x" -> "text/plain". An empty value means text/plain. */
+static void
+mail_ct_type(const char *ct, char *out, size_t outsz)
+{
+	size_t o = 0;
+
+	while (*ct == ' ' || *ct == '\t')
+		ct++;
+	while (*ct && *ct != ';' && *ct != ' ' && o + 1 < outsz)
+		out[o++] = (char)tolower((unsigned char)*ct++);
+	out[o] = '\0';
+	if (o == 0)
+		snprintf(out, outsz, "text/plain");
+}
+
+/* A parameter of a Content-Type or Content-Disposition value, without quotes.
+ * Returns 1 when present. */
+static int
+mail_ct_param(const char *ct, const char *param, char *out, size_t outsz)
+{
+	size_t n = strlen(param);
+	const char *p = ct;
+
+	out[0] = '\0';
+	while ((p = strchr(p, ';')) != NULL) {
+		p++;
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (strncasecmp(p, param, n) == 0 && p[n] == '=') {
+			size_t o = 0;
+
+			p += n + 1;
+			if (*p == '"') {
+				p++;
+				while (*p && *p != '"' && o + 1 < outsz)
+					out[o++] = *p++;
+			} else {
+				while (*p && *p != ';' && *p != ' ' && *p != '\t' &&
+				    *p != '\r' && *p != '\n' && o + 1 < outsz)
+					out[o++] = *p++;
+			}
+			out[o] = '\0';
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* ---- transfer encodings ---- */
+
+static int
+mail_hexval(int c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	return -1;
+}
+
+/* Decode quoted-printable in[0..n) into out (which may equal in, and needs n
+ * bytes). Soft line breaks ("=" at the end of a line) vanish. Returns the
+ * decoded length. */
+static size_t
+mail_qp_decode(const char *in, size_t n, char *out)
+{
+	size_t i = 0, o = 0;
+
+	while (i < n) {
+		if (in[i] == '=' && i + 1 < n) {
+			if (in[i + 1] == '\n') {
+				i += 2;
+				continue;
+			}
+			if (in[i + 1] == '\r' && i + 2 < n && in[i + 2] == '\n') {
+				i += 3;
+				continue;
+			}
+			if (i + 2 < n) {
+				int hi = mail_hexval(in[i + 1]);
+				int lo = mail_hexval(in[i + 2]);
+
+				if (hi >= 0 && lo >= 0) {
+					out[o++] = (char)(hi * 16 + lo);
+					i += 3;
+					continue;
+				}
+			}
+		}
+		out[o++] = in[i++];
+	}
+	return o;
+}
+
+/* Decode base64 in[0..n) into out (may equal in; needs n bytes), skipping
+ * whitespace and anything that is not in the alphabet. Returns the length. */
+static size_t
+mail_b64_decode(const char *in, size_t n, char *out)
+{
+	size_t i, o = 0;
+	unsigned acc = 0;
+	int bits = 0;
+
+	for (i = 0; i < n; i++) {
+		int c = (unsigned char)in[i], v;
+
+		if (c >= 'A' && c <= 'Z')
+			v = c - 'A';
+		else if (c >= 'a' && c <= 'z')
+			v = c - 'a' + 26;
+		else if (c >= '0' && c <= '9')
+			v = c - '0' + 52;
+		else if (c == '+')
+			v = 62;
+		else if (c == '/')
+			v = 63;
+		else if (c == '=')
+			break;
+		else
+			continue;
+		acc = (acc << 6) | (unsigned)v;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			out[o++] = (char)((acc >> bits) & 0xff);
+		}
+	}
+	return o;
+}
+
+/* ---- MIME parts ---- */
+
+#define MAIL_PARTS_MAX	32
+
+/* One leaf of the MIME tree: its own headers and its raw (still encoded)
+ * body, both pointing into the fetched message. */
+typedef struct mailpart {
+	const char	*hdr;
+	size_t		 hlen;
+	const char	*body;
+	size_t		 blen;
+	char		 type[64];	/* media type, lowercased */
+	char		 enc[24];	/* transfer encoding, lowercased */
+	char		 name[128];	/* filename or name parameter, or "" */
+} Mailpart;
+
+static void
+mail_lower(char *s)
+{
+	for (; *s; s++)
+		*s = (char)tolower((unsigned char)*s);
+}
+
+/* Describe the entity whose headers are msg[0..hlen) and body body[0..blen)
+ * as one leaf in out[*n], or recurse into its multipart body. */
+static void
+mail_parts_entity(const char *hdr, size_t hlen, const char *body, size_t blen,
+    Mailpart *out, int *n, int depth)
+{
+	char ct[256], type[64], boundary[80], cd[256];
+
+	if (*n >= MAIL_PARTS_MAX)
+		return;
+	mail_header(hdr, hlen, "Content-Type", ct, sizeof(ct));
+	mail_ct_type(ct, type, sizeof(type));
+	if (depth < 8 && strncmp(type, "multipart/", 10) == 0 &&
+	    mail_ct_param(ct, "boundary", boundary, sizeof(boundary)) &&
+	    boundary[0]) {
+		size_t bl = strlen(boundary), i = 0, start = 0;
+		int inside = 0;
+
+		/* A delimiter is a line "--boundary"; "--boundary--" ends it.
+		 * The part between two delimiters is a full entity (headers,
+		 * blank line, body); the CRLF before a delimiter belongs to the
+		 * delimiter, not the part. */
+		while (i <= blen) {
+			size_t eol = i;
+			int delim, last = 0;
+
+			while (eol < blen && body[eol] != '\n')
+				eol++;
+			delim = eol - i >= bl + 2 && body[i] == '-' &&
+			    body[i + 1] == '-' &&
+			    memcmp(body + i + 2, boundary, bl) == 0;
+			if (delim && eol - i >= bl + 4 &&
+			    body[i + 2 + bl] == '-' && body[i + 3 + bl] == '-')
+				last = 1;
+			if (delim) {
+				if (inside) {
+					size_t end = i;
+					size_t ph;
+
+					if (end > start && body[end - 1] == '\n')
+						end--;
+					if (end > start && body[end - 1] == '\r')
+						end--;
+					ph = mail_body_off(body + start, end - start);
+					mail_parts_entity(body + start, ph,
+					    body + start + ph, end - start - ph,
+					    out, n, depth + 1);
+				}
+				if (last)
+					break;
+				inside = 1;
+				start = eol + 1;
+			}
+			if (eol >= blen)
+				break;
+			i = eol + 1;
+		}
+		return;
+	}
+	{
+		Mailpart *p = &out[(*n)++];
+
+		memset(p, 0, sizeof(*p));
+		p->hdr = hdr;
+		p->hlen = hlen;
+		p->body = body;
+		p->blen = blen;
+		snprintf(p->type, sizeof(p->type), "%s", type);
+		mail_header(hdr, hlen, "Content-Transfer-Encoding", p->enc,
+		    sizeof(p->enc));
+		mail_lower(p->enc);
+		mail_header(hdr, hlen, "Content-Disposition", cd, sizeof(cd));
+		if (!mail_ct_param(cd, "filename", p->name, sizeof(p->name)))
+			mail_ct_param(ct, "name", p->name, sizeof(p->name));
+	}
+}
+
+/* Split a message into its leaf parts. Returns the count (at least 1 for a
+ * non-empty message). */
+static int
+mail_parts(const char *msg, size_t len, Mailpart *out)
+{
+	size_t hlen = mail_body_off(msg, len);
+	int n = 0;
+
+	mail_parts_entity(msg, hlen, msg + hlen, len - hlen, out, &n, 0);
+	if (n == 0) {			/* an empty multipart: show it raw */
+		memset(&out[0], 0, sizeof(out[0]));
+		out[0].hdr = msg;
+		out[0].hlen = hlen;
+		out[0].body = msg + hlen;
+		out[0].blen = len - hlen;
+		snprintf(out[0].type, sizeof(out[0].type), "text/plain");
+		n = 1;
+	}
+	return n;
+}
+
+/* The decoded bytes of a part, malloc'd (NUL-terminated for convenience).
+ * Text parts also lose their CRs so they open as plain Unix lines. */
+static char *
+mail_part_decode(const Mailpart *p, size_t *outlen)
+{
+	char *buf = malloc(p->blen + 1);
+	size_t n;
+
+	if (!buf)
+		return NULL;
+	if (strcmp(p->enc, "base64") == 0)
+		n = mail_b64_decode(p->body, p->blen, buf);
+	else if (strcmp(p->enc, "quoted-printable") == 0)
+		n = mail_qp_decode(p->body, p->blen, buf);
+	else {
+		memcpy(buf, p->body, p->blen);
+		n = p->blen;
+	}
+	if (strncmp(p->type, "text/", 5) == 0) {
+		size_t i, o = 0;
+
+		for (i = 0; i < n; i++)
+			if (buf[i] != '\r' || i + 1 >= n || buf[i + 1] != '\n')
+				buf[o++] = buf[i];
+		n = o;
+	}
+	buf[n] = '\0';
+	*outlen = n;
+	return buf;
+}
+
+/* The index of the part to show first: the first text/plain, else the first
+ * other text type, else part 0. */
+static int
+mail_main_part(const Mailpart *parts, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		if (strcmp(parts[i].type, "text/plain") == 0)
+			return i;
+	for (i = 0; i < n; i++)
+		if (strncmp(parts[i].type, "text/", 5) == 0)
+			return i;
+	return 0;
+}
+
+/* ---- buffers ---- */
+
+static int
+mail_require(Editor *e)
+{
+	if (e->mail)
+		return 1;
+	set_status(e, "no mail backend (set mail.dir in the config)");
+	return 0;
+}
+
+/* Open a new unnamed buffer holding data[0..len) with the given mail
+ * reference (copied). Returns the buffer index, or -1 with a status. */
+static int
+mail_new_buffer(Editor *e, const char *data, size_t len, const Mailref *ref,
+    int dirty)
+{
+	Mailref *m = malloc(sizeof(*m));
+	int i;
+
+	if (!m) {
+		set_status(e, "out of memory");
+		return -1;
+	}
+	*m = *ref;
+	i = buf_open(e, NULL);
+	if (i < 0) {
+		free(m);
+		return -1;
+	}
+	if (len > 0) {
+		FILE *in = fmemopen((void *)data, len, "rb");
+
+		if (in) {
+			text_load_fp(e->t, in);
+			fclose(in);
+		}
+	}
+	e->t->dirty = dirty;
+	e->mref = m;
+	e->cy = e->cx = e->top = e->left = 0;
+	buf_save(e, &e->bufs[e->cur]);
+	return i;
+}
+
+/* A short label for a part: "part 2: image/png photo.png". */
+static void
+mail_part_label(const Mailpart *p, int i, char *out, size_t outsz)
+{
+	snprintf(out, outsz, "part %d: %s%s%s", i + 1, p->type,
+	    p->name[0] ? " " : "", p->name);
+}
+
+/* Fetch the message folder/uid and open it: one buffer per part, the main
+ * text part last so it is the active one, headed by the headers worth
+ * reading. Marks the message seen. Returns 0, or -1 with a status. */
+static int
+mail_open_message(Editor *e, const char *folder, const char *uid)
+{
+	char *msg = NULL, *body;
+	size_t len = 0, blen, hlen;
+	Mailpart parts[MAIL_PARTS_MAX];
+	int n, main_i, i;
+	Mailref ref;
+	char subject[200], from[200], to[200], cc[200], date[80];
+	char *text = NULL;
+	size_t tlen = 0;
+	FILE *fp;
+
+	if (!mail_require(e))
+		return -1;
+	if (e->mail->fetch(e->mail->ctx, folder, uid, &msg, &len) != 0) {
+		set_status(e, "cannot fetch message: %s", strerror(errno));
+		return -1;
+	}
+	hlen = mail_body_off(msg, len);
+	mail_header(msg, hlen, "Subject", subject, sizeof(subject));
+	mail_header(msg, hlen, "From", from, sizeof(from));
+	mail_header(msg, hlen, "To", to, sizeof(to));
+	mail_header(msg, hlen, "Cc", cc, sizeof(cc));
+	mail_header(msg, hlen, "Date", date, sizeof(date));
+	n = mail_parts(msg, len, parts);
+	main_i = mail_main_part(parts, n);
+
+	memset(&ref, 0, sizeof(ref));
+	ref.kind = MREF_MESSAGE;
+	snprintf(ref.folder, sizeof(ref.folder), "%s", folder);
+	snprintf(ref.uid, sizeof(ref.uid), "%s", uid);
+
+	/* the other parts first, each in its own buffer */
+	for (i = 0; i < n; i++) {
+		char plabel[160];
+
+		if (i == main_i)
+			continue;
+		body = mail_part_decode(&parts[i], &blen);
+		if (!body)
+			continue;
+		ref.part = i;
+		mail_part_label(&parts[i], i, plabel, sizeof(plabel));
+		snprintf(ref.label, sizeof(ref.label), "[mail] %.60s (%.80s)",
+		    subject[0] ? subject : "(no subject)", plabel);
+		mail_new_buffer(e, body, blen, &ref, 0);
+		free(body);
+	}
+
+	/* the main part, with the headers on top */
+	body = mail_part_decode(&parts[main_i], &blen);
+	fp = open_memstream(&text, &tlen);
+	if (!body || !fp) {
+		free(body);
+		if (fp)
+			fclose(fp);
+		free(text);
+		free(msg);
+		set_status(e, "out of memory");
+		return -1;
+	}
+	fprintf(fp, "From: %s\n", from);
+	if (to[0])
+		fprintf(fp, "To: %s\n", to);
+	if (cc[0])
+		fprintf(fp, "Cc: %s\n", cc);
+	fprintf(fp, "Date: %s\nSubject: %s\n", date, subject);
+	if (n > 1)
+		fprintf(fp, "Parts: %d (the others are open as buffers)\n", n);
+	fputc('\n', fp);
+	fwrite(body, 1, blen, fp);
+	fclose(fp);
+	free(body);
+	ref.part = main_i;
+	snprintf(ref.label, sizeof(ref.label), "[mail] %.120s",
+	    subject[0] ? subject : "(no subject)");
+	i = mail_new_buffer(e, text, tlen, &ref, 0);
+	free(text);
+	free(msg);
+	if (i < 0)
+		return -1;
+	if (e->mail->store)
+		(void)e->mail->store(e->mail->ctx, folder, uid, VEDIT_MAIL_SEEN, 0);
+	set_status(e, "%.60s  [%d/%d]%s", subject[0] ? subject : "(no subject)",
+	    e->cur + 1, e->nbuf, n > 1 ? "  (more parts in the buffer list)" : "");
+	return 0;
+}
+
+/* ---- compose, reply, send ---- */
+
+/* Start a compose buffer. to, subject, inreplyto, refs and quoted may be
+ * NULL or empty. The cursor lands on the To line when it is empty, else on
+ * the first body line. Returns 0 or -1. */
+static int
+mail_compose(Editor *e, const char *to, const char *subject,
+    const char *inreplyto, const char *refs, const char *quoted,
+    const char *rfolder, const char *ruid)
+{
+	const char *from = cfg_get(g_cfg, "mail.from");
+	char *text = NULL;
+	size_t tlen = 0;
+	FILE *fp;
+	Mailref ref;
+	int i, hdr_lines;
+
+	if (!mail_require(e))
+		return -1;
+	fp = open_memstream(&text, &tlen);
+	if (!fp) {
+		set_status(e, "out of memory");
+		return -1;
+	}
+	fprintf(fp, "From: %s\nTo: %s\nCc: \nSubject: %s\n", from ? from : "",
+	    to ? to : "", subject ? subject : "");
+	hdr_lines = 4;
+	if (inreplyto && inreplyto[0]) {
+		fprintf(fp, "In-Reply-To: %s\n", inreplyto);
+		hdr_lines++;
+	}
+	if (refs && refs[0]) {
+		fprintf(fp, "References: %s\n", refs);
+		hdr_lines++;
+	}
+	fputc('\n', fp);
+	if (quoted && quoted[0])
+		fputs(quoted, fp);
+	fclose(fp);
+
+	memset(&ref, 0, sizeof(ref));
+	ref.kind = MREF_COMPOSE;
+	snprintf(ref.label, sizeof(ref.label), "[compose] %.120s",
+	    subject && subject[0] ? subject : "(no subject)");
+	if (rfolder)
+		snprintf(ref.rfolder, sizeof(ref.rfolder), "%s", rfolder);
+	if (ruid)
+		snprintf(ref.ruid, sizeof(ref.ruid), "%s", ruid);
+	i = mail_new_buffer(e, text, tlen, &ref, 1);
+	free(text);
+	if (i < 0)
+		return -1;
+	if (to && to[0]) {
+		e->cy = (size_t)hdr_lines + 1;
+	} else {
+		size_t l = 0;
+
+		e->cy = 1;
+		(void)text_line(e->t, 1, &l);
+		e->cx = l;
+	}
+	buf_save(e, &e->bufs[e->cur]);
+	set_status(e, "compose: fill in the headers and body, then :send");
+	return 0;
+}
+
+/* The address part of a From-style header: "Name <a@b>" -> "a@b", else the
+ * value itself. Used only for display; the raw value is what gets sent. */
+static const char *
+mail_display_name(const char *from, char *out, size_t outsz)
+{
+	const char *lt = strchr(from, '<');
+	size_t n;
+
+	if (lt && lt > from) {
+		n = (size_t)(lt - from);
+		while (n > 0 && (from[n - 1] == ' ' || from[n - 1] == '"'))
+			n--;
+		snprintf(out, outsz, "%.*s", (int)n, from[0] == '"' ? from + 1 :
+		    from);
+		if (out[0])
+			return out;
+	}
+	snprintf(out, outsz, "%s", from);
+	return out;
+}
+
+/* Reply to the message the active buffer shows: a compose buffer addressed
+ * to Reply-To or From, "Re:" subject, threading headers, the text quoted
+ * with "> ". Returns 0 or -1 with a status. */
+static int
+mail_reply(Editor *e)
+{
+	Mailref *m = e->mref;
+	char *msg = NULL, *body = NULL, *quoted = NULL;
+	size_t len = 0, blen = 0, qlen = 0, hlen, i, at;
+	Mailpart parts[MAIL_PARTS_MAX];
+	int n;
+	char to[300], subject[260], subj2[270], msgid[300], refs[1000];
+	char from[200], date[80], name[200];
+	FILE *fp;
+	int rc;
+
+	if (!mail_require(e))
+		return -1;
+	if (!m || m->kind != MREF_MESSAGE) {
+		set_status(e, "not a mail message buffer");
+		return -1;
+	}
+	if (e->mail->fetch(e->mail->ctx, m->folder, m->uid, &msg, &len) != 0) {
+		set_status(e, "cannot fetch message: %s", strerror(errno));
+		return -1;
+	}
+	hlen = mail_body_off(msg, len);
+	if (!mail_header(msg, hlen, "Reply-To", to, sizeof(to)) || !to[0])
+		mail_header(msg, hlen, "From", to, sizeof(to));
+	mail_header(msg, hlen, "From", from, sizeof(from));
+	mail_header(msg, hlen, "Date", date, sizeof(date));
+	mail_header(msg, hlen, "Subject", subject, sizeof(subject));
+	mail_header(msg, hlen, "Message-ID", msgid, sizeof(msgid));
+	mail_header(msg, hlen, "References", refs, sizeof(refs));
+	if (msgid[0]) {
+		size_t rl = strlen(refs);
+
+		snprintf(refs + rl, sizeof(refs) - rl, "%s%s", rl ? " " : "",
+		    msgid);
+	}
+	if (strncasecmp(subject, "re:", 3) == 0)
+		snprintf(subj2, sizeof(subj2), "%s", subject);
+	else
+		snprintf(subj2, sizeof(subj2), "Re: %s", subject);
+
+	n = mail_parts(msg, len, parts);
+	body = mail_part_decode(&parts[mail_main_part(parts, n)], &blen);
+	fp = open_memstream(&quoted, &qlen);
+	if (!body || !fp) {
+		free(body);
+		if (fp)
+			fclose(fp);
+		free(quoted);
+		free(msg);
+		set_status(e, "out of memory");
+		return -1;
+	}
+	fprintf(fp, "On %s, %s wrote:\n", date,
+	    mail_display_name(from, name, sizeof(name)));
+	at = 1;
+	for (i = 0; i < blen; i++) {
+		if (at)
+			fputs("> ", fp);
+		fputc(body[i], fp);
+		at = body[i] == '\n';
+	}
+	if (!at)
+		fputc('\n', fp);
+	fclose(fp);
+	free(body);
+	rc = mail_compose(e, to, subj2, msgid, refs, quoted, m->folder, m->uid);
+	free(quoted);
+	free(msg);
+	return rc;
+}
+
+/* An RFC 5322 date for now, in the local zone. */
+static void
+mail_date_now(char *out, size_t outsz)
+{
+	time_t now = time(NULL);
+	struct tm tm;
+
+	localtime_r(&now, &tm);
+	if (strftime(out, outsz, "%a, %d %b %Y %H:%M:%S %z", &tm) == 0)
+		out[0] = '\0';
+}
+
+/* Hand the active compose buffer to the backend as a complete message. The
+ * header lines the user left (non-empty values only) are kept as typed; Date,
+ * Message-ID and the MIME headers are added. Returns 0 or -1 with a status. */
+static int
+mail_send(Editor *e)
+{
+	Mailref *m = e->mref;
+	char *buf = NULL, *out = NULL;
+	size_t len = 0, olen = 0, hlen, i;
+	char to[1000], date[80], host[256], msgid[320];
+	FILE *fp;
+	int rc;
+	static unsigned seq;
+
+	if (!mail_require(e))
+		return -1;
+	if (!m || m->kind != MREF_COMPOSE) {
+		set_status(e, "not a compose buffer (:compose starts one)");
+		return -1;
+	}
+	if (!e->mail->send) {
+		set_status(e, "the mail backend cannot send");
+		return -1;
+	}
+	fp = open_memstream(&buf, &len);
+	if (!fp || text_write_fp(e->t, fp) != OK) {
+		if (fp)
+			fclose(fp);
+		free(buf);
+		set_status(e, "out of memory");
+		return -1;
+	}
+	fclose(fp);
+	hlen = mail_body_off(buf, len);
+	if (!mail_header(buf, hlen, "To", to, sizeof(to)) || !to[0]) {
+		free(buf);
+		set_status(e, "no To: address");
+		return -1;
+	}
+	fp = open_memstream(&out, &olen);
+	if (!fp) {
+		free(buf);
+		set_status(e, "out of memory");
+		return -1;
+	}
+	/* the user's header lines, dropping any with an empty value */
+	for (i = 0; i < hlen;) {
+		size_t eol = i, colon;
+
+		while (eol < hlen && buf[eol] != '\n')
+			eol++;
+		colon = i;
+		while (colon < eol && buf[colon] != ':')
+			colon++;
+		if (colon < eol) {
+			size_t v = colon + 1;
+
+			while (v < eol && (buf[v] == ' ' || buf[v] == '\t' ||
+			    buf[v] == '\r'))
+				v++;
+			if (v < eol || (eol + 1 < hlen &&
+			    (buf[eol + 1] == ' ' || buf[eol + 1] == '\t')))
+				fprintf(fp, "%.*s\n", (int)(eol - i), buf + i);
+		} else if (eol > i && (buf[i] == ' ' || buf[i] == '\t'))
+			fprintf(fp, "%.*s\n", (int)(eol - i), buf + i);
+		i = eol + 1;
+	}
+	mail_date_now(date, sizeof(date));
+	if (gethostname(host, sizeof(host)) != 0 || !host[0])
+		snprintf(host, sizeof(host), "localhost");
+	host[sizeof(host) - 1] = '\0';
+	snprintf(msgid, sizeof(msgid), "<%ld.%ld.%u@%s>", (long)time(NULL),
+	    (long)getpid(), ++seq, host);
+	fprintf(fp, "Date: %s\nMessage-ID: %s\nMIME-Version: 1.0\n"
+	    "Content-Type: text/plain; charset=utf-8\n"
+	    "Content-Transfer-Encoding: 8bit\n\n", date, msgid);
+	if (hlen < len)
+		fwrite(buf + hlen, 1, len - hlen, fp);
+	fclose(fp);
+	free(buf);
+	rc = e->mail->send(e->mail->ctx, out, olen);
+	if (rc != 0) {
+		set_status(e, "send failed: %s", strerror(errno));
+	} else {
+		if (m->ruid[0] && e->mail->store)
+			(void)e->mail->store(e->mail->ctx, m->rfolder, m->ruid,
+			    VEDIT_MAIL_ANSWERED, 0);
+		e->t->dirty = 0;
+		set_status(e, "message handed to the mail backend (%zu bytes)",
+		    olen);
+	}
+	free(out);
+	return rc == 0 ? 0 : -1;
+}
+
+/* ---- the folder and message pickers ---- */
+
+typedef struct mailfolders {
+	Editor	*e;
+	char	**names;
+	int	 n, cap;
+	int	 chosen;
+} Mailfolders;
+
+static int
+mailfolders_emit(void *sink, const char *name)
+{
+	Mailfolders *f = sink;
+	char *dup;
+
+	if (f->n == f->cap) {
+		int ncap = f->cap ? f->cap * 2 : 16;
+		char **p = realloc(f->names, (size_t)ncap * sizeof(*p));
+
+		if (!p)
+			return -1;
+		f->names = p;
+		f->cap = ncap;
+	}
+	dup = strdup(name);
+	if (!dup)
+		return -1;
+	f->names[f->n++] = dup;
+	return 0;
+}
+
+static const char *
+mailfolders_title(void *ctx)
+{
+	(void)ctx;
+	return "Mail folders";
+}
+
+static int
+mailfolders_count(void *ctx)
+{
+	return ((Mailfolders *)ctx)->n;
+}
+
+static const char *
+mailfolders_label(void *ctx, int i)
+{
+	Mailfolders *f = ctx;
+
+	return (i >= 0 && i < f->n) ? f->names[i] : "";
+}
+
+static int
+mailfolders_choose(void *ctx, int i)
+{
+	Mailfolders *f = ctx;
+
+	if (i < 0 || i >= f->n)
+		return PICK_STAY;
+	f->chosen = i;
+	return PICK_DONE;
+}
+
+static int mail_index(Editor *e, const char *folder);
+
+/* Pick a folder from the backend's list, then show its messages. */
+static int
+mail_folders(Editor *e)
+{
+	Picksrc s = {
+		.title = mailfolders_title, .count = mailfolders_count,
+		.label = mailfolders_label, .choose = mailfolders_choose,
+	};
+	Mailfolders f;
+	int i, rc = -1;
+
+	if (!mail_require(e))
+		return -1;
+	memset(&f, 0, sizeof(f));
+	f.e = e;
+	f.chosen = -1;
+	if (e->mail->folders(e->mail->ctx, mailfolders_emit, &f) != 0) {
+		set_status(e, "cannot list folders: %s", strerror(errno));
+		goto out;
+	}
+	if (f.n == 0) {
+		set_status(e, "no mail folders");
+		goto out;
+	}
+	for (i = 0; i < f.n; i++)
+		if (strcmp(f.names[i], e->mail_folder) == 0)
+			break;
+	s.ctx = &f;
+	if (dlg_pick(e, &s) && f.chosen >= 0)
+		rc = mail_index(e, f.names[f.chosen]);
+	else
+		rc = 0;
+out:
+	for (i = 0; i < f.n; i++)
+		free(f.names[i]);
+	free(f.names);
+	return rc;
+}
+
+/* One row of the message index, copied out of the backend's summary. */
+typedef struct mailsum {
+	char		uid[256];
+	unsigned	flags;
+	char		from[96];
+	char		subject[160];
+	char		date[48];
+} Mailsum;
+
+typedef struct mailindex {
+	Editor	*e;
+	char	 folder[128];
+	Mailsum	*rows;
+	int	 n, cap;
+	int	 chosen;
+	char	 title[160];
+	char	 line[400];
+} Mailindex;
+
+static int
+mailindex_emit(void *sink, const struct vedit_mail_summary *m)
+{
+	Mailindex *x = sink;
+	Mailsum *r;
+
+	if (x->n == x->cap) {
+		int ncap = x->cap ? x->cap * 2 : 64;
+		Mailsum *p = realloc(x->rows, (size_t)ncap * sizeof(*p));
+
+		if (!p)
+			return -1;
+		x->rows = p;
+		x->cap = ncap;
+	}
+	r = &x->rows[x->n++];
+	memset(r, 0, sizeof(*r));
+	snprintf(r->uid, sizeof(r->uid), "%s", m->uid ? m->uid : "");
+	r->flags = m->flags;
+	snprintf(r->from, sizeof(r->from), "%s", m->from ? m->from : "");
+	snprintf(r->subject, sizeof(r->subject), "%s",
+	    m->subject ? m->subject : "");
+	snprintf(r->date, sizeof(r->date), "%s", m->date ? m->date : "");
+	return 0;
+}
+
+/* Newest first: a Maildir uid starts with its delivery time, and any backend
+ * can order its uids the same way. */
+static int
+mailsum_cmp(const void *a, const void *b)
+{
+	return strcmp(((const Mailsum *)b)->uid, ((const Mailsum *)a)->uid);
+}
+
+static const char *
+mailindex_title(void *ctx)
+{
+	return ((Mailindex *)ctx)->title;
+}
+
+static int
+mailindex_count(void *ctx)
+{
+	return ((Mailindex *)ctx)->n;
+}
+
+/* "N  7 Oct 10:00  Sender Name        Subject". The date keeps the day and
+ * time of an RFC 5322 date ("Tue, 7 Oct 2026 10:00:00 +0000"). */
+static const char *
+mailindex_label(void *ctx, int i)
+{
+	Mailindex *x = ctx;
+	const Mailsum *r;
+	char name[64], day[20];
+	const char *d, *colon;
+
+	if (i < 0 || i >= x->n)
+		return "";
+	r = &x->rows[i];
+	d = strchr(r->date, ',');	/* past the weekday */
+	d = d ? d + 1 : r->date;
+	while (*d == ' ')
+		d++;
+	colon = strchr(d, ':');	/* the hour:minute */
+	snprintf(day, sizeof(day), "%.6s %.5s", d,
+	    colon && colon - d >= 2 ? colon - 2 : "");
+	mail_display_name(r->from, name, sizeof(name));
+	snprintf(x->line, sizeof(x->line), "%c%c  %-12.12s  %-18.18s  %s",
+	    (r->flags & VEDIT_MAIL_SEEN) ? ' ' : 'N',
+	    (r->flags & VEDIT_MAIL_ANSWERED) ? 'A' :
+	    (r->flags & VEDIT_MAIL_FLAGGED) ? 'F' : ' ', day, name,
+	    r->subject[0] ? r->subject : "(no subject)");
+	return x->line;
+}
+
+static int
+mailindex_choose(void *ctx, int i)
+{
+	Mailindex *x = ctx;
+
+	if (i < 0 || i >= x->n)
+		return PICK_STAY;
+	x->chosen = i;
+	return PICK_DONE;
+}
+
+/* List a folder and open the chosen message. */
+static int
+mail_index(Editor *e, const char *folder)
+{
+	Picksrc s = {
+		.title = mailindex_title, .count = mailindex_count,
+		.label = mailindex_label, .choose = mailindex_choose,
+	};
+	Mailindex x;
+	int rc = 0;
+
+	if (!mail_require(e))
+		return -1;
+	memset(&x, 0, sizeof(x));
+	x.e = e;
+	x.chosen = -1;
+	snprintf(x.folder, sizeof(x.folder), "%s", folder);
+	folder = x.folder;		/* :mail . passes e->mail_folder itself */
+	if (e->mail->list(e->mail->ctx, folder, mailindex_emit, &x) != 0) {
+		set_status(e, "cannot list %.60s: %s", folder, strerror(errno));
+		free(x.rows);
+		return -1;
+	}
+	snprintf(e->mail_folder, sizeof(e->mail_folder), "%s", folder);
+	if (x.n == 0) {
+		set_status(e, "%.60s: no messages", folder);
+		free(x.rows);
+		return 0;
+	}
+	qsort(x.rows, (size_t)x.n, sizeof(*x.rows), mailsum_cmp);
+	snprintf(x.title, sizeof(x.title), "%.100s (%d)", folder, x.n);
+	s.ctx = &x;
+	if (dlg_pick(e, &s) && x.chosen >= 0)
+		rc = mail_open_message(e, folder, x.rows[x.chosen].uid);
+	free(x.rows);
+	return rc;
+}
+#endif /* VEDIT_MAIL */
 
 /****************************************************************
  * File browser (a picker client)
@@ -18400,6 +19565,7 @@ ed_open(Editor *e)
 		art_sync_file(e);
 #endif
 		tbl_sync_file(e);
+		mail_detach(e);
 		swap_adopt(e, mt, action);
 		buf_save(e, &e->bufs[e->cur]);
 		if (action != SWAP_RECOVERED)
@@ -19891,6 +21057,26 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_RELOAD_CONFIG:
 		ed_reload_config(e);
 		break;
+#ifdef VEDIT_MAIL
+	case MA_MAIL_FOLDERS:
+		mail_folders(e);
+		break;
+	case MA_MAIL_INDEX:
+		if (e->mail_folder[0])
+			mail_index(e, e->mail_folder);
+		else
+			mail_folders(e);
+		break;
+	case MA_MAIL_COMPOSE:
+		mail_compose(e, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+		break;
+	case MA_MAIL_REPLY:
+		mail_reply(e);
+		break;
+	case MA_MAIL_SEND:
+		mail_send(e);
+		break;
+#endif
 #ifndef VEDIT_NO_TOOLS
 	case MA_COMPILE:
 		run_tool_cmd(e, CMD_COMPILE);
@@ -21251,6 +22437,7 @@ editor_teardown(Editor *e)
 #endif
 			tbl_free(e->bufs[i].tbl);
 			tabs_free(e->bufs[i].tabs);
+			mail_ref_free(&e->bufs[i]);
 			buf_free_fields(e->bufs[i].t, e->bufs[i].line_state);
 		}
 	} else {
@@ -21587,7 +22774,11 @@ static const char g_config_template[] =
 	"#	split = on           # ... shown in a pane under the file\n"
 	"\n"
 	"[syntax]\n"
-	"#	enable = on          # highlight recognized file types\n";
+	"#	enable = on          # highlight recognized file types\n"
+	"\n"
+	"[mail]\n"
+	"#	dir = ~/Maildir      # a Maildir++ tree; enables the Mail menu\n"
+	"#	from = Me <me@example.org>  # the From: line of new messages\n";
 
 /* Options > Edit Config and :config. Opens the config file in a buffer, the
  * one named at startup or the default location the front end chose. A file
@@ -21661,6 +22852,15 @@ void
 vedit_set_tools(struct vedit *v, const struct vedit_tool_api *api)
 {
 	v->e.tools = api;
+}
+#endif
+
+#ifdef VEDIT_MAIL
+/* Hand the editor a mail backend (public API). NULL removes it. */
+void
+vedit_set_mail(struct vedit *v, const struct vedit_mail_api *api)
+{
+	v->e.mail = api;
 }
 #endif
 
@@ -25693,6 +26893,9 @@ term_install(Editor *e, Term *t)
 	e->term_prefix = 0;
 	e->art = NULL;
 	e->tbl = NULL;
+#ifdef VEDIT_MAIL
+	e->mref = NULL;
+#endif
 	e->term_dirty = 1;
 	buf_save(e, &e->bufs[i]);		/* keep the slot consistent */
 	return i;
@@ -27668,14 +28871,498 @@ static const struct vedit_tool_api cli_tools = {
 	NULL, cli_run_capture, cli_run_foreground, cli_run_filter,
 };
 #endif /* VEDIT_NO_TOOLS */
+#ifdef VEDIT_MAIL
+/****************************************************************
+ * Maildir++ backend for the standalone binary: the mail vtable over a
+ * directory tree. The root (config mail.dir) is INBOX; a subfolder is a
+ * dot-directory beside its cur/new/tmp (".Sent", ".lists.vedit" for
+ * "lists/vedit"), the Maildir++ convention Dovecot and Courier use. A uid is
+ * the unique part of the file name (before ":2,"), which survives flag
+ * changes; the flags are the letters after it.
+ ****************************************************************/
+
+typedef struct maildir {
+	char	root[PATH_MAX];
+} Maildir;
+
+static Maildir g_maildir;	/* the CLI serves one mailbox tree */
+
+/* The directory of a folder: the root for INBOX, else root/.a.b for "a/b". */
+static int
+maildir_folder_dir(const Maildir *m, const char *folder, char *buf,
+    size_t bufsz)
+{
+	size_t o, i;
+
+	if (!folder[0] || strcmp(folder, "INBOX") == 0)
+		return snprintf(buf, bufsz, "%s", m->root) < (int)bufsz ? 0 : -1;
+	o = (size_t)snprintf(buf, bufsz, "%s/.", m->root);
+	for (i = 0; folder[i] && o + 1 < bufsz; i++)
+		buf[o++] = folder[i] == '/' ? '.' : folder[i];
+	buf[o] = '\0';
+	return folder[i] ? -1 : 0;
+}
+
+static const char maildir_flag_letters[] = "DFRST";
+static const unsigned maildir_flag_bits[] = {
+	VEDIT_MAIL_DRAFT, VEDIT_MAIL_FLAGGED, VEDIT_MAIL_ANSWERED,
+	VEDIT_MAIL_SEEN, VEDIT_MAIL_TRASHED
+};
+
+/* The flags encoded in a file name's ":2,DFRST" suffix. */
+static unsigned
+maildir_flags_of(const char *name)
+{
+	const char *p = strstr(name, ":2,");
+	unsigned f = 0;
+	int k;
+
+	if (!p)
+		return 0;
+	for (p += 3; *p; p++)
+		for (k = 0; maildir_flag_letters[k]; k++)
+			if (*p == maildir_flag_letters[k])
+				f |= maildir_flag_bits[k];
+	return f;
+}
+
+/* The ":2,..." suffix for flags, in the canonical letter order; "" for none
+ * (a file in new/ carries no suffix). */
+static void
+maildir_suffix(unsigned flags, char *out, size_t outsz)
+{
+	size_t o = 0;
+	int k;
+
+	if (outsz < 4)
+		return;
+	out[o++] = ':';
+	out[o++] = '2';
+	out[o++] = ',';
+	for (k = 0; maildir_flag_letters[k] && o + 1 < outsz; k++)
+		if (flags & maildir_flag_bits[k])
+			out[o++] = maildir_flag_letters[k];
+	out[o] = '\0';
+}
+
+/* Find the file for uid in folder: fills path and says whether it sits in
+ * new/ (unseen delivery) or cur/. Returns 0, or -1 with errno ENOENT. */
+static int
+maildir_find(const Maildir *m, const char *folder, const char *uid,
+    char *path, size_t pathsz, int *in_new)
+{
+	static const char *const subs[] = { "cur", "new" };
+	char dir[PATH_MAX];
+	size_t ulen = strlen(uid);
+	int s;
+
+	if (maildir_folder_dir(m, folder, dir, sizeof(dir)) != 0) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	for (s = 0; s < 2; s++) {
+		char sub[PATH_MAX];
+		DIR *d;
+		struct dirent *de;
+
+		if (snprintf(sub, sizeof(sub), "%s/%s", dir, subs[s]) >=
+		    (int)sizeof(sub))
+			continue;
+		d = opendir(sub);
+		if (!d)
+			continue;
+		while ((de = readdir(d)) != NULL) {
+			if (strncmp(de->d_name, uid, ulen) != 0 ||
+			    (de->d_name[ulen] != '\0' && de->d_name[ulen] != ':'))
+				continue;
+			if (snprintf(path, pathsz, "%s/%s", sub, de->d_name) >=
+			    (int)pathsz) {
+				closedir(d);
+				errno = ENAMETOOLONG;
+				return -1;
+			}
+			closedir(d);
+			*in_new = s == 1;
+			return 0;
+		}
+		closedir(d);
+	}
+	errno = ENOENT;
+	return -1;
+}
+
+static int
+maildir_name_cmp(const void *a, const void *b)
+{
+	return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* INBOX, then every dot-directory with a cur/ inside, as "a/b" names. */
+static int
+maildir_folders(void *ctx, int (*emit)(void *sink, const char *name),
+    void *sink)
+{
+	Maildir *m = ctx;
+	DIR *d;
+	struct dirent *de;
+	char **names = NULL;
+	int n = 0, cap = 0, i, rc = 0;
+
+	if (emit(sink, "INBOX") != 0)
+		return -1;
+	d = opendir(m->root);
+	if (!d)
+		return -1;
+	while ((de = readdir(d)) != NULL) {
+		char probe[PATH_MAX], *name;
+		struct stat st;
+		size_t k;
+
+		if (de->d_name[0] != '.' || de->d_name[1] == '\0' ||
+		    de->d_name[1] == '.')
+			continue;
+		if (snprintf(probe, sizeof(probe), "%s/%s/cur", m->root,
+		    de->d_name) >= (int)sizeof(probe) ||
+		    stat(probe, &st) != 0 || !S_ISDIR(st.st_mode))
+			continue;
+		if (n == cap) {
+			int ncap = cap ? cap * 2 : 16;
+			char **p = realloc(names, (size_t)ncap * sizeof(*p));
+
+			if (!p) {
+				rc = -1;
+				break;
+			}
+			names = p;
+			cap = ncap;
+		}
+		name = strdup(de->d_name + 1);
+		if (!name) {
+			rc = -1;
+			break;
+		}
+		for (k = 0; name[k]; k++)
+			if (name[k] == '.')
+				name[k] = '/';
+		names[n++] = name;
+	}
+	closedir(d);
+	if (rc == 0) {
+		qsort(names, (size_t)n, sizeof(*names), maildir_name_cmp);
+		for (i = 0; i < n; i++)
+			if (emit(sink, names[i]) != 0) {
+				rc = -1;
+				break;
+			}
+	}
+	for (i = 0; i < n; i++)
+		free(names[i]);
+	free(names);
+	return rc;
+}
+
+/* Read a whole file into a malloc'd NUL-terminated buffer. */
+static int
+maildir_slurp(const char *path, char **data, size_t *len)
+{
+	FILE *f = fopen(path, "rb");
+	char *buf = NULL;
+	size_t cap = 0, n = 0;
+
+	if (!f)
+		return -1;
+	for (;;) {
+		size_t got;
+
+		if (n + 4096 + 1 > cap) {
+			size_t ncap = cap ? cap * 2 : 16384;
+			char *p = realloc(buf, ncap);
+
+			if (!p) {
+				free(buf);
+				fclose(f);
+				errno = ENOMEM;
+				return -1;
+			}
+			buf = p;
+			cap = ncap;
+		}
+		got = fread(buf + n, 1, cap - n - 1, f);
+		n += got;
+		if (got == 0)
+			break;
+	}
+	if (ferror(f)) {
+		free(buf);
+		fclose(f);
+		return -1;
+	}
+	fclose(f);
+	buf[n] = '\0';
+	*data = buf;
+	*len = n;
+	return 0;
+}
+
+/* The headers of a message file (up to the blank line, at most 32 KB) so
+ * the index can show From, Subject and Date without reading every body. */
+static int
+maildir_head(const char *path, char *buf, size_t bufsz, size_t *hlen)
+{
+	FILE *f = fopen(path, "rb");
+	size_t n;
+
+	if (!f)
+		return -1;
+	n = fread(buf, 1, bufsz - 1, f);
+	fclose(f);
+	buf[n] = '\0';
+	*hlen = mail_body_off(buf, n);
+	return 0;
+}
+
+static int
+maildir_list(void *ctx, const char *folder,
+    int (*emit)(void *sink, const struct vedit_mail_summary *m), void *sink)
+{
+	static const char *const subs[] = { "new", "cur" };
+	Maildir *m = ctx;
+	char dir[PATH_MAX];
+	int s, found = 0;
+	char *head = malloc(32768);
+
+	if (!head) {
+		errno = ENOMEM;
+		return -1;
+	}
+	if (maildir_folder_dir(m, folder, dir, sizeof(dir)) != 0) {
+		free(head);
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	for (s = 0; s < 2; s++) {
+		char sub[PATH_MAX];
+		DIR *d;
+		struct dirent *de;
+
+		if (snprintf(sub, sizeof(sub), "%s/%s", dir, subs[s]) >=
+		    (int)sizeof(sub))
+			continue;
+		d = opendir(sub);
+		if (!d)
+			continue;
+		found = 1;
+		while ((de = readdir(d)) != NULL) {
+			char path[PATH_MAX], uid[256];
+			char from[256], subject[256], date[128];
+			struct vedit_mail_summary sum;
+			struct stat st;
+			size_t hlen;
+			const char *colon;
+
+			if (de->d_name[0] == '.')
+				continue;
+			if (snprintf(path, sizeof(path), "%s/%s", sub, de->d_name) >=
+			    (int)sizeof(path))
+				continue;
+			if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+				continue;
+			colon = strchr(de->d_name, ':');
+			snprintf(uid, sizeof(uid), "%.*s", colon ?
+			    (int)(colon - de->d_name) : (int)strlen(de->d_name),
+			    de->d_name);
+			if (maildir_head(path, head, 32768, &hlen) != 0)
+				continue;
+			mail_header(head, hlen, "From", from, sizeof(from));
+			mail_header(head, hlen, "Subject", subject, sizeof(subject));
+			mail_header(head, hlen, "Date", date, sizeof(date));
+			sum.uid = uid;
+			sum.flags = maildir_flags_of(de->d_name);
+			sum.from = from;
+			sum.subject = subject;
+			sum.date = date;
+			sum.size = (long)st.st_size;
+			if (emit(sink, &sum) != 0) {
+				closedir(d);
+				free(head);
+				return -1;
+			}
+		}
+		closedir(d);
+	}
+	free(head);
+	if (!found) {
+		errno = ENOENT;
+		return -1;
+	}
+	return 0;
+}
+
+static int
+maildir_fetch(void *ctx, const char *folder, const char *uid, char **data,
+    size_t *len)
+{
+	char path[PATH_MAX];
+	int in_new;
+
+	if (maildir_find(ctx, folder, uid, path, sizeof(path), &in_new) != 0)
+		return -1;
+	return maildir_slurp(path, data, len);
+}
+
+/* Create a folder's cur/new/tmp when missing. */
+static int
+maildir_ensure(const char *dir)
+{
+	static const char *const subs[] = { "tmp", "new", "cur" };
+	char sub[PATH_MAX];
+	int s;
+
+	for (s = 0; s < 3; s++) {
+		snprintf(sub, sizeof(sub), "%s/%s", dir, subs[s]);
+		if (mkdir_p(sub) != 0)
+			return -1;
+	}
+	return 0;
+}
+
+/* Rename the message file to carry its new flags; a file in new/ moves to
+ * cur/ on its first flag change, as a reader is expected to do. */
+static int
+maildir_store(void *ctx, const char *folder, const char *uid, unsigned set,
+    unsigned clear)
+{
+	Maildir *m = ctx;
+	char path[PATH_MAX], dir[PATH_MAX], np[PATH_MAX], suffix[16];
+	unsigned flags;
+	int in_new;
+
+	if (maildir_find(m, folder, uid, path, sizeof(path), &in_new) != 0)
+		return -1;
+	flags = (maildir_flags_of(path) | set) & ~clear;
+	maildir_folder_dir(m, folder, dir, sizeof(dir));
+	if (in_new && maildir_ensure(dir) != 0)	/* cur/ may not exist yet */
+		return -1;
+	maildir_suffix(flags, suffix, sizeof(suffix));
+	if (snprintf(np, sizeof(np), "%s/cur/%s%s", dir, uid, suffix) >=
+	    (int)sizeof(np)) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	if (strcmp(path, np) == 0)
+		return 0;
+	return rename(path, np);
+}
+
+static int
+maildir_move(void *ctx, const char *folder, const char *uid, const char *dest)
+{
+	Maildir *m = ctx;
+	char path[PATH_MAX], ddir[PATH_MAX], np[PATH_MAX];
+	const char *base;
+	int in_new;
+
+	if (maildir_find(m, folder, uid, path, sizeof(path), &in_new) != 0)
+		return -1;
+	if (maildir_folder_dir(m, dest, ddir, sizeof(ddir)) != 0 ||
+	    maildir_ensure(ddir) != 0)
+		return -1;
+	base = strrchr(path, '/');
+	base = base ? base + 1 : path;
+	if (snprintf(np, sizeof(np), "%s/%s/%s", ddir, in_new ? "new" : "cur",
+	    base) >= (int)sizeof(np)) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	return rename(path, np);
+}
+
+/* Deliver data as a new message: written under tmp/ and renamed into cur/
+ * (new/ when it carries no flags), with a fresh unique name. */
+static int
+maildir_append(void *ctx, const char *folder, const char *data, size_t len,
+    unsigned flags)
+{
+	Maildir *m = ctx;
+	static unsigned seq;
+	char dir[PATH_MAX], tmp[PATH_MAX], fin[PATH_MAX], host[256], suffix[16];
+	char name[300];
+	FILE *f;
+	size_t k;
+
+	if (maildir_folder_dir(m, folder, dir, sizeof(dir)) != 0) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	if (maildir_ensure(dir) != 0)
+		return -1;
+	if (gethostname(host, sizeof(host)) != 0 || !host[0])
+		snprintf(host, sizeof(host), "localhost");
+	host[sizeof(host) - 1] = '\0';
+	for (k = 0; host[k]; k++)	/* the name must not contain these */
+		if (host[k] == '/' || host[k] == ':')
+			host[k] = '_';
+	snprintf(name, sizeof(name), "%ld.P%ldQ%u.%s", (long)time(NULL),
+	    (long)getpid(), ++seq, host);
+	maildir_suffix(flags, suffix, sizeof(suffix));
+	if (snprintf(tmp, sizeof(tmp), "%s/tmp/%s", dir, name) >=
+	    (int)sizeof(tmp) ||
+	    snprintf(fin, sizeof(fin), "%s/%s/%s%s", dir, flags ? "cur" : "new",
+	    name, flags ? suffix : "") >= (int)sizeof(fin)) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	f = fopen(tmp, "wb");
+	if (!f)
+		return -1;
+	if (fwrite(data, 1, len, f) != len || fclose(f) != 0) {
+		unlink(tmp);
+		return -1;
+	}
+	if (rename(tmp, fin) != 0) {
+		unlink(tmp);
+		return -1;
+	}
+	return 0;
+}
+
+/* Sending queues the message in the Outbox folder; delivery from there is
+ * whatever drains it (a cron job, a submission script). */
+static int
+maildir_send(void *ctx, const char *data, size_t len)
+{
+	return maildir_append(ctx, "Outbox", data, len, 0);
+}
+
+static const struct vedit_mail_api cli_mail = {
+	&g_maildir, maildir_folders, maildir_list, maildir_fetch,
+	maildir_store, maildir_move, maildir_append, maildir_send,
+};
+
+/* Point the backend at root ("~/x" is expanded) and return its vtable. */
+static const struct vedit_mail_api *
+cli_mail_setup(const char *root)
+{
+	const char *home = getenv("HOME");
+
+	if (root[0] == '~' && (root[1] == '/' || root[1] == '\0') && home)
+		snprintf(g_maildir.root, sizeof(g_maildir.root), "%s%s", home,
+		    root + 1);
+	else
+		snprintf(g_maildir.root, sizeof(g_maildir.root), "%s", root);
+	return &cli_mail;
+}
+#endif /* VEDIT_MAIL */
+
 
 /* Pick the config file path. An explicit --config (opt) or $VEDIT_CONFIG is
- * used as given; otherwise the first of $XDG_CONFIG_HOME/vedit/config and
- * ~/.veditrc that exists. When neither exists the XDG location (with
- * ~/.config standing in for an unset $XDG_CONFIG_HOME) is chosen anyway, so
- * Options > Edit Config knows where to create the file. Writes buf and
- * returns 1 when the file should be read (as given, or found), 0 when the path
- * is a default that does not exist yet, and -1 when no path can be formed. */
+ * used as given. Otherwise the file lives at $XDG_CONFIG_HOME/vedit/config,
+ * with ~/.config standing in for an unset variable; a build for a platform
+ * without the XDG layout (-DVEDIT_NO_XDG) uses ~/.veditrc instead. The path is
+ * chosen whether or not the file exists, so Options > Edit Config knows where
+ * to create it. Writes buf and returns 1 when the file should be read (as
+ * given, or found), 0 when it does not exist yet, and -1 when no path can be
+ * formed (no HOME). */
 static int
 cli_config_path(const char *opt, char *buf, size_t bufsz)
 {
@@ -27922,6 +29609,14 @@ main(int argc, char **argv)
 		if (have >= 0)		/* enable :reload and :config */
 			vedit_set_config_path(v, cfg_path);
 	}
+#ifdef VEDIT_MAIL
+	{
+		const char *md = cfg ? cfg_get(cfg, "mail.dir") : NULL;
+
+		if (md && md[0])
+			vedit_set_mail(v, cli_mail_setup(md));
+	}
+#endif
 	if (file && vedit_open(v, file) < 0) {
 		fprintf(stderr, "%s: %s: %s\n", progname, file,
 		    strerror(errno));
@@ -32004,6 +33699,7 @@ enum excmd {
 	EX_EDIT, EX_ENEW, EX_WRITE, EX_WQ, EX_XIT, EX_QUIT, EX_QALL, EX_WQALL,
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
 	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD, EX_CONFIG,
+	EX_MAIL, EX_COMPOSE, EX_REPLY, EX_SEND,
 	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH, EX_CELL, EX_SORT, EX_TABSTOPS,
 	EX_ROWADD, EX_ROWDEL, EX_COLADD, EX_COLDEL,
 };
@@ -32056,6 +33752,12 @@ static const struct excmd_name {
 	{ "coldel",	4, EX_COLDEL },
 	{ "reload",	3, EX_RELOAD },
 	{ "config",	4, EX_CONFIG },
+#ifdef VEDIT_MAIL
+	{ "mail",	4, EX_MAIL },
+	{ "compose",	4, EX_COMPOSE },
+	{ "reply",	3, EX_REPLY },
+	{ "send",	4, EX_SEND },
+#endif
 	{ "marks",	3, EX_MARKS },
 	{ "delmarks",	4, EX_DELMARKS },
 	{ "jumps",	2, EX_JUMPS },
@@ -32435,6 +34137,26 @@ vi_ex_exec(Editor *e, char *buf)
 	case EX_CONFIG:
 		ed_edit_config(e);
 		return REQ_CONTINUE;
+#ifdef VEDIT_MAIL
+	case EX_MAIL:			/* :mail [folder|.] */
+		if (strcmp(rest, ".") == 0 && e->mail_folder[0])
+			mail_index(e, e->mail_folder);
+		else if (*rest)
+			mail_index(e, rest);
+		else
+			mail_folders(e);
+		return REQ_CONTINUE;
+	case EX_COMPOSE:		/* :compose [address] */
+		mail_compose(e, *rest ? rest : NULL, NULL, NULL, NULL, NULL, NULL,
+		    NULL);
+		return REQ_CONTINUE;
+	case EX_REPLY:
+		mail_reply(e);
+		return REQ_CONTINUE;
+	case EX_SEND:
+		mail_send(e);
+		return REQ_CONTINUE;
+#endif
 	default:
 		break;
 	}

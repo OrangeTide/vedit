@@ -31,6 +31,13 @@ inside the editor for the key bindings of the active personality, and open the
 Help menu, or press
 .B t
 on the key-bindings screen, for the built-in tutorials.
+.PP
+With
+.B mail.dir
+set in the configuration, the Mail menu (and the
+.BR :mail ", " :compose ", " :reply ", and " :send
+commands) reads a Maildir++ tree and composes replies and new messages, which
+are queued in its Outbox folder for delivery by other means.
 .SH OPTIONS
 .TP
 .BR \-h ", " \-\-help
@@ -245,6 +252,8 @@ The main sections are
 .BR [cc] ,
 .BR [error] ,
 .BR [syntax] ,
+.B [mail]
+(dir, a Maildir++ tree that enables the Mail menu, and from),
 and per-language
 .BI [command\  """lang"""]
 sections for the compile, build, run, and format commands. See

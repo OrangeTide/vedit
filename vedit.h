@@ -170,6 +170,72 @@ struct vedit_tool_api {
 void vedit_set_tools(struct vedit *v, const struct vedit_tool_api *api);
 #endif /* VEDIT_NO_TOOLS */
 
+#ifndef VEDIT_NO_MAIL
+/*
+ * Mail (the alpine-style reader and composer). The editor core never touches a
+ * mailbox itself: it talks to this vtable, which is shaped like IMAP (folders,
+ * message lists, flags, fetch / store / move / append as transactions) rather
+ * than files, so an embedding host can serve its own server's mail through it.
+ * The standalone binary installs a Maildir++ backend when mail.dir is set in
+ * the config. Define VEDIT_NO_MAIL before including vedit.c to drop the whole
+ * subsystem.
+ *
+ * Folder names are UTF-8 strings as the backend presents them ("INBOX",
+ * "Sent", "lists/vedit"). A uid is an opaque string naming one message within
+ * its folder for the life of the session.
+ */
+#define VEDIT_MAIL_SEEN		0x01
+#define VEDIT_MAIL_ANSWERED	0x02
+#define VEDIT_MAIL_FLAGGED	0x04
+#define VEDIT_MAIL_DRAFT	0x08
+#define VEDIT_MAIL_TRASHED	0x10
+
+/* One row of a folder listing. The strings are the raw header values. */
+struct vedit_mail_summary {
+	const char	*uid;
+	unsigned	 flags;
+	const char	*from;
+	const char	*subject;
+	const char	*date;
+	long		 size;
+};
+
+struct vedit_mail_api {
+	void	*ctx;
+	/* List the folders, calling emit(sink, name) for each. Returns 0, or
+	 * -1 with errno set. */
+	int	(*folders)(void *ctx, int (*emit)(void *sink, const char *name),
+		    void *sink);
+	/* List the messages of folder, calling emit(sink, m) for each; m and
+	 * its strings are valid only during the call. Returns 0 or -1. */
+	int	(*list)(void *ctx, const char *folder,
+		    int (*emit)(void *sink, const struct vedit_mail_summary *m),
+		    void *sink);
+	/* Fetch the raw RFC 5322 message into a malloc'd buffer the caller
+	 * frees. Returns 0, or -1 with errno set (ENOENT: no such uid). */
+	int	(*fetch)(void *ctx, const char *folder, const char *uid,
+		    char **data, size_t *len);
+	/* Set and clear flags (VEDIT_MAIL_*) on a message. */
+	int	(*store)(void *ctx, const char *folder, const char *uid,
+		    unsigned set, unsigned clear);
+	/* Move a message to another folder. */
+	int	(*move)(void *ctx, const char *folder, const char *uid,
+		    const char *dest);
+	/* Add a complete message to a folder (a draft, a sent copy). The
+	 * folder is created when the backend can. */
+	int	(*append)(void *ctx, const char *folder, const char *data,
+		    size_t len, unsigned flags);
+	/* Hand a complete message over for delivery. The backend decides what
+	 * that means (queue it, submit it); 0 when accepted. */
+	int	(*send)(void *ctx, const char *data, size_t len);
+};
+
+/* Install the mail backend. The api is borrowed, not copied, so it must
+ * outlive the editor. Call before vedit_run(). With none installed (the
+ * default) the Mail menu and commands report that there is no mail backend. */
+void vedit_set_mail(struct vedit *v, const struct vedit_mail_api *api);
+#endif /* VEDIT_NO_MAIL */
+
 /* Run the editor to completion. Returns 0 on a normal quit, 1 on end of input
  * or vi ':cq'. */
 int vedit_run(struct vedit *v);
