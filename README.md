@@ -189,6 +189,10 @@ A gitconfig-style file sets the startup defaults. It is read from the first of
     tabs   = on          # mark hard tabs with a guide glyph
     paneheight = 0       # rows for the pane under the text; 0 = a third
 
+[art]
+    view  = on           # open .ans files in the art view (needs the emulator)
+    width = 0            # grid columns, 80 to 1024; 0 = from the file
+
 [edit]
     mode = vi            # vi | modeless
     autoindent = on      # new lines copy the previous indent
@@ -1010,6 +1014,53 @@ Because the blanks you draw are real spaces, draw mode does not trim trailing
 whitespace on save. That is what you want for art; keep it in mind when drawing
 a diagram into a source file.
 
+## Art view (colour text art, .ans files)
+
+A file whose name ends in `.ans` opens in the art view: the file's bytes are
+replayed through the built-in terminal emulator into a grid of cells, and you
+edit the cells. Each cell holds one Unicode glyph with a foreground, a
+background and attributes, so coloured art renders the way a terminal would
+show it. Saving writes the grid back as UTF-8 with the SGR colour sequences
+that reproduce it, one line per row, so `cat file.ans` still shows the picture.
+The art view needs the terminal emulator (it is not in a `VEDIT_NO_TERM` build)
+and the status line shows `-- ART --` while it is active.
+
+The editing model is draw mode's, applied to cells:
+
+- The cursor roams freely. Arrows step one cell, Home and End go to the start
+  of the row and past its last glyph, PgUp and PgDn page, Enter is a carriage
+  return, Tab jumps to the next 8-column stop. Moving below the grid adds rows.
+- Typing overwrites the cell under the cursor with the glyph in the current
+  pen. Backspace erases the cell to the left and Delete the one under the
+  cursor. Wide (CJK) glyphs take two cells.
+- Shift+arrows mark a rectangle. Ctrl-C copies it, Ctrl-X cuts it, Ctrl-V
+  overlays the copy at the cursor, and Ctrl-B draws a box-drawing border
+  around it (a one-cell-wide or one-cell-tall rectangle becomes a line). Cells
+  keep their colours through copy and paste.
+- Ctrl-Z and Ctrl-Y undo and redo whole-grid steps. Ctrl-S saves, Ctrl-Q
+  quits, F1 opens help, F8 cycles buffers, and the menu bar works as usual.
+
+The pen is the colour new glyphs get. A swatch of it (`Ab`) sits on the
+status line next to the mode:
+
+| Key | Pen |
+|---|---|
+| Alt+Up / Alt+Down | next / previous foreground: default, then colours 0 to 15 |
+| Alt+Right / Alt+Left | next / previous background, the same cycle |
+| Alt+B, Alt+L, Alt+U | toggle bold, blink, underline |
+| Alt+P | pick up the colours of the cell under the cursor |
+| Alt+R | reset the pen to plain |
+
+The grid is as wide as the widest line in the file but at least 80 columns,
+which is what classic art is laid out for, and as tall as the file. `art.width`
+in the config forces a width (80 to 1024), and `art.view = off` opens `.ans`
+files as plain text instead, which also shows the raw escape sequences.
+Colours beyond the first 16 (256-colour and RGB) load, render and save
+unchanged, but the pen only cycles the base 16 and picks the rest up from an
+existing cell with Alt+P. A cell holds one code point, so a combining
+sequence or an emoji with modifiers keeps only its first code point.
+
+
 ## Syntax highlighting
 
 vedit highlights through a single data-driven engine, the state-machine model
@@ -1097,15 +1148,15 @@ entirely.
 vedit has a text buffer with undo and redo, the modeless and vi personalities,
 the MS-EDIT chrome (menu bar, frame, scrollbars, dialogs), regex find and
 replace, selection and an internal clipboard, goto-line, multiple buffers, a hex
-view, a 2D/block draw mode, per-language build commands with a quickfix error
-list, selectable line endings (LF, CRLF, NUL), tab display with auto-indent and
-tab/space conversion, a symbol picker that merges a buffer scan with a ctags
-tags file, terminal buffers running a shell or a build through a built-in VT
-emulator, and lightweight syntax highlighting. It draws through a
-self-contained ANSI
-renderer over the io vtable, and decodes the keyboard with a compact decoder that
-covers UTF-8 text, control keys, arrows, navigation keys, function keys, CSI
-modifiers, Alt+letter, and bracketed paste.
+view, a 2D/block draw mode, an art view for coloured .ans files, per-language
+build commands with a quickfix error list, selectable line endings (LF, CRLF,
+NUL), tab display with auto-indent and tab/space conversion, a symbol picker
+that merges a buffer scan with a ctags tags file, terminal buffers running a
+shell or a build through a built-in VT emulator, and lightweight syntax
+highlighting. It draws through a self-contained ANSI renderer over the io
+vtable, and decodes the keyboard with a compact decoder that covers UTF-8 text,
+control keys, arrows, navigation keys, function keys, CSI modifiers,
+Alt+letter, and bracketed paste.
 
 It deliberately leaves out, as overworked for a primitive-terminal editor:
 

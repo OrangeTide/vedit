@@ -1254,6 +1254,200 @@ t_term_resize_skips(Test *t)
 	memio_free(&m);
 }
 
+/* ---- the art view ---- */
+
+static void
+art_press(Editor *e, uint16_t key, uint32_t ch, int mod)
+{
+	struct tkbd_seq seq;
+
+	memset(&seq, 0, sizeof(seq));
+	seq.type = TKBD_KEY;
+	seq.key = key;
+	seq.ch = ch;
+	seq.mod = mod;
+	run_req(e, art_key(e, &seq));
+}
+
+static void
+art_type(Editor *e, const char *s)
+{
+	for (; *s; s++)
+		art_press(e, (uint16_t)toupper((unsigned char)*s),
+		    (uint32_t)(unsigned char)*s, 0);
+}
+
+/* A .ans file opens as a grid, renders through the emulator's cells, and
+ * saves back as SGR-coloured UTF-8 with blank rows and cells dropped. */
+static void
+t_art_roundtrip(Test *t)
+{
+	char dir[] = "/tmp/vedit-art-XXXXXX";
+	char path[PATH_MAX], back[256];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Scrbuf *sb;
+	const Cell *c;
+	FILE *f;
+	size_t n;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	write_file(dir, "a.ans",
+	    "\033[1;31mRed\033[0m x\r\n"
+	    "\r\n"
+	    "\xe6\x97\xa5 \033[44m  \033[0m\r\n"
+	    "\r\n\r\n");
+	snprintf(path, sizeof(path), "%s/a.ans", dir);
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	TAP_ASSERT(t, v->e.art != NULL);
+	TAP_CHECKF(t, v->e.art->cols == 80 && v->e.art->rows == 6,
+	    "grid %dx%d", v->e.art->cols, v->e.art->rows);
+	TAP_CHECK(t, text_eol(v->e.t) == EOL_CRLF);
+
+	c = art_cell(v->e.art, 0, 0);
+	TAP_CHECK(t, c->codepoint == 'R' && (c->attrs & ATTR_BOLD) &&
+	    c->fg.type == COLOR_INDEXED && c->fg.index == 1);
+	c = art_cell(v->e.art, 0, 4);
+	TAP_CHECK(t, c->codepoint == 'x' && art_cell_plain(c));
+	c = art_cell(v->e.art, 2, 0);
+	TAP_CHECK(t, c->codepoint == 0x65e5 && c->width == 2);
+	c = art_cell(v->e.art, 2, 1);
+	TAP_CHECK(t, c->width == 0);
+	c = art_cell(v->e.art, 2, 3);
+	TAP_CHECK(t, c->codepoint == ' ' && c->bg.type == COLOR_INDEXED &&
+	    c->bg.index == 4);
+
+	/* the frame shows the cells with their colours */
+	ed_render(&v->e, v->e.d);
+	sb = v->e.d->t;
+	TAP_CHECK(t, sb->cur[(size_t)CHROME_TOP * sb->cols + CHROME_LEFT].codepoint == 'R');
+	TAP_CHECK(t, sb->cur[(size_t)CHROME_TOP * sb->cols + CHROME_LEFT].fg.index == 1);
+	TAP_CHECK(t, sb->cur[(size_t)(CHROME_TOP + 2) * sb->cols + CHROME_LEFT + 3].bg.index == 4);
+	TAP_CHECK(t, !text_dirty(v->e.t));
+
+	/* an untouched grid saves back the same picture */
+	TAP_ASSERT(t, save_editor(&v->e) == 0);
+	f = fopen(path, "rb");
+	TAP_ASSERT(t, f != NULL);
+	n = fread(back, 1, sizeof(back) - 1, f);
+	fclose(f);
+	back[n] = '\0';
+	TAP_CHECKF(t, strcmp(back,
+	    "\033[0;1;31mRed\033[0m x\r\n"
+	    "\r\n"
+	    "\xe6\x97\xa5 \033[0;44m  \033[0m\r\n") == 0, "saved [%s]", back);
+	TAP_CHECK(t, !text_dirty(v->e.t) && v->e.art != NULL);
+
+	vedit_free(v);
+	memio_free(&m);
+	remove_file(dir, "a.ans");
+	rmdir(dir);
+}
+
+/* Keys edit cells with the pen; the rectangle, box and undo work on cells. */
+static void
+t_art_edit(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Art *a;
+	const Cell *c;
+	size_t len;
+	const char *line;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	snprintf(v->e.path, sizeof(v->e.path), "new.ans");
+	v->e.has_name = 1;
+	art_sync_file(&v->e);
+	TAP_ASSERT(t, v->e.art != NULL);
+	a = v->e.art;
+	TAP_CHECKF(t, a->rows == 1 && a->cols == 80, "grid %dx%d", a->cols, a->rows);
+
+	/* Alt+Up picks fg 0, Alt+Right bg 0, Alt+b bold; typing uses them */
+	art_press(&v->e, TKBD_KEY_UP, TKBD_CH_NONE, TKBD_MOD_ALT);
+	art_press(&v->e, TKBD_KEY_RIGHT, TKBD_CH_NONE, TKBD_MOD_ALT);
+	art_press(&v->e, 'b', 'b', TKBD_MOD_ALT);
+	TAP_CHECK(t, a->fg.type == COLOR_INDEXED && a->fg.index == 0 &&
+	    a->bg.index == 0 && (a->attrs & ATTR_BOLD));
+	art_type(&v->e, "hi");
+	TAP_CHECK(t, a->cx == 2 && text_dirty(v->e.t));
+	c = art_cell(a, 0, 0);
+	TAP_CHECK(t, c->codepoint == 'h' && c->fg.index == 0 && (c->attrs & ATTR_BOLD));
+
+	/* Enter is a carriage return; rows grow under the cursor */
+	art_press(&v->e, TKBD_KEY_ENTER, TKBD_CH_NONE, 0);
+	art_press(&v->e, TKBD_KEY_DOWN, TKBD_CH_NONE, 0);
+	TAP_CHECK(t, a->cy == 2 && a->cx == 0 && a->rows == 1);
+	art_press(&v->e, 'r', 'r', TKBD_MOD_ALT);	/* plain pen again */
+	art_type(&v->e, "z");
+	TAP_CHECKF(t, a->rows == 3, "rows %d", a->rows);
+
+	/* Shift+arrows mark 3x2 from (2,0); Ctrl-B draws a box in it */
+	art_press(&v->e, TKBD_KEY_LEFT, TKBD_CH_NONE, 0);
+	art_press(&v->e, TKBD_KEY_RIGHT, TKBD_CH_NONE, TKBD_MOD_SHIFT);
+	art_press(&v->e, TKBD_KEY_RIGHT, TKBD_CH_NONE, TKBD_MOD_SHIFT);
+	art_press(&v->e, TKBD_KEY_DOWN, TKBD_CH_NONE, TKBD_MOD_SHIFT);
+	TAP_CHECK(t, v->e.sel_active && a->cy == 3 && a->cx == 2);
+	art_press(&v->e, TKBD_KEY_B, 0x02, TKBD_MOD_CTRL);
+	TAP_CHECK(t, !v->e.sel_active && a->rows == 4);
+	TAP_CHECK(t, art_cell(a, 2, 0)->codepoint == 0x250c &&
+	    art_cell(a, 2, 1)->codepoint == 0x2500 &&
+	    art_cell(a, 2, 2)->codepoint == 0x2510 &&
+	    art_cell(a, 3, 0)->codepoint == 0x2514 &&
+	    art_cell(a, 3, 2)->codepoint == 0x2518);
+
+	/* undo restores the 'z' and the row count; redo brings the box back */
+	art_press(&v->e, TKBD_KEY_Z, 0x1a, TKBD_MOD_CTRL);
+	TAP_CHECKF(t, a->rows == 3 && art_cell(a, 2, 0)->codepoint == 'z',
+	    "after undo: rows %d cell U+%04X", a->rows, art_cell(a, 2, 0)->codepoint);
+	art_press(&v->e, TKBD_KEY_Y, 0x19, TKBD_MOD_CTRL);
+	TAP_CHECK(t, a->rows == 4 && art_cell(a, 2, 0)->codepoint == 0x250c);
+
+	/* copy the box, paste it at the top right */
+	a->cy = 2;
+	a->cx = 0;
+	art_press(&v->e, TKBD_KEY_RIGHT, TKBD_CH_NONE, TKBD_MOD_SHIFT);
+	art_press(&v->e, TKBD_KEY_RIGHT, TKBD_CH_NONE, TKBD_MOD_SHIFT);
+	art_press(&v->e, TKBD_KEY_DOWN, TKBD_CH_NONE, TKBD_MOD_SHIFT);
+	art_press(&v->e, TKBD_KEY_C, 0x03, TKBD_MOD_CTRL);
+	TAP_CHECK(t, v->e.art_clip_w == 3 && v->e.art_clip_h == 2);
+	a->cy = 0;
+	a->cx = 4;
+	art_press(&v->e, TKBD_KEY_V, 0x16, TKBD_MOD_CTRL);
+	TAP_CHECK(t, art_cell(a, 0, 4)->codepoint == 0x250c &&
+	    art_cell(a, 1, 6)->codepoint == 0x2518);
+
+	/* Backspace erases the cell to the left; Delete the one under */
+	a->cy = 0;
+	a->cx = 2;
+	art_press(&v->e, TKBD_KEY_BACKSPACE, TKBD_CH_NONE, 0);
+	TAP_CHECK(t, a->cx == 1 && art_cell(a, 0, 1)->codepoint == ' ' &&
+	    art_cell_plain(art_cell(a, 0, 1)));
+
+	/* the saved form: a bold black-on-black h, the pasted box, and so on */
+	TAP_ASSERT(t, art_export(&v->e) == 0);
+	TAP_CHECKF(t, text_lines(v->e.t) == 4, "%zu lines", text_lines(v->e.t));
+	line = text_line(v->e.t, 0, &len);
+	TAP_CHECKF(t, strcmp(line, "\033[0;1;30;40mh\033[0m   \xe2\x94\x8c\xe2\x94\x80\xe2\x94\x90") == 0,
+	    "line 0 [%s]", line);
+	line = text_line(v->e.t, 2, &len);
+	TAP_CHECKF(t, strcmp(line, "\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x90") == 0,
+	    "line 2 [%s]", line);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 const Case tap_cases[] = {
 	{ "term_attach_render", t_term_attach_render },
 	{ "term_collect", t_term_collect },
@@ -1291,5 +1485,7 @@ const Case tap_cases[] = {
 	{ "term_cursor_clamp_edges", t_term_cursor_clamp_edges },
 	{ "term_attach_tiny", t_term_attach_tiny },
 	{ "term_resize_skips", t_term_resize_skips },
+	{ "art_roundtrip", t_art_roundtrip },
+	{ "art_edit", t_art_edit },
 	{ NULL, NULL },
 };

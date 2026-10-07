@@ -5836,6 +5836,7 @@ typedef struct vi_keylog {
 
 enum buf_kind { BUF_TEXT = 0, BUF_TERM };
 typedef struct term Term;
+typedef struct art Art;		/* art view grid (.ans), defined with it */
 
 /* A terminal session behind a BUF_TERM buffer. Defined here, ahead of the
  * terminal code, so the tool layer can read its exit state. The vt types are
@@ -5851,6 +5852,32 @@ struct term {
 	int		rows, cols;	/* grid size (matches the text area) */
 	struct vt_state	*vt;
 	struct vt_parse	*parser;
+};
+
+/* The art view's grid for a .ans file, defined here so the status bar and
+ * the config reader can look inside; the code is with the emulator. */
+#define ART_COLS_MIN	80	/* classic art is laid out for 80 columns */
+#define ART_COLS_MAX	1024
+#define ART_ROWS_MAX	10000
+#define ART_UNDO_MAX	100
+
+typedef struct art_snap {
+	Cell	*cells;			/* rows * cols */
+	int	rows;
+	int	cy, cx;
+} Artsnap;
+
+struct art {
+	struct vt_state	*vt;		/* the grid; cols is fixed, rows grow */
+	int		rows, cols;
+	int		cy, cx;		/* cursor, grid coordinates */
+	int		top, left;	/* view offset */
+	Color		fg, bg;		/* the pen */
+	uint16_t	attrs;
+	Artsnap		undo[ART_UNDO_MAX];
+	int		nundo;
+	Artsnap		redo[ART_UNDO_MAX];
+	int		nredo;
 };
 
 /* One open file. The editor keeps a list of these; the active buffer's fields
@@ -5884,6 +5911,7 @@ typedef struct ebuf {
 	Term		*vterm;		/* terminal session when kind == BUF_TERM */
 	int		in_pane;	/* a text buffer shown in the pane */
 	int		top_last;	/* the buffer last shown above the pane */
+	Art		*art;		/* art view grid for a .ans file, or NULL */
 } Buf;
 
 /* Referenced only by pointer here; the users include the real headers. */
@@ -6102,6 +6130,14 @@ typedef struct editor {
 	int		term_dirty;	/* active terminal output pending a render */
 	int		term_prefix;	/* 1 = Ctrl-W seen, awaiting a command key */
 	int		pane_focus;	/* keys go to the pane's terminal, not the text */
+
+	/* art view (VEDIT_TERM). art mirrors the active buffer's grid; the
+	 * clipboard of cells is shared across art buffers. */
+	Art		*art;		/* active buffer's art grid, or NULL */
+	int		art_on;		/* art.view: open .ans files in the art view */
+	int		art_cols;	/* art.width: grid columns; 0 = from the file */
+	Cell		*art_clip;	/* copied rectangle of cells */
+	int		art_clip_w, art_clip_h;
 } Editor;
 
 #ifdef VEDIT_TERM
@@ -6124,6 +6160,12 @@ static void pane_close(Editor *e);		/* close the pane's terminal */
 static void pane_key(Editor *e);		/* Ctrl-W from a text buffer */
 static int pane_shown(const Editor *e);		/* the pane is on screen */
 static int pane_possible(const Editor *e);	/* a pane could open now */
+static void art_sync_file(Editor *e);		/* .ans files get the art view */
+static void art_detach(Editor *e);		/* drop the active buffer's grid */
+static void art_free(Art *a);
+static int art_export(Editor *e);		/* grid -> text buffer, for saving */
+static void art_render(Editor *e, Screen *d);
+static Req art_key(Editor *e, const struct tkbd_seq *seq);
 static Term *pane_term(const Editor *e, int *idx);	/* the pane's terminal */
 static int pane_text_idx(const Editor *e);	/* the pane's text buffer, or -1 */
 static int pane_top_idx(const Editor *e);	/* the buffer shown above it */
@@ -8098,7 +8140,7 @@ pane_height(const Editor *e)
 static int
 pane_shown(const Editor *e)
 {
-	if (e->kind != BUF_TEXT || e->hex_view)
+	if (e->kind != BUF_TEXT || e->hex_view || e->art)
 		return 0;
 	if (text_height_full(e) < PANE_MIN_TOTAL)
 		return 0;
@@ -8903,7 +8945,12 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 	char right[80];
 	char flags[32];
 	int rlen;
+	size_t ly = e->cy;	/* the line shown; the art view has its own */
 
+#ifdef VEDIT_TERM
+	if (e->art)
+		ly = (size_t)e->art->cy;
+#endif
 	scr_fill(e->d, row, 0, e->cols, ' ', p->bar_fg, p->bar_bg, at);
 
 	/* compact indicators for the sticky display toggles, then the line-ending
@@ -8921,6 +8968,11 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 	} else {
 		const char *mode = "";
 
+#ifdef VEDIT_TERM
+		if (e->art)
+			mode = "-- ART --  ";
+		else
+#endif
 		if (e->draw_mode)
 			mode = "-- DRAW --  ";
 		else if (e->vi_visual == 'v')
@@ -8936,10 +8988,15 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 		scr_text(e->d, row, 1, mode, p->bar_fg, p->bar_bg, at);
 		scr_text(e->d, row, 1 + (int)strlen(mode), "F1=Help",
 		    p->bar_fg, p->bar_bg, at);
+#ifdef VEDIT_TERM
+		if (e->art)		/* a swatch of the pen */
+			scr_text(e->d, row, 1 + (int)strlen(mode) + 9, " Ab ",
+			    e->art->fg, e->art->bg, e->art->attrs);
+#endif
 	}
 
 	rlen = snprintf(right, sizeof(right), "%sLine:%zu  Col:%zu%s",
-	    flags, e->cy + 1, (size_t)cur_col + 1,
+	    flags, ly + 1, (size_t)cur_col + 1,
 	    text_dirty(e->t) ? "  *" : "");
 	if (rlen > 0 && rlen < e->cols - 1)
 		scr_text(e->d, row, e->cols - rlen - 1, right,
@@ -10143,6 +10200,14 @@ render_body(Editor *e, Screen *d)
 	if (cur_in_pane) {		/* the current buffer is the one below */
 		cur_row0 = prow0;
 		cur_rows = ph;
+	}
+#endif
+
+#ifdef VEDIT_TERM
+	if (e->art) {
+		e->prev_text_view = 0;	/* a cell grid, not the text view */
+		art_render(e, d);
+		return;
 	}
 #endif
 
@@ -12122,6 +12187,10 @@ ed_save_file(Editor *e)
 		    backup_path_for(e->path, backup, sizeof(backup)))
 			(void)file_copy(e->path, backup, st.st_mode & 07777);
 	}
+#ifdef VEDIT_TERM
+	if (e->art && art_export(e) < 0)	/* the grid is the truth */
+		return ERR;
+#endif
 	rc = text_save(e->t, e->path);
 	if (rc == OK) {
 		swap_remove(e);
@@ -12657,6 +12726,36 @@ static const char *const tut_draw[] = {
 };
 
 #ifdef VEDIT_TERM
+static const char *const tut_art[] = {
+	"The art view edits coloured text art. A file named *.ans opens",
+	"as a grid of cells, each a glyph with its own colours, and is",
+	"saved back as UTF-8 with the colour escapes that redraw it.",
+	"",
+	"Moving and typing",
+	"",
+	"  - Arrows step one cell; Home, End, PgUp and PgDn work as you",
+	"    expect. Enter is a carriage return. The grid grows below.",
+	"  - Typing overwrites the cell under the cursor with the pen's",
+	"    colours. Backspace and Delete erase a cell to a blank.",
+	"",
+	"The pen",
+	"",
+	"  - Alt+Up and Alt+Down cycle the foreground; Alt+Right and",
+	"    Alt+Left the background. Each runs default, then 0 to 15.",
+	"  - Alt+B bold, Alt+L blink, Alt+U underline, Alt+R plain.",
+	"  - Alt+P picks up the colours of the cell under the cursor.",
+	"  - The status line shows a swatch of the pen next to -- ART --.",
+	"",
+	"Blocks",
+	"",
+	"  - Shift+arrows mark a rectangle. Ctrl-C copies it, Ctrl-X cuts",
+	"    it, Ctrl-V overlays the copy at the cursor, and Ctrl-B draws",
+	"    a box-drawing border around it.",
+	"  - Ctrl-Z and Ctrl-Y undo and redo. Ctrl-S saves the file.",
+	"",
+	"Set art.view = off in the config to open .ans files as text.",
+};
+
 static const char *const tut_term[] = {
 	"A terminal buffer runs a shell, or any command, inside vedit as",
 	"one more buffer alongside your files. It needs a host that can",
@@ -12765,6 +12864,7 @@ static const Tutorial g_tutorials[] = {
 	{ "Line Draw Mode",	TUT(tut_draw) },
 #ifdef VEDIT_TERM
 	{ "Terminal Buffers",	TUT(tut_term) },
+	{ "Art View (.ans)",	TUT(tut_art) },
 #endif
 	{ "Crash Recovery",	TUT(tut_recover) },
 };
@@ -13106,7 +13206,7 @@ buffer_reset(Editor *e)
 	X(t) X(has_name) X(cy) X(cx) X(top) X(left) X(sel_active) X(ay) X(ax) \
 	X(syn) X(line_state) X(line_state_cap) X(hl_valid) X(hex_view) \
 	X(hex_top) X(expand_tabs) X(vi_marks_set) X(swap_on) X(swap_rev) \
-	X(load_mtime) X(kind) X(vterm) X(in_pane) X(top_last)
+	X(load_mtime) X(kind) X(vterm) X(in_pane) X(top_last) X(art)
 #define BUF_STATE_ARRAYS(X) \
 	X(path) X(vi_mark_y) X(vi_mark_x) X(swap_path)
 
@@ -13262,6 +13362,7 @@ buf_open(Editor *e, const char *path)
 #ifdef VEDIT_TERM
 	e->kind = BUF_TEXT;		/* parked a terminal: this slot is text */
 	e->vterm = NULL;
+	e->art = NULL;
 #endif
 	if (path && path[0]) {
 		snprintf(e->path, sizeof(e->path), "%s", path);
@@ -13274,6 +13375,9 @@ buf_open(Editor *e, const char *path)
 	}
 	e->expand_tabs = indent_expand_default(e->syn ? e->syn->name : NULL);
 	e->cy = e->cx = e->top = e->left = 0;
+#ifdef VEDIT_TERM
+	art_sync_file(e);
+#endif
 	e->sel_active = 0;
 	e->line_state = NULL;
 	e->line_state_cap = 0;
@@ -13314,6 +13418,7 @@ buf_close(Editor *e, int i)
 			e->kind = BUF_TEXT;
 			e->vterm = NULL;
 		}
+		art_detach(e);
 #endif
 		buf_free_fields(e->t, e->line_state);
 		memmove(&e->bufs[i], &e->bufs[i + 1],
@@ -13326,6 +13431,7 @@ buf_close(Editor *e, int i)
 			unlink(e->bufs[i].swap_path);
 #ifdef VEDIT_TERM
 		term_buf_free(&e->bufs[i]);	/* no-op unless it is a terminal */
+		art_free(e->bufs[i].art);
 #endif
 		buf_free_fields(e->bufs[i].t, e->bufs[i].line_state);
 		memmove(&e->bufs[i], &e->bufs[i + 1],
@@ -15201,6 +15307,9 @@ ed_new(Editor *e)
 	e->path[0] = '\0';
 	e->syn = NULL;
 	buffer_reset(e);
+#ifdef VEDIT_TERM
+	art_detach(e);
+#endif
 	buf_save(e, &e->bufs[e->cur]);
 	set_status(e, "new buffer");
 }
@@ -15495,6 +15604,9 @@ ed_open(Editor *e)
 		e->has_name = 1;
 		e->syn = syn_for_ext(file_ext(e->path));
 		buffer_reset(e);
+#ifdef VEDIT_TERM
+		art_sync_file(e);
+#endif
 		swap_adopt(e, mt, action);
 		buf_save(e, &e->bufs[e->cur]);
 		if (action != SWAP_RECOVERED)
@@ -17789,6 +17901,7 @@ editor_init(Editor *e)
 	e->hex_pending = -1;
 	e->hex_cols = 16;
 	e->scheme = SCHEME_DOS;	/* MS-EDIT look by default; View cycles it */
+	e->art_on = 1;		/* .ans files open in the art view */
 }
 
 /* Run the event loop until the editor exits. Returns a process-style code:
@@ -17875,6 +17988,16 @@ editor_loop(Editor *e)
 			ed_render(e, e->d);
 			continue;
 		}
+
+#ifdef VEDIT_TERM
+		/* The art view takes every key while a .ans file is current. */
+		if (e->art) {
+			if (run_req(e, art_key(e, &seq)))
+				return 0;
+			ed_render(e, e->d);
+			continue;
+		}
+#endif
 
 		/* The Insert key toggles the 2D/block draw mode in either
 		 * personality. */
@@ -18021,14 +18144,19 @@ editor_teardown(Editor *e)
 				unlink(e->bufs[i].swap_path);
 #ifdef VEDIT_TERM
 			term_buf_free(&e->bufs[i]);	/* reap any child */
+			art_free(e->bufs[i].art);
 #endif
 			buf_free_fields(e->bufs[i].t, e->bufs[i].line_state);
 		}
 	} else {
+#ifdef VEDIT_TERM
+		art_detach(e);
+#endif
 		buf_free_fields(e->t, e->line_state);
 	}
 	free(e->bufs);
 	free(e->clip);
+	free(e->art_clip);
 	for (i = 0; i < 26; i++)
 		free(e->vi_regs[i].bytes);
 	free(e->vi_dot.ev);
@@ -18117,6 +18245,9 @@ vedit_open(struct vedit *v, const char *path)
 	v->e.load_mtime = (stat(v->e.path, &st) == 0) ? st.st_mtime : 0;
 	v->e.syn = syn_for_ext(file_ext(v->e.path));
 	v->e.expand_tabs = indent_expand_default(v->e.syn ? v->e.syn->name : NULL);
+#ifdef VEDIT_TERM
+	art_sync_file(&v->e);
+#endif
 	return 0;
 }
 
@@ -18192,6 +18323,14 @@ ed_apply_config(Editor *e)
 
 		if (v >= 0 && v <= 500)
 			e->pane_rows = v;
+	}
+	e->art_on = cfg_bool(g_cfg, "art.view", e->art_on);
+	s = cfg_get(g_cfg, "art.width");
+	if (s) {
+		int v = atoi(s);
+
+		if (v == 0 || (v >= ART_COLS_MIN && v <= ART_COLS_MAX))
+			e->art_cols = v;
 	}
 #endif
 	s = cfg_get(g_cfg, "edit.shiftwidth");
@@ -22328,6 +22467,7 @@ term_install(Editor *e, Term *t)
 	e->kind = BUF_TERM;
 	e->vterm = t;
 	e->term_prefix = 0;
+	e->art = NULL;
 	e->term_dirty = 1;
 	buf_save(e, &e->bufs[i]);		/* keep the slot consistent */
 	return i;
@@ -22564,6 +22704,1021 @@ term_loop_step(Editor *e)
 	ed_render(e, e->d);
 	e->term_dirty = 0;
 	return TERM_CONT;
+}
+
+/****************************************************************
+ * Art view: colour text art edited as a grid of cells
+ *
+ * A file whose name ends in .ans opens in the art view. Its bytes are
+ * replayed through the terminal emulator into a grid of cells, and the
+ * grid is what gets edited: the cursor roams it freely, typing overwrites
+ * the cell under it with the current pen (foreground, background and
+ * attributes), and Shift+arrows mark a rectangle for copy, cut, paste and
+ * box. Saving serializes the grid back into the text buffer as UTF-8 with
+ * SGR colour sequences, one line per row, and writes that. The Text behind
+ * the buffer only ever holds the file form; the grid is the editing model.
+ * Undo keeps whole-grid snapshots, which are small at these sizes.
+ ****************************************************************/
+
+static Color
+art_def(void)
+{
+	Color c;
+
+	memset(&c, 0, sizeof(c));
+	c.type = COLOR_DEFAULT;
+	return c;
+}
+
+static int
+art_is_ext(const char *ext)
+{
+	return strcasecmp(ext, "ans") == 0;
+}
+
+static Color
+art_idx(int n)
+{
+	Color c;
+
+	memset(&c, 0, sizeof(c));
+	c.type = COLOR_INDEXED;
+	c.index = (uint8_t)n;
+	return c;
+}
+
+static Cell *
+art_cell(const Art *a, int y, int x)
+{
+	return vt_buf_cell(a->vt->buf, y, x);
+}
+
+static void
+art_blank(Cell *c)
+{
+	vt_cell_clear(c);
+}
+
+/* A cell that contributes nothing to the file: a plain blank. */
+static int
+art_cell_plain(const Cell *c)
+{
+	return c->attrs == 0 && c->fg.type == COLOR_DEFAULT &&
+	    c->bg.type == COLOR_DEFAULT;
+}
+
+static int
+art_cell_blank(const Cell *c)
+{
+	return (c->codepoint == ' ' || c->codepoint == 0) && art_cell_plain(c);
+}
+
+static int
+art_style_same(const Cell *a, const Cell *b)
+{
+	return a->attrs == b->attrs && color_eq(a->fg, b->fg) &&
+	    color_eq(a->bg, b->bg);
+}
+
+/* Serialize the text buffer: the file bytes the art is replayed from. */
+static char *
+art_text_bytes(const Text *t, size_t *n)
+{
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *fp = open_memstream(&buf, &len);
+
+	if (!fp)
+		return NULL;
+	if (text_write_fp(t, fp) != OK) {
+		fclose(fp);
+		free(buf);
+		return NULL;
+	}
+	fclose(fp);
+	*n = len;
+	return buf;
+}
+
+/* Size a grid for the file: one row per line, and the widest line's display
+ * width (escape sequences skipped) but at least ART_COLS_MIN so classic
+ * 80-column art lays out as drawn. Cursor motion in the file can still move
+ * past the bottom, in which case the emulator scrolls; art relying on that
+ * is rare. */
+static void
+art_measure(const char *s, size_t n, int *rows, int *cols)
+{
+	size_t i = 0;
+	int r = 1, w = 0, wmax = 0;
+
+	while (i < n) {
+		unsigned char c = (unsigned char)s[i];
+
+		if (c == 0x1b) {		/* ESC [ params final, or ESC x */
+			i++;
+			if (i < n && s[i] == '[') {
+				i++;
+				while (i < n && (unsigned char)s[i] < 0x40)
+					i++;
+			}
+			if (i < n)
+				i++;
+			continue;
+		}
+		if (c == '\n') {
+			r++;
+			if (w > wmax)
+				wmax = w;
+			w = 0;
+			i++;
+			continue;
+		}
+		if (c == '\t') {
+			w = (w / 8 + 1) * 8;
+			i++;
+			continue;
+		}
+		if (c < 0x20 || c == 0x7f) {
+			i++;
+			continue;
+		}
+		{
+			uint32_t cp;
+			int k = utf8_decode(&cp, (const unsigned char *)s + i,
+			    n - i);
+			int cw;
+
+			if (k <= 0) {
+				k = 1;
+				cp = '?';
+			}
+			cw = rune_width(cp);
+			if (cw < 0)
+				cw = 1;
+			w += cw;
+			i += (size_t)k;
+		}
+	}
+	if (w > wmax)
+		wmax = w;
+	if (wmax < ART_COLS_MIN)
+		wmax = ART_COLS_MIN;
+	if (wmax > ART_COLS_MAX)
+		wmax = ART_COLS_MAX;
+	if (r > ART_ROWS_MAX)
+		r = ART_ROWS_MAX;
+	*rows = r;
+	*cols = wmax;
+}
+
+static void
+art_snap_free(Artsnap *s)
+{
+	free(s->cells);
+	s->cells = NULL;
+}
+
+static void
+art_free(Art *a)
+{
+	int i;
+
+	if (!a)
+		return;
+	for (i = 0; i < a->nundo; i++)
+		art_snap_free(&a->undo[i]);
+	for (i = 0; i < a->nredo; i++)
+		art_snap_free(&a->redo[i]);
+	vt_state_free(a->vt);
+	free(a);
+}
+
+static Art *
+art_new(int rows, int cols)
+{
+	Art *a = calloc(1, sizeof(*a));
+
+	if (!a)
+		return NULL;
+	a->vt = vt_state_new(rows, cols, 0);
+	if (!a->vt) {
+		free(a);
+		return NULL;
+	}
+	a->rows = rows;
+	a->cols = cols;
+	a->fg = art_def();
+	a->bg = art_def();
+	return a;
+}
+
+/* Replay file bytes into the grid. */
+static int
+art_import(Art *a, const char *bytes, size_t n)
+{
+	struct vt_parse *p = vt_parse_new(vt_ops_default(), a->vt);
+
+	if (!p)
+		return -1;
+	vt_parse_feed(p, bytes, n);
+	vt_parse_free(p);
+	return 0;
+}
+
+static void
+art_detach(Editor *e)
+{
+	art_free(e->art);
+	e->art = NULL;
+}
+
+/* Replay the text buffer into a fresh grid and make it the view. Returns 0,
+ * or -1 leaving the buffer as plain text. */
+static int
+art_attach(Editor *e)
+{
+	size_t n = 0;
+	char *bytes;
+	int rows, cols;
+	Art *a;
+
+	art_detach(e);
+	bytes = art_text_bytes(e->t, &n);
+	if (!bytes)
+		return -1;
+	art_measure(bytes, n, &rows, &cols);
+	if (e->art_cols > 0)
+		cols = e->art_cols;
+	a = art_new(rows, cols);
+	if (!a || art_import(a, bytes, n) < 0) {
+		free(bytes);
+		art_free(a);
+		return -1;
+	}
+	free(bytes);
+	e->art = a;
+	e->draw_mode = 0;
+	e->hex_view = 0;
+	e->sel_active = 0;
+	return 0;
+}
+
+/* Called whenever the active buffer's text or name changes: a .ans file gets
+ * the art view, anything else is plain text. */
+static void
+art_sync_file(Editor *e)
+{
+	if (e->art_on && e->has_name && e->kind == BUF_TEXT &&
+	    art_is_ext(file_ext(e->path)))
+		art_attach(e);
+	else
+		art_detach(e);
+}
+
+/* Rebuild the text buffer from the grid: UTF-8 with SGR sequences, one line
+ * per row, trailing blank rows and cells dropped, a reset wherever a plain
+ * cell follows a styled run and at the end of a styled line. The line-ending
+ * style of the file is kept. Returns 0, or -1 with errno set. */
+static void
+art_emit(void *ctx, const char *data, size_t len)
+{
+	fwrite(data, 1, len, (FILE *)ctx);
+}
+
+static int
+art_export(Editor *e)
+{
+	Art *a = e->art;
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *fp = open_memstream(&buf, &len);
+	Text *nt;
+	int last = -1, y, x;
+
+	if (!fp)
+		return -1;
+	for (y = 0; y < a->rows; y++)
+		for (x = 0; x < a->cols; x++)
+			if (!art_cell_blank(art_cell(a, y, x))) {
+				last = y;
+				break;
+			}
+	for (y = 0; y <= last; y++) {
+		const struct vt_row *r = vt_buf_row(a->vt->buf, y);
+		const Cell *prev = NULL;
+		int end = 0, styled = 0;
+
+		for (x = 0; x < a->cols; x++)
+			if (!art_cell_blank(&r->cells[x]))
+				end = x + 1;
+		for (x = 0; x < end; x++) {
+			const Cell *c = &r->cells[x];
+			unsigned char u[4];
+			int n;
+
+			if (c->width == 0)	/* tail of a wide glyph */
+				continue;
+			if (!prev || !art_style_same(prev, c)) {
+				if (art_cell_plain(c)) {
+					if (styled)
+						fputs("\033[0m", fp);
+					styled = 0;
+				} else {
+					dump_sgr(art_emit, fp, c);
+					styled = 1;
+				}
+			}
+			prev = c;
+			n = utf8_encode(u, c->codepoint ? c->codepoint : ' ');
+			if (n > 0)
+				fwrite(u, 1, (size_t)n, fp);
+		}
+		if (styled)
+			fputs("\033[0m", fp);
+		fputc('\n', fp);
+	}
+	if (fclose(fp) != 0) {
+		free(buf);
+		return -1;
+	}
+	nt = text_new();
+	if (!nt) {
+		free(buf);
+		errno = ENOMEM;
+		return -1;
+	}
+	if (len > 0) {
+		FILE *in = fmemopen(buf, len, "rb");
+		int rc = in ? text_load_fp(nt, in) : ERR;
+
+		if (in)
+			fclose(in);
+		if (rc != OK) {
+			text_free(nt);
+			free(buf);
+			return -1;
+		}
+	}
+	free(buf);
+	text_set_eol(nt, text_eol(e->t));
+	nt->dirty = 1;
+	text_free(e->t);
+	e->t = nt;
+	e->cy = e->cx = e->top = e->left = 0;
+	e->hl_valid = 0;
+	return 0;
+}
+
+/* ---- undo: whole-grid snapshots ---- */
+
+static int
+art_snap_take(const Art *a, Artsnap *s)
+{
+	size_t n = (size_t)a->rows * (size_t)a->cols;
+	int y;
+
+	s->cells = malloc(n * sizeof(Cell));
+	if (!s->cells)
+		return -1;
+	for (y = 0; y < a->rows; y++)
+		memcpy(s->cells + (size_t)y * a->cols,
+		    vt_buf_row(a->vt->buf, y)->cells,
+		    (size_t)a->cols * sizeof(Cell));
+	s->rows = a->rows;
+	s->cy = a->cy;
+	s->cx = a->cx;
+	return 0;
+}
+
+static void
+art_snap_apply(Art *a, const Artsnap *s)
+{
+	int y;
+
+	if (s->rows != a->rows) {
+		if (vt_state_resize(a->vt, s->rows, a->cols) < 0)
+			return;
+		a->rows = s->rows;
+	}
+	for (y = 0; y < a->rows; y++)
+		memcpy(vt_buf_row(a->vt->buf, y)->cells,
+		    s->cells + (size_t)y * a->cols,
+		    (size_t)a->cols * sizeof(Cell));
+	a->cy = s->cy;
+	a->cx = s->cx;
+}
+
+static void
+art_stack_push(Artsnap *st, int *n, const Artsnap *s)
+{
+	if (*n == ART_UNDO_MAX) {		/* drop the oldest */
+		art_snap_free(&st[0]);
+		memmove(st, st + 1, (ART_UNDO_MAX - 1) * sizeof(*st));
+		(*n)--;
+	}
+	st[(*n)++] = *s;
+}
+
+/* Record the grid before a change. */
+static void
+art_mark(Editor *e)
+{
+	Art *a = e->art;
+	Artsnap s;
+
+	if (art_snap_take(a, &s) == 0) {
+		art_stack_push(a->undo, &a->nundo, &s);
+		while (a->nredo > 0)
+			art_snap_free(&a->redo[--a->nredo]);
+	}
+	e->t->dirty = 1;	/* the file form is stale until the next save */
+}
+
+static void
+art_undo(Editor *e, int redo)
+{
+	Art *a = e->art;
+	Artsnap *from = redo ? a->redo : a->undo;
+	Artsnap *to = redo ? a->undo : a->redo;
+	int *nfrom = redo ? &a->nredo : &a->nundo;
+	int *nto = redo ? &a->nundo : &a->nredo;
+	Artsnap cur, s;
+
+	if (*nfrom == 0) {
+		set_status(e, redo ? "nothing to redo" : "nothing to undo");
+		return;
+	}
+	if (art_snap_take(a, &cur) < 0)
+		return;
+	art_stack_push(to, nto, &cur);
+	s = from[--*nfrom];
+	art_snap_apply(a, &s);
+	art_snap_free(&s);
+	e->t->dirty = 1;
+}
+
+/* ---- editing primitives ---- */
+
+/* Make row y exist, adding blank rows at the bottom. */
+static int
+art_reach(Art *a, int y)
+{
+	if (y < a->rows)
+		return 0;
+	if (y >= ART_ROWS_MAX)
+		return -1;
+	if (vt_state_resize(a->vt, y + 1, a->cols) < 0)
+		return -1;
+	a->rows = y + 1;
+	return 0;
+}
+
+/* Overwrite the cell at (y, x) with cp in the pen's colours. Returns the
+ * glyph's width, or 0 when nothing was written. */
+static int
+art_put(Editor *e, int y, int x, uint32_t cp)
+{
+	Art *a = e->art;
+	Cell *c;
+	int w;
+
+	if (x < 0 || x >= a->cols || y < 0 || art_reach(a, y) < 0)
+		return 0;
+	w = rune_width(cp);
+	if (w < 1)
+		w = 1;
+	if (w == 2 && x + 1 >= a->cols)
+		return 0;
+	c = art_cell(a, y, x);
+	if (c->width == 0 && x > 0) {	/* splitting a wide glyph: blank it */
+		Cell *l = art_cell(a, y, x - 1);
+
+		l->codepoint = ' ';
+		l->width = 1;
+	}
+	if (c->width == 2) {		/* was wide: free its tail */
+		Cell *t = art_cell(a, y, x + 1);
+
+		if (t)
+			art_blank(t);
+	}
+	c->codepoint = cp;
+	c->fg = a->fg;
+	c->bg = a->bg;
+	c->attrs = a->attrs;
+	c->width = (uint8_t)w;
+	if (w == 2) {
+		Cell *t = art_cell(a, y, x + 1);
+
+		if (t->width == 2) {	/* its own tail, further right */
+			Cell *tt = art_cell(a, y, x + 2);
+
+			if (tt)
+				art_blank(tt);
+		}
+		art_blank(t);
+		t->width = 0;
+	}
+	return w;
+}
+
+/* Erase the cell under the cursor to a plain blank, without moving. */
+static void
+art_erase(Editor *e)
+{
+	Art *a = e->art;
+	Cell *c = art_cell(a, a->cy, a->cx);
+
+	if (!c)
+		return;
+	art_mark(e);
+	if (c->width == 0 && a->cx > 0) {
+		Cell *l = art_cell(a, a->cy, a->cx - 1);
+
+		l->codepoint = ' ';
+		l->width = 1;
+	} else if (c->width == 2) {
+		Cell *t = art_cell(a, a->cy, a->cx + 1);
+
+		if (t)
+			art_blank(t);
+	}
+	art_blank(c);
+}
+
+/* Move the cursor by (dy, dx) cells, never wrapping at an edge. */
+static void
+art_move(Art *a, int dy, int dx)
+{
+	a->cy += dy;
+	if (a->cy < 0)
+		a->cy = 0;
+	if (a->cy >= ART_ROWS_MAX)
+		a->cy = ART_ROWS_MAX - 1;
+	a->cx += dx;
+	if (a->cx < 0)
+		a->cx = 0;
+	if (a->cx >= a->cols)
+		a->cx = a->cols - 1;
+}
+
+/* Keep the cursor on screen. */
+static void
+art_scroll(Art *a, int h, int w)
+{
+	if (a->cy < a->top)
+		a->top = a->cy;
+	else if (a->cy >= a->top + h)
+		a->top = a->cy - h + 1;
+	if (a->cx < a->left)
+		a->left = a->cx;
+	else if (a->cx >= a->left + w)
+		a->left = a->cx - w + 1;
+}
+
+/* The marked rectangle (anchor to cursor), normalized and inclusive. */
+static void
+art_sel_rect(const Editor *e, int *y1, int *y2, int *x1, int *x2)
+{
+	const Art *a = e->art;
+	int ay = (int)e->ay, ax = (int)e->ax;
+
+	*y1 = ay < a->cy ? ay : a->cy;
+	*y2 = ay > a->cy ? ay : a->cy;
+	*x1 = ax < a->cx ? ax : a->cx;
+	*x2 = ax > a->cx ? ax : a->cx;
+}
+
+/* Copy the selected rectangle into the art clipboard. */
+static void
+art_block_copy(Editor *e)
+{
+	Art *a = e->art;
+	int y1, y2, x1, x2, y, x, w, h;
+	Cell *clip;
+
+	if (!e->sel_active)
+		return;
+	art_sel_rect(e, &y1, &y2, &x1, &x2);
+	w = x2 - x1 + 1;
+	h = y2 - y1 + 1;
+	clip = malloc((size_t)w * (size_t)h * sizeof(Cell));
+	if (!clip)
+		return;
+	for (y = 0; y < h; y++)
+		for (x = 0; x < w; x++) {
+			const Cell *c = art_cell(a, y1 + y, x1 + x);
+			Cell *d = &clip[(size_t)y * w + x];
+
+			if (c)
+				*d = *c;
+			else
+				art_blank(d);
+		}
+	free(e->art_clip);
+	e->art_clip = clip;
+	e->art_clip_w = w;
+	e->art_clip_h = h;
+	set_status(e, "copied %dx%d", w, h);
+}
+
+/* Blank the rectangle in place. */
+static void
+art_block_erase(Editor *e, int y1, int y2, int x1, int x2)
+{
+	Art *a = e->art;
+	int y, x;
+
+	for (y = y1; y <= y2 && y < a->rows; y++)
+		for (x = x1; x <= x2; x++) {
+			Cell *c = art_cell(a, y, x);
+
+			if (c)
+				art_blank(c);
+		}
+}
+
+static void
+art_block_cut(Editor *e)
+{
+	int y1, y2, x1, x2;
+
+	if (!e->sel_active)
+		return;
+	art_sel_rect(e, &y1, &y2, &x1, &x2);
+	art_block_copy(e);
+	art_mark(e);
+	art_block_erase(e, y1, y2, x1, x2);
+	e->sel_active = 0;
+}
+
+/* Overlay the clipboard at the cursor, extending the grid downward. */
+static void
+art_block_paste(Editor *e)
+{
+	Art *a = e->art;
+	int y, x;
+
+	if (!e->art_clip)
+		return;
+	art_mark(e);
+	for (y = 0; y < e->art_clip_h; y++) {
+		if (art_reach(a, a->cy + y) < 0)
+			break;
+		for (x = 0; x < e->art_clip_w; x++) {
+			const Cell *s = &e->art_clip[(size_t)y * e->art_clip_w + x];
+			Cell *d = art_cell(a, a->cy + y, a->cx + x);
+
+			if (!d)
+				break;
+			if (s->width == 2 && a->cx + x + 1 >= a->cols)
+				break;		/* a wide glyph would overflow */
+			if (d->width == 0 && a->cx + x > 0 && x == 0) {
+				Cell *l = art_cell(a, a->cy + y, a->cx - 1);
+
+				l->codepoint = ' ';
+				l->width = 1;
+			}
+			*d = *s;
+		}
+	}
+	e->sel_active = 0;
+}
+
+/* Draw a box-drawing border around the selection; a one-cell-wide or
+ * one-cell-tall rectangle reduces to a line. Glyphs take the pen. */
+static void
+art_block_box(Editor *e)
+{
+	int y1, y2, x1, x2, x, y;
+
+	if (!e->sel_active)
+		return;
+	art_sel_rect(e, &y1, &y2, &x1, &x2);
+	art_mark(e);
+	if (y1 == y2) {
+		for (x = x1; x <= x2; x++)
+			art_put(e, y1, x, 0x2500);		/* horizontal */
+	} else if (x1 == x2) {
+		for (y = y1; y <= y2; y++)
+			art_put(e, y, x1, 0x2502);		/* vertical */
+	} else {
+		for (x = x1 + 1; x < x2; x++) {
+			art_put(e, y1, x, 0x2500);
+			art_put(e, y2, x, 0x2500);
+		}
+		for (y = y1 + 1; y < y2; y++) {
+			art_put(e, y, x1, 0x2502);
+			art_put(e, y, x2, 0x2502);
+		}
+		art_put(e, y1, x1, 0x250c);
+		art_put(e, y1, x2, 0x2510);
+		art_put(e, y2, x1, 0x2514);
+		art_put(e, y2, x2, 0x2518);
+	}
+	e->sel_active = 0;
+}
+
+/* ---- the pen ---- */
+
+/* Step a pen colour through default, then the 16 base colours, and around. */
+static Color
+art_color_step(Color c, int dir)
+{
+	int i;
+
+	if (c.type != COLOR_INDEXED)
+		return art_idx(dir > 0 ? 0 : 15);
+	if (c.index > 15)
+		return dir > 0 ? art_def() : art_idx(15);
+	i = (int)c.index + dir;
+	if (i < 0 || i > 15)
+		return art_def();
+	return art_idx(i);
+}
+
+static const char *
+art_color_name(Color c, char *buf, size_t n)
+{
+	if (c.type == COLOR_INDEXED)
+		snprintf(buf, n, "%d", c.index);
+	else if (c.type == COLOR_RGB)
+		snprintf(buf, n, "#%02x%02x%02x", c.rgb.r, c.rgb.g, c.rgb.b);
+	else
+		snprintf(buf, n, "default");
+	return buf;
+}
+
+static void
+art_pen_status(Editor *e)
+{
+	Art *a = e->art;
+	char f[16], b[16];
+
+	set_status(e, "pen: fg %s, bg %s%s%s%s",
+	    art_color_name(a->fg, f, sizeof(f)),
+	    art_color_name(a->bg, b, sizeof(b)),
+	    (a->attrs & ATTR_BOLD) ? ", bold" : "",
+	    (a->attrs & ATTR_BLINK) ? ", blink" : "",
+	    (a->attrs & ATTR_UNDERLINE) ? ", underline" : "");
+}
+
+/* Alt+key: pen controls. Returns 1 when the key was one. */
+static int
+art_pen_key(Editor *e, const struct tkbd_seq *seq)
+{
+	Art *a = e->art;
+	uint32_t ch = seq->ch;
+
+	switch (seq->key) {
+	case TKBD_KEY_UP:
+		a->fg = art_color_step(a->fg, 1);
+		break;
+	case TKBD_KEY_DOWN:
+		a->fg = art_color_step(a->fg, -1);
+		break;
+	case TKBD_KEY_RIGHT:
+		a->bg = art_color_step(a->bg, 1);
+		break;
+	case TKBD_KEY_LEFT:
+		a->bg = art_color_step(a->bg, -1);
+		break;
+	default:
+		if (ch == TKBD_CH_NONE)
+			return 0;
+		switch (tolower((int)ch)) {
+		case 'b':
+			a->attrs ^= ATTR_BOLD;
+			break;
+		case 'l':
+			a->attrs ^= ATTR_BLINK;
+			break;
+		case 'u':
+			a->attrs ^= ATTR_UNDERLINE;
+			break;
+		case 'p': {			/* pick up the cell's colours */
+			const Cell *c = art_cell(a, a->cy, a->cx);
+
+			if (c) {
+				a->fg = c->fg;
+				a->bg = c->bg;
+				a->attrs = c->attrs;
+			}
+			break;
+		}
+		case 'r':
+			a->fg = art_def();
+			a->bg = art_def();
+			a->attrs = 0;
+			break;
+		default:
+			return 0;
+		}
+	}
+	art_pen_status(e);
+	return 1;
+}
+
+/* ---- rendering ---- */
+
+static void
+art_render(Editor *e, Screen *d)
+{
+	const Pal *p = ed_chrome(e);
+	Art *a = e->art;
+	int text_h = text_height(e), text_w = text_width(e);
+	int y1 = 0, y2 = -1, x1 = 0, x2 = -1, r, c;
+	Color def = art_def();
+
+	art_scroll(a, text_h, text_w);
+	if (e->sel_active)
+		art_sel_rect(e, &y1, &y2, &x1, &x2);
+	scr_clear(d);
+	for (r = 0; r < text_h; r++) {
+		int y = a->top + r;
+
+		for (c = 0; c < text_w; c++) {
+			int x = a->left + c;
+			const Cell *cell = x < a->cols ? art_cell(a, y, x) : NULL;
+			uint32_t cp = ' ';
+			Color fg = def, bg = def;
+			uint16_t at = 0;
+
+			if (cell) {
+				cp = cell->codepoint ? cell->codepoint : ' ';
+				fg = cell->fg;
+				bg = cell->bg;
+				at = cell->attrs;
+				if (cell->width == 0) {	/* tail of a wide glyph */
+					if (c == 0)
+						cp = ' ';	/* cut by the view */
+					else
+						continue;
+				} else if (cell->width == 2 && c + 1 >= text_w)
+					cp = ' ';		/* would spill */
+			}
+			if (y >= y1 && y <= y2 && x >= x1 && x <= x2)
+				at ^= ATTR_REVERSE;
+			scr_cell(d, CHROME_TOP + r, CHROME_LEFT + c, cp, fg, bg,
+			    at);
+		}
+	}
+	ui_menubar(e, p, -1);
+	ui_frame(e, p);
+	ui_statusbar(e, p, a->cx);
+	scr_cursor_shape(d, CURSOR_DEFAULT);
+	scr_cursor_vis(d, 1);
+	scr_cursor(d, CHROME_TOP + a->cy - a->top, CHROME_LEFT + a->cx - a->left);
+}
+
+/* ---- keys ---- */
+
+/* Handle one key in the art view. Returns a request for the main loop. */
+static Req
+art_key(Editor *e, const struct tkbd_seq *seq)
+{
+	Art *a = e->art;
+	int shift = seq->mod & TKBD_MOD_SHIFT;
+	int ctrl = seq->mod & TKBD_MOD_CTRL;
+	uint16_t k = seq->key;
+
+	if (seq->type != TKBD_KEY)
+		return REQ_CONTINUE;
+
+	if ((seq->mod & TKBD_MOD_ALT) && art_pen_key(e, seq))
+		return REQ_CONTINUE;
+
+	if (ctrl) {
+		switch (k) {
+		case TKBD_KEY_S:
+			return REQ_SAVE;
+		case TKBD_KEY_Q:
+			return REQ_QUIT;
+		case TKBD_KEY_Z:
+			e->sel_active = 0;
+			art_undo(e, 0);
+			return REQ_CONTINUE;
+		case TKBD_KEY_Y:
+			e->sel_active = 0;
+			art_undo(e, 1);
+			return REQ_CONTINUE;
+		case TKBD_KEY_C:
+			art_block_copy(e);
+			return REQ_CONTINUE;
+		case TKBD_KEY_X:
+			art_block_cut(e);
+			return REQ_CONTINUE;
+		case TKBD_KEY_V:
+			art_block_paste(e);
+			return REQ_CONTINUE;
+		case TKBD_KEY_B:
+			art_block_box(e);
+			return REQ_CONTINUE;
+		default:
+			return REQ_CONTINUE;
+		}
+	}
+
+	/* Shift+arrow extends a rectangle; an unshifted move drops it. */
+	if (k == TKBD_KEY_LEFT || k == TKBD_KEY_RIGHT || k == TKBD_KEY_UP ||
+	    k == TKBD_KEY_DOWN || k == TKBD_KEY_HOME || k == TKBD_KEY_END) {
+		if (shift) {
+			if (!e->sel_active) {
+				e->sel_active = 1;
+				e->sel_block = 1;
+				e->ay = (size_t)a->cy;
+				e->ax = (size_t)a->cx;
+			}
+		} else {
+			e->sel_active = 0;
+		}
+	}
+
+	switch (k) {
+	case TKBD_KEY_LEFT:
+		art_move(a, 0, -1);
+		return REQ_CONTINUE;
+	case TKBD_KEY_RIGHT:
+		art_move(a, 0, 1);
+		return REQ_CONTINUE;
+	case TKBD_KEY_UP:
+		art_move(a, -1, 0);
+		return REQ_CONTINUE;
+	case TKBD_KEY_DOWN:
+		art_move(a, 1, 0);
+		return REQ_CONTINUE;
+	case TKBD_KEY_HOME:
+		a->cx = 0;
+		return REQ_CONTINUE;
+	case TKBD_KEY_END: {			/* past the row's last glyph */
+		int x, end = 0;
+
+		for (x = 0; x < a->cols; x++) {
+			const Cell *c = art_cell(a, a->cy, x);
+
+			if (c && !art_cell_blank(c))
+				end = x + 1;
+		}
+		a->cx = end < a->cols ? end : a->cols - 1;
+		return REQ_CONTINUE;
+	}
+	case TKBD_KEY_PGUP: {
+		int h = text_height(e) - 1;
+
+		e->sel_active = 0;
+		art_move(a, h < 1 ? -1 : -h, 0);
+		return REQ_CONTINUE;
+	}
+	case TKBD_KEY_PGDN: {
+		int h = text_height(e) - 1;
+
+		e->sel_active = 0;
+		art_move(a, h < 1 ? 1 : h, 0);
+		return REQ_CONTINUE;
+	}
+	case TKBD_KEY_ENTER:			/* carriage return */
+		e->sel_active = 0;
+		art_move(a, 1, 0);
+		a->cx = 0;
+		return REQ_CONTINUE;
+	case TKBD_KEY_TAB:
+		e->sel_active = 0;
+		art_move(a, 0, 8 - a->cx % 8);
+		return REQ_CONTINUE;
+	case TKBD_KEY_BACKSPACE:
+	case TKBD_KEY_BACKSPACE2:
+		e->sel_active = 0;
+		if (a->cx > 0) {
+			art_move(a, 0, -1);
+			art_erase(e);
+		}
+		return REQ_CONTINUE;
+	case TKBD_KEY_DEL:
+		e->sel_active = 0;
+		art_erase(e);
+		return REQ_CONTINUE;
+	case TKBD_KEY_ESC:
+		e->sel_active = 0;
+		return REQ_CONTINUE;
+	case TKBD_KEY_F1:
+		return REQ_HELP;
+	case TKBD_KEY_F8:
+		buf_cycle(e, shift ? -1 : 1);
+		return REQ_CONTINUE;
+	default:
+		break;
+	}
+
+	if (seq->ch != TKBD_CH_NONE && seq->ch >= 0x20 && seq->ch != 0x7f) {
+		int w;
+
+		e->sel_active = 0;
+		art_mark(e);
+		w = art_put(e, a->cy, a->cx, seq->ch);
+		if (w > 0)
+			art_move(a, 0, w);
+	}
+	return REQ_CONTINUE;
 }
 
 #endif /* VEDIT_TERM */
@@ -27291,6 +28446,9 @@ vi_ex_exec(Editor *e, char *buf)
 			e->cy = e->cx = e->top = e->left = 0;
 			e->sel_active = 0;
 			e->hl_valid = 0;
+#ifdef VEDIT_TERM
+			art_sync_file(e);
+#endif
 			set_status(e, "reloaded %.100s",
 			    e->path);
 		}
