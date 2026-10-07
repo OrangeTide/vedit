@@ -964,6 +964,7 @@ While a terminal buffer has focus, keystrokes pass straight through to the child
 | Key                     | What it does                                        |
 |-------------------------|-----------------------------------------------------|
 | `Ctrl-W m`              | open the menu bar (F10 and Alt+letter go to the child) |
+| `Ctrl-W :`              | an ex command line (`:e file`, `:split`, `:set` ...) |
 | `Ctrl-W w` / `Ctrl-W W` | next / previous buffer                              |
 | `Ctrl-W n`              | open another terminal                               |
 | `Ctrl-W r` / `Ctrl-W R` | repost the output into a new buffer: as text / as art |
@@ -973,8 +974,8 @@ While a terminal buffer has focus, keystrokes pass straight through to the child
 
 The editor shortcuts, including F1, F8, F10, and Alt+letter, reach the child
 rather than the editor while a terminal has focus. `Ctrl-W m` is the way to
-the menu bar, and from there to every editor command; when the menu closes,
-focus returns to the terminal.
+the menu bar, and from there to every editor command, and `Ctrl-W :` is the
+way to the ex command line; when either closes, focus returns to the terminal.
 
 A terminal's output can be copied into a buffer of its own with `Ctrl-W r`
 (Terminal > Repost as Text, or `:repost`), which gives a new text buffer holding

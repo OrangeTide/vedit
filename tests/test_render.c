@@ -2094,7 +2094,7 @@ t_menu_narrow(Test *t)
 static void
 t_help_scroll(Test *t)
 {
-	const char keys[] = "\033OQ\033OP    ";	/* F2, F1, four page-downs */
+	const char keys[] = "\033OQ\033OP     ";	/* F2, F1, five page-downs */
 	Memio m;
 	struct vedit_io io;
 	struct vedit *v;

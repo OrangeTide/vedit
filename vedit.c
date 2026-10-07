@@ -15071,8 +15071,11 @@ static const struct {
 #ifdef VEDIT_TERM
 	{ "Ctrl-W s / b / w / c",	"Pane below: a shell / this buffer / focus / close" },
 	{ "Ctrl-W + / -  :set ph=N",	"Pane a row taller / shorter; set its rows" },
-	{ "Ctrl-W m",		"In a terminal buffer: open the menu (F1 for the rest)" },
+	{ "Ctrl-W m / :",	"In a terminal: the menu bar / an ex command line" },
+	{ "Ctrl-W w / W / 1..9",	"In a terminal: next / previous buffer / buffer N" },
+	{ "Ctrl-W n / c / q",	"In a terminal: new terminal / close it / close dead" },
 	{ "Ctrl-W r / R",	"Copy a terminal's output to a new buffer: text / art" },
+	{ "Ctrl-W Ctrl-W",	"In a terminal: send a literal Ctrl-W to the program" },
 #endif
 #ifndef VEDIT_NO_TOOLS
 	{ "Alt+F9 / F9",	"Compile the file / make the project" },
@@ -15134,7 +15137,11 @@ static const struct {
 	{ ":sbuffer [N]",	"Show buffer N (or this one) in the pane" },
 	{ "Ctrl-W s / b / w / c",	"Pane below: a shell / this buffer / focus / close" },
 	{ "Ctrl-W + / -  :set ph=N",	"Pane a row taller / shorter; set its rows" },
-	{ "Ctrl-W m / w / c",	"In a terminal: menu / next buffer / close" },
+	{ "Ctrl-W m / :",	"In a terminal: the menu bar / an ex command line" },
+	{ "Ctrl-W w / W / 1..9",	"In a terminal: next / previous buffer / buffer N" },
+	{ "Ctrl-W n / c / q",	"In a terminal: new terminal / close it / close dead" },
+	{ "Ctrl-W r / R",	"Copy a terminal's output to a new buffer: text / art" },
+	{ "Ctrl-W Ctrl-W",	"In a terminal: send a literal Ctrl-W to the program" },
 	{ ":repost [art]",	"Copy a terminal's output to a new buffer" },
 	{ ":table [off|,|;|tab]",	"CSV/TSV grid view on this buffer (View menu too)" },
 	{ ":colwidth N|fit [all]",	"Table view: set or fit this column's width, or all" },
@@ -15342,6 +15349,7 @@ static const char *const tut_term[] = {
 	"  for terminal control: press it, then one more key.",
 	"",
 	"      Ctrl-W m        open the menu bar (File, Edit, Terminal ...)",
+	"      Ctrl-W :        an ex command line (:e file, :split, :set ...)",
 	"      Ctrl-W w / W    next / previous buffer",
 	"      Ctrl-W 1 .. 9   switch to buffer 1 through 9",
 	"      Ctrl-W n        open another terminal",
@@ -15349,10 +15357,12 @@ static const char *const tut_term[] = {
 	"      Ctrl-W q        close a terminal whose program has exited",
 	"      Ctrl-W Ctrl-W   send a literal Ctrl-W to the program",
 	"      Ctrl-W r / R    copy the output to a new buffer as text / art",
+	"      Ctrl-W + / -    a pane terminal: a row taller / shorter",
 	"",
 	"  Ctrl-W m is the way to the menu bar from a terminal, and from",
-	"  there to every editor command, including this help. The menu",
-	"  closes back into the terminal when it is done.",
+	"  there to every editor command, including this help. Ctrl-W :",
+	"  is the way to the ex command line. Both close back into the",
+	"  terminal when they are done.",
 	"",
 	"The embedded emulator handles colors, cursor movement, and the",
 	"alternate screen, so full-screen programs such as a pager run",
@@ -25222,7 +25232,7 @@ pane_key(Editor *e)
 	Event ev;
 	uint32_t ch;
 
-	set_status(e, "Ctrl-W: (s)hell below, (b)uffer below, (w) focus the pane, (c)lose it, (r)epost it, (+/-) resize it");
+	set_status(e, "Ctrl-W: (s)hell below, (b)uffer below, (w) focus the pane, (c)lose it, (r)epost it, (+/-) resize it, (:) ex");
 	ed_render(e, e->d);
 	for (;;) {
 		switch (scr_wait(e->d, &ev)) {
@@ -25641,6 +25651,23 @@ term_loop_step(Editor *e)
 			act = menu_bar_run(e, 0, 0);
 			if (run_menu_act(e, act))
 				return TERM_QUIT;
+			ed_render(e, e->d);
+			return TERM_CONT;
+		}
+		if (b == ':') {
+			/* Ctrl-W :: the ex command line, the same way. */
+			scr_raw_unread(e->d, raw + i + 1, n - i - 1);
+			switch (vi_colon(e)) {
+			case REQ_FORCE_QUIT:
+			case REQ_QUIT_ERR:
+				return TERM_QUIT;
+			case REQ_QUIT:
+				if (run_req(e, REQ_QUIT))
+					return TERM_QUIT;
+				break;
+			default:
+				break;
+			}
 			ed_render(e, e->d);
 			return TERM_CONT;
 		}

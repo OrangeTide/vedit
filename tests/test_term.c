@@ -597,6 +597,33 @@ t_term_loop_menu(Test *t)
 	memio_free(&m);
 }
 
+/* Ctrl-W : opens the ex command line; the command runs and the terminal
+ * stays focused, with nothing leaked to the child. */
+static void
+t_term_loop_colon(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child, n;
+	char buf[8];
+
+	v = term_editor_in(&m, &io, "\027:set ph=7\r", 12, 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_CONT);
+	TAP_CHECK(t, term_is_active(&v->e));
+	TAP_CHECKF(t, v->e.pane_rows == 7, "pane_rows %d", v->e.pane_rows);
+	n = read_all(child, buf, sizeof(buf));
+	TAP_CHECKF(t, n == 0, "ex command leaked %d bytes to child", n);
+
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* Bytes typed before Ctrl-W are flushed to the child before the command. */
 static void
 t_term_loop_flush(Test *t)
@@ -1644,6 +1671,7 @@ const Case tap_cases[] = {
 	{ "tool_term_capture", t_tool_term_capture },
 	{ "tool_term_start", t_tool_term_start },
 	{ "tool_term_shell", t_tool_term_shell },
+	{ "term_loop_colon", t_term_loop_colon },
 	{ "pane_split", t_pane_split },
 	{ "pane_text", t_pane_text },
 	{ "term_poll_fallback", t_term_poll_fallback },
