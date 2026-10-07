@@ -193,6 +193,7 @@ XDG layout (`-DVEDIT_NO_XDG`) uses `~/.veditrc` instead.
     tabs   = on          # mark hard tabs with a guide glyph
     paneheight = 0       # rows for the pane under the text; 0 = a third
                          # (Ctrl-W + and - or :set ph=N change it later)
+    mouse  = on          # click places the cursor, the wheel scrolls
 
 [art]
     view  = on           # open .ans files in the art view (needs the emulator)
@@ -238,6 +239,9 @@ XDG layout (`-DVEDIT_NO_XDG`) uses `~/.veditrc` instead.
 [gitcommit]
     subject = 50         # mark a commit subject past this column
     body = 72            # and body lines past this one
+
+[mouse "screen*"]        # per-terminal override, matched against $TERM
+    enable = off         # (applied after ui.mouse; later sections win)
 
 [mail]
     dir = ~/Maildir      # a Maildir++ tree; enables the Mail menu
@@ -476,6 +480,18 @@ mode, `>` in DEC or ASCII mode) in a colour close to the background, so tabs
 and runs of spaces are easy to tell apart without the glyphs shouting. The
 colour is the `guide.fg` of the scheme (see "Configuration file" for themes);
 the plain scheme dims the text colour instead. In vi keys it is `:set list` / `:set nolist`.
+
+**View > Mouse** (`:set mouse` / `:set nomouse`, on by default) asks the
+terminal to report the mouse: a left click in the text puts the cursor there,
+the wheel scrolls the view three lines (the cursor follows only when it would
+leave the window), and a click on the menu bar opens that menu; the menus and
+dialogs then take clicks too. Terminal buffers, the pane, and the hex, table
+and art views ignore the mouse for now, and a program running in a terminal
+buffer never receives it. While reporting is on, the emulator's own text
+selection usually needs Shift held. `ui.mouse` in the config sets the default
+and a `[mouse "<glob>"]` section with `enable = on|off` overrides it for the
+terminals whose `$TERM` matches (later sections win); `VEDIT_MOUSE=0|1` in the
+environment overrides both, and a build with `-DVEDIT_NO_MOUSE` never asks.
 
 **View > Auto Indent** (on by default) starts each new line with the same
 leading whitespace as the line you left, for Enter and for vi's `o` and `O`. In

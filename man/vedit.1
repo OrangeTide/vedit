@@ -239,7 +239,7 @@ it as well.
 .PP
 The main sections are
 .B [ui]
-(scheme, line numbers, word wrap, box mode, colors),
+(scheme, line numbers, word wrap, box mode, colors, mouse),
 .B [edit]
 (personality, auto-indent, tab stops, swap and backup files, format-on-save),
 .B [indent]
@@ -285,6 +285,13 @@ Override the box-drawing mode.
 .B VEDIT_COLORS
 Override the color depth
 .RB ( 256 " or " 16 ).
+.TP
+.B VEDIT_MOUSE
+Enable
+.RB ( 1 )
+or disable
+.RB ( 0 )
+mouse reporting, over the config.
 .TP
 .B VEDIT_SCROLL
 Enable

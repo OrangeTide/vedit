@@ -170,6 +170,114 @@ t_tab_guide_color(Test *t)
 	memio_free(&m);
 }
 
+static Cfg *cfg_from_text(const char *text);
+#ifndef VEDIT_NO_MOUSE
+/* With the mouse on, the session asks the terminal for reports, a click
+ * lands the cursor on that cell, and the wheel scrolls three lines pulling
+ * the cursor along at the edge. With ui.mouse off nothing is asked for and
+ * a report is ignored. */
+static void
+t_mouse_click_wheel(Test *t)
+{
+	static const char *const L[] = {
+		"line 0", "line 1", "line 2 is longer", "line 3", "line 4",
+		"line 5", "line 6", "line 7", "line 8", "line 9", "line 10",
+		"line 11", "line 12", "line 13", "line 14", "line 15",
+		"line 16", "line 17", "line 18", "line 19", "line 20",
+		"line 21", "line 22", "line 23", "line 24", "line 25",
+		"line 26", "line 27", "line 28", "line 29"
+	};
+	/* click at screen column 6, row 4 (text row 2 under the 2 chrome
+	 * rows; column 1 is the first text column), then wheel down twice */
+	const char keys[] = "\033[<0;6;5M\033[<65;6;5M\033[<65;6;5M";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Cfg *cfg;
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 30);
+	v->e.mouse = 1;
+	scr_mouse(v->e.d, 1);
+	vedit_run(v);
+	TAP_CHECK(t, strstr(m.out, "\033[?1000h\033[?1006h") != NULL);
+	/* the click put the cursor on line 2 column 4; two wheel steps then
+	 * scrolled the view to line 6 and pulled the cursor to that edge */
+	TAP_CHECKF(t, v->e.top == 6 && v->e.cy == 6 && v->e.cx == 4,
+	    "top=%zu cy=%zu cx=%zu", v->e.top, v->e.cy, v->e.cx);
+	vedit_free(v);
+	TAP_CHECK(t, strstr(m.out, "\033[?1006l\033[?1000l") != NULL);	/* off at teardown */
+	memio_free(&m);
+
+	/* ui.mouse = off: no request, and the click is ignored */
+	cfg = cfg_from_text("[ui]\nmouse = off\n");
+	TAP_ASSERT(t, cfg != NULL);
+	memio_init(&m, keys, 9, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config(v, cfg);
+	fill_lines(v->e.t, L, 30);
+	vedit_run(v);
+	TAP_CHECK(t, strstr(m.out, "\033[?1000h") == NULL);
+	TAP_CHECK(t, v->e.cy == 0 && v->e.cx == 0);
+	vedit_free(v);
+	memio_free(&m);
+	g_cfg = NULL;			/* the config is borrowed: unhook before freeing */
+	vedit_cfg_free(cfg);
+}
+
+/* Under soft wrap a click on the second row of a wrapped line lands in that
+ * segment, and a click below the last line goes to its end. */
+static void
+t_mouse_click_wrap(Test *t)
+{
+	static const char *const L[] = {
+		"aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll "
+		"mmmm nnnn oooo pppp qqqq rrrr ssss tttt uuuu vvvv wwww xxxx",
+		"short"
+	};
+	/* row 3 is the first line's second wrapped row; then a click far
+	 * below everything */
+	const char keys[] = "\033[<0;3;4M\033[<0;3;20M";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	size_t cy1, cx1;
+
+	memio_init(&m, keys, 9, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	v->e.wrap = 1;
+	v->e.mouse = 1;
+	fill_lines(v->e.t, L, 2);
+	vedit_run(v);
+	cy1 = v->e.cy;
+	cx1 = v->e.cx;
+	TAP_CHECKF(t, cy1 == 0 && cx1 > 70 && cx1 < 90, "wrap click cy=%zu cx=%zu",
+	    cy1, cx1);
+	vedit_free(v);
+	memio_free(&m);
+
+	memio_init(&m, keys + 9, 10, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	v->e.wrap = 1;
+	v->e.mouse = 1;
+	fill_lines(v->e.t, L, 2);
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.cy == 1 && v->e.cx == 5, "below click cy=%zu cx=%zu",
+	    v->e.cy, v->e.cx);
+	vedit_free(v);
+	memio_free(&m);
+}
+#endif /* VEDIT_NO_MOUSE */
+
 static void
 t_status_flags(Test *t)
 {
@@ -3360,6 +3468,10 @@ const Case tap_cases[] = {
 	{ "nowrap_truncates_tail", t_nowrap_truncates_tail },
 	{ "gutter_numbers", t_gutter_numbers },
 	{ "tab_guide_color", t_tab_guide_color },
+#ifndef VEDIT_NO_MOUSE
+	{ "mouse_click_wheel", t_mouse_click_wheel },
+	{ "mouse_click_wrap", t_mouse_click_wrap },
+#endif
 	{ "status_flags", t_status_flags },
 	{ "tab_key_expand", t_tab_key_expand },
 	{ "tag_jump", t_tag_jump },

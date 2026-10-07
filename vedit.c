@@ -2795,6 +2795,75 @@ scroll_default(void)
 	return 0;	/* conservative: dumb full-row repaint */
 }
 
+#ifndef VEDIT_NO_MOUSE
+/* Shell-style wildcard match of s against pat: '*' any run, '?' one char. */
+static int
+glob_match(const char *pat, const char *s)
+{
+	while (*pat) {
+		if (*pat == '*') {
+			while (*pat == '*')
+				pat++;
+			if (!*pat)
+				return 1;
+			for (; *s; s++)
+				if (glob_match(pat, s))
+					return 1;
+			return 0;
+		}
+		if (!*s || (*pat != '?' && *pat != *s))
+			return 0;
+		pat++;
+		s++;
+	}
+	return *s == '\0';
+}
+#endif
+
+/* Whether to use the mouse: VEDIT_MOUSE in the environment wins; else the
+ * [mouse "<glob>"] sections whose pattern matches $TERM, in file order so a
+ * later one overrides, applied over the global ui.mouse; else on. A build with
+ * VEDIT_NO_MOUSE never asks for the mouse. */
+static int
+mouse_default(void)
+{
+#ifdef VEDIT_NO_MOUSE
+	return 0;
+#else
+	const char *s = getenv("VEDIT_MOUSE");
+	const char *term = getenv("TERM");
+	int on = 1, i;
+
+	if (s) {
+		if (strcmp(s, "1") == 0 || strcmp(s, "on") == 0 ||
+		    strcmp(s, "yes") == 0)
+			return 1;
+		if (strcmp(s, "0") == 0 || strcmp(s, "off") == 0 ||
+		    strcmp(s, "no") == 0)
+			return 0;
+	}
+	on = cfg_bool(g_cfg, "ui.mouse", on);
+	if (!g_cfg || !term)
+		return on;
+	for (i = 0; i < g_cfg->count; i++) {
+		const char *key = g_cfg->entries[i].key;
+		size_t kl = strlen(key);
+		char pat[128];
+
+		/* mouse.<glob>.enable: the glob is what sits between */
+		if (strncmp(key, "mouse.", 6) != 0 || kl < 6 + 1 + 7 ||
+		    strcmp(key + kl - 7, ".enable") != 0 ||
+		    kl - 6 - 7 >= sizeof(pat))
+			continue;
+		memcpy(pat, key + 6, kl - 6 - 7);
+		pat[kl - 6 - 7] = '\0';
+		if (glob_match(pat, term))
+			on = str_bool(g_cfg->entries[i].value, on);
+	}
+	return on;
+#endif
+}
+
 /* Chrome color schemes, cycled by View > Color Scheme (MA_SCHEME). The black
  * scheme leaves the text-area background at the terminal default, which lets
  * scr_present clear trailing blanks with erase-to-EOL (see there). */
@@ -4656,9 +4725,9 @@ struct tkbd_seq {
 #define TKBD_KEY_F11 0x6C
 #define TKBD_KEY_F12 0x6D
 
-/* Mouse pseudo-keys. vedit does not decode mouse input, but the editor
- * references these constants; they stay so it compiles and the mouse paths
- * remain dead code. */
+/* Mouse pseudo-keys, from the SGR (?1006) reports tkbd_decode parses; the
+ * menus, dialogs and the text area act on them when the mouse is enabled
+ * (see mouse_default and scr_mouse). */
 #define TKBD_MOUSE_LEFT       (0xFFFF - 1)
 #define TKBD_MOUSE_RIGHT      (0xFFFF - 2)
 #define TKBD_MOUSE_MIDDLE     (0xFFFF - 3)
@@ -4713,6 +4782,7 @@ typedef struct draw_term {
 	int		cursor_vis;
 
 	int		begun;
+	int		mouse;		/* report the mouse (?1000 + ?1006) while begun */
 	int		want_resize;	/* a resize is pending for scr_wait */
 	int		box_mode;	/* enum vedit_box_mode for the glyphs */
 	int		colors;		/* 256 or 16 (downgrade palette) */
@@ -5434,6 +5504,8 @@ scr_begin(Screen *d)
 	t->begun = 1;
 	scr_str(t, "\033[?1049h");	/* alt screen, if supported */
 	scr_str(t, "\033[?2004h");	/* bracketed paste */
+	if (t->mouse)
+		scr_str(t, "\033[?1000h\033[?1006h");	/* mouse, SGR reports */
 	scr_str(t, "\033[2J");		/* clear */
 	scr_str(t, "\033[H");
 	for (i = 0; i < t->rows; i++)
@@ -5452,6 +5524,8 @@ scr_end(Screen *d)
 	scr_str(t, "\033[0m");
 	scr_str(t, "\033[?2004l");
 	scr_str(t, "\033[?25h");
+	if (t->mouse)
+		scr_str(t, "\033[?1006l\033[?1000l");
 	/* Drop the cursor to the bottom and scroll up one line, so on a client
 	 * without the alternate screen the shell prompt lands on a fresh line
 	 * below the editor instead of in the middle of the chrome. A client that
@@ -5464,6 +5538,23 @@ scr_end(Screen *d)
 	t->begun = 0;
 	if (t->io.end)
 		t->io.end(t->io.ctx);
+}
+
+/* Turn mouse reporting on or off for the session: now, when the screen is
+ * up, and again on every later scr_begin. */
+static void
+scr_mouse(Screen *d, int on)
+{
+	Scrbuf *t = d->t;
+
+	on = on ? 1 : 0;
+	if (t->mouse == on)
+		return;
+	t->mouse = on;
+	if (!t->begun)
+		return;
+	scr_str(t, on ? "\033[?1000h\033[?1006h" : "\033[?1006l\033[?1000l");
+	scr_flush(t);
 }
 
 static void
@@ -5677,6 +5768,51 @@ tkbd_decode(struct tkbd_seq *seq, const unsigned char *buf, int len)
 		}
 	}
 
+	/* SGR mouse report (CSI < b ; x ; y M for a press, m for a release;
+	 * xterm's ?1006 encoding). b carries the button in bits 0-1, the
+	 * modifiers in 4/8/16, motion in 32, and the wheel in 64. x and y
+	 * are 1-based; the seq carries them 0-based. */
+	if (len > 2 && buf[2] == '<') {
+		int i = 3, p[3] = { 0, 0, 0 }, np = 0, b;
+
+		while (i < len && np < 3) {
+			if (buf[i] >= '0' && buf[i] <= '9') {
+				p[np] = p[np] * 10 + (buf[i] - '0');
+				i++;
+			} else if (buf[i] == ';') {
+				np++;
+				i++;
+			} else
+				break;
+		}
+		if (i >= len)
+			return -1;		/* incomplete */
+		if (buf[i] != 'M' && buf[i] != 'm')
+			return i + 1;		/* malformed: consume */
+		b = p[0];
+		seq->type = TKBD_MOUSE;
+		seq->ch = TKBD_CH_NONE;
+		seq->mod = 0;
+		if (b & 4)
+			seq->mod |= TKBD_MOD_SHIFT;
+		if (b & 8)
+			seq->mod |= TKBD_MOD_ALT;
+		if (b & 16)
+			seq->mod |= TKBD_MOD_CTRL;
+		if (b & 32)
+			seq->mod |= TKBD_MOD_MOTION;
+		if (buf[i] == 'm')
+			seq->key = TKBD_MOUSE_RELEASE;
+		else if (b & 64)
+			seq->key = (b & 1) ? TKBD_MOUSE_WHEEL_DOWN :
+			    TKBD_MOUSE_WHEEL_UP;
+		else
+			seq->key = (b & 3) == 0 ? TKBD_MOUSE_LEFT :
+			    (b & 3) == 1 ? TKBD_MOUSE_MIDDLE : TKBD_MOUSE_RIGHT;
+		seq->x = p[1] > 0 ? p[1] - 1 : 0;
+		seq->y = p[2] > 0 ? p[2] - 1 : 0;
+		return i + 1;
+	}
 	/* CSI: ESC [ ... final */
 	{
 		int i = 2;
@@ -6402,6 +6538,7 @@ typedef struct editor {
 	int		show_lineno;	/* draw the line-number gutter */
 	int		wrap;		/* soft-wrap long lines to the window width */
 	int		show_tabs;	/* draw a guide glyph at each hard tab */
+	int		mouse;		/* act on mouse reports (and ask for them) */
 	int		auto_indent;	/* a new line copies the previous indent */
 	int		expand_tabs;	/* Tab and auto-indent use spaces (per buffer) */
 	int		shiftwidth;	/* >> / << shift size in columns; 0 = a tab stop */
@@ -6617,6 +6754,9 @@ int buf_close(Editor *e, int i);			/* 0 ok, -1 refused */
 void buf_list(Editor *e);			/* summarize into status */
 static int dlg_save_file(Editor *e, char *out, size_t outsz);
 static int dlg_confirm_yesno(Editor *e, const char *msg);
+#ifndef VEDIT_NO_MOUSE
+static void mouse_set(Editor *e, int on);	/* toggle mouse reporting */
+#endif
 #ifdef VEDIT_MAIL
 struct mailref;
 static void mail_detach(Editor *e);		/* free the active buffer's mail ref */
@@ -8724,7 +8864,7 @@ typedef enum menu_act {
 	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_HEX, MA_TABLE, MA_DRAW,
 	MA_TBL_ROWADD, MA_TBL_ROWDEL, MA_TBL_COLADD, MA_TBL_COLDEL, MA_TBL_FIT,
 	MA_SORT,
-	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS,
+	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS, MA_MOUSE,
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS,
 	MA_VI_MODE, MA_EDIT_CONFIG, MA_RELOAD_CONFIG, MA_GLYPHS, MA_COLORS,
 	MA_TABSTOPS,
@@ -8845,6 +8985,9 @@ static const Menuitem mi_view[] = {
 	{ "&Word Wrap",		"",	":set wrap",	MA_WRAP },
 	{ "Line &Endings",	"",	":set ff",	MA_EOL },
 	{ "Show &Tabs",		"",	":set list",	MA_SHOW_TABS },
+#ifndef VEDIT_NO_MOUSE
+	{ "&Mouse",		"",	":set mouse",	MA_MOUSE },
+#endif
 	{ "&Auto Indent",	"",	":set ai",	MA_AUTO_INDENT },
 	{ "&Indent with Spaces","",	":set et",	MA_EXPAND_TABS },
 	{ "&Hex Dump",		"",	"",	MA_HEX },
@@ -9165,6 +9308,10 @@ menu_checked(const Editor *e, Menuact act)
 		return e->draw_mode ? 1 : 0;
 	case MA_TABLE:
 		return e->tbl ? 1 : 0;
+#ifndef VEDIT_NO_MOUSE
+	case MA_MOUSE:
+		return e->mouse ? 1 : 0;
+#endif
 	case MA_VI_MODE:
 		return e->mode != MODE_MODELESS ? 1 : 0;
 	default:
@@ -15496,6 +15643,7 @@ static const struct {
 	{ "gf",			"Open the header or file named under the cursor" },
 	{ ":bn :bp :bd :ls",	"Next / prev / delete / list buffers (also F8)" },
 	{ ":set nu wrap list",	"Toggle line numbers, word wrap, show-tabs" },
+	{ ":set mouse",		"Click to place the cursor, wheel to scroll (View menu)" },
 	{ ":set ai et ff=",	"Auto-indent, indent with spaces, line endings" },
 	{ ":retab  :set sw=N",	"Convert tabs <-> spaces; set the shift width" },
 	{ ":tabstops 5 9 17|off",	"Tab stops for this buffer; :set ts=N the interval" },
@@ -21197,6 +21345,11 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_RELOAD_CONFIG:
 		ed_reload_config(e);
 		break;
+	case MA_MOUSE:
+#ifndef VEDIT_NO_MOUSE
+		mouse_set(e, !e->mouse);
+#endif
+		break;
 #ifdef VEDIT_MAIL
 	case MA_MAIL_FOLDERS:
 		mail_folders(e);
@@ -22287,6 +22440,7 @@ editor_init(Editor *e)
 	memset(e, 0, sizeof(*e));
 	e->hl_on = 1;		/* highlight when a file type is recognized */
 	e->show_tabs = 1;	/* show hard tabs by default */
+	e->mouse = mouse_default();
 	e->auto_indent = 1;	/* copy the previous line's indent by default */
 	e->swap_enabled = 1;	/* write crash-recovery swap files by default */
 	e->backup_enabled = 0;	/* keep no previous-version backup by default */
@@ -22305,6 +22459,140 @@ editor_init(Editor *e)
 
 /* Run the event loop until the editor exits. Returns a process-style code:
  * 0 on a normal quit, 1 on end-of-input or vi ':cq'. */
+
+#ifndef VEDIT_NO_MOUSE
+/* Switch the mouse on or off for the session and tell the terminal. */
+static void
+mouse_set(Editor *e, int on)
+{
+	e->mouse = on ? 1 : 0;
+	if (e->d)
+		scr_mouse(e->d, e->mouse);
+	set_status(e, "mouse %s", e->mouse ? "on" : "off");
+}
+
+/* Scroll the view by delta lines, keeping the cursor inside it: it is pulled
+ * to the nearest edge only when it would leave, at the same column. */
+static void
+mouse_scroll(Editor *e, long delta, int text_h)
+{
+	size_t n = text_lines(e->t), top = e->top;
+	int col = cursor_dispcol(e);
+
+	if (n == 0)
+		return;
+	if (delta < 0)
+		top = (size_t)(-delta) > top ? 0 : top - (size_t)(-delta);
+	else
+		top = top + (size_t)delta >= n ? n - 1 : top + (size_t)delta;
+	e->top = top;
+	if (e->cy < top)
+		e->cy = top;
+	else if (text_h > 0 && e->cy >= top + (size_t)text_h)
+		e->cy = top + (size_t)text_h - 1;
+	if (e->cy >= n)
+		e->cy = n - 1;
+	e->cx = vi_col_to_byte(e, e->cy, col);
+	e->vi_vert_run = 0;
+	if (e->mode != MODE_MODELESS)
+		vi_clamp(e);
+}
+
+/* Put the cursor on the text under screen row `row` (0 = the first text
+ * row) and column offset xoff into the text area, honoring soft wrap. */
+static void
+mouse_click(Editor *e, int row, int xoff, int text_w)
+{
+	size_t n = text_lines(e->t), idx = e->top, llen = 0;
+	const char *s;
+	int col;
+
+	if (n == 0)
+		return;
+	if (xoff < 0)
+		xoff = 0;
+	if (e->wrap && !e->draw_mode) {
+		int i = 0;
+
+		/* walk the rows the way the painter lays them out */
+		for (;;) {
+			int rows, k;
+			size_t a = 0, stop, nxt;
+			int acol = 0, ncol;
+
+			s = text_line(e->t, idx, &llen);
+			if (!s) {		/* below the last line */
+				idx = n - 1;
+				s = text_line(e->t, idx, &llen);
+				col = INT_MAX;
+				break;
+			}
+			rows = llen ? line_rows(s, llen, text_w) : 1;
+			if (row < i + rows) {
+				for (k = row - i; k > 0; k--)
+					wrap_next(s, llen, a, acol, text_w, &a, &acol);
+				stop = llen ? wrap_next(s, llen, a, acol, text_w,
+				    &nxt, &ncol) : 0;
+				col = acol + xoff;
+				e->cy = idx;
+				e->cx = vi_col_to_byte(e, idx, col);
+				if (e->cx > stop)
+					e->cx = stop;
+				goto placed;
+			}
+			i += rows;
+			idx++;
+		}
+	} else {
+		idx = e->top + (size_t)row;
+		if (idx >= n)
+			idx = n - 1;
+		col = (int)e->left + xoff;
+	}
+	e->cy = idx;
+	e->cx = vi_col_to_byte(e, idx, col);
+placed:
+	e->sel_active = 0;
+	e->vi_vert_run = 0;
+	if (e->mode != MODE_MODELESS)
+		vi_clamp(e);
+}
+
+/* Act on a mouse report. A click on the menu bar opens that menu and returns
+ * the action chosen there; in the text area a left click places the cursor
+ * and the wheel scrolls three lines. Terminal buffers, the pane, and the
+ * hex, table and art views take nothing from the mouse yet. */
+static Menuact
+mouse_event(Editor *e, const struct tkbd_seq *m)
+{
+	int text_h = text_height(e), gutter = gutter_width(e);
+	int col0 = CHROME_LEFT + gutter, text_w = text_width(e) - gutter;
+	int press = m->key == TKBD_MOUSE_LEFT && !(m->mod & TKBD_MOD_MOTION);
+
+	if (text_w < 1)
+		text_w = 1;
+	if (press && m->y == 0) {
+		int mi = menu_hit(e, m->x);
+
+		return mi >= 0 ? menu_bar_run(e, mi, 1) : MA_NONE;
+	}
+	if (e->hex_view || e->tbl)
+		return MA_NONE;
+#ifdef VEDIT_TERM
+	if (e->kind == BUF_TERM || e->art || e->pane_focus)
+		return MA_NONE;
+#endif
+	if (m->y < CHROME_TOP || m->y >= CHROME_TOP + text_h)
+		return MA_NONE;
+	if (m->key == TKBD_MOUSE_WHEEL_UP)
+		mouse_scroll(e, -3, text_h);
+	else if (m->key == TKBD_MOUSE_WHEEL_DOWN)
+		mouse_scroll(e, 3, text_h);
+	else if (press)
+		mouse_click(e, m->y - CHROME_TOP, m->x - col0, text_w);
+	return MA_NONE;
+}
+#endif /* VEDIT_NO_MOUSE */
 static int
 editor_loop(Editor *e)
 {
@@ -22361,6 +22649,14 @@ editor_loop(Editor *e)
 
 		e->status[0] = '\0';	/* clear any transient message */
 
+#ifndef VEDIT_NO_MOUSE
+		if (seq.type == TKBD_MOUSE) {
+			if (e->mouse && run_menu_act(e, mouse_event(e, &seq)))
+				return 0;
+			ed_render(e, e->d);
+			continue;
+		}
+#endif
 		/* F10 or Alt+letter opens the menu bar. It takes over input
 		 * until an item is chosen or Esc backs out. */
 		{
@@ -22662,6 +22958,9 @@ vedit_new(const struct vedit_io *io)
 	term->aux_collect = term_collect;
 	term->aux_ready = term_drain;
 #endif
+#ifndef VEDIT_NO_MOUSE
+	scr_mouse(v->e.d, v->e.mouse);	/* ask for reports when the screen begins */
+#endif
 	return v;
 }
 
@@ -22743,6 +23042,9 @@ ed_apply_config(Editor *e)
 	e->wrap = cfg_bool(g_cfg, "ui.wrap", e->wrap);
 	e->show_lineno = cfg_bool(g_cfg, "ui.number", e->show_lineno);
 	e->show_tabs = cfg_bool(g_cfg, "ui.tabs", e->show_tabs);
+	e->mouse = mouse_default();
+	if (e->d)
+		scr_mouse(e->d, e->mouse);
 	e->auto_indent = cfg_bool(g_cfg, "edit.autoindent", e->auto_indent);
 	e->swap_enabled = cfg_bool(g_cfg, "edit.swap", e->swap_enabled);
 	e->backup_enabled = cfg_bool(g_cfg, "edit.backup", e->backup_enabled);
@@ -22877,7 +23179,7 @@ static const char g_config_template[] =
 	"#	clipboard = off      # mirror every copy/yank to the terminal (OSC 52)\n"
 	"#	tabs = on            # mark hard tabs with a guide glyph\n"
 	"#	paneheight = 0       # rows for the pane under the text; 0 = a third\n"
-	"\n"
+	"#	mouse = on           # click places the cursor, the wheel scrolls\n"	"\n"
 	"[art]\n"
 	"#	view = on            # open .ans files in the art view\n"
 	"#	width = 0            # grid columns, 80 to 1024; 0 = from the file\n"
@@ -23144,7 +23446,7 @@ static void
 tty_on_fatal(int sig)
 {
 	static const char restore[] =
-	    "\033[0m\033[?2004l\033[?25h\033[?1049l";
+	    "\033[0m\033[?1006l\033[?1000l\033[?2004l\033[?25h\033[?1049l";
 	ssize_t wr;
 
 	signal(sig, SIG_DFL);
@@ -33654,6 +33956,13 @@ ex_set(Editor *e, const char *arg)
 		set_status(e, "show tabs %s",
 		    e->show_tabs ? "on" : "off");
 		return REQ_CONTINUE;
+#ifndef VEDIT_NO_MOUSE
+	} else if (strcmp(arg, "mouse") == 0 || strcmp(arg, "nomouse") == 0 ||
+	    strcmp(arg, "mouse!") == 0 || strcmp(arg, "invmouse") == 0) {
+		mouse_set(e, arg[0] == 'n' ? 0 : (strchr(arg, '!') ||
+		    arg[0] == 'i') ? !e->mouse : 1);
+		return REQ_CONTINUE;
+#endif
 	} else if (strcmp(arg, "autoindent") == 0 || strcmp(arg, "ai") == 0 ||
 	    strcmp(arg, "noautoindent") == 0 || strcmp(arg, "noai") == 0 ||
 	    strcmp(arg, "autoindent!") == 0 || strcmp(arg, "ai!") == 0 ||

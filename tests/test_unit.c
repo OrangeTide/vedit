@@ -734,6 +734,98 @@ t_cli_config_path(Test *t)
 		unsetenv("VEDIT_CONFIG");
 }
 
+static Cfg *load_cfg_text(const char *text, char *path, size_t pathsz);
+#ifndef VEDIT_NO_MOUSE
+/* SGR mouse reports decode to mouse pseudo-keys with 0-based coordinates;
+ * a partial report asks for more bytes. */
+static void
+t_tkbd_mouse(Test *t)
+{
+	struct tkbd_seq seq;
+	int n;
+
+	n = tkbd_decode(&seq, (const unsigned char *)"\033[<0;5;3M", 9);
+	TAP_CHECKF(t, n == 9 && seq.type == TKBD_MOUSE &&
+	    seq.key == TKBD_MOUSE_LEFT && seq.x == 4 && seq.y == 2 &&
+	    seq.mod == 0, "left press: n=%d type=%d x=%d y=%d", n, seq.type,
+	    seq.x, seq.y);
+	n = tkbd_decode(&seq, (const unsigned char *)"\033[<0;5;3m", 9);
+	TAP_CHECK(t, n == 9 && seq.key == TKBD_MOUSE_RELEASE);
+	n = tkbd_decode(&seq, (const unsigned char *)"\033[<64;1;1M", 10);
+	TAP_CHECK(t, n == 10 && seq.key == TKBD_MOUSE_WHEEL_UP && seq.x == 0);
+	n = tkbd_decode(&seq, (const unsigned char *)"\033[<65;80;24M", 12);
+	TAP_CHECK(t, n == 12 && seq.key == TKBD_MOUSE_WHEEL_DOWN &&
+	    seq.x == 79 && seq.y == 23);
+	n = tkbd_decode(&seq, (const unsigned char *)"\033[<34;7;8M", 10);
+	TAP_CHECK(t, n == 10 && seq.key == TKBD_MOUSE_RIGHT &&
+	    (seq.mod & TKBD_MOD_MOTION));
+	n = tkbd_decode(&seq, (const unsigned char *)"\033[<20;1;1M", 10);
+	TAP_CHECK(t, n == 10 && seq.key == TKBD_MOUSE_LEFT &&
+	    (seq.mod & TKBD_MOD_CTRL) && (seq.mod & TKBD_MOD_SHIFT));
+	n = tkbd_decode(&seq, (const unsigned char *)"\033[<0;5", 6);
+	TAP_CHECK(t, n == -1);			/* incomplete */
+	n = tkbd_decode(&seq, (const unsigned char *)"\033[<0;5;3X", 9);
+	TAP_CHECK(t, n == 9 && seq.type != TKBD_MOUSE);	/* malformed: eaten */
+}
+
+/* glob_match and mouse_default: the environment wins, then [mouse "<glob>"]
+ * sections matching $TERM in file order over ui.mouse, else on. */
+static void
+t_mouse_default(Test *t)
+{
+	static const char *text =
+	    "[ui]\nmouse = off\n"
+	    "[mouse \"xterm*\"]\nenable = on\n"
+	    "[mouse \"xterm-kitty\"]\nenable = off\n";
+	char path[256];
+	Cfg *c;
+	const Cfg *old = g_cfg;
+	const char *oterm = getenv("TERM"), *omouse = getenv("VEDIT_MOUSE");
+	char sterm[256] = "", smouse[64] = "";
+
+	if (oterm)
+		snprintf(sterm, sizeof(sterm), "%s", oterm);
+	if (omouse)
+		snprintf(smouse, sizeof(smouse), "%s", omouse);
+	unsetenv("VEDIT_MOUSE");
+
+	TAP_CHECK(t, glob_match("xterm*", "xterm-256color"));
+	TAP_CHECK(t, glob_match("*color", "xterm-256color"));
+	TAP_CHECK(t, glob_match("scree?", "screen") && !glob_match("scree?", "screens"));
+	TAP_CHECK(t, !glob_match("xterm", "xterm-256color"));
+	TAP_CHECK(t, glob_match("*", "") && glob_match("", ""));
+
+	c = load_cfg_text(text, path, sizeof(path));
+	TAP_ASSERT(t, c != NULL);
+	g_cfg = NULL;
+	setenv("TERM", "vt100", 1);
+	TAP_CHECK(t, mouse_default() == 1);		/* nothing set: on */
+	g_cfg = c;
+	TAP_CHECK(t, mouse_default() == 0);		/* ui.mouse off, no match */
+	setenv("TERM", "xterm-256color", 1);
+	TAP_CHECK(t, mouse_default() == 1);		/* xterm* turns it on */
+	setenv("TERM", "xterm-kitty", 1);
+	TAP_CHECK(t, mouse_default() == 0);		/* the later section wins */
+	setenv("VEDIT_MOUSE", "1", 1);
+	TAP_CHECK(t, mouse_default() == 1);		/* the environment wins */
+	setenv("VEDIT_MOUSE", "off", 1);
+	setenv("TERM", "xterm-256color", 1);
+	TAP_CHECK(t, mouse_default() == 0);
+
+	g_cfg = old;
+	vedit_cfg_free(c);
+	unlink(path);
+	if (oterm)
+		setenv("TERM", sterm, 1);
+	else
+		unsetenv("TERM");
+	if (omouse)
+		setenv("VEDIT_MOUSE", smouse, 1);
+	else
+		unsetenv("VEDIT_MOUSE");
+}
+#endif /* VEDIT_NO_MOUSE */
+
 #ifdef VEDIT_MAIL
 /* Header unfolding, content-type parsing, the two transfer decoders, and
  * splitting a nested multipart message into its leaf parts. */
@@ -3457,6 +3549,10 @@ const Case tap_cases[] = {
 	{ "syntax_gitcommit", t_syntax_gitcommit },
 	{ "mkdir_p", t_mkdir_p },
 	{ "cli_config_path", t_cli_config_path },
+#ifndef VEDIT_NO_MOUSE
+	{ "tkbd_mouse", t_tkbd_mouse },
+	{ "mouse_default", t_mouse_default },
+#endif
 #ifdef VEDIT_MAIL
 	{ "mail_parse", t_mail_parse },
 	{ "maildir", t_maildir },
