@@ -910,6 +910,16 @@ t_pane_split(Test *t)
 	TAP_CHECK(t, text_height(&v->e) == full);
 	TAP_CHECK(t, strcmp(v->e.status, "pane closed") == 0);
 
+	/* a new shell leaves the focus in the text; Ctrl-W s again moves in */
+	pane_run(&v->e, NULL);
+	pt = pane_term(&v->e, NULL);
+	TAP_ASSERT(t, pt != NULL);
+	TAP_CHECK(t, !v->e.pane_focus && strstr(v->e.status, "shell") != NULL);
+	pane_run(&v->e, NULL);
+	TAP_CHECK(t, v->e.pane_focus == 1);
+	v->e.pane_focus = 0;
+	pane_close(&v->e);
+
 	vedit_free(v);
 	memio_free(&m);
 }

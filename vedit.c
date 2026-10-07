@@ -25178,12 +25178,13 @@ pane_run(Editor *e, const char *cmd)
 		set_status(e, "pane: keys go to the terminal; Ctrl-W w returns to the file");
 		return;
 	}
+	/* A new pane leaves the focus in the text, shell or command alike, so
+	 * the keys that follow still go to the file; Ctrl-W w moves in. */
 	argv = term_argv(cmd, &cmdbuf, words, 63);
 	if (pane_open(e, argv, NULL, NULL) >= 0) {
-		e->pane_focus = (cmd == NULL);
-		set_status(e, cmd ? "pane: %.60s (Ctrl-W w focuses it, Ctrl-W c closes it)"
-		    : "pane: keys go to the terminal; Ctrl-W w returns to the file",
-		    cmd ? cmd : "");
+		e->pane_focus = 0;
+		set_status(e, "pane: %.60s (Ctrl-W w focuses it, Ctrl-W c closes it)",
+		    cmd ? cmd : "shell");
 	}
 	free(cmdbuf);
 }

@@ -996,7 +996,9 @@ Taller Pane and Shorter Pane, change its height a row at a time, and
 `:set paneheight=N` (`:set ph=N`) sets it; 0 returns to a third. The keys work
 from the text and from a terminal in the pane. Open a shell there with `Ctrl-W s`, Terminal >
 Split Terminal, or the vi command `:split`; `:split cmd` runs `cmd` in the pane
-instead, as `:terminal cmd` would (`tail -f build.log`, say). The build commands
+instead, as `:terminal cmd` would (`tail -f build.log`, say). A new pane leaves
+the focus in the file, so the keys you type next still edit it; `Ctrl-W w` (or
+`Ctrl-W s` again) moves into the shell. The build commands
 put their output there by default. `Ctrl-W b`, Terminal > Buffer in Pane, or
 `:sbuffer [N]` shows the current text buffer (or buffer N) in the pane, with the
 buffer last on top, else the previous one, above it.
