@@ -193,6 +193,11 @@ A gitconfig-style file sets the startup defaults. It is read from the first of
     view  = on           # open .ans files in the art view (needs the emulator)
     width = 0            # grid columns, 80 to 1024; 0 = from the file
 
+[table]
+    view   = on          # open .csv/.tsv/.tab files in the table view
+    header = on          # line 1 is a frozen header row
+    width  = 10          # default column width
+
 [edit]
     mode = vi            # vi | modeless
     autoindent = on      # new lines copy the previous indent
@@ -1078,6 +1083,39 @@ existing cell with Alt+P. A cell holds one code point, so a combining
 sequence or an emoji with modifiers keeps only its first code point.
 
 
+## Table view (CSV and TSV)
+
+A file whose name ends in `.csv`, `.tsv` or `.tab` opens in the table view. The
+text buffer stays the truth: a record is a line and a cell is a byte range
+inside it, so undo, redo, search and the swap file all work as they do on text,
+and saving writes the lines back unchanged. A quoted field may hold the
+delimiter, doubled quotes and newlines; a record whose quoted field spans
+several lines of the file is joined into one buffer line on open (the newline
+is just a byte in the line) and saved back as it was. A UTF-8 byte order mark
+at the start of the file is kept and is not part of cell A1.
+
+The delimiter comes from the extension (`.tsv` and `.tab` are tab files, which
+never quote) or, for `.csv`, from sniffing the first lines for the most
+consistent of comma, semicolon, tab and pipe. Columns are labelled A, B .. Z,
+AA, AB like a spreadsheet, and the status line shows the cell under the cursor
+with its decoded value: `-- TABLE --  C7: value`.
+
+Commands:
+
+- `:table` turns the view on for any buffer (sniffing the delimiter), or off
+  again. `:table ,` `:table ;` `:table tab` `:table pipe` force a delimiter;
+  `:table off` leaves the view; `:table header` and `:table noheader` say
+  whether line 1 is a frozen header row.
+- `:colwidth N` sets the current column's display width, `:colwidth N all`
+  every column's. Widths are fixed, not fitted to the content; the default is
+  10 columns.
+
+Config, under `[table]`: `view` (on by default) opens these files in the view,
+`header` (on) treats line 1 as a header, `width` sets the default column width.
+A record longer than 64 lines is left as separate lines and reported, so one
+stray quote in a hand-edited file cannot swallow the rest of it.
+
+
 ## Syntax highlighting
 
 vedit highlights through a single data-driven engine, the state-machine model
@@ -1165,7 +1203,7 @@ entirely.
 vedit has a text buffer with undo and redo, the modeless and vi personalities,
 the MS-EDIT chrome (menu bar, frame, scrollbars, dialogs), regex find and
 replace, selection and an internal clipboard, goto-line, multiple buffers, a hex
-view, a 2D/block draw mode, an art view for coloured .ans files, per-language
+view, a 2D/block draw mode, an art view for coloured .ans files, a table view for CSV and TSV, per-language
 build commands with a quickfix error list, selectable line endings (LF, CRLF,
 NUL), tab display with auto-indent and tab/space conversion, a symbol picker
 that merges a buffer scan with a ctags tags file, terminal buffers running a

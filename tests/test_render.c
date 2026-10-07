@@ -2145,6 +2145,131 @@ t_menu_terminal(Test *t)
 }
 #endif
 
+/* A .csv opens with the table view attached: records joined, the BOM noted,
+ * the columns counted; a .tsv uses tabs; :table toggles and :colwidth sets. */
+static void
+t_tbl_attach(Test *t)
+{
+	char dir[] = "/tmp/vedit-tbl-XXXXXX";
+	char path[PATH_MAX];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	FILE *f;
+	Scrbuf *sb;
+	char bar[81];
+	int i;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/a.csv", dir);
+	f = fopen(path, "wb");
+	TAP_ASSERT(t, f != NULL);
+	fputs("\xef\xbb\xbfid;name;note\r\n1;Ann;\"two\r\nlines\"\r\n2;Bob;x;extra\r\n", f);
+	fclose(f);
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	TAP_ASSERT(t, v->e.tbl != NULL);
+	TAP_CHECKF(t, v->e.tbl->delim == ';', "delimiter %d", v->e.tbl->delim);
+	TAP_CHECKF(t, v->e.tbl->ncols == 4, "%d columns", v->e.tbl->ncols);
+	TAP_CHECK(t, v->e.tbl->bom == 3 && v->e.tbl->header);
+	TAP_CHECKF(t, text_lines(v->e.t) == 3, "%zu lines", text_lines(v->e.t));
+	TAP_CHECK(t, !text_dirty(v->e.t));
+	TAP_CHECK(t, tbl_width(v->e.tbl, 0) == TBL_WIDTH_DEFAULT);
+
+	/* the status line names the cell, without the BOM */
+	ed_render(&v->e, v->e.d);
+	sb = v->e.d->t;
+	for (i = 0; i < 80; i++)
+		bar[i] = (char)sb->cur[(size_t)(sb->rows - 1) * sb->cols + i].codepoint;
+	bar[80] = '\0';
+	TAP_CHECKF(t, strstr(bar, "-- TABLE --  A1: id") != NULL, "bar [%s]", bar);
+
+	/* saving writes the joined record back as it was */
+	TAP_ASSERT(t, save_editor(&v->e) == 0);
+	f = fopen(path, "rb");
+	TAP_ASSERT(t, f != NULL);
+	{
+		char back[128];
+		size_t n = fread(back, 1, sizeof(back) - 1, f);
+
+		back[n] = '\0';
+		TAP_CHECKF(t, strcmp(back,
+		    "\xef\xbb\xbfid;name;note\r\n1;Ann;\"two\r\nlines\"\r\n2;Bob;x;extra\r\n") == 0,
+		    "saved [%s]", back);
+	}
+	fclose(f);
+
+	/* :colwidth, :table off, :table back on with a forced delimiter */
+	tbl_colwidth(&v->e, "20");
+	TAP_CHECK(t, tbl_width(v->e.tbl, 0) == 20 && tbl_width(v->e.tbl, 1) == 10);
+	tbl_colwidth(&v->e, "7 all");
+	TAP_CHECK(t, tbl_width(v->e.tbl, 0) == 7 && tbl_width(v->e.tbl, 1) == 7);
+	tbl_colwidth(&v->e, "0");
+	TAP_CHECK(t, strncmp(v->e.status, "E474", 4) == 0);
+	tbl_command(&v->e, "off");
+	TAP_CHECK(t, v->e.tbl == NULL);
+	tbl_colwidth(&v->e, "5");
+	TAP_CHECK(t, strncmp(v->e.status, "not a table", 11) == 0);
+	tbl_command(&v->e, "pipe");
+	TAP_ASSERT(t, v->e.tbl != NULL);
+	TAP_CHECK(t, v->e.tbl->delim == '|' && v->e.tbl->ncols == 1);
+	tbl_command(&v->e, "noheader");
+	TAP_CHECK(t, !v->e.tbl->header);
+	tbl_command(&v->e, "");
+	TAP_CHECK(t, v->e.tbl == NULL);
+	tbl_command(&v->e, "bogus");
+	TAP_CHECK(t, v->e.tbl == NULL && strncmp(v->e.status, "E474", 4) == 0);
+
+	/* the table state parks with its buffer */
+	tbl_command(&v->e, ";");
+	TAP_ASSERT(t, buf_slot(&v->e) == 0);
+	buf_save(&v->e, &v->e.bufs[0]);
+	TAP_ASSERT(t, buf_open(&v->e, NULL) == 1);
+	TAP_CHECK(t, v->e.tbl == NULL && v->e.bufs[0].tbl != NULL);
+	buf_switch(&v->e, 0);
+	TAP_CHECK(t, v->e.tbl != NULL && v->e.tbl->delim == ';');
+
+	vedit_free(v);
+	memio_free(&m);
+
+	/* a .tsv: tabs, and a typed tab stays a tab */
+	snprintf(path, sizeof(path), "%s/b.tsv", dir);
+	f = fopen(path, "wb");
+	TAP_ASSERT(t, f != NULL);
+	fputs("a\tb\n1\t2\n", f);
+	fclose(f);
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	v->e.expand_tabs = 1;
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	TAP_ASSERT(t, v->e.tbl != NULL);
+	TAP_CHECK(t, v->e.tbl->delim == '\t' && v->e.tbl->ncols == 2 && !v->e.expand_tabs);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* table.view = off leaves the file as text */
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	v->e.tbl_on = 0;
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	TAP_CHECK(t, v->e.tbl == NULL);
+	vedit_free(v);
+	memio_free(&m);
+
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/a.csv", dir);
+	unlink(path);
+	rmdir(dir);
+}
+
 const Case tap_cases[] = {
 	{ "resize_grid", t_resize_grid },
 	{ "resize_signal", t_resize_signal },
@@ -2200,6 +2325,7 @@ const Case tap_cases[] = {
 #endif
 #ifdef VEDIT_TERM
 	{ "menu_terminal", t_menu_terminal },
+	{ "tbl_attach", t_tbl_attach },
 #endif
 	{ NULL, NULL },
 };

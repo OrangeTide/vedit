@@ -5880,6 +5880,20 @@ struct art {
 	int		nredo;
 };
 
+/* The table view's state for a CSV/TSV buffer, defined here so the status
+ * bar and the config reader can look inside; the code is after the hex view. */
+typedef struct tbl {
+	char	delim;			/* ',', ';', '\t', '|' or another byte */
+	int	header;			/* line 1 is a frozen header row */
+	int	bom;			/* bytes of a UTF-8 BOM ahead of cell A1 */
+	int	ncols;			/* cached widest field count */
+	int	*width;			/* per-column display widths; 0 = default */
+	int	width_n;
+	int	width_default;		/* table.width */
+	int	cx;			/* cell cursor column (the row is e->cy) */
+	int	left;			/* first visible column */
+} Tbl;
+
 /* One open file. The editor keeps a list of these; the active buffer's fields
  * are mirrored into the flat Editor for editing and copied back here on
  * a switch. Only genuinely per-file state lives here -- the draw surface,
@@ -5912,6 +5926,7 @@ typedef struct ebuf {
 	int		in_pane;	/* a text buffer shown in the pane */
 	int		top_last;	/* the buffer last shown above the pane */
 	Art		*art;		/* art view grid for a .ans file, or NULL */
+	Tbl		*tbl;		/* table view state for a CSV/TSV, or NULL */
 } Buf;
 
 /* Referenced only by pointer here; the users include the real headers. */
@@ -6139,6 +6154,12 @@ typedef struct editor {
 	int		art_cols;	/* art.width: grid columns; 0 = from the file */
 	Cell		*art_clip;	/* copied rectangle of cells */
 	int		art_clip_w, art_clip_h;
+
+	/* table view. tbl mirrors the active buffer. */
+	Tbl		*tbl;		/* active buffer's table state, or NULL */
+	int		tbl_on;		/* table.view: open .csv/.tsv files as a table */
+	int		tbl_header;	/* table.header: line 1 is a header row */
+	int		tbl_width;	/* table.width: default column width; 0 = built-in */
 } Editor;
 
 #ifdef VEDIT_TERM
@@ -8304,6 +8325,12 @@ typedef enum menu_act {
 /* draw mode toggle, defined with the draw-mode module further down */
 static void draw_toggle(Editor *e);
 static void dlg_glyphs(Editor *e);	/* the glyph palette dialog */
+static void tbl_sync_file(Editor *e);	/* .csv/.tsv files get the table view */
+static void tbl_detach(Editor *e);
+static void tbl_free(Tbl *tb);
+static void tbl_command(Editor *e, const char *arg);	/* :table */
+static void tbl_colwidth(Editor *e, const char *arg);	/* :colwidth */
+static void tbl_cell_status(const Editor *e, char *buf, size_t n);
 static int glyph_alt_key(Editor *e, const struct tkbd_seq *seq);
 static void ed_reload_config(Editor *e);
 
@@ -9018,9 +9045,16 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 			mode = "-- NORMAL --  ";
 		else if (e->mode == MODE_INSERT)
 			mode = "-- INSERT --  ";
+		if (e->tbl) {		/* the cell's address and value instead */
+			char cell[160];
+
+			tbl_cell_status(e, cell, sizeof(cell));
+			scr_text(e->d, row, 1, cell, p->bar_fg, p->bar_bg, at);
+		} else {
 		scr_text(e->d, row, 1, mode, p->bar_fg, p->bar_bg, at);
 		scr_text(e->d, row, 1 + (int)strlen(mode), "F1=Help",
 		    p->bar_fg, p->bar_bg, at);
+		}
 #ifdef VEDIT_TERM
 		if (e->art)		/* a swatch of the pen */
 			scr_text(e->d, row, 1 + (int)strlen(mode) + 9, " Ab ",
@@ -9812,6 +9846,529 @@ hex_render(Editor *e, Screen *d)
 	if (currow >= e->hex_top && currow < e->hex_top + (size_t)content_h)
 		scr_cursor(d, 1 + (int)(currow - e->hex_top),
 		    e->hex_ascii ? hex_asciicol(curj, (int)cols) : hex_hexcol(curj));
+}
+
+/****************************************************************
+ * Table view: CSV and TSV as a grid of cells
+ *
+ * A file whose name ends in .csv, .tsv or .tab (or any buffer, with the
+ * :table command) is shown as a grid. The text buffer stays the truth: a
+ * record is a line, and a cell is a byte range inside it found by parsing
+ * the line on demand, so every edit is a delete and an insert on the line
+ * and undo, redo, search and the swap file work unchanged. A quoted field
+ * may hold the delimiter, doubled quotes, and newlines; a newline inside a
+ * field is just a byte in the line, so attaching the view joins the lines
+ * of such a record and saving writes it back as it was. Column widths are
+ * fixed per column; the labels count A, B .. Z, AA, AB like a spreadsheet.
+ ****************************************************************/
+
+#define TBL_WIDTH_DEFAULT	10
+#define TBL_WIDTH_MIN		1
+#define TBL_WIDTH_MAX		200
+#define TBL_JOIN_MAX		64	/* lines one record may span */
+#define TBL_SNIFF_LINES		20
+#define TBL_LABEL_MAX		8
+
+/* One field of a record as a byte range of the line, quotes included. */
+typedef struct tbl_field {
+	size_t	off, len;
+	int	quoted;			/* starts with a quote */
+} Tblfield;
+
+/* The delimiter a table uses, with whether RFC 4180 quoting applies. */
+static int
+tbl_quoting(char delim)
+{
+	return delim != '\t';
+}
+
+static int
+tbl_is_ext(const char *ext)
+{
+	return strcasecmp(ext, "csv") == 0 || strcasecmp(ext, "tsv") == 0 ||
+	    strcasecmp(ext, "tab") == 0;
+}
+
+/* Spreadsheet column label for a 0-based column: A .. Z, AA .. ZZ, AAA.
+ * Bijective base 26. Returns buf. */
+static const char *
+tbl_label(int col, char *buf, size_t n)
+{
+	char tmp[TBL_LABEL_MAX];
+	size_t i = 0, k;
+	long v = col;
+
+	if (col < 0 || n == 0) {
+		if (n)
+			buf[0] = '\0';
+		return buf;
+	}
+	do {
+		tmp[i++] = (char)('A' + v % 26);
+		v = v / 26 - 1;
+	} while (v >= 0 && i < sizeof(tmp));
+	for (k = 0; k < i && k + 1 < n; k++)
+		buf[k] = tmp[i - 1 - k];
+	buf[k] = '\0';
+	return buf;
+}
+
+/* Split one record into fields. A field that starts with a quote runs to
+ * the matching quote (doubled quotes are literal) and then to the next
+ * delimiter; an unterminated one runs to the end of the line, which keeps a
+ * sloppy line editable. Returns the field count, filling up to max entries;
+ * the count may exceed max. */
+static int
+tbl_fields(char delim, const char *s, size_t len, Tblfield *out, int max)
+{
+	int quoting = tbl_quoting(delim), n = 0;
+	size_t i = 0;
+
+	for (;;) {
+		size_t start = i;
+		int q = quoting && i < len && s[i] == '"';
+
+		if (q) {
+			i++;
+			for (;;) {
+				if (i >= len)
+					break;
+				if (s[i] == '"') {
+					if (i + 1 < len && s[i + 1] == '"') {
+						i += 2;
+						continue;
+					}
+					i++;
+					break;
+				}
+				i++;
+			}
+		}
+		while (i < len && s[i] != delim)
+			i++;
+		if (n < max) {
+			out[n].off = start;
+			out[n].len = i - start;
+			out[n].quoted = q;
+		}
+		n++;
+		if (i >= len)
+			break;
+		i++;				/* past the delimiter */
+	}
+	return n;
+}
+
+/* Whether a record is still inside a quoted field at the end of its line,
+ * which means the file continued it on the next line. */
+static int
+tbl_open_quote(char delim, const char *s, size_t len)
+{
+	size_t i = 0;
+
+	if (!tbl_quoting(delim))
+		return 0;
+	for (;;) {
+		if (i < len && s[i] == '"') {
+			i++;
+			for (;;) {
+				if (i >= len)
+					return 1;
+				if (s[i] == '"') {
+					if (i + 1 < len && s[i + 1] == '"') {
+						i += 2;
+						continue;
+					}
+					i++;
+					break;
+				}
+				i++;
+			}
+		}
+		while (i < len && s[i] != delim)
+			i++;
+		if (i >= len)
+			return 0;
+		i++;
+	}
+}
+
+/* Decode a field's bytes into its value: strip the quotes, undouble the
+ * doubled ones. Writes at most cap - 1 bytes plus a NUL; returns the full
+ * value length so a caller can size a buffer. */
+static size_t
+tbl_unquote(const Tblfield *f, const char *line, char *out, size_t cap)
+{
+	const char *s = line + f->off;
+	size_t n = f->len, i = 0, o = 0;
+
+	if (!f->quoted) {
+		if (cap) {
+			size_t c = n < cap - 1 ? n : cap - 1;
+
+			memcpy(out, s, c);
+			out[c] = '\0';
+		}
+		return n;
+	}
+	i = 1;					/* past the opening quote */
+	while (i < n) {
+		char c = s[i];
+
+		if (c == '"') {
+			if (i + 1 < n && s[i + 1] == '"') {
+				i += 2;
+			} else {
+				i++;
+				break;		/* closing quote */
+			}
+		} else {
+			i++;
+		}
+		if (o + 1 < cap)
+			out[o] = c;
+		o++;
+	}
+	while (i < n) {				/* junk after the closing quote */
+		if (o + 1 < cap)
+			out[o] = s[i];
+		o++;
+		i++;
+	}
+	if (cap)
+		out[o < cap ? o : cap - 1] = '\0';
+	return o;
+}
+
+/* Guess the delimiter from the first lines: the candidate that appears on
+ * every sampled line with the same count wins; otherwise the one with the
+ * most occurrences; comma when nothing shows up. */
+static char
+tbl_sniff(const Text *t)
+{
+	static const char cands[] = { ',', ';', '\t', '|' };
+	size_t nl = text_lines(t), i, k;
+	int best = -1, best_score = 0, best_total = 0;
+
+	for (k = 0; k < sizeof(cands); k++) {
+		int consistent = 1, first = -1, total = 0, sampled = 0;
+
+		for (i = 0; i < nl && i < TBL_SNIFF_LINES; i++) {
+			size_t len;
+			const char *s = text_line(t, i, &len);
+			Tblfield f[1];
+			int n;
+
+			if (len == 0)
+				continue;
+			n = tbl_fields(cands[k], s, len, f, 1) - 1;
+			if (first < 0)
+				first = n;
+			else if (n != first)
+				consistent = 0;
+			total += n;
+			sampled++;
+		}
+		if (total == 0)
+			continue;
+		{
+			int score = consistent && sampled > 1 ? 2 : 1;
+
+			if (score > best_score ||
+			    (score == best_score && total > best_total)) {
+				best = (int)k;
+				best_score = score;
+				best_total = total;
+			}
+		}
+	}
+	return best < 0 ? ',' : cands[best];
+}
+
+/* Join the lines of records whose quoted field continues past a line end,
+ * putting the file's line terminator back between them. A representation
+ * change, not an edit: no undo record and the buffer stays clean. A record
+ * that would span more than TBL_JOIN_MAX lines is left as separate lines
+ * and reported. Returns the number of records that hit the cap. */
+static int
+tbl_join_records(Text *t, char delim)
+{
+	const char *sep = (t->eol == EOL_CRLF) ? "\r\n" : "\n";
+	size_t seplen = strlen(sep), i = 0;
+	int capped = 0;
+
+	while (i + 1 < t->nlines) {
+		Line *l = &t->lines[i];
+		int span = 1;
+
+		if (!tbl_open_quote(delim, l->buf, l->len)) {
+			i++;
+			continue;
+		}
+		/* the quote must open a field for this to be a record */
+		while (tbl_open_quote(delim, l->buf, l->len) &&
+		    i + 1 < t->nlines && span < TBL_JOIN_MAX) {
+			Line *next = &t->lines[i + 1];
+
+			if (line_reserve(l, l->len + seplen + next->len) != OK)
+				return capped;
+			memcpy(l->buf + l->len, sep, seplen);
+			l->len += seplen;
+			memcpy(l->buf + l->len, next->buf, next->len);
+			l->len += next->len;
+			l->buf[l->len] = '\0';
+			lines_remove_at(t, i + 1);
+			span++;
+		}
+		if (tbl_open_quote(delim, l->buf, l->len))
+			capped++;
+		i++;
+	}
+	return capped;
+}
+
+/* The widest record's field count. */
+static int
+tbl_count_cols(const Text *t, char delim)
+{
+	size_t nl = text_lines(t), i;
+	int max = 1;
+
+	for (i = 0; i < nl; i++) {
+		size_t len;
+		const char *s = text_line(t, i, &len);
+		Tblfield f[1];
+		int n = tbl_fields(delim, s, len, f, 1);
+
+		if (n > max)
+			max = n;
+	}
+	return max;
+}
+
+/* The display width of column c. */
+static int
+tbl_width(const Tbl *tb, int c)
+{
+	if (c >= 0 && c < tb->width_n && tb->width[c] > 0)
+		return tb->width[c];
+	return tb->width_default;
+}
+
+/* Set column c's width, growing the array (unset entries use the default). */
+static int
+tbl_set_width(Tbl *tb, int c, int w)
+{
+	if (c < 0)
+		return -1;
+	if (w < TBL_WIDTH_MIN)
+		w = TBL_WIDTH_MIN;
+	if (w > TBL_WIDTH_MAX)
+		w = TBL_WIDTH_MAX;
+	if (c >= tb->width_n) {
+		int nn = c + 16;
+		int *nw = realloc(tb->width, (size_t)nn * sizeof(*nw));
+
+		if (!nw)
+			return -1;
+		memset(nw + tb->width_n, 0,
+		    (size_t)(nn - tb->width_n) * sizeof(*nw));
+		tb->width = nw;
+		tb->width_n = nn;
+	}
+	tb->width[c] = w;
+	return 0;
+}
+
+static void
+tbl_free(Tbl *tb)
+{
+	if (!tb)
+		return;
+	free(tb->width);
+	free(tb);
+}
+
+static void
+tbl_detach(Editor *e)
+{
+	tbl_free(e->tbl);
+	e->tbl = NULL;
+}
+
+/* Attach the table view with delimiter delim (0 = sniff): join multi-line
+ * records, note a byte order mark, count the columns. Returns 0, or -1. */
+static int
+tbl_attach(Editor *e, char delim, int header)
+{
+	Tbl *tb;
+	int capped;
+	size_t len;
+	const char *s;
+
+	tbl_detach(e);
+	tb = calloc(1, sizeof(*tb));
+	if (!tb)
+		return -1;
+	tb->delim = delim ? delim : tbl_sniff(e->t);
+	tb->header = header;
+	tb->width_default = e->tbl_width > 0 ? e->tbl_width : TBL_WIDTH_DEFAULT;
+	capped = tbl_join_records(e->t, tb->delim);
+	s = text_line(e->t, 0, &len);
+	if (s && len >= 3 && memcmp(s, "\xef\xbb\xbf", 3) == 0)
+		tb->bom = 3;
+	tb->ncols = tbl_count_cols(e->t, tb->delim);
+	e->tbl = tb;
+	e->hex_view = 0;
+	e->draw_mode = 0;
+	e->sel_active = 0;
+	if (e->cy >= text_lines(e->t))
+		e->cy = text_lines(e->t) ? text_lines(e->t) - 1 : 0;
+	e->cx = 0;
+	e->hl_valid = 0;
+	if (capped)
+		set_status(e, "%d record%s longer than %d lines left split",
+		    capped, capped == 1 ? "" : "s", TBL_JOIN_MAX);
+	return 0;
+}
+
+/* Called whenever the active buffer's text or name changes: a .csv, .tsv or
+ * .tab file gets the table view, anything else is left alone. */
+static void
+tbl_sync_file(Editor *e)
+{
+	const char *ext = file_ext(e->path);
+
+	if (e->tbl_on && e->has_name && e->kind == BUF_TEXT && tbl_is_ext(ext)) {
+		char delim = strcasecmp(ext, "csv") == 0 ? 0 : '\t';
+
+		tbl_attach(e, delim, e->tbl_header);
+		if (delim == '\t')
+			e->expand_tabs = 0;	/* a typed tab is a delimiter */
+	} else {
+		tbl_detach(e);
+	}
+}
+
+/* :table [off | , | ; | tab | pipe | noheader | header] -- toggle the view
+ * on the current buffer, force a delimiter, or set the header flag. */
+static void
+tbl_command(Editor *e, const char *arg)
+{
+	char delim = 0;
+	int header = e->tbl ? e->tbl->header : e->tbl_header;
+
+	if (strcmp(arg, "off") == 0) {
+		tbl_detach(e);
+		set_status(e, "text view");
+		return;
+	}
+	if (strcmp(arg, "noheader") == 0 || strcmp(arg, "header") == 0) {
+		header = strcmp(arg, "header") == 0;
+		if (e->tbl) {
+			e->tbl->header = header;
+			set_status(e, header ? "first row is the header" :
+			    "no header row");
+			return;
+		}
+	} else if (strcmp(arg, "tab") == 0 || strcmp(arg, "\\t") == 0) {
+		delim = '\t';
+	} else if (strcmp(arg, "pipe") == 0) {
+		delim = '|';
+	} else if (strcmp(arg, "comma") == 0) {
+		delim = ',';
+	} else if (strcmp(arg, "semicolon") == 0) {
+		delim = ';';
+	} else if (arg[0] && !arg[1] && arg[0] != '"' && arg[0] != '\n') {
+		delim = arg[0];
+	} else if (arg[0]) {
+		set_status(e, "E474: :table [off|header|noheader|,|;|tab|pipe]");
+		return;
+	}
+	if (e->tbl && !arg[0]) {		/* a bare :table toggles */
+		tbl_detach(e);
+		set_status(e, "text view");
+		return;
+	}
+	if (tbl_attach(e, delim, header) < 0) {
+		set_status(e, "out of memory");
+		return;
+	}
+	if (!e->status[0])
+		set_status(e, "table view: %d column%s, delimiter %s",
+		    e->tbl->ncols, e->tbl->ncols == 1 ? "" : "s",
+		    e->tbl->delim == '\t' ? "tab" : e->tbl->delim == ',' ?
+		    "comma" : e->tbl->delim == ';' ? "semicolon" :
+		    e->tbl->delim == '|' ? "pipe" : "other");
+}
+
+/* "-- TABLE --  C7: value" for the status line: the cell under the cursor
+ * and its decoded value, cut to fit. */
+static void
+tbl_cell_status(const Editor *e, char *buf, size_t n)
+{
+	Tblfield f[1];
+	char label[TBL_LABEL_MAX], val[80];
+	size_t len;
+	const char *s = text_line(e->t, e->cy, &len);
+	int nf, c = e->tbl->cx;
+
+	val[0] = '\0';
+	if (s) {
+		Tblfield *all;
+
+		nf = tbl_fields(e->tbl->delim, s, len, f, 0);
+		all = c < nf ? malloc((size_t)nf * sizeof(*all)) : NULL;
+		if (all) {
+			tbl_fields(e->tbl->delim, s, len, all, nf);
+			if (e->cy == 0 && c == 0 && e->tbl->bom) {
+				all[0].off += (size_t)e->tbl->bom;
+				all[0].len -= (size_t)e->tbl->bom;
+			}
+			tbl_unquote(&all[c], s, val, sizeof(val));
+			free(all);
+		}
+	}
+	for (len = 0; val[len]; len++)	/* one line for the bar */
+		if ((unsigned char)val[len] < 0x20)
+			val[len] = ' ';
+	snprintf(buf, n, "-- TABLE --  %s%zu: %s",
+	    tbl_label(c, label, sizeof(label)), e->cy + 1, val);
+}
+
+/* :colwidth N [all] -- set the current column's width, or every column's. */
+static void
+tbl_colwidth(Editor *e, const char *arg)
+{
+	char *end;
+	long w;
+	int c;
+
+	if (!e->tbl) {
+		set_status(e, "not a table (:table turns the view on)");
+		return;
+	}
+	w = strtol(arg, &end, 10);
+	if (end == arg || w < TBL_WIDTH_MIN || w > TBL_WIDTH_MAX) {
+		set_status(e, "E474: :colwidth N [all], N from %d to %d",
+		    TBL_WIDTH_MIN, TBL_WIDTH_MAX);
+		return;
+	}
+	while (*end == ' ')
+		end++;
+	if (strcmp(end, "all") == 0) {
+		for (c = 0; c < e->tbl->width_n; c++)
+			e->tbl->width[c] = 0;
+		e->tbl->width_default = (int)w;
+		set_status(e, "every column %ld wide", w);
+		return;
+	}
+	if (tbl_set_width(e->tbl, e->tbl->cx, (int)w) < 0) {
+		set_status(e, "out of memory");
+		return;
+	}
+	set_status(e, "column %d is %d wide", e->tbl->cx + 1,
+	    tbl_width(e->tbl, e->tbl->cx));
 }
 
 /* Selection highlight bounds for one buffer line, as display columns [*hs,*he)
@@ -13253,7 +13810,7 @@ buffer_reset(Editor *e)
 	X(t) X(has_name) X(cy) X(cx) X(top) X(left) X(sel_active) X(ay) X(ax) \
 	X(syn) X(line_state) X(line_state_cap) X(hl_valid) X(hex_view) \
 	X(hex_top) X(expand_tabs) X(vi_marks_set) X(swap_on) X(swap_rev) \
-	X(load_mtime) X(kind) X(vterm) X(in_pane) X(top_last) X(art)
+	X(load_mtime) X(kind) X(vterm) X(in_pane) X(top_last) X(art) X(tbl)
 #define BUF_STATE_ARRAYS(X) \
 	X(path) X(vi_mark_y) X(vi_mark_x) X(swap_path)
 
@@ -13411,6 +13968,7 @@ buf_open(Editor *e, const char *path)
 	e->vterm = NULL;
 	e->art = NULL;
 #endif
+	e->tbl = NULL;
 	if (path && path[0]) {
 		snprintf(e->path, sizeof(e->path), "%s", path);
 		e->has_name = 1;
@@ -13425,6 +13983,7 @@ buf_open(Editor *e, const char *path)
 #ifdef VEDIT_TERM
 	art_sync_file(e);
 #endif
+	tbl_sync_file(e);
 	e->sel_active = 0;
 	e->line_state = NULL;
 	e->line_state_cap = 0;
@@ -13467,6 +14026,7 @@ buf_close(Editor *e, int i)
 		}
 		art_detach(e);
 #endif
+		tbl_detach(e);
 		buf_free_fields(e->t, e->line_state);
 		memmove(&e->bufs[i], &e->bufs[i + 1],
 		    (size_t)(e->nbuf - i - 1) * sizeof(*e->bufs));
@@ -13480,6 +14040,7 @@ buf_close(Editor *e, int i)
 		term_buf_free(&e->bufs[i]);	/* no-op unless it is a terminal */
 		art_free(e->bufs[i].art);
 #endif
+		tbl_free(e->bufs[i].tbl);
 		buf_free_fields(e->bufs[i].t, e->bufs[i].line_state);
 		memmove(&e->bufs[i], &e->bufs[i + 1],
 		    (size_t)(e->nbuf - i - 1) * sizeof(*e->bufs));
@@ -15357,6 +15918,7 @@ ed_new(Editor *e)
 #ifdef VEDIT_TERM
 	art_detach(e);
 #endif
+	tbl_detach(e);
 	buf_save(e, &e->bufs[e->cur]);
 	set_status(e, "new buffer");
 }
@@ -15654,6 +16216,7 @@ ed_open(Editor *e)
 #ifdef VEDIT_TERM
 		art_sync_file(e);
 #endif
+		tbl_sync_file(e);
 		swap_adopt(e, mt, action);
 		buf_save(e, &e->bufs[e->cur]);
 		if (action != SWAP_RECOVERED)
@@ -18170,6 +18733,8 @@ editor_init(Editor *e)
 	e->hex_cols = 16;
 	e->scheme = SCHEME_DOS;	/* MS-EDIT look by default; View cycles it */
 	e->art_on = 1;		/* .ans files open in the art view */
+	e->tbl_on = 1;		/* .csv/.tsv files open in the table view */
+	e->tbl_header = 1;
 }
 
 /* Run the event loop until the editor exits. Returns a process-style code:
@@ -18414,12 +18979,14 @@ editor_teardown(Editor *e)
 			term_buf_free(&e->bufs[i]);	/* reap any child */
 			art_free(e->bufs[i].art);
 #endif
+			tbl_free(e->bufs[i].tbl);
 			buf_free_fields(e->bufs[i].t, e->bufs[i].line_state);
 		}
 	} else {
 #ifdef VEDIT_TERM
 		art_detach(e);
 #endif
+		tbl_detach(e);
 		buf_free_fields(e->t, e->line_state);
 	}
 	free(e->bufs);
@@ -18516,6 +19083,7 @@ vedit_open(struct vedit *v, const char *path)
 #ifdef VEDIT_TERM
 	art_sync_file(&v->e);
 #endif
+	tbl_sync_file(&v->e);
 	return 0;
 }
 
@@ -18601,6 +19169,15 @@ ed_apply_config(Editor *e)
 			e->art_cols = v;
 	}
 #endif
+	e->tbl_on = cfg_bool(g_cfg, "table.view", e->tbl_on);
+	e->tbl_header = cfg_bool(g_cfg, "table.header", e->tbl_header);
+	s = cfg_get(g_cfg, "table.width");
+	if (s) {
+		int v = atoi(s);
+
+		if (v >= 0 && v <= TBL_WIDTH_MAX)
+			e->tbl_width = v;
+	}
 	s = cfg_get(g_cfg, "edit.shiftwidth");
 	if (s) {
 		int v = atoi(s);
@@ -22740,6 +23317,7 @@ term_install(Editor *e, Term *t)
 	e->vterm = t;
 	e->term_prefix = 0;
 	e->art = NULL;
+	e->tbl = NULL;
 	e->term_dirty = 1;
 	buf_save(e, &e->bufs[i]);		/* keep the slot consistent */
 	return i;
@@ -28786,7 +29364,7 @@ enum excmd {
 	EX_EDIT, EX_ENEW, EX_WRITE, EX_WQ, EX_XIT, EX_QUIT, EX_QALL, EX_WQALL,
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
 	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD,
-	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT,
+	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH,
 };
 
 static const struct excmd_name {
@@ -28826,6 +29404,8 @@ static const struct excmd_name {
 	{ "pop",	2, EX_POP },
 	{ "retab",	3, EX_RETAB },
 	{ "draw",	2, EX_DRAW },
+	{ "table",	3, EX_TABLE },
+	{ "colwidth",	4, EX_COLWIDTH },
 	{ "reload",	3, EX_RELOAD },
 	{ "marks",	3, EX_MARKS },
 	{ "delmarks",	4, EX_DELMARKS },
@@ -29033,6 +29613,7 @@ vi_ex_exec(Editor *e, char *buf)
 #ifdef VEDIT_TERM
 			art_sync_file(e);
 #endif
+			tbl_sync_file(e);
 			set_status(e, "reloaded %.100s",
 			    e->path);
 		}
@@ -29173,6 +29754,12 @@ vi_ex_exec(Editor *e, char *buf)
 #endif
 	case EX_DRAW:
 		draw_toggle(e);
+		return REQ_CONTINUE;
+	case EX_TABLE:
+		tbl_command(e, rest);
+		return REQ_CONTINUE;
+	case EX_COLWIDTH:
+		tbl_colwidth(e, rest);
 		return REQ_CONTINUE;
 	case EX_RELOAD:
 		ed_reload_config(e);

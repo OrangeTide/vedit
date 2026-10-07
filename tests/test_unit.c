@@ -2784,6 +2784,135 @@ t_isearch(Test *t)
 	text_free(e.t);
 }
 
+/* ---- the table view's parser ---- */
+
+static void
+t_tbl_fields(Test *t)
+{
+	static const char rec[] = "a,\"b,c\",\"d\"\"e\",,f";
+	Tblfield f[8];
+	char val[32];
+	int n;
+
+	n = tbl_fields(',', rec, sizeof(rec) - 1, f, 8);
+	TAP_CHECKF(t, n == 5, "%d fields", n);
+	TAP_CHECK(t, f[0].off == 0 && f[0].len == 1 && !f[0].quoted);
+	TAP_CHECK(t, f[1].off == 2 && f[1].len == 5 && f[1].quoted);
+	TAP_CHECK(t, f[3].len == 0 && f[4].off == 16 && f[4].len == 1);
+	TAP_CHECK(t, tbl_unquote(&f[1], rec, val, sizeof(val)) == 3 &&
+	    strcmp(val, "b,c") == 0);
+	TAP_CHECK(t, tbl_unquote(&f[2], rec, val, sizeof(val)) == 3 &&
+	    strcmp(val, "d\"e") == 0);
+	TAP_CHECK(t, tbl_unquote(&f[3], rec, val, sizeof(val)) == 0 && val[0] == '\0');
+
+	/* the count is right even when the array is too small */
+	TAP_CHECK(t, tbl_fields(',', rec, sizeof(rec) - 1, f, 2) == 5);
+	/* an empty line is one empty field */
+	TAP_CHECK(t, tbl_fields(',', "", 0, f, 8) == 1 && f[0].len == 0);
+	/* a tab file never quotes */
+	n = tbl_fields('\t', "\"x\ty\"\tz", 7, f, 8);
+	TAP_CHECK(t, n == 3 && !f[0].quoted && f[0].len == 2);
+	/* an unterminated quote runs to the end of the line */
+	n = tbl_fields(',', "a,\"open,x", 9, f, 8);
+	TAP_CHECK(t, n == 2 && f[1].len == 7);
+	TAP_CHECK(t, tbl_unquote(&f[1], "a,\"open,x", val, sizeof(val)) == 6 &&
+	    strcmp(val, "open,x") == 0);
+	/* a short output buffer still reports the full length */
+	TAP_CHECK(t, tbl_unquote(&f[1], "a,\"open,x", val, 3) == 6 &&
+	    strcmp(val, "op") == 0);
+}
+
+static void
+t_tbl_label(Test *t)
+{
+	static const struct { int col; const char *s; } cases[] = {
+		{ 0, "A" }, { 1, "B" }, { 25, "Z" }, { 26, "AA" }, { 27, "AB" },
+		{ 51, "AZ" }, { 52, "BA" }, { 701, "ZZ" }, { 702, "AAA" },
+		{ 18277, "ZZZ" }, { 18278, "AAAA" },
+	};
+	char buf[TBL_LABEL_MAX];
+	size_t i;
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		tbl_label(cases[i].col, buf, sizeof(buf));
+		TAP_CHECKF(t, strcmp(buf, cases[i].s) == 0, "%d -> %s, want %s",
+		    cases[i].col, buf, cases[i].s);
+	}
+	tbl_label(-1, buf, sizeof(buf));
+	TAP_CHECK(t, buf[0] == '\0');
+	tbl_label(27, buf, 2);			/* truncates, stays terminated */
+	TAP_CHECK(t, strcmp(buf, "A") == 0);
+}
+
+static void
+t_tbl_sniff(Test *t)
+{
+	static const char *const semi[] = { "a;b;c", "1;2;3", "x,y;z;w" };
+	static const char *const tabs[] = { "a\tb", "1\t2", "", "3\t4" };
+	static const char *const none[] = { "just text", "more" };
+	static const char *const mixed[] = { "a,b;c", "1,2,3", "4,5" };
+	Text *tx = text_new();
+
+	TAP_ASSERT(t, tx != NULL);
+	tx_fill(tx, semi, 3);
+	TAP_CHECK(t, tbl_sniff(tx) == ';');
+	text_free(tx);
+	tx = text_new();
+	tx_fill(tx, tabs, 4);
+	TAP_CHECK(t, tbl_sniff(tx) == '\t');
+	text_free(tx);
+	tx = text_new();
+	tx_fill(tx, none, 2);
+	TAP_CHECK(t, tbl_sniff(tx) == ',');
+	text_free(tx);
+	tx = text_new();
+	tx_fill(tx, mixed, 3);			/* commas: more, not consistent */
+	TAP_CHECK(t, tbl_sniff(tx) == ',');
+	text_free(tx);
+}
+
+static void
+t_tbl_join(Test *t)
+{
+	static const char *const L[] = {
+		"id,note", "1,\"first line", "second line\",x", "2,plain",
+		"3,\"a \"\"quoted\"\" word\"", "4,a\"b,c" };
+	Text *tx = text_new();
+	size_t len;
+	const char *s;
+	int i;
+
+	TAP_ASSERT(t, tx != NULL);
+	tx_fill(tx, L, 6);
+	text_set_eol(tx, EOL_CRLF);
+	tx->dirty = 0;
+	TAP_CHECK(t, tbl_join_records(tx, ',') == 0);
+	TAP_CHECKF(t, text_lines(tx) == 5, "%zu lines after the join", text_lines(tx));
+	s = text_line(tx, 1, &len);
+	TAP_CHECKF(t, len == 29 && memcmp(s, "1,\"first line\r\nsecond line\",x", 29) == 0,
+	    "joined [%.*s]", (int)len, s);
+	TAP_CHECK(t, !text_dirty(tx));	/* a representation change, not an edit */
+	/* a quote inside an unquoted field does not open one (line 4 stays) */
+	s = text_line(tx, 4, &len);
+	TAP_CHECK(t, len == 7 && memcmp(s, "4,a\"b,c", 7) == 0);
+	/* joining again is a no-op */
+	TAP_CHECK(t, tbl_join_records(tx, ',') == 0 && text_lines(tx) == 5);
+	text_free(tx);
+
+	/* a stray quote cannot swallow the file: the join stops at the cap */
+	tx = text_new();
+	TAP_ASSERT(t, tx != NULL);
+	text_insert(tx, 0, 0, "a,\"stray", 8);
+	for (i = 0; i < TBL_JOIN_MAX + 10; i++) {
+		text_split(tx, (size_t)i, text_line_len(tx, (size_t)i));
+		text_insert(tx, (size_t)i + 1, 0, "n,m", 3);
+	}
+	TAP_CHECK(t, tbl_join_records(tx, ',') == 1);
+	TAP_CHECKF(t, text_lines(tx) == (size_t)(TBL_JOIN_MAX + 11) - (TBL_JOIN_MAX - 1),
+	    "%zu lines left", text_lines(tx));
+	text_free(tx);
+}
+
 const Case tap_cases[] = {
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },
@@ -2802,6 +2931,10 @@ const Case tap_cases[] = {
 	{ "syntax_html", t_syntax_html },
 	{ "entry_scroll", t_entry_scroll },
 	{ "text_fp_roundtrip", t_text_fp_roundtrip },
+	{ "tbl_fields", t_tbl_fields },
+	{ "tbl_label", t_tbl_label },
+	{ "tbl_sniff", t_tbl_sniff },
+	{ "tbl_join", t_tbl_join },
 	{ "swap_paths", t_swap_paths },
 	{ "atomic_save", t_atomic_save },
 	{ "save_rodir_fallback", t_save_rodir_fallback },
