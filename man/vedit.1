@@ -167,6 +167,20 @@ ignores case and
 .B !
 reverses. In a table the key is the cursor column's cell. Edit > Sort Lines
 asks the same in a dialog.
+.TP
+.BI :tabstops " [COLS...|off]"
+Set the buffer's ruler of tab stops at the listed columns, show it, or clear
+it. Past the last stop they continue every
+.B tabstop
+columns
+.RB ( ":set ts=N" ).
+Hard tabs draw to the stops, and the Tab key, auto-indent,
+.B >>
+and
+.B :retab
+reach for them. Options > Tab Stops asks for the list. The ruler changes
+only how this editor shows and inserts tabs; the file keeps plain tab
+characters, so another program shows it at its own tab width.
 .SS vi
 NORMAL mode has the usual motions
 .RB ( "h j k l" ", " "0 ^ $" ", " "w b e" ", " "gg G" ", " "f F t T" )
@@ -200,7 +214,7 @@ The main sections are
 .B [ui]
 (scheme, line numbers, word wrap, box mode, colors),
 .B [edit]
-(personality, auto-indent, swap and backup files, format-on-save),
+(personality, auto-indent, tab stops, swap and backup files, format-on-save),
 .B [indent]
 (tabs versus spaces),
 .B [art]

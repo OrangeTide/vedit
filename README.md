@@ -203,6 +203,8 @@ A gitconfig-style file sets the startup defaults. It is read from the first of
     autoindent = on      # new lines copy the previous indent
     ignorecase = off     # on = searches match regardless of case
     shiftwidth = 0       # >> / << indent width in columns; 0 = one tab stop
+    tabstop = 8          # the interval between tab stops
+    tabstops =           # a ruler of stops, e.g. "5 9 17"; empty = none
     swap = on            # write a .swp crash-recovery snapshot (on by default)
     swapdir =            # where swap files go; empty = beside the file
     backup = off         # keep the previous version as a "~" file on save
@@ -442,7 +444,8 @@ and column.
 
 ### Tabs and indentation
 
-Tabs expand to 8-column stops on screen. **View > Show Tabs** (on by default)
+Tabs expand to 8-column stops on screen unless the buffer has a ruler (see
+"Tab stops" below). **View > Show Tabs** (on by default)
 marks each hard tab's first column with a dim guide glyph (an arrow in UTF-8
 mode, `>` in DEC or ASCII mode), so tabs and runs of spaces are easy to tell
 apart. In vi keys it is `:set list` / `:set nolist`.
@@ -469,6 +472,18 @@ expands every tab in each line; "Spaces to Tabs" repacks each line's leading
 indent into tabs plus a spaces remainder. In vi keys, `:retab` does whichever
 the current `expandtab` setting implies (tabs to spaces when indenting with
 spaces, otherwise the reverse), and takes an optional line range.
+
+**Tab stops** give a buffer a ruler like an old word processor's. `:tabstops 5
+9 17` puts stops at those columns (as the status bar counts them); past the
+last one they continue at the interval set by `:set tabstop=N` (`:set ts=N`),
+8 unless changed. Options > Tab Stops... asks for the same list. The ruler
+steers everything that reaches for "the next stop": how a hard tab is drawn,
+what the Tab key inserts when indenting with spaces, `>>` with no shiftwidth,
+and `:retab`. `:tabstops` alone shows the ruler and `:tabstops off` clears it,
+leaving only the interval. The ruler belongs to the buffer and follows it
+when you switch. It changes only how vedit shows and inserts tabs: the file
+keeps plain tab characters, so another program shows it at its own tab width. Fresh buffers take `edit.tabstop` (the interval) and
+`edit.tabstops` (the list) from the config.
 
 The config sets a fresh buffer's indent style, per language or globally:
 
@@ -1195,7 +1210,8 @@ Commands:
   every column's. `:colwidth fit` fits the current column to its widest cell
   (at least its label, at most 200 columns) and `:colwidth fit all`, or Edit >
   Fit Column Widths, fits every column. Widths otherwise stay fixed; the
-  default is 10 columns.
+  default is 10 columns. The per-column widths are the same structure a text
+  buffer uses for its tab stops (`:tabstops`).
 
 Config, under `[table]`: `view` (on by default) opens these files in the view,
 `header` (on) treats line 1 as a header, `width` sets the default column width.

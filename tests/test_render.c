@@ -1092,6 +1092,82 @@ t_shiftwidth(Test *t)
 	memio_free(&m);
 }
 
+/* A buffer's ruler of tab stops: :tabstops sets it, the display, the Tab key,
+ * >> and :retab follow it, :set ts=N changes the interval past the last
+ * stop, and the run stays with its buffer. */
+static void
+t_tabstops(Test *t)
+{
+	static const char *const L[] = { "x", "        y" };
+	char exbuf[64];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 2);
+
+	/* plain default: every 8 */
+	TAP_CHECK(t, v->e.tabs == NULL && disp_cols("\t\t", 2) == 16);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "tabstops")) == REQ_CONTINUE &&
+	    strstr(v->e.status, "every 8") != NULL);
+
+	/* a ruler: stops at columns 5 and 9, then every 8 */
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "tabstops 5 9")) == REQ_CONTINUE);
+	TAP_ASSERT(t, v->e.tabs != NULL);
+	TAP_CHECKF(t, strstr(v->e.status, "at 5 9, then every 8") != NULL, "status '%s'", v->e.status);
+	TAP_CHECK(t, disp_cols("\t", 1) == 4 && disp_cols("\t\t", 2) == 8 &&
+	    disp_cols("\t\t\t", 3) == 16 && disp_cols("ab\t", 3) == 4);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "tabstops 5 x")) == REQ_CONTINUE &&
+	    strstr(v->e.status, "E474") != NULL && disp_cols("\t", 1) == 4);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "tabstops 5 3")) == REQ_CONTINUE &&
+	    strstr(v->e.status, "E474") != NULL && disp_cols("\t", 1) == 4);
+
+	/* the Tab key with spaces reaches the next stop */
+	v->e.expand_tabs = 1;
+	v->e.cy = 0;
+	v->e.cx = 0;
+	ed_indent_tab(&v->e);
+	TAP_CHECK(t, vline_is(v, 0, "    x"));
+	ed_indent_tab(&v->e);
+	TAP_CHECK(t, vline_is(v, 0, "        x"));
+
+	/* >> with no shiftwidth is one stop; hard tabs pack to the stops */
+	v->e.expand_tabs = 0;
+	v->e.shiftwidth = 0;
+	vi_shift_lines(&v->e, 0, 0, 1);
+	TAP_CHECK(t, vline_is(v, 0, "\t        x"));
+	vi_shift_lines(&v->e, 0, 0, -1);
+	TAP_CHECK(t, vline_is(v, 0, "        x"));
+
+	/* :retab packs eight spaces as two tabs here */
+	TAP_CHECK(t, ed_retab_range(&v->e, 1, 1, 0) == 1 && vline_is(v, 1, "\t\ty"));
+	TAP_CHECK(t, ed_retab_range(&v->e, 1, 1, 1) == 1 && vline_is(v, 1, "        y"));
+
+	/* the interval past the last stop */
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "set ts=4")) == REQ_CONTINUE &&
+	    v->e.tabs->dflt == 4 && disp_cols("\t\t\t", 3) == 12);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "tabstops off")) == REQ_CONTINUE &&
+	    strstr(v->e.status, "every 4") != NULL && disp_cols("\t", 1) == 4);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "set ts=0")) == REQ_CONTINUE &&
+	    v->e.tabs->dflt == 4);
+
+	/* a new buffer starts plain; switching back restores the ruler */
+	TAP_ASSERT(t, buf_slot(&v->e) == 0);
+	buf_save(&v->e, &v->e.bufs[0]);
+	TAP_CHECK(t, buf_open(&v->e, NULL) >= 0 && v->e.tabs == NULL &&
+	    g_tabs == NULL && disp_cols("\t", 1) == 8);
+	buf_switch(&v->e, 0);
+	TAP_CHECK(t, v->e.tabs != NULL && g_tabs == v->e.tabs && disp_cols("\t", 1) == 4);
+
+	vedit_free(v);
+	TAP_CHECK(t, g_tabs == NULL);
+	memio_free(&m);
+}
+
 /* True when line y of the buffer equals the NUL-terminated want. */
 static int
 vline_is(struct vedit *v, size_t y, const char *want)
@@ -2928,6 +3004,7 @@ const Case tap_cases[] = {
 	{ "search_icase", t_search_icase },
 	{ "search_word", t_search_word },
 	{ "shiftwidth", t_shiftwidth },
+	{ "tabstops", t_tabstops },
 	{ "macro_play", t_macro_play },
 	{ "macro_record", t_macro_record },
 	{ "marks_special", t_marks_special },

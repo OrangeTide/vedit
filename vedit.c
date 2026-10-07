@@ -5880,6 +5880,132 @@ struct art {
 	int		nredo;
 };
 
+#define TAB_WIDTH 8
+
+/****************************************************************
+ * Column widths: the table's columns and a buffer's tab stops
+ *
+ * One structure serves both. The table view keeps a width per column; a
+ * text buffer keeps the same run as its tab stops, where stop k sits at
+ * the end of the first k + 1 widths. An entry of 0, and every column past
+ * the end of the run, takes the default width.
+ ****************************************************************/
+
+typedef struct widths {
+	int	*w;
+	int	n;
+	int	dflt;
+} Widths;
+
+static int
+widths_get(const Widths *ws, int c)
+{
+	if (c >= 0 && c < ws->n && ws->w[c] > 0)
+		return ws->w[c];
+	return ws->dflt;
+}
+
+/* Store w as column c's width, growing the run. Returns 0, or -1. */
+static int
+widths_set(Widths *ws, int c, int w)
+{
+	if (c < 0)
+		return -1;
+	if (c >= ws->n) {
+		int nn = c + 16;
+		int *nw = realloc(ws->w, (size_t)nn * sizeof(*nw));
+
+		if (!nw)
+			return -1;
+		memset(nw + ws->n, 0, (size_t)(nn - ws->n) * sizeof(*nw));
+		ws->w = nw;
+		ws->n = nn;
+	}
+	ws->w[c] = w;
+	return 0;
+}
+
+/* Make room for n columns at c, or close up n columns there (n < 0). */
+static void
+widths_shift(Widths *ws, int c, int n)
+{
+	int i;
+
+	if (c >= ws->n)
+		return;
+	if (n > 0) {
+		if (widths_set(ws, ws->n + n - 1, 0) < 0)
+			return;
+		for (i = ws->n - 1; i >= c + n; i--)
+			ws->w[i] = ws->w[i - n];
+		for (i = c; i < c + n; i++)
+			ws->w[i] = 0;
+	} else {
+		n = -n;
+		for (i = c; i + n < ws->n; i++)
+			ws->w[i] = ws->w[i + n];
+		for (; i < ws->n; i++)
+			ws->w[i] = 0;
+	}
+}
+
+/* Every column back to the default. */
+static void
+widths_clear(Widths *ws)
+{
+	if (ws->n)
+		memset(ws->w, 0, (size_t)ws->n * sizeof(*ws->w));
+}
+
+/* Set entries at the front of the run: the stops a ruler lists. */
+static int
+widths_count(const Widths *ws)
+{
+	int c = 0;
+
+	while (ws && c < ws->n && ws->w[c] > 0)
+		c++;
+	return c;
+}
+
+static void
+widths_free(Widths *ws)
+{
+	free(ws->w);
+	ws->w = NULL;
+	ws->n = 0;
+}
+
+/* The tab stops of the buffer being edited and drawn, or NULL for a stop
+ * every TAB_WIDTH columns. Set when a buffer becomes the active one
+ * (buf_load) and whenever its stops change: the display helpers take no
+ * editor, so they read the stops from here. */
+static const Widths *g_tabs;
+
+#define TAB_STOP_MAX	256	/* widest gap between two stops */
+
+/* The display column of the first tab stop past col. */
+static int
+tab_next(const Widths *ws, int col)
+{
+	int c, pos = 0;
+
+	if (!ws)
+		return (col / TAB_WIDTH + 1) * TAB_WIDTH;
+	for (c = 0; ; c++) {
+		int w = widths_get(ws, c);
+
+		if (w < 1)
+			w = 1;
+		pos += w;
+		if (pos > col)
+			return pos;
+	}
+}
+
+/* Columns from col to the next tab stop. */
+#define tab_fill(col)	(tab_next(g_tabs, (col)) - (col))
+
 /* The table view's state for a CSV/TSV buffer, defined here so the status
  * bar and the config reader can look inside; the code is after the hex view. */
 typedef struct tbl {
@@ -5887,9 +6013,7 @@ typedef struct tbl {
 	int	header;			/* line 1 is a frozen header row */
 	int	bom;			/* bytes of a UTF-8 BOM ahead of cell A1 */
 	int	ncols;			/* cached widest field count */
-	int	*width;			/* per-column display widths; 0 = default */
-	int	width_n;
-	int	width_default;		/* table.width */
+	Widths	w;			/* per-column display widths */
 	int	cx;			/* cell cursor column (the row is e->cy) */
 	int	left;			/* first visible column */
 	int	pending;		/* vi: a 'g' waiting for its second key */
@@ -5929,12 +6053,11 @@ typedef struct ebuf {
 	int		top_last;	/* the buffer last shown above the pane */
 	Art		*art;		/* art view grid for a .ans file, or NULL */
 	Tbl		*tbl;		/* table view state for a CSV/TSV, or NULL */
+	Widths		*tabs;		/* the ruler of tab stops, or NULL */
 } Buf;
 
 /* Referenced only by pointer here; the users include the real headers. */
 struct tkbd_seq;
-
-#define TAB_WIDTH 8
 
 /* Fixed-size text buffers carried on the Editor struct. */
 #define STATUS_MAX	160	/* transient status/message line */
@@ -6159,6 +6282,7 @@ typedef struct editor {
 
 	/* table view. tbl mirrors the active buffer. */
 	Tbl		*tbl;		/* active buffer's table state, or NULL */
+	Widths		*tabs;		/* active buffer's tab stops, or NULL */
 	int		tbl_on;		/* table.view: open .csv/.tsv files as a table */
 	int		tbl_header;	/* table.header: line 1 is a header row */
 	int		tbl_width;	/* table.width: default column width; 0 = built-in */
@@ -7666,7 +7790,7 @@ key_to_cmd(const struct tkbd_seq *seq)
  ****************************************************************/
 
 /* Display columns spanned by the first nbytes of s, expanding tabs to the
- * next TAB_WIDTH stop and honoring rune widths. */
+ * next tab stop and honoring rune widths. */
 int
 disp_cols(const char *s, size_t nbytes)
 {
@@ -7682,7 +7806,7 @@ disp_cols(const char *s, size_t nbytes)
 		if (n <= 0)
 			n = 1;
 		if (r == '\t')
-			w = TAB_WIDTH - (col % TAB_WIDTH);
+			w = tab_fill(col);
 		else if (r < 0x20 || r == 0x7f)
 			w = 1;
 		else {
@@ -8314,7 +8438,7 @@ typedef enum menu_act {
 	MA_SORT,
 	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS,
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS,
-	MA_VI_MODE, MA_RELOAD_CONFIG, MA_GLYPHS, MA_COLORS,
+	MA_VI_MODE, MA_RELOAD_CONFIG, MA_GLYPHS, MA_COLORS, MA_TABSTOPS,
 #ifndef VEDIT_NO_TOOLS
 	MA_FORMAT,
 	MA_COMPILE, MA_MAKE, MA_RUN, MA_VIEW_OUTPUT, MA_ERR_NEXT, MA_ERR_PREV,
@@ -8438,6 +8562,7 @@ static const Menuitem mi_options[] = {
 #ifdef VEDIT_TERM
 	{ "&Color Palette...",	"Alt+C",	"",	MA_COLORS },
 #endif
+	{ "&Tab Stops...",	"",	":tabstops",	MA_TABSTOPS },
 	{ "&Vi Keys",		"F2",	"",		MA_VI_MODE },
 	{ "&Reload Config",	"",	":reload",	MA_RELOAD_CONFIG },
 };
@@ -9148,7 +9273,7 @@ scr_line(Screen *d, int row, int col0, const char *s, size_t len,
 		if (n <= 0)
 			n = 1;
 		if (r == '\t')
-			w = TAB_WIDTH - (col % TAB_WIDTH);
+			w = tab_fill(col);
 		else if (r < 0x20 || r == 0x7f)
 			w = 1;
 		else {
@@ -10279,9 +10404,7 @@ tbl_count_cols(const Text *t, char delim)
 static int
 tbl_width(const Tbl *tb, int c)
 {
-	if (c >= 0 && c < tb->width_n && tb->width[c] > 0)
-		return tb->width[c];
-	return tb->width_default;
+	return widths_get(&tb->w, c);
 }
 
 /* Set column c's width, growing the array (unset entries use the default). */
@@ -10294,19 +10417,7 @@ tbl_set_width(Tbl *tb, int c, int w)
 		w = TBL_WIDTH_MIN;
 	if (w > TBL_WIDTH_MAX)
 		w = TBL_WIDTH_MAX;
-	if (c >= tb->width_n) {
-		int nn = c + 16;
-		int *nw = realloc(tb->width, (size_t)nn * sizeof(*nw));
-
-		if (!nw)
-			return -1;
-		memset(nw + tb->width_n, 0,
-		    (size_t)(nn - tb->width_n) * sizeof(*nw));
-		tb->width = nw;
-		tb->width_n = nn;
-	}
-	tb->width[c] = w;
-	return 0;
+	return widths_set(&tb->w, c, w);
 }
 
 static void
@@ -10314,7 +10425,7 @@ tbl_free(Tbl *tb)
 {
 	if (!tb)
 		return;
-	free(tb->width);
+	widths_free(&tb->w);
 	free(tb);
 }
 
@@ -10341,7 +10452,7 @@ tbl_attach(Editor *e, char delim, int header)
 		return -1;
 	tb->delim = delim ? delim : tbl_sniff(e->t);
 	tb->header = header;
-	tb->width_default = e->tbl_width > 0 ? e->tbl_width : TBL_WIDTH_DEFAULT;
+	tb->w.dflt = e->tbl_width > 0 ? e->tbl_width : TBL_WIDTH_DEFAULT;
 	capped = tbl_join_records(e->t, tb->delim);
 	s = text_line(e->t, 0, &len);
 	if (s && len >= 3 && memcmp(s, "\xef\xbb\xbf", 3) == 0)
@@ -11228,24 +11339,7 @@ tbl_row_paste(Editor *e, int below)
 static void
 tbl_width_shift(Tbl *tb, int c, int n)
 {
-	int i;
-
-	if (c >= tb->width_n)
-		return;
-	if (n > 0) {
-		if (tbl_set_width(tb, tb->width_n + n - 1, 0) < 0)
-			return;
-		for (i = tb->width_n - 1; i >= c + n; i--)
-			tb->width[i] = tb->width[i - n];
-		for (i = c; i < c + n; i++)
-			tb->width[i] = 0;
-	} else {
-		n = -n;
-		for (i = c; i + n < tb->width_n; i++)
-			tb->width[i] = tb->width[i + n];
-		for (; i < tb->width_n; i++)
-			tb->width[i] = 0;
-	}
+	widths_shift(&tb->w, c, n);
 }
 
 /* Insert n empty columns left of the cursor column, or right of it. A row
@@ -11458,9 +11552,8 @@ tbl_colwidth(Editor *e, const char *arg)
 	while (*end == ' ')
 		end++;
 	if (strcmp(end, "all") == 0) {
-		for (c = 0; c < e->tbl->width_n; c++)
-			e->tbl->width[c] = 0;
-		e->tbl->width_default = (int)w;
+		widths_clear(&e->tbl->w);
+		e->tbl->w.dflt = (int)w;
 		set_status(e, "every column %ld wide", w);
 		return;
 	}
@@ -11532,7 +11625,7 @@ wrap_next(const char *s, size_t llen, size_t a, int acol, int W,
 		if (n <= 0)
 			n = 1;
 		if (r == '\t')
-			w = TAB_WIDTH - (col % TAB_WIDTH);
+			w = tab_fill(col);
 		else if ((w = rune_width(r)) < 1)
 			w = 1;
 		if (col - acol + w > W && i > a) {
@@ -12948,8 +13041,178 @@ ed_newline(Editor *e)
 	}
 }
 
+/****************************************************************
+ * Tab stops: a ruler for the Tab key and for drawing hard tabs
+ *
+ * Like a word processor's ruler: :tabstops 5 9 17 puts stops at those
+ * columns (counted as the status bar does), and the Tab key, auto-indent,
+ * >> and :retab all reach for the next stop, as does a hard tab on the
+ * screen. Past the last stop they continue every tabstop columns (:set
+ * ts=N). A buffer with no ruler stops every TAB_WIDTH columns. The run is
+ * part of the buffer and follows it when buffers switch.
+ ****************************************************************/
+
+/* Drop a run; the display helpers stop reading it. */
+static void
+tabs_free(Widths *ws)
+{
+	if (!ws)
+		return;
+	if (g_tabs == ws)
+		g_tabs = NULL;
+	widths_free(ws);
+	free(ws);
+}
+
+/* Give the active buffer the run ws (NULL = the plain default). */
+static void
+tabs_set(Editor *e, Widths *ws)
+{
+	tabs_free(e->tabs);
+	e->tabs = ws;
+	g_tabs = ws;
+}
+
+static void
+tabs_detach(Editor *e)
+{
+	tabs_set(e, NULL);
+}
+
+/* The buffer's run, made with the interval dflt when it has none. */
+static Widths *
+tabs_make(Editor *e, int dflt)
+{
+	if (!e->tabs) {
+		Widths *ws = calloc(1, sizeof(*ws));
+
+		if (!ws)
+			return NULL;
+		ws->dflt = dflt;
+		tabs_set(e, ws);
+	}
+	return e->tabs;
+}
+
+/* Parse a ruler "5 9 17" (1-based columns, ascending) into a new run with
+ * the interval dflt. Returns the run, or NULL with a message in err. */
+static Widths *
+tabs_parse(const char *s, int dflt, char *err, size_t errsz)
+{
+	Widths *ws = calloc(1, sizeof(*ws));
+	int c = 0, last = 1;
+
+	if (!ws) {
+		snprintf(err, errsz, "out of memory");
+		return NULL;
+	}
+	ws->dflt = dflt;
+	for (;;) {
+		char *end;
+		long col;
+
+		while (*s == ' ' || *s == ',')
+			s++;
+		if (*s == '\0')
+			break;
+		col = strtol(s, &end, 10);
+		if (end == s || (*end != '\0' && *end != ' ' && *end != ',')) {
+			snprintf(err, errsz,
+			    "E474: tab stops are columns in ascending order");
+			goto fail;
+		}
+		if (col <= last || col - last > TAB_STOP_MAX) {
+			snprintf(err, errsz,
+			    "E474: stop %ld must be past %d by at most %d",
+			    col, last, TAB_STOP_MAX);
+			goto fail;
+		}
+		if (widths_set(ws, c++, (int)(col - last)) < 0) {
+			snprintf(err, errsz, "out of memory");
+			goto fail;
+		}
+		last = (int)col;
+		s = end;
+	}
+	return ws;
+fail:
+	widths_free(ws);
+	free(ws);
+	return NULL;
+}
+
+/* The ruler as "5 9 17" (empty when there are no listed stops). */
+static void
+tabs_format(const Widths *ws, char *buf, size_t bufsz)
+{
+	int c, n = widths_count(ws), col = 1;
+	size_t len = 0;
+
+	buf[0] = '\0';
+	for (c = 0; c < n && len + 12 < bufsz; c++) {
+		col += ws->w[c];
+		len += (size_t)snprintf(buf + len, bufsz - len, "%s%d",
+		    c ? " " : "", col);
+	}
+}
+
+/* :tabstops [COLS...|off] -- show, set or clear the buffer's ruler. */
+static void
+ex_tabstops(Editor *e, const char *arg)
+{
+	char buf[256], err[96];
+	Widths *ws;
+	int dflt = e->tabs ? e->tabs->dflt : TAB_WIDTH;
+
+	while (*arg == ' ')
+		arg++;
+	if (strcmp(arg, "off") == 0 || strcmp(arg, "default") == 0) {
+		if (e->tabs)
+			widths_clear(e->tabs);
+		arg = "";
+	} else if (*arg) {
+		ws = tabs_parse(arg, dflt, err, sizeof(err));
+		if (!ws) {
+			set_status(e, "%s", err);
+			return;
+		}
+		tabs_set(e, ws);
+	}
+	tabs_format(e->tabs, buf, sizeof(buf));
+	if (buf[0])
+		set_status(e, "tab stops at %s, then every %d", buf, dflt);
+	else
+		set_status(e, "a tab stop every %d columns", dflt);
+}
+
+/* A fresh buffer's ruler from the config: edit.tabstop is the interval and
+ * edit.tabstops the listed stops. */
+static void
+tabs_config(Editor *e)
+{
+	const char *s;
+	char err[96];
+	int dflt = TAB_WIDTH;
+
+	tabs_detach(e);
+	s = cfg_get(g_cfg, "edit.tabstop");
+	if (s && atoi(s) >= 1 && atoi(s) <= TAB_STOP_MAX)
+		dflt = atoi(s);
+	s = cfg_get(g_cfg, "edit.tabstops");
+	if (s && *s) {
+		Widths *ws = tabs_parse(s, dflt, err, sizeof(err));
+
+		if (ws) {
+			tabs_set(e, ws);
+			return;
+		}
+	}
+	if (dflt != TAB_WIDTH)
+		tabs_make(e, dflt);
+}
+
 /* Insert one indent step at the cursor: a hard tab, or, when the buffer indents
- * with spaces, enough spaces to reach the next TAB_WIDTH stop. */
+ * with spaces, enough spaces to reach the next tab stop. */
 static void
 ed_indent_tab(Editor *e)
 {
@@ -12964,8 +13227,8 @@ ed_indent_tab(Editor *e)
 	s = text_line(e->t, e->cy, &llen);
 	col = s ? disp_cols(s, e->cx) : 0;
 	{
-		int n = TAB_WIDTH - (col % TAB_WIDTH);
-		char spaces[TAB_WIDTH];
+		int n = tab_fill(col);
+		char spaces[TAB_STOP_MAX];
 
 		memset(spaces, ' ', (size_t)n);
 		ed_insert(e, spaces, (size_t)n);
@@ -13005,7 +13268,7 @@ ed_newline_indent(Editor *e)
 }
 
 /* Rewrite the whitespace of lines [lo, hi]. to_spaces expands every hard tab in
- * the line to spaces at the TAB_WIDTH stops; otherwise the leading indent is
+ * the line to spaces at the tab stops; otherwise the leading indent is
  * repacked into tabs plus a spaces remainder. The whole range is one undo step.
  * Returns the number of lines changed. */
 static int
@@ -13023,7 +13286,8 @@ ed_retab_range(Editor *e, size_t lo, size_t hi, int to_spaces)
 
 		if (!s || len == 0)
 			continue;
-		cap = len * TAB_WIDTH + 1;	/* a tab expands to at most 8 */
+		/* a tab becomes at most its columns; other bytes are copied */
+		cap = (size_t)disp_cols(s, len) + len + 1;
 		out = malloc(cap);
 		if (!out)
 			break;
@@ -13040,11 +13304,11 @@ ed_retab_range(Editor *e, size_t lo, size_t hi, int to_spaces)
 				if (n <= 0)
 					n = 1;
 				if (r == '\t') {
-					int w = TAB_WIDTH - (col % TAB_WIDTH);
+					int w = tab_fill(col);
 
 					while (w-- > 0)
 						out[olen++] = ' ';
-					col += TAB_WIDTH - (col % TAB_WIDTH);
+					col += tab_fill(col);
 				} else {
 					int rw = rune_width(r);
 
@@ -13058,20 +13322,20 @@ ed_retab_range(Editor *e, size_t lo, size_t hi, int to_spaces)
 			}
 		} else {
 			size_t i = 0;
-			int width = 0, tabs, sp, k;
+			int width = 0, pos = 0;
 
 			while (i < len && (s[i] == ' ' || s[i] == '\t')) {
 				if (s[i] == '\t')
-					width += TAB_WIDTH - (width % TAB_WIDTH);
+					width += tab_fill(width);
 				else
 					width++;
 				i++;
 			}
-			tabs = width / TAB_WIDTH;
-			sp = width % TAB_WIDTH;
-			for (k = 0; k < tabs; k++)
+			while (tab_next(g_tabs, pos) <= width) {
 				out[olen++] = '\t';
-			for (k = 0; k < sp; k++)
+				pos = tab_next(g_tabs, pos);
+			}
+			for (; pos < width; pos++)
 				out[olen++] = ' ';
 			memcpy(out + olen, s + i, len - i);
 			olen += len - i;
@@ -14815,6 +15079,7 @@ static const struct {
 	{ ":set nu wrap list",	"Toggle line numbers, word wrap, show-tabs" },
 	{ ":set ai et ff=",	"Auto-indent, indent with spaces, line endings" },
 	{ ":retab  :set sw=N",	"Convert tabs <-> spaces; set the shift width" },
+	{ ":tabstops 5 9 17|off",	"Tab stops for this buffer; :set ts=N the interval" },
 	{ ":[range]sort[!] n i N",	"Sort lines: decimal, ignore case, key at col N" },
 	{ ":set swapfile bk",	"Crash-recovery swap file / keep a ~ backup" },
 #ifndef VEDIT_NO_TOOLS
@@ -15488,7 +15753,7 @@ buffer_reset(Editor *e)
 	X(t) X(has_name) X(cy) X(cx) X(top) X(left) X(sel_active) X(ay) X(ax) \
 	X(syn) X(line_state) X(line_state_cap) X(hl_valid) X(hex_view) \
 	X(hex_top) X(expand_tabs) X(vi_marks_set) X(swap_on) X(swap_rev) \
-	X(load_mtime) X(kind) X(vterm) X(in_pane) X(top_last) X(art) X(tbl)
+	X(load_mtime) X(kind) X(vterm) X(in_pane) X(top_last) X(art) X(tbl) X(tabs)
 #define BUF_STATE_ARRAYS(X) \
 	X(path) X(vi_mark_y) X(vi_mark_x) X(swap_path)
 
@@ -15514,6 +15779,7 @@ buf_load(Editor *e, const Buf *b)
 #define CP(f) memcpy(e->f, b->f, sizeof(e->f));
 	BUF_STATE_ARRAYS(CP)
 #undef CP
+	g_tabs = e->tabs;
 	e->vi_visual = 0;
 	e->vi_want_col = e->vi_vert_run = e->vi_vert_prev = 0;
 	e->hex_ascii = 0;
@@ -15647,6 +15913,7 @@ buf_open(Editor *e, const char *path)
 	e->art = NULL;
 #endif
 	e->tbl = NULL;
+	e->tabs = NULL;
 	if (path && path[0]) {
 		snprintf(e->path, sizeof(e->path), "%s", path);
 		e->has_name = 1;
@@ -15657,6 +15924,7 @@ buf_open(Editor *e, const char *path)
 		e->syn = NULL;
 	}
 	e->expand_tabs = indent_expand_default(e->syn ? e->syn->name : NULL);
+	tabs_config(e);
 	e->cy = e->cx = e->top = e->left = 0;
 #ifdef VEDIT_TERM
 	art_sync_file(e);
@@ -15705,6 +15973,7 @@ buf_close(Editor *e, int i)
 		art_detach(e);
 #endif
 		tbl_detach(e);
+		tabs_detach(e);
 		buf_free_fields(e->t, e->line_state);
 		memmove(&e->bufs[i], &e->bufs[i + 1],
 		    (size_t)(e->nbuf - i - 1) * sizeof(*e->bufs));
@@ -17597,6 +17866,7 @@ ed_new(Editor *e)
 	art_detach(e);
 #endif
 	tbl_detach(e);
+	tabs_config(e);
 	buf_save(e, &e->bufs[e->cur]);
 	set_status(e, "new buffer");
 }
@@ -19366,6 +19636,15 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_GLYPHS:
 		dlg_glyphs(e);
 		break;
+	case MA_TABSTOPS: {
+		char buf[256];
+
+		tabs_format(e->tabs, buf, sizeof(buf));
+		if (prompt_line(e, "Tab stops (columns, or off): ", buf,
+		    sizeof(buf), 0))
+			ex_tabstops(e, buf);
+		break;
+	}
 	case MA_COLORS:
 #ifdef VEDIT_TERM
 		dlg_colors(e);
@@ -20726,6 +21005,7 @@ editor_teardown(Editor *e)
 			art_free(e->bufs[i].art);
 #endif
 			tbl_free(e->bufs[i].tbl);
+			tabs_free(e->bufs[i].tabs);
 			buf_free_fields(e->bufs[i].t, e->bufs[i].line_state);
 		}
 	} else {
@@ -20733,6 +21013,7 @@ editor_teardown(Editor *e)
 		art_detach(e);
 #endif
 		tbl_detach(e);
+		tabs_detach(e);
 		buf_free_fields(e->t, e->line_state);
 	}
 	free(e->bufs);
@@ -20826,6 +21107,7 @@ vedit_open(struct vedit *v, const char *path)
 	v->e.load_mtime = (stat(v->e.path, &st) == 0) ? st.st_mtime : 0;
 	v->e.syn = syn_for_ext(file_ext(v->e.path));
 	v->e.expand_tabs = indent_expand_default(v->e.syn ? v->e.syn->name : NULL);
+	tabs_config(&v->e);
 #ifdef VEDIT_TERM
 	art_sync_file(&v->e);
 #endif
@@ -20932,6 +21214,7 @@ ed_apply_config(Editor *e)
 			e->shiftwidth = v;
 	}
 	e->expand_tabs = indent_expand_default(e->syn ? e->syn->name : NULL);
+	tabs_config(e);
 	e->hl_on = cfg_bool(g_cfg, "syntax.enable", e->hl_on);
 	e->clip_osc52 = cfg_bool(g_cfg, "ui.clipboard", e->clip_osc52);
 	s = cfg_get(g_cfg, "edit.mode");
@@ -27660,7 +27943,7 @@ vi_col_to_byte(Editor *e, size_t y, int target_col)
 		if (n <= 0)
 			n = 1;
 		if (r == '\t')
-			w = TAB_WIDTH - (col % TAB_WIDTH);
+			w = tab_fill(col);
 		else if (r < 0x20 || r == 0x7f)
 			w = 1;
 		else {
@@ -28572,7 +28855,7 @@ vi_move_lines(Editor *e, int delta)
 }
 
 /* Shift lines [y1,y2] one indent level: dir > 0 prepends a tab, dir < 0 drops
- * a leading tab or up to TAB_WIDTH leading spaces. Blank lines are left alone.
+ * a leading tab or the spaces up to one stop. Blank lines are left alone.
  * The cursor rests on the first non-blank of the first shifted line. */
 static void
 vi_shift_lines(Editor *e, size_t y1, size_t y2, int dir)
@@ -28588,8 +28871,8 @@ vi_shift_lines(Editor *e, size_t y1, size_t y2, int dir)
 	if (y2 >= text_lines(e->t))
 		y2 = text_lines(e->t) - 1;
 
-	/* Shift by shiftwidth columns, or one tab stop when it is unset. */
-	int sw = e->shiftwidth > 0 ? e->shiftwidth : TAB_WIDTH;
+	/* Shift by shiftwidth columns, or to the first tab stop when unset. */
+	int sw = e->shiftwidth > 0 ? e->shiftwidth : tab_fill(0);
 
 	text_undo_group_begin(e->t);
 	for (y = y1; y <= y2; y++) {
@@ -28599,20 +28882,18 @@ vi_shift_lines(Editor *e, size_t y1, size_t y2, int dir)
 		if (len == 0)			/* leave blank lines unindented */
 			continue;
 		if (dir > 0) {
-			char ind[TAB_WIDTH * 8 + 8];	/* a bounded indent run */
-			int ni = 0, cols = sw;
+			char ind[TAB_STOP_MAX + 40];	/* a bounded indent run */
+			int ni = 0, cols = 0;
 
-			if (e->expand_tabs) {
-				while (cols-- > 0 && ni < (int)sizeof(ind))
-					ind[ni++] = ' ';
-			} else {
-				while (cols >= TAB_WIDTH && ni < (int)sizeof(ind)) {
+			if (!e->expand_tabs) {	/* tabs while a whole stop fits */
+				while (tab_next(g_tabs, cols) <= sw &&
+				    ni < (int)sizeof(ind)) {
 					ind[ni++] = '\t';
-					cols -= TAB_WIDTH;
+					cols = tab_next(g_tabs, cols);
 				}
-				while (cols-- > 0 && ni < (int)sizeof(ind))
-					ind[ni++] = ' ';
 			}
+			while (cols++ < sw && ni < (int)sizeof(ind))
+				ind[ni++] = ' ';
 			if (ni)
 				text_insert(e->t, y, 0, ind, (size_t)ni);
 		} else {
@@ -28623,7 +28904,7 @@ vi_shift_lines(Editor *e, size_t y1, size_t y2, int dir)
 			 * full stop, so the last one may slightly overshoot) */
 			while (i < len && cols < sw) {
 				if (s[i] == '\t')
-					cols += TAB_WIDTH;
+					cols = tab_next(g_tabs, cols);
 				else if (s[i] == ' ')
 					cols += 1;
 				else
@@ -31028,6 +31309,21 @@ ex_set(Editor *e, const char *arg)
 		set_status(e, "ignorecase %s",
 		    e->search_icase ? "on" : "off");
 		return REQ_CONTINUE;
+	} else if (strncmp(arg, "tabstop=", 8) == 0 ||
+	    strncmp(arg, "ts=", 3) == 0) {
+		int v = atoi(strchr(arg, '=') + 1);
+
+		if (v < 1 || v > TAB_STOP_MAX) {
+			set_status(e, "tabstop out of range (1-%d)", TAB_STOP_MAX);
+			return REQ_CONTINUE;
+		}
+		if (!tabs_make(e, v)) {
+			set_status(e, "out of memory");
+			return REQ_CONTINUE;
+		}
+		e->tabs->dflt = v;
+		set_status(e, "tabstop %d", v);
+		return REQ_CONTINUE;
 	} else if (strncmp(arg, "shiftwidth=", 11) == 0 ||
 	    strncmp(arg, "sw=", 3) == 0) {
 		int v = atoi(strchr(arg, '=') + 1);
@@ -31110,7 +31406,7 @@ enum excmd {
 	EX_EDIT, EX_ENEW, EX_WRITE, EX_WQ, EX_XIT, EX_QUIT, EX_QALL, EX_WQALL,
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
 	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD,
-	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH, EX_CELL, EX_SORT,
+	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH, EX_CELL, EX_SORT, EX_TABSTOPS,
 	EX_ROWADD, EX_ROWDEL, EX_COLADD, EX_COLDEL,
 };
 
@@ -31155,6 +31451,7 @@ static const struct excmd_name {
 	{ "colwidth",	4, EX_COLWIDTH },
 	{ "cell",	4, EX_CELL },
 	{ "sort",	3, EX_SORT },
+	{ "tabstops",	4, EX_TABSTOPS },
 	{ "rowadd",	4, EX_ROWADD },
 	{ "rowdel",	4, EX_ROWDEL },
 	{ "coladd",	4, EX_COLADD },
@@ -31513,6 +31810,9 @@ vi_ex_exec(Editor *e, char *buf)
 		return REQ_CONTINUE;
 	case EX_COLWIDTH:
 		tbl_colwidth(e, rest);
+		return REQ_CONTINUE;
+	case EX_TABSTOPS:
+		ex_tabstops(e, rest);
 		return REQ_CONTINUE;
 	case EX_CELL:
 		tbl_cell_goto(e, rest);
