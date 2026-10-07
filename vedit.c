@@ -1865,7 +1865,8 @@ rx_replace(rx_t *re, const char *text, size_t len, const char *repl,
             continue;
         }
 
-        sb_put(&out, text + copied, (size_t)(m[0].so - copied));
+        if (m[0].so > copied)   /* the gap before this match */
+            sb_put(&out, text + copied, (size_t)(m[0].so - copied));
         expand(&out, repl, text, m, ng);
         copied = m[0].eo;
         prev_end = m[0].eo;
@@ -1879,7 +1880,8 @@ rx_replace(rx_t *re, const char *text, size_t len, const char *repl,
             break;
     }
 
-    sb_put(&out, text + copied, (size_t)((long)len - copied));
+    if ((long)len > copied)     /* the tail after the last match */
+        sb_put(&out, text + copied, (size_t)((long)len - copied));
     free(m);
 
     if (out.oom) {
@@ -29950,7 +29952,11 @@ maildir_ensure(const char *dir)
 	int s;
 
 	for (s = 0; s < 3; s++) {
-		snprintf(sub, sizeof(sub), "%s/%s", dir, subs[s]);
+		if (snprintf(sub, sizeof(sub), "%s/%s", dir, subs[s]) >=
+		    (int)sizeof(sub)) {
+			errno = ENAMETOOLONG;
+			return -1;
+		}
 		if (mkdir_p(sub) != 0)
 			return -1;
 	}
