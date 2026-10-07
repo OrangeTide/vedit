@@ -1008,6 +1008,12 @@ In draw mode:
   `|` edges). A one-cell-wide or one-cell-tall selection reduces to a straight
   line, so the same key draws lines. The glyphs are plain ASCII, so they render
   on any client.
+- Alt+1 to Alt+9 and Alt+0 insert a glyph from the active set of the glyph
+  palette: ten named sets of ten (single, double and heavy box lines, rounded
+  corners, blocks, quadrants, eighths, arrows, shapes, marks). Alt+G, or
+  Options > Glyph Palette, opens a dialog showing every set: Up and Down pick
+  the active set, Left and Right a glyph, Enter inserts it, a digit inserts
+  that slot. The same palette serves the art view below.
 - Ctrl-S, Ctrl-Q, Ctrl-Z/Y, Ctrl-F, and Ctrl-L work as usual.
 
 Because the blanks you draw are real spaces, draw mode does not trim trailing
@@ -1050,6 +1056,8 @@ status line next to the mode:
 | Alt+B, Alt+L, Alt+U | toggle bold, blink, underline |
 | Alt+P | pick up the colours of the cell under the cursor |
 | Alt+R | reset the pen to plain |
+| Alt+C | the colour palette: a grid of every foreground and background pair; Enter takes both, F or B one of them |
+| Alt+1 to Alt+0, Alt+G | the glyph palette, as in draw mode; glyphs take the pen |
 
 The grid is as wide as the widest line in the file but at least 80 columns,
 which is what classic art is laid out for, and as tall as the file. `art.width`

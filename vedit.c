@@ -6020,6 +6020,7 @@ typedef struct editor {
 	char	tool_result[STATUS_MAX];	/* "Make exited 0, ..." for the frame */
 #endif
 	int		draw_mode;	/* 2D/block draw mode: free cursor + overtype */
+	int		glyph_set;	/* active set of the glyph palette (Alt+digit) */
 	char		last_find[FIND_MAX];	/* last search string, for repeat */
 	char		last_replace[FIND_MAX]; /* last replacement string */
 	int		vi_search_dir;	/* last search direction: 1 fwd, -1 back */
@@ -6166,6 +6167,10 @@ static void art_free(Art *a);
 static int art_export(Editor *e);		/* grid -> text buffer, for saving */
 static void art_render(Editor *e, Screen *d);
 static Req art_key(Editor *e, const struct tkbd_seq *seq);
+static int art_put(Editor *e, int y, int x, uint32_t cp);
+static void art_mark(Editor *e);
+static void art_move(Art *a, int dy, int dx);
+static void dlg_colors(Editor *e);		/* the colour palette dialog */
 static Term *pane_term(const Editor *e, int *idx);	/* the pane's terminal */
 static int pane_text_idx(const Editor *e);	/* the pane's text buffer, or -1 */
 static int pane_top_idx(const Editor *e);	/* the buffer shown above it */
@@ -8281,7 +8286,7 @@ typedef enum menu_act {
 	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_HEX, MA_DRAW,
 	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS,
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS,
-	MA_VI_MODE, MA_RELOAD_CONFIG,
+	MA_VI_MODE, MA_RELOAD_CONFIG, MA_GLYPHS, MA_COLORS,
 #ifndef VEDIT_NO_TOOLS
 	MA_FORMAT,
 	MA_COMPILE, MA_MAKE, MA_RUN, MA_VIEW_OUTPUT, MA_ERR_NEXT, MA_ERR_PREV,
@@ -8294,6 +8299,8 @@ typedef enum menu_act {
 
 /* draw mode toggle, defined with the draw-mode module further down */
 static void draw_toggle(Editor *e);
+static void dlg_glyphs(Editor *e);	/* the glyph palette dialog */
+static int glyph_alt_key(Editor *e, const struct tkbd_seq *seq);
 static void ed_reload_config(Editor *e);
 
 typedef struct menu_item {
@@ -8361,6 +8368,10 @@ static const Menuitem mi_view[] = {
 };
 static const Menuitem mi_options[] = {
 	{ "&Draw Mode",		"Ins",	"",		MA_DRAW },
+	{ "&Glyph Palette...",	"Alt+G",	"",	MA_GLYPHS },
+#ifdef VEDIT_TERM
+	{ "&Color Palette...",	"Alt+C",	"",	MA_COLORS },
+#endif
 	{ "&Vi Keys",		"F2",	"",		MA_VI_MODE },
 	{ "&Reload Config",	"",	":reload",	MA_RELOAD_CONFIG },
 };
@@ -8688,6 +8699,18 @@ menu_item_enabled(const Editor *e, Menuact act)
 		return text_can_redo(e->t);
 	case MA_CUT:
 		return e->sel_active;
+	case MA_GLYPHS:
+#ifdef VEDIT_TERM
+		if (e->art)
+			return 1;
+#endif
+		return e->draw_mode;
+	case MA_COLORS:
+#ifdef VEDIT_TERM
+		return e->art != NULL;
+#else
+		return 0;
+#endif
 	case MA_PASTE:
 		return e->clip && e->clip_len > 0;
 	case MA_OSC_COPY_FILE:
@@ -12705,6 +12728,13 @@ static const char *const tut_draw[] = {
 	"  - The glyphs are plain ASCII, so the drawing shows on any",
 	"    terminal.",
 	"",
+	"The glyph palette",
+	"",
+	"  - Alt+1 to Alt+9 and Alt+0 insert a glyph from the active set:",
+	"    box lines, blocks, arrows and more, ten glyphs per set.",
+	"  - Alt+G (or Options > Glyph Palette) shows every set. Up and",
+	"    Down pick the active set, Enter or a digit inserts a glyph.",
+	"",
 	"Moving blocks around",
 	"",
 	"  - With a rectangle marked, Ctrl-C copies it and Ctrl-X cuts",
@@ -12743,6 +12773,10 @@ static const char *const tut_art[] = {
 	"  - Alt+Up and Alt+Down cycle the foreground; Alt+Right and",
 	"    Alt+Left the background. Each runs default, then 0 to 15.",
 	"  - Alt+B bold, Alt+L blink, Alt+U underline, Alt+R plain.",
+	"  - Alt+C opens the colour palette: a grid of every foreground",
+	"    and background pair. Enter takes both, F or B just one.",
+	"  - Alt+1 to Alt+0 and Alt+G use the glyph palette, as in draw",
+	"    mode; the glyphs take the pen.",
 	"  - Alt+P picks up the colours of the cell under the cursor.",
 	"  - The status line shows a swatch of the pen next to -- ART --.",
 	"",
@@ -17037,6 +17071,14 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_VI_MODE:
 		toggle_vi(e);
 		break;
+	case MA_GLYPHS:
+		dlg_glyphs(e);
+		break;
+	case MA_COLORS:
+#ifdef VEDIT_TERM
+		dlg_colors(e);
+#endif
+		break;
 	case MA_RELOAD_CONFIG:
 		ed_reload_config(e);
 		break;
@@ -17753,6 +17795,9 @@ draw_key(Editor *e, const struct tkbd_seq *seq)
 	if (seq->type != TKBD_KEY)
 		return REQ_CONTINUE;
 
+	if ((seq->mod & TKBD_MOD_ALT) && glyph_alt_key(e, seq))
+		return REQ_CONTINUE;
+
 	if (ctrl) {
 		switch (k) {
 		case TKBD_KEY_S:
@@ -17875,6 +17920,210 @@ draw_key(Editor *e, const struct tkbd_seq *seq)
 		}
 	}
 	return REQ_CONTINUE;
+}
+
+/****************************************************************
+ * Glyph palette: sets of ten drawing glyphs on Alt+1 .. Alt+0
+ *
+ * TheDraw keeps a strip of ten glyphs on the function keys and lets you
+ * switch strips. Here each strip is a named set; Alt+digit inserts the
+ * glyph in that slot of the active set, and Alt+G opens a dialog that
+ * shows every set, picks the active one, and inserts any glyph. The
+ * palette serves draw mode (into the text) and the art view (into the
+ * grid, with the pen).
+ ****************************************************************/
+
+typedef struct glyph_set {
+	const char	*name;
+	uint32_t	cp[10];		/* slots 1 .. 9, 0 */
+} Glyphset;
+
+static const Glyphset g_glyph_sets[] = {
+	{ "Single",	{ 0x2500, 0x2502, 0x250c, 0x2510, 0x2514, 0x2518,
+			  0x251c, 0x2524, 0x252c, 0x2534 } },
+	{ "Double",	{ 0x2550, 0x2551, 0x2554, 0x2557, 0x255a, 0x255d,
+			  0x2560, 0x2563, 0x2566, 0x2569 } },
+	{ "Heavy",	{ 0x2501, 0x2503, 0x250f, 0x2513, 0x2517, 0x251b,
+			  0x2523, 0x252b, 0x2533, 0x253b } },
+	{ "Rounded",	{ 0x256d, 0x256e, 0x2570, 0x256f, 0x253c, 0x256c,
+			  0x2504, 0x2506, 0x2574, 0x2576 } },
+	{ "Blocks",	{ 0x2588, 0x2580, 0x2584, 0x258c, 0x2590, 0x2591,
+			  0x2592, 0x2593, 0x25a0, 0x25a1 } },
+	{ "Quadrants",	{ 0x2596, 0x2597, 0x2598, 0x259d, 0x259a, 0x259e,
+			  0x2599, 0x259b, 0x259c, 0x259f } },
+	{ "Eighths",	{ 0x2581, 0x2582, 0x2583, 0x2585, 0x2586, 0x2587,
+			  0x258f, 0x258e, 0x258d, 0x258b } },
+	{ "Arrows",	{ 0x2190, 0x2192, 0x2191, 0x2193, 0x2194, 0x2195,
+			  0x21d0, 0x21d2, 0x21d1, 0x21d3 } },
+	{ "Shapes",	{ 0x25cf, 0x25cb, 0x25c6, 0x25c7, 0x25b2, 0x25bc,
+			  0x25c0, 0x25b6, 0x2605, 0x2606 } },
+	{ "Marks",	{ 0x00b7, 0x2022, 0x2219, 0x25e6, 0x00a6, 0x2020,
+			  0x2021, 0x00a7, 0x00b6, 0x00a4 } },
+};
+#define GLYPH_SETS ((int)(sizeof(g_glyph_sets) / sizeof(g_glyph_sets[0])))
+
+/* Slot index for a digit key: 1..9 then 0 is the tenth; -1 otherwise. */
+static int
+glyph_slot(uint32_t ch)
+{
+	if (ch == '0')
+		return 9;
+	if (ch >= '1' && ch <= '9')
+		return (int)(ch - '1');
+	return -1;
+}
+
+/* Put one glyph at the cursor: into the art grid with the pen when the art
+ * view is up, else over the text as draw mode does. */
+static void
+glyph_insert(Editor *e, uint32_t cp)
+{
+	unsigned char buf[8];
+	int n;
+
+#ifdef VEDIT_TERM
+	if (e->art) {
+		int w;
+
+		e->sel_active = 0;
+		art_mark(e);
+		w = art_put(e, e->art->cy, e->art->cx, cp);
+		if (w > 0)
+			art_move(e->art, 0, w);
+		return;
+	}
+#endif
+	n = utf8_encode(buf, cp);
+	if (n > 0) {
+		e->sel_active = 0;
+		draw_overtype(e, (char *)buf, (size_t)n);
+	}
+}
+
+/* The palette dialog: a row per set, the active set marked, a cursor over
+ * one glyph. Up/Down pick the set (which becomes the active one), Left/Right
+ * the glyph, Enter inserts it, a digit inserts that slot of the set under
+ * the cursor, Esc closes. */
+typedef struct glyph_ctx {
+	int	col;		/* glyph slot under the cursor */
+	int	insert;		/* set by the key handler: insert this slot */
+} Glyphctx;
+
+#define GLYPH_NAME_W	10
+#define GLYPH_ROW0	2	/* rows below the title and the slot header */
+
+static void
+dlg_glyph_draw(Editor *e, const Modal *m, void *ctx)
+{
+	Glyphctx *g = ctx;
+	Screen *d = e->d;
+	int i, s, x0 = m->x + 2, gx = x0 + 2 + GLYPH_NAME_W + 1;
+
+	scr_text(d, m->y, m->x + 2, " Glyph palette ", m->fg, m->bg, m->base);
+	scr_text(d, m->y + 1, gx, "1 2 3 4 5 6 7 8 9 0", m->fg, m->bg,
+	    m->base | ATTR_BOLD);
+	for (s = 0; s < GLYPH_SETS; s++) {
+		int row = m->y + GLYPH_ROW0 + s;
+		const Glyphset *gs = &g_glyph_sets[s];
+		char label[GLYPH_NAME_W + 4];
+
+		snprintf(label, sizeof(label), "%c %-*s", s == e->glyph_set ?
+		    '>' : ' ', GLYPH_NAME_W, gs->name);
+		scr_text(d, row, x0, label, m->fg, m->bg, m->base);
+		for (i = 0; i < 10; i++) {
+			uint16_t at = m->base;
+
+			if (s == e->glyph_set && i == g->col)
+				at ^= ATTR_REVERSE;
+			scr_cell(d, row, gx + i * 2, gs->cp[i], m->fg, m->bg, at);
+		}
+	}
+	scr_text(d, m->y + m->h - 2, x0,
+	    "Enter inserts; Alt+digit inserts from the > set", m->fg, m->bg,
+	    m->base);
+	scr_cursor_vis(d, 1);
+	scr_cursor(d, m->y + GLYPH_ROW0 + e->glyph_set, gx + g->col * 2);
+}
+
+static int
+dlg_glyph_key(Editor *e, const Modal *m, const Event *ev, void *ctx)
+{
+	Glyphctx *g = ctx;
+	const struct tkbd_seq *k = &ev->key;
+	int slot;
+
+	(void)m;
+	if (k->type != TKBD_KEY)
+		return 0;
+	switch (k->key) {
+	case TKBD_KEY_UP:
+		if (e->glyph_set > 0)
+			e->glyph_set--;
+		return 0;
+	case TKBD_KEY_DOWN:
+		if (e->glyph_set + 1 < GLYPH_SETS)
+			e->glyph_set++;
+		return 0;
+	case TKBD_KEY_LEFT:
+		if (g->col > 0)
+			g->col--;
+		return 0;
+	case TKBD_KEY_RIGHT:
+		if (g->col < 9)
+			g->col++;
+		return 0;
+	case TKBD_KEY_HOME:
+		g->col = 0;
+		return 0;
+	case TKBD_KEY_END:
+		g->col = 9;
+		return 0;
+	case TKBD_KEY_ENTER:
+		g->insert = g->col;
+		return 1;
+	case TKBD_KEY_ESC:
+		return 1;
+	default:
+		break;
+	}
+	slot = k->ch != TKBD_CH_NONE ? glyph_slot(k->ch) : -1;
+	if (slot >= 0) {
+		g->insert = slot;
+		return 1;
+	}
+	return 0;
+}
+
+static void
+dlg_glyphs(Editor *e)
+{
+	Glyphctx g = { 0, -1 };
+
+	dlg_run(e, 52, GLYPH_ROW0 + GLYPH_SETS + 3, &g, dlg_glyph_draw,
+	    dlg_glyph_key);
+	if (g.insert >= 0)
+		glyph_insert(e, g_glyph_sets[e->glyph_set].cp[g.insert]);
+}
+
+/* Alt+digit and Alt+G in draw mode or the art view. Returns 1 when the key
+ * was one of them. */
+static int
+glyph_alt_key(Editor *e, const struct tkbd_seq *seq)
+{
+	int slot;
+
+	if (seq->ch == TKBD_CH_NONE)
+		return 0;
+	slot = glyph_slot(seq->ch);
+	if (slot >= 0) {
+		glyph_insert(e, g_glyph_sets[e->glyph_set].cp[slot]);
+		return 1;
+	}
+	if (tolower((int)seq->ch) == 'g') {
+		dlg_glyphs(e);
+		return 1;
+	}
+	return 0;
 }
 
 /****************************************************************
@@ -23506,6 +23755,9 @@ art_pen_key(Editor *e, const struct tkbd_seq *seq)
 			}
 			break;
 		}
+		case 'c':
+			dlg_colors(e);
+			return 1;
 		case 'r':
 			a->fg = art_def();
 			a->bg = art_def();
@@ -23517,6 +23769,143 @@ art_pen_key(Editor *e, const struct tkbd_seq *seq)
 	}
 	art_pen_status(e);
 	return 1;
+}
+
+/* ---- colour palette: every pair of the base colours in a grid ---- */
+
+/* Grid index 0 is the default colour, 1 .. 16 are colours 0 .. 15. */
+typedef struct color_ctx {
+	int	fy, fx;		/* cursor: foreground row, background column */
+	int	pick;		/* 0 none, 1 both, 2 foreground only, 3 background */
+} Colorctx;
+
+#define COLOR_GRID	17
+#define COLOR_LABEL_W	6
+
+static Color
+art_pal_color(int i)
+{
+	return i == 0 ? art_def() : art_idx(i - 1);
+}
+
+static int
+art_pal_index(Color c)
+{
+	if (c.type == COLOR_INDEXED && c.index < 16)
+		return c.index + 1;
+	return 0;
+}
+
+static void
+dlg_color_draw(Editor *e, const Modal *m, void *ctx)
+{
+	Colorctx *c = ctx;
+	Screen *d = e->d;
+	int x0 = m->x + 2, gx = x0 + COLOR_LABEL_W, r, k;
+	char label[16];
+
+	scr_text(d, m->y, m->x + 2, " Colour palette ", m->fg, m->bg, m->base);
+	scr_text(d, m->y + 1, x0, "fg\\bg", m->fg, m->bg, m->base | ATTR_BOLD);
+	for (k = 0; k < COLOR_GRID; k++) {
+		if (k == 0)
+			snprintf(label, sizeof(label), "D");
+		else
+			snprintf(label, sizeof(label), "%d", k - 1);
+		scr_text(d, m->y + 1, gx + k * 3, label, m->fg, m->bg,
+		    m->base | ATTR_BOLD);
+	}
+	for (r = 0; r < COLOR_GRID; r++) {
+		int row = m->y + 2 + r;
+
+		if (r == 0)
+			snprintf(label, sizeof(label), "D");
+		else
+			snprintf(label, sizeof(label), "%d", r - 1);
+		scr_text(d, row, x0, label, m->fg, m->bg, m->base | ATTR_BOLD);
+		for (k = 0; k < COLOR_GRID; k++)
+			scr_text(d, row, gx + k * 3, "Ab", art_pal_color(r),
+			    art_pal_color(k), e->art->attrs);
+	}
+	scr_text(d, m->y + m->h - 2, x0,
+	    "Enter: fg and bg   F: fg only   B: bg only   Esc: keep", m->fg,
+	    m->bg, m->base);
+	scr_cursor_vis(d, 1);
+	scr_cursor(d, m->y + 2 + c->fy, gx + c->fx * 3);
+}
+
+static int
+dlg_color_key(Editor *e, const Modal *m, const Event *ev, void *ctx)
+{
+	Colorctx *c = ctx;
+	const struct tkbd_seq *k = &ev->key;
+
+	(void)e;
+	(void)m;
+	if (k->type != TKBD_KEY)
+		return 0;
+	switch (k->key) {
+	case TKBD_KEY_UP:
+		if (c->fy > 0)
+			c->fy--;
+		return 0;
+	case TKBD_KEY_DOWN:
+		if (c->fy + 1 < COLOR_GRID)
+			c->fy++;
+		return 0;
+	case TKBD_KEY_LEFT:
+		if (c->fx > 0)
+			c->fx--;
+		return 0;
+	case TKBD_KEY_RIGHT:
+		if (c->fx + 1 < COLOR_GRID)
+			c->fx++;
+		return 0;
+	case TKBD_KEY_HOME:
+		c->fx = 0;
+		return 0;
+	case TKBD_KEY_END:
+		c->fx = COLOR_GRID - 1;
+		return 0;
+	case TKBD_KEY_ENTER:
+		c->pick = 1;
+		return 1;
+	case TKBD_KEY_ESC:
+		return 1;
+	default:
+		break;
+	}
+	if (k->ch == 'f' || k->ch == 'F') {
+		c->pick = 2;
+		return 1;
+	}
+	if (k->ch == 'b' || k->ch == 'B') {
+		c->pick = 3;
+		return 1;
+	}
+	return 0;
+}
+
+/* Alt+C in the art view (and Options > Colour Palette): pick the pen's
+ * colours from the grid. The cursor starts on the current pair. */
+static void
+dlg_colors(Editor *e)
+{
+	Art *a = e->art;
+	Colorctx c;
+
+	if (!a)
+		return;
+	c.fy = art_pal_index(a->fg);
+	c.fx = art_pal_index(a->bg);
+	c.pick = 0;
+	dlg_run(e, 2 + COLOR_LABEL_W + COLOR_GRID * 3 + 1, COLOR_GRID + 5, &c,
+	    dlg_color_draw, dlg_color_key);
+	if (c.pick == 1 || c.pick == 2)
+		a->fg = art_pal_color(c.fy);
+	if (c.pick == 1 || c.pick == 3)
+		a->bg = art_pal_color(c.fx);
+	if (c.pick)
+		art_pen_status(e);
 }
 
 /* ---- rendering ---- */
@@ -23585,7 +23974,8 @@ art_key(Editor *e, const struct tkbd_seq *seq)
 	if (seq->type != TKBD_KEY)
 		return REQ_CONTINUE;
 
-	if ((seq->mod & TKBD_MOD_ALT) && art_pen_key(e, seq))
+	if ((seq->mod & TKBD_MOD_ALT) &&
+	    (glyph_alt_key(e, seq) || art_pen_key(e, seq)))
 		return REQ_CONTINUE;
 
 	if (ctrl) {

@@ -1448,6 +1448,98 @@ t_art_edit(Test *t)
 	memio_free(&m);
 }
 
+/* Alt+digit inserts from the active glyph set, in draw mode over the text and
+ * in the art view with the pen; the colour grid sets the pen. */
+static void
+t_palettes(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	struct tkbd_seq seq;
+	Modal md;
+	Event ev;
+	Colorctx cc;
+	size_t len;
+	const char *line;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+
+	/* draw mode: Alt+1 of the first set is a horizontal line glyph */
+	draw_toggle(&v->e);
+	memset(&seq, 0, sizeof(seq));
+	seq.type = TKBD_KEY;
+	seq.mod = TKBD_MOD_ALT;
+	seq.ch = '1';
+	seq.key = '1';
+	run_req(&v->e, draw_key(&v->e, &seq));
+	v->e.glyph_set = 4;			/* Blocks: slot 0 is a full block */
+	seq.ch = '0';
+	seq.key = '0';
+	run_req(&v->e, draw_key(&v->e, &seq));
+	line = text_line(v->e.t, 0, &len);
+	TAP_CHECKF(t, len == 6 && memcmp(line, "\xe2\x94\x80\xe2\x96\xa1", 6) == 0,
+	    "draw line [%.*s]", (int)len, line);
+	TAP_CHECK(t, v->e.cx == 6);		/* a byte offset in the text */
+	draw_toggle(&v->e);
+
+	/* the art view: the glyph takes the pen */
+	snprintf(v->e.path, sizeof(v->e.path), "p.ans");
+	v->e.has_name = 1;
+	art_sync_file(&v->e);
+	TAP_ASSERT(t, v->e.art != NULL);
+	v->e.art->fg = art_idx(3);
+	v->e.glyph_set = 0;
+	seq.ch = '2';
+	seq.key = '2';
+	run_req(&v->e, art_key(&v->e, &seq));
+	TAP_CHECK(t, art_cell(v->e.art, 0, 0)->codepoint == 0x2502 &&
+	    art_cell(v->e.art, 0, 0)->fg.index == 3 && v->e.art->cx == 1);
+
+	/* the colour grid: start on the pen, move, Enter sets both */
+	cc.fy = art_pal_index(v->e.art->fg);
+	cc.fx = art_pal_index(v->e.art->bg);
+	cc.pick = 0;
+	TAP_CHECK(t, cc.fy == 4 && cc.fx == 0);
+	memset(&ev, 0, sizeof(ev));
+	ev.type = EVENT_KEY;
+	ev.key.type = TKBD_KEY;
+	ev.key.ch = TKBD_CH_NONE;
+	ev.key.key = TKBD_KEY_DOWN;
+	TAP_CHECK(t, dlg_color_key(&v->e, &md, &ev, &cc) == 0);
+	ev.key.key = TKBD_KEY_RIGHT;
+	TAP_CHECK(t, dlg_color_key(&v->e, &md, &ev, &cc) == 0);
+	ev.key.key = TKBD_KEY_ENTER;
+	TAP_CHECK(t, dlg_color_key(&v->e, &md, &ev, &cc) == 1 && cc.pick == 1);
+	TAP_CHECK(t, cc.fy == 5 && cc.fx == 1);
+	v->e.art->fg = art_pal_color(cc.fy);
+	v->e.art->bg = art_pal_color(cc.fx);
+	TAP_CHECK(t, v->e.art->fg.index == 4 && v->e.art->bg.type == COLOR_INDEXED &&
+	    v->e.art->bg.index == 0);
+	ev.key.key = TKBD_KEY_NONE;
+	ev.key.ch = 'f';
+	TAP_CHECK(t, dlg_color_key(&v->e, &md, &ev, &cc) == 1 && cc.pick == 2);
+
+	/* the glyph dialog's keys: a digit picks that slot and closes */
+	{
+		Glyphctx g = { 0, -1 };
+
+		ev.key.ch = TKBD_CH_NONE;
+		ev.key.key = TKBD_KEY_DOWN;
+		TAP_CHECK(t, dlg_glyph_key(&v->e, &md, &ev, &g) == 0 &&
+		    v->e.glyph_set == 1);
+		ev.key.key = TKBD_KEY_NONE;
+		ev.key.ch = '3';
+		TAP_CHECK(t, dlg_glyph_key(&v->e, &md, &ev, &g) == 1 && g.insert == 2);
+	}
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 const Case tap_cases[] = {
 	{ "term_attach_render", t_term_attach_render },
 	{ "term_collect", t_term_collect },
@@ -1487,5 +1579,6 @@ const Case tap_cases[] = {
 	{ "term_resize_skips", t_term_resize_skips },
 	{ "art_roundtrip", t_art_roundtrip },
 	{ "art_edit", t_art_edit },
+	{ "palettes", t_palettes },
 	{ NULL, NULL },
 };
