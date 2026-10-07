@@ -927,6 +927,7 @@ While a terminal buffer has focus, keystrokes pass straight through to the child
 | `Ctrl-W m`              | open the menu bar (F10 and Alt+letter go to the child) |
 | `Ctrl-W w` / `Ctrl-W W` | next / previous buffer                              |
 | `Ctrl-W n`              | open another terminal                               |
+| `Ctrl-W r` / `Ctrl-W R` | repost the output into a new buffer: as text / as art |
 | `Ctrl-W 1`..`9`         | switch to that buffer                               |
 | `Ctrl-W c` / `Ctrl-W q` | close the terminal (quits if it is the last buffer) |
 | `Ctrl-W Ctrl-W`         | send a literal Ctrl-W to the child                  |
@@ -935,6 +936,13 @@ The editor shortcuts, including F1, F8, F10, and Alt+letter, reach the child
 rather than the editor while a terminal has focus. `Ctrl-W m` is the way to
 the menu bar, and from there to every editor command; when the menu closes,
 focus returns to the terminal.
+
+A terminal's output can be copied into a buffer of its own with `Ctrl-W r`
+(Terminal > Repost as Text, or `:repost`), which gives a new text buffer holding
+the scrollback and the screen with trailing blanks dropped and wrapped lines
+rejoined, or `Ctrl-W R` (Terminal > Repost as Art, `:repost art`), which keeps
+the colours by opening the cells in the art view, ready to save as a `.ans`
+file. From a text buffer the same keys read the pane's terminal.
 
 The build commands (F9, Alt+F9, Ctrl+F9) open a terminal buffer of their own,
 labelled with the command name and shown in the pane described next, as covered
@@ -957,6 +965,7 @@ buffer last on top, else the previous one, above it.
 | `Ctrl-W b`                | show this buffer in the pane, another above; undo it |
 | `Ctrl-W w`                | move the focus into the pane, or back out of it      |
 | `Ctrl-W c`                | close the pane (a terminal is closed, a buffer kept) |
+| `Ctrl-W r` / `Ctrl-W R`   | repost the pane terminal's output as text / as art   |
 
 The pane's title is drawn reversed while the focus is there. With a terminal in
 the pane, keys then go to its program, with `Ctrl-W` as the prefix just as in a

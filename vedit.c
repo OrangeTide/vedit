@@ -6171,6 +6171,9 @@ static int art_put(Editor *e, int y, int x, uint32_t cp);
 static void art_mark(Editor *e);
 static void art_move(Art *a, int dy, int dx);
 static void dlg_colors(Editor *e);		/* the colour palette dialog */
+static Term *term_repost_src(const Editor *e);	/* terminal a repost reads */
+static int term_repost_text(Editor *e);	/* terminal history -> text buffer */
+static int term_repost_art(Editor *e);		/* terminal history -> art buffer */
 static Term *pane_term(const Editor *e, int *idx);	/* the pane's terminal */
 static int pane_text_idx(const Editor *e);	/* the pane's text buffer, or -1 */
 static int pane_top_idx(const Editor *e);	/* the buffer shown above it */
@@ -8293,6 +8296,7 @@ typedef enum menu_act {
 #endif
 #ifdef VEDIT_TERM
 	MA_TERM_NEW, MA_TERM_CLOSE, MA_TERM_SPLIT, MA_PANE_BUFFER, MA_PANE_CLOSE,
+	MA_TERM_REPOST_TEXT, MA_TERM_REPOST_ART,
 #endif
 	MA_HELP, MA_TUTORIAL, MA_ABOUT,
 } Menuact;
@@ -8396,6 +8400,9 @@ static const Menuitem mi_term[] = {
 	{ "&Split Terminal",	"Ctrl-W s",	":split",	MA_TERM_SPLIT },
 	{ "&Buffer in Pane",	"Ctrl-W b",	":sbuffer",	MA_PANE_BUFFER },
 	{ "Close &Pane",	"Ctrl-W c",	"",		MA_PANE_CLOSE },
+	{ "",			"",	"",		MA_SEP },
+	{ "Repost as &Text",	"Ctrl-W r",	":repost",	MA_TERM_REPOST_TEXT },
+	{ "Repost as &Art",	"Ctrl-W R",	":repost art",	MA_TERM_REPOST_ART },
 };
 #endif
 static const Menuitem mi_help[] = {
@@ -8752,6 +8759,9 @@ menu_item_enabled(const Editor *e, Menuact act)
 		return e->kind == BUF_TEXT && (e->in_pane || e->nbuf > 1);
 	case MA_PANE_CLOSE:
 		return pane_term(e, NULL) != NULL || pane_text_idx(e) >= 0;
+	case MA_TERM_REPOST_TEXT:
+	case MA_TERM_REPOST_ART:
+		return term_repost_src(e) != NULL;
 #endif
 	default:
 		return 1;
@@ -12575,6 +12585,7 @@ static const struct {
 #ifdef VEDIT_TERM
 	{ "Ctrl-W s / b / w / c",	"Pane below: a shell / this buffer / focus / close" },
 	{ "Ctrl-W m",		"In a terminal buffer: open the menu (F1 for the rest)" },
+	{ "Ctrl-W r / R",	"Copy a terminal's output to a new buffer: text / art" },
 #endif
 #ifndef VEDIT_NO_TOOLS
 	{ "Alt+F9 / F9",	"Compile the file / make the project" },
@@ -12634,6 +12645,7 @@ static const struct {
 	{ ":sbuffer [N]",	"Show buffer N (or this one) in the pane" },
 	{ "Ctrl-W s / b / w / c",	"Pane below: a shell / this buffer / focus / close" },
 	{ "Ctrl-W m / w / c",	"In a terminal: menu / next buffer / close" },
+	{ ":repost [art]",	"Copy a terminal's output to a new buffer" },
 #endif
 	{ ":reload",		"Re-read the config file (also Options menu)" },
 	{ "F1 / F2",		"Show this help / back to modeless keys" },
@@ -12839,6 +12851,7 @@ static const char *const tut_term[] = {
 	"      Ctrl-W c        close this terminal",
 	"      Ctrl-W q        close a terminal whose program has exited",
 	"      Ctrl-W Ctrl-W   send a literal Ctrl-W to the program",
+	"      Ctrl-W r / R    copy the output to a new buffer as text / art",
 	"",
 	"  Ctrl-W m is the way to the menu bar from a terminal, and from",
 	"  there to every editor command, including this help. The menu",
@@ -17122,6 +17135,12 @@ run_menu_act(Editor *e, Menuact act)
 		break;
 	case MA_PANE_CLOSE:
 		pane_close(e);
+		break;
+	case MA_TERM_REPOST_TEXT:
+		term_repost_text(e);
+		break;
+	case MA_TERM_REPOST_ART:
+		term_repost_art(e);
 		break;
 #endif
 	case MA_HELP:
@@ -22545,7 +22564,7 @@ pane_key(Editor *e)
 	Event ev;
 	uint32_t ch;
 
-	set_status(e, "Ctrl-W: (s)hell below, (b)uffer below, (w) focus the pane, (c)lose it");
+	set_status(e, "Ctrl-W: (s)hell below, (b)uffer below, (w) focus the pane, (c)lose it, (r)epost it");
 	ed_render(e, e->d);
 	for (;;) {
 		switch (scr_wait(e->d, &ev)) {
@@ -22581,6 +22600,10 @@ pane_key(Editor *e)
 		pane_buffer(e);
 	} else if (ch == 'c' || ch == 'q') {
 		pane_close(e);
+	} else if (ch == 'r') {
+		term_repost_text(e);
+	} else if (ch == 'R') {
+		term_repost_art(e);
 	}
 }
 
@@ -22908,6 +22931,14 @@ term_loop_step(Editor *e)
 		}
 		if (b == 'n') {
 			term_open(e, NULL);
+			ed_render(e, e->d);
+			return TERM_CONT;
+		}
+		if (b == 'r' || b == 'R') {	/* repost as text / as art */
+			if (b == 'r')
+				term_repost_text(e);
+			else
+				term_repost_art(e);
 			ed_render(e, e->d);
 			return TERM_CONT;
 		}
@@ -23315,6 +23346,168 @@ art_export(Editor *e)
 	e->t = nt;
 	e->cy = e->cx = e->top = e->left = 0;
 	e->hl_valid = 0;
+	return 0;
+}
+
+/* ---- repost: copy a terminal's scrollback and screen into a new buffer ---- */
+
+/* The terminal a repost reads: the active one, else the pane's. */
+static Term *
+term_repost_src(const Editor *e)
+{
+	if (term_is_active(e))
+		return e->vterm;
+	return pane_term(e, NULL);
+}
+
+/* Rows of history: the scrollback (oldest first) followed by the screen. */
+static int
+term_hist_rows(const Term *t)
+{
+	return vt_buf_scrollback_lines(t->vt->buf) + vt_buf_rows(t->vt->buf);
+}
+
+static struct vt_row *
+term_hist_row(const Term *t, int i)
+{
+	struct vt_buf *b = t->vt->buf;
+	int sb = vt_buf_scrollback_lines(b);
+
+	if (i < sb)
+		return vt_buf_scrollback_row(b, i - sb);
+	return vt_buf_row(b, i - sb);
+}
+
+/* The last history row with anything on it, or -1. */
+static int
+term_hist_last(const Term *t)
+{
+	int cols = vt_buf_cols(t->vt->buf), last = -1, y, x;
+
+	for (y = 0; y < term_hist_rows(t); y++) {
+		const struct vt_row *r = term_hist_row(t, y);
+
+		if (!r)
+			continue;
+		for (x = 0; x < cols; x++)
+			if (!art_cell_blank(&r->cells[x])) {
+				last = y;
+				break;
+			}
+	}
+	return last;
+}
+
+/* Repost the terminal as a text buffer: its glyphs, one line per row with
+ * trailing blanks dropped, rows the terminal wrapped joined back into one
+ * line. Returns 0, or -1 with a status message. */
+static int
+term_repost_text(Editor *e)
+{
+	Term *t = term_repost_src(e);
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *fp;
+	int cols, last, y, x, nlines = 0;
+
+	if (!t) {
+		set_status(e, "no terminal to repost");
+		return -1;
+	}
+	cols = vt_buf_cols(t->vt->buf);
+	last = term_hist_last(t);
+	fp = open_memstream(&buf, &len);
+	if (!fp)
+		return -1;
+	for (y = 0; y <= last; y++) {
+		const struct vt_row *r = term_hist_row(t, y);
+		int wrapped, end = 0;
+
+		if (!r)
+			continue;
+		wrapped = (r->flags & VT_ROW_WRAPPED) && y < last;
+		if (wrapped)
+			end = cols;	/* the blanks are part of the long line */
+		else
+			for (x = 0; x < cols; x++)
+				if (r->cells[x].codepoint != ' ' &&
+				    r->cells[x].codepoint != 0)
+					end = x + 1;
+		for (x = 0; x < end; x++) {
+			const Cell *c = &r->cells[x];
+			unsigned char u[4];
+			int n;
+
+			if (c->width == 0)
+				continue;
+			n = utf8_encode(u, c->codepoint ? c->codepoint : ' ');
+			if (n > 0)
+				fwrite(u, 1, (size_t)n, fp);
+		}
+		if (!wrapped) {
+			fputc('\n', fp);
+			nlines++;
+		}
+	}
+	if (fclose(fp) != 0) {
+		free(buf);
+		return -1;
+	}
+	if (buf_open(e, NULL) < 0) {
+		free(buf);
+		return -1;
+	}
+	if (len > 0) {
+		FILE *in = fmemopen(buf, len, "rb");
+
+		if (in) {
+			text_load_fp(e->t, in);
+			fclose(in);
+		}
+	}
+	free(buf);
+	e->t->dirty = 1;
+	set_status(e, "reposted %d lines as text [%d/%d]", nlines, e->cur + 1,
+	    e->nbuf);
+	return 0;
+}
+
+/* Repost the terminal as art: the cells with their colours, in a new unnamed
+ * buffer in the art view. Save it as a .ans file to keep it. */
+static int
+term_repost_art(Editor *e)
+{
+	Term *t = term_repost_src(e);
+	Art *a;
+	int cols, rows, y;
+
+	if (!t) {
+		set_status(e, "no terminal to repost");
+		return -1;
+	}
+	cols = vt_buf_cols(t->vt->buf);
+	rows = term_hist_last(t) + 1;
+	if (rows < 1)
+		rows = 1;
+	a = art_new(rows, cols);
+	if (!a)
+		return -1;
+	for (y = 0; y < rows; y++) {
+		const struct vt_row *r = term_hist_row(t, y);
+
+		if (r)
+			memcpy(vt_buf_row(a->vt->buf, y)->cells, r->cells,
+			    (size_t)cols * sizeof(Cell));
+	}
+	if (buf_open(e, NULL) < 0) {
+		art_free(a);
+		return -1;
+	}
+	e->art = a;
+	e->t->dirty = 1;
+	buf_save(e, &e->bufs[e->cur]);
+	set_status(e, "reposted %d rows as art; save as a .ans file [%d/%d]",
+	    rows, e->cur + 1, e->nbuf);
 	return 0;
 }
 
@@ -28593,7 +28786,7 @@ enum excmd {
 	EX_EDIT, EX_ENEW, EX_WRITE, EX_WQ, EX_XIT, EX_QUIT, EX_QALL, EX_WQALL,
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
 	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD,
-	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_FORMAT,
+	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT,
 };
 
 static const struct excmd_name {
@@ -28644,6 +28837,7 @@ static const struct excmd_name {
 	{ "terminal",	4, EX_TERM },
 	{ "split",	2, EX_SPLIT },
 	{ "sbuffer",	2, EX_SBUFFER },
+	{ "repost",	3, EX_REPOST },
 #endif
 };
 
@@ -28924,6 +29118,15 @@ vi_ex_exec(Editor *e, char *buf)
 		return REQ_CONTINUE;
 	case EX_SPLIT:
 		pane_run(e, *rest ? rest : NULL);
+		return REQ_CONTINUE;
+	case EX_REPOST:			/* :repost [art] */
+		if (strcmp(rest, "art") == 0 || strcmp(rest, "color") == 0 ||
+		    strcmp(rest, "colour") == 0)
+			term_repost_art(e);
+		else if (*rest)
+			set_status(e, "E474: :repost takes 'art' or nothing");
+		else
+			term_repost_text(e);
 		return REQ_CONTINUE;
 	case EX_SBUFFER:
 		if (*rest >= '0' && *rest <= '9') {

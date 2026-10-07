@@ -1540,6 +1540,64 @@ t_palettes(Test *t)
 	memio_free(&m);
 }
 
+/* Repost copies the scrollback and the screen into a new buffer: as text with
+ * wrapped rows rejoined and trailing blanks dropped, or as art with colours. */
+static void
+t_term_repost(Test *t)
+{
+	static const char out[] =
+	    "one\r\ntwo\r\nthree\r\n"
+	    "abcdefghijklmnopqrstuvwxy\r\n"	/* wraps at 20 columns */
+	    "\033[1;32mgreen\033[0m end\r\n";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child;
+	size_t len;
+	const char *line;
+
+	v = term_editor(&m, &io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, term_pair(v, &child, 4, 20) == 0);
+	TAP_ASSERT(t, write(child, out, sizeof(out) - 1) == (ssize_t)(sizeof(out) - 1));
+	term_drain(&v->e, v->e.vterm->master_fd);
+	TAP_CHECKF(t, vt_buf_scrollback_lines(v->e.vterm->vt->buf) == 3,
+	    "%d lines scrolled off", vt_buf_scrollback_lines(v->e.vterm->vt->buf));
+
+	TAP_ASSERT(t, term_repost_text(&v->e) == 0);
+	TAP_CHECK(t, v->e.nbuf == 2 && v->e.cur == 1 && v->e.kind == BUF_TEXT);
+	TAP_CHECKF(t, text_lines(v->e.t) == 5, "%zu lines", text_lines(v->e.t));
+	line = text_line(v->e.t, 0, &len);
+	TAP_CHECKF(t, len == 3 && memcmp(line, "one", 3) == 0, "line 0 [%.*s]", (int)len, line);
+	line = text_line(v->e.t, 3, &len);
+	TAP_CHECKF(t, len == 25 && memcmp(line, "abcdefghijklmnopqrstuvwxy", 25) == 0,
+	    "line 3 [%.*s]", (int)len, line);
+	line = text_line(v->e.t, 4, &len);
+	TAP_CHECKF(t, len == 9 && memcmp(line, "green end", 9) == 0, "line 4 [%.*s]", (int)len, line);
+	TAP_CHECK(t, text_dirty(v->e.t) && v->e.art == NULL);
+
+	/* from the text buffer there is no terminal to read */
+	TAP_CHECK(t, term_repost_src(&v->e) == NULL);
+	TAP_CHECK(t, term_repost_art(&v->e) < 0);
+
+	buf_switch(&v->e, 0);
+	TAP_ASSERT(t, term_is_active(&v->e));
+	TAP_ASSERT(t, term_repost_art(&v->e) == 0);
+	TAP_CHECK(t, v->e.nbuf == 3 && v->e.cur == 2 && v->e.art != NULL);
+	TAP_CHECKF(t, v->e.art->rows == 6 && v->e.art->cols == 20, "art %dx%d",
+	    v->e.art->cols, v->e.art->rows);
+	TAP_CHECK(t, art_cell(v->e.art, 0, 0)->codepoint == 'o');
+	TAP_CHECK(t, art_cell(v->e.art, 5, 0)->codepoint == 'g' &&
+	    art_cell(v->e.art, 5, 0)->fg.index == 2 &&
+	    (art_cell(v->e.art, 5, 0)->attrs & ATTR_BOLD));
+	TAP_CHECK(t, art_cell_plain(art_cell(v->e.art, 5, 6)));
+	TAP_CHECK(t, v->e.bufs[2].art == v->e.art);
+
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
 const Case tap_cases[] = {
 	{ "term_attach_render", t_term_attach_render },
 	{ "term_collect", t_term_collect },
@@ -1580,5 +1638,6 @@ const Case tap_cases[] = {
 	{ "art_roundtrip", t_art_roundtrip },
 	{ "art_edit", t_art_edit },
 	{ "palettes", t_palettes },
+	{ "term_repost", t_term_repost },
 	{ NULL, NULL },
 };
