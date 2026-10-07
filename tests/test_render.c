@@ -2752,6 +2752,152 @@ t_tbl_rows(Test *t)
 	rmdir(dir);
 }
 
+/* :sort: strings, decimal keys, ignore case, reverse, a key column, a
+ * stable order, the table's data rows, and the dialog's key handler. */
+static void
+t_sort(Test *t)
+{
+	static const char *const L[] = {
+		"pear 10", "Apple 2", "fig 2", "apple 1", "zoo x", "fig 100" };
+	char dir[] = "/tmp/vedit-tbl-XXXXXX";
+	char path[PATH_MAX], exbuf[32];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	FILE *f;
+	Sortctx c;
+	Event ev;
+	Modal md;
+	size_t len;
+	const char *s;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 6);
+
+	/* plain: bytewise, so capitals first; then ignore case; then reverse */
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "sort")) == REQ_CONTINUE);
+	s = text_line(v->e.t, 0, &len);
+	TAP_CHECKF(t, strcmp(s, "Apple 2") == 0, "line 0 [%s]", s);
+	s = text_line(v->e.t, 1, &len);
+	TAP_CHECK(t, strcmp(s, "apple 1") == 0);
+	s = text_line(v->e.t, 5, &len);
+	TAP_CHECK(t, strcmp(s, "zoo x") == 0);
+	TAP_CHECK(t, text_dirty(v->e.t));
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "sort i")) == REQ_CONTINUE);
+	s = text_line(v->e.t, 0, &len);
+	TAP_CHECKF(t, strcmp(s, "apple 1") == 0, "icase line 0 [%s]", s);
+	s = text_line(v->e.t, 1, &len);
+	TAP_CHECK(t, strcmp(s, "Apple 2") == 0);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "sort!")) == REQ_CONTINUE);
+	s = text_line(v->e.t, 0, &len);
+	TAP_CHECKF(t, strcmp(s, "zoo x") == 0, "reverse line 0 [%s]", s);
+	TAP_CHECK(t, strncmp(v->e.status, "sorted 6 lines", 14) == 0);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "sort!")) == REQ_CONTINUE);
+	TAP_CHECK(t, strcmp(v->e.status, "already in order") == 0);
+
+	/* a numeric key at column 4 (after the name); non-numbers last */
+	{
+		static const char *const N[] = {
+			"aa 10", "bb 2", "cc 100", "dd x", "ee 1" };
+
+		vedit_free(v);
+		memio_free(&m);
+		memio_init(&m, "", 0, 24, 80);
+		memio_bind(&io, &m);
+		v = vedit_new(&io);
+		TAP_ASSERT(t, v != NULL);
+		fill_lines(v->e.t, N, 5);
+	}
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "sort n 4")) == REQ_CONTINUE);
+	s = text_line(v->e.t, 0, &len);
+	TAP_CHECKF(t, strcmp(s, "ee 1") == 0, "numeric line 0 [%s]", s);
+	s = text_line(v->e.t, 2, &len);
+	TAP_CHECKF(t, strcmp(s, "aa 10") == 0, "numeric line 2 [%s]", s);
+	s = text_line(v->e.t, 3, &len);
+	TAP_CHECK(t, strcmp(s, "cc 100") == 0);
+	s = text_line(v->e.t, 4, &len);
+	TAP_CHECK(t, strcmp(s, "dd x") == 0);
+	/* a range sorts only those lines; undo restores one step */
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "1,3sort! n 4")) == REQ_CONTINUE);
+	s = text_line(v->e.t, 4, &len);
+	TAP_CHECK(t, strcmp(s, "dd x") == 0);
+	s = text_line(v->e.t, 0, &len);
+	TAP_CHECKF(t, strcmp(s, "aa 10") == 0, "range line 0 [%s]", s);
+	TAP_CHECK(t, text_undo(v->e.t, &v->e.cy, &v->e.cx) == 0);
+	s = text_line(v->e.t, 0, &len);
+	TAP_CHECK(t, strcmp(s, "ee 1") == 0);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "sort q")) == REQ_CONTINUE &&
+	    strncmp(v->e.status, "E474", 4) == 0);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* a table: the header stays, the key is the cursor column or a label */
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/s.csv", dir);
+	f = fopen(path, "wb");
+	TAP_ASSERT(t, f != NULL);
+	fputs("name,qty\n\"Smith, J\",10\nadams,9\nBrown,100\n", f);
+	fclose(f);
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	TAP_ASSERT(t, v->e.tbl != NULL);
+	v->e.tbl->cx = 1;
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "sort n")) == REQ_CONTINUE);
+	s = text_line(v->e.t, 0, &len);
+	TAP_CHECK(t, strcmp(s, "name,qty") == 0);
+	s = text_line(v->e.t, 1, &len);
+	TAP_CHECKF(t, strcmp(s, "adams,9") == 0, "table row 2 [%s]", s);
+	s = text_line(v->e.t, 3, &len);
+	TAP_CHECK(t, strcmp(s, "Brown,100") == 0);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "sort i A")) == REQ_CONTINUE);
+	s = text_line(v->e.t, 1, &len);
+	TAP_CHECKF(t, strcmp(s, "adams,9") == 0, "by name [%s]", s);
+	s = text_line(v->e.t, 3, &len);
+	TAP_CHECKF(t, strcmp(s, "\"Smith, J\",10") == 0, "by name last [%s]", s);
+
+	/* the dialog's keys: Tab to the kind, Right picks decimal, r reverses,
+	 * then Enter; a letter in the column field is a label */
+	memset(&c, 0, sizeof(c));
+	c.table = 1;
+	snprintf(c.col, sizeof(c.col), "B");
+	memset(&ev, 0, sizeof(ev));
+	ev.type = EVENT_KEY;
+	ev.key.type = TKBD_KEY;
+	ev.key.ch = TKBD_CH_NONE;
+	ev.key.key = TKBD_KEY_TAB;
+	TAP_CHECK(t, dlg_sort_key(&v->e, &md, &ev, &c) == 0 && c.focus == 1);
+	ev.key.key = TKBD_KEY_RIGHT;
+	TAP_CHECK(t, dlg_sort_key(&v->e, &md, &ev, &c) == 0 && c.numeric);
+	ev.key.key = TKBD_KEY_NONE;
+	ev.key.ch = 'r';
+	TAP_CHECK(t, dlg_sort_key(&v->e, &md, &ev, &c) == 0 && c.reverse);
+	ev.key.key = TKBD_KEY_ENTER;
+	ev.key.ch = TKBD_CH_NONE;
+	TAP_CHECK(t, dlg_sort_key(&v->e, &md, &ev, &c) == 1 && c.ok);
+	c.focus = 5;
+	ev.key.key = TKBD_KEY_ESC;
+	c.ok = 0;
+	TAP_CHECK(t, dlg_sort_key(&v->e, &md, &ev, &c) == 1 && !c.ok);
+	c.focus = 0;
+	ev.key.key = TKBD_KEY_NONE;
+	ev.key.ch = 'A';
+	TAP_CHECK(t, dlg_sort_key(&v->e, &md, &ev, &c) == 0 && strcmp(c.col, "BA") == 0);
+	ev.key.key = TKBD_KEY_BACKSPACE;
+	ev.key.ch = TKBD_CH_NONE;
+	TAP_CHECK(t, dlg_sort_key(&v->e, &md, &ev, &c) == 0 && strcmp(c.col, "B") == 0);
+
+	vedit_free(v);
+	memio_free(&m);
+	unlink(path);
+	rmdir(dir);
+}
+
 const Case tap_cases[] = {
 	{ "resize_grid", t_resize_grid },
 	{ "resize_signal", t_resize_signal },
@@ -2812,6 +2958,7 @@ const Case tap_cases[] = {
 	{ "tbl_edit", t_tbl_edit },
 	{ "tbl_loop", t_tbl_loop },
 	{ "tbl_rows", t_tbl_rows },
+	{ "sort", t_sort },
 #endif
 	{ NULL, NULL },
 };

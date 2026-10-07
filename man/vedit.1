@@ -156,6 +156,17 @@ in vi style
 and
 .B u
 work on cells and rows.
+.TP
+.BI : [range] sort [!] " [n] [i] [N]"
+Sort the lines of the range (the buffer, or a table's data rows) by the key
+starting at column N, as strings or with
+.B n
+as decimal numbers;
+.B i
+ignores case and
+.B !
+reverses. In a table the key is the cursor column's cell. Edit > Sort Lines
+asks the same in a dialog.
 .SS vi
 NORMAL mode has the usual motions
 .RB ( "h j k l" ", " "0 ^ $" ", " "w b e" ", " "gg G" ", " "f F t T" )

@@ -713,7 +713,7 @@ in insert mode too. `ZZ`
 writes and quits, `ZQ` quits without writing. The `:` line runs `write`, `quit`,
 `wq`, `xit`, `qall`, `wqall`, `cquit`, `edit`, `enew`, `read`, `buffer`,
 `bnext`, `bprevious`, `bdelete`, `buffers`, `tag`, `pop`, `retab`, `marks`,
-`delmarks`, `jumps`, `:N`,
+`delmarks`, `jumps`, `sort`, `:N`,
 `:set number` / `:set nonumber`, and `:set wrap` / `:set nowrap`. `:!cmd` runs a
 shell command the way the build commands run: in a terminal buffer labelled
 with the command, or in the output pane when a terminal buffer is not possible
@@ -847,6 +847,24 @@ A command marked with a sibling
 buffer, for a program that needs the full terminal rather than the embedded
 emulator. vedit leaves the alternate screen while it runs and returns when it
 exits.
+
+### Sorting lines
+
+`:[range]sort` sorts lines, the whole buffer when no range is given, as a
+stable sort in one undo step. The words after it set the key: `n` compares the
+keys as decimal numbers (lines without a number sort after the rest), `s` as
+strings (the default), `i` ignores case, `r` or a `!` after the command
+reverses the order, and a number N starts the key at column N of each line
+(`:sort n 12` sorts by the number that starts in column 12). `:'<,'>sort`
+sorts the last visual selection, `:5,20sort` a line range. Edit > Sort Lines
+collects the same options in a dialog and sorts the selected lines, or every
+line when nothing is selected.
+
+In the table view the key is the cell in the cursor column, or the column
+named after the command (`:sort n C`, `:sort 3`), and the default range is
+the data rows under the header, so the header stays put. Edit > Sort Lines
+does the same with the dialog.
+
 
 ### Formatting
 
@@ -1161,6 +1179,7 @@ operations, and its Undo, Redo, Copy and Paste act on the grid while it is up.
 | delete the column | Edit menu, `:coldel` | `:coldel` |
 | cut the cell | Ctrl+X | Ctrl+X |
 | undo, redo | Ctrl+Z, Ctrl+Y | u, Ctrl+R |
+| sort the rows by this column | Edit > Sort Lines, `:sort` | `:sort`, `:sort! n` |
 
 Row copies go through the clipboard as lines, so a row cut with `:rowdel` or
 dd pastes back with p or P, and pasting into a cell with Ctrl+V pastes the

@@ -8310,7 +8310,7 @@ typedef enum menu_act {
 	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_TAG_POP, MA_OPEN_HEADER,
 	MA_GOTO,
 	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_HEX, MA_TABLE, MA_DRAW,
-	MA_TBL_ROWADD, MA_TBL_ROWDEL, MA_TBL_COLADD, MA_TBL_COLDEL,
+	MA_TBL_ROWADD, MA_TBL_ROWDEL, MA_TBL_COLADD, MA_TBL_COLDEL, MA_SORT,
 	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS,
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS,
 	MA_VI_MODE, MA_RELOAD_CONFIG, MA_GLYPHS, MA_COLORS,
@@ -8397,6 +8397,7 @@ static const Menuitem mi_edit[] = {
 	{ "&Delete Row",	"",	":rowdel",	MA_TBL_ROWDEL },
 	{ "Insert Colu&mn",	"",	":coladd",	MA_TBL_COLADD },
 	{ "De&lete Column",	"",	":coldel",	MA_TBL_COLDEL },
+	{ "S&ort Lines...",	"",	":sort",	MA_SORT },
 	{ "",		"",		"",		MA_SEP },
 	{ "Copy to T&erminal",	 "",	"",	MA_OSC_COPY },
 	{ "Copy &File to Terminal","",	"",	MA_OSC_COPY_FILE },
@@ -11993,6 +11994,431 @@ dlg_run(Editor *e, int w, int h, void *ctx,
 }
 
 /****************************************************************
+ * Sorting lines
+ *
+ * :[range]sort[!] [n] [i] [N] sorts the lines of the range (the whole
+ * buffer by default) by the key that starts at column N (1-based; the
+ * whole line by default), as strings or, with n, as decimal numbers; i
+ * ignores case and ! reverses. In the table view the key is the cell in
+ * the cursor column (or the column named by N) and the default range is
+ * the data rows under the header. Edit > Sort Lines collects the same
+ * options in a dialog and sorts the selection, or everything. The sort is
+ * stable, and one undo step.
+ ****************************************************************/
+
+typedef struct sort_opt {
+	int	numeric;		/* decimal keys, else strings */
+	int	icase;
+	int	reverse;
+	size_t	col;			/* text: 0-based byte column of the key */
+	int	tblcol;			/* table: the key column, or -1 for text */
+} Sortopt;
+
+typedef struct sort_key {
+	size_t		idx;		/* the line's place before the sort */
+	const char	*s;
+	size_t		n;
+	double		num;
+	int		isnum;		/* a number was parsed */
+	char		*owned;		/* a decoded table cell */
+} Sortkey;
+
+static const Sortopt *g_sort_opt;	/* for the qsort comparator */
+
+static int
+sort_cmp_str(const Sortkey *a, const Sortkey *b, int icase)
+{
+	size_t n = a->n < b->n ? a->n : b->n, i;
+
+	for (i = 0; i < n; i++) {
+		int ca = (unsigned char)a->s[i], cb = (unsigned char)b->s[i];
+
+		if (icase) {
+			ca = tolower(ca);
+			cb = tolower(cb);
+		}
+		if (ca != cb)
+			return ca < cb ? -1 : 1;
+	}
+	return a->n < b->n ? -1 : a->n > b->n ? 1 : 0;
+}
+
+static int
+sort_cmp(const void *pa, const void *pb)
+{
+	const Sortkey *a = pa, *b = pb;
+	const Sortopt *o = g_sort_opt;
+	int r = 0;
+
+	if (o->numeric) {
+		if (a->isnum && b->isnum)
+			r = a->num < b->num ? -1 : a->num > b->num ? 1 : 0;
+		else if (a->isnum != b->isnum)
+			r = a->isnum ? -1 : 1;	/* numbers before the rest */
+	}
+	if (r == 0)
+		r = sort_cmp_str(a, b, o->icase);
+	if (o->reverse)
+		r = -r;
+	if (r == 0)				/* stable: keep the old order */
+		r = a->idx < b->idx ? -1 : a->idx > b->idx ? 1 : 0;
+	return r;
+}
+
+/* Sort lines [lo, hi] of the buffer. Returns the number of lines that
+ * moved, 0 when the range was already in order, or -1 on an error. */
+static long
+sort_lines(Editor *e, size_t lo, size_t hi, const Sortopt *o)
+{
+	size_t n, i, moved = 0;
+	Sortkey *keys;
+	char **bytes;
+	size_t *lens;
+
+	if (hi >= text_lines(e->t))
+		hi = text_lines(e->t) - 1;
+	if (lo > hi || hi - lo < 1)
+		return 0;
+	n = hi - lo + 1;
+	keys = calloc(n, sizeof(*keys));
+	bytes = calloc(n, sizeof(*bytes));
+	lens = calloc(n, sizeof(*lens));
+	if (!keys || !bytes || !lens) {
+		free(keys);
+		free(bytes);
+		free(lens);
+		return -1;
+	}
+	for (i = 0; i < n; i++) {
+		size_t len = 0;
+		const char *line = text_line(e->t, lo + i, &len);
+		Sortkey *k = &keys[i];
+
+		k->idx = i;
+		if (o->tblcol >= 0) {
+			k->owned = malloc(TBL_CELL_MAX);
+			if (!k->owned)
+				goto out;
+			tbl_cell_value(e, lo + i, o->tblcol, k->owned, TBL_CELL_MAX);
+			k->s = k->owned;
+			k->n = strlen(k->owned);
+		} else {
+			size_t c = o->col < len ? o->col : len;
+
+			k->s = line + c;
+			k->n = len - c;
+		}
+		if (o->numeric) {
+			char tmp[64], *end;
+			size_t j = 0, m = 0;
+
+			while (j < k->n && (k->s[j] == ' ' || k->s[j] == '\t'))
+				j++;
+			while (j < k->n && m + 1 < sizeof(tmp))
+				tmp[m++] = k->s[j++];
+			tmp[m] = '\0';
+			k->num = strtod(tmp, &end);
+			k->isnum = end != tmp;
+		}
+		bytes[i] = malloc(len + 1);
+		if (!bytes[i])
+			goto out;
+		memcpy(bytes[i], line, len);
+		bytes[i][len] = '\0';
+		lens[i] = len;
+	}
+	g_sort_opt = o;
+	qsort(keys, n, sizeof(*keys), sort_cmp);
+	for (i = 0; i < n; i++)
+		if (keys[i].idx != i)
+			moved++;
+	if (moved) {
+		text_undo_group_begin(e->t);
+		for (i = 0; i < n; i++) {
+			if (keys[i].idx == i)
+				continue;
+			text_delete(e->t, lo + i, 0, text_line_len(e->t, lo + i));
+			text_insert(e->t, lo + i, 0, bytes[keys[i].idx],
+			    lens[keys[i].idx]);
+		}
+		text_undo_group_end(e->t);
+		hl_touch(e, lo);
+	}
+out:
+	for (i = 0; i < n; i++) {
+		free(keys[i].owned);
+		free(bytes[i]);
+	}
+	free(keys);
+	free(bytes);
+	free(lens);
+	return (long)moved;
+}
+
+/* Parse the option words of :sort into *o (n, s, i, r, and a key column:
+ * a 1-based number for text, a number or a label for a table). Returns 0,
+ * or -1 after reporting the bad word. */
+static int
+sort_parse(Editor *e, const char *args, Sortopt *o)
+{
+	const char *p = args;
+
+	while (*p) {
+		const char *w = p;
+		size_t wl;
+
+		while (*p && *p != ' ')
+			p++;
+		wl = (size_t)(p - w);
+		while (*p == ' ')
+			p++;
+		if (wl == 1 && (*w == 'n' || *w == 'N')) {
+			o->numeric = 1;
+		} else if (wl == 1 && (*w == 's' || *w == 'S')) {
+			o->numeric = 0;
+		} else if (wl == 1 && (*w == 'i' || *w == 'I')) {
+			o->icase = 1;
+		} else if (wl == 1 && (*w == 'r' || *w == 'R')) {
+			o->reverse = !o->reverse;
+		} else if (isdigit((unsigned char)*w)) {
+			long v = strtol(w, NULL, 10);
+
+			if (v < 1) {
+				set_status(e, "E474: the key column counts from 1");
+				return -1;
+			}
+			if (o->tblcol >= 0)
+				o->tblcol = (int)v - 1;
+			else
+				o->col = (size_t)v - 1;
+		} else if (o->tblcol >= 0 && wl < TBL_LABEL_MAX) {
+			char label[TBL_LABEL_MAX];
+			int c;
+
+			memcpy(label, w, wl);
+			label[wl] = '\0';
+			c = tbl_label_col(label);
+			if (c < 0) {
+				set_status(e, "E474: :sort [n|s] [i] [r] [column]");
+				return -1;
+			}
+			o->tblcol = c;
+		} else {
+			set_status(e, "E474: :sort [n|s] [i] [r] [column]");
+			return -1;
+		}
+	}
+	if (o->tblcol >= 0 && e->tbl && o->tblcol >= e->tbl->ncols)
+		o->tblcol = e->tbl->ncols - 1;
+	return 0;
+}
+
+/* Run a sort over [lo, hi] and report. */
+static void
+sort_run(Editor *e, size_t lo, size_t hi, const Sortopt *o)
+{
+	long moved = sort_lines(e, lo, hi, o);
+
+	if (moved < 0)
+		set_status(e, "out of memory");
+	else if (moved == 0)
+		set_status(e, "already in order");
+	else
+		set_status(e, "sorted %zu line%s (%ld moved)", hi - lo + 1,
+		    hi - lo + 1 == 1 ? "" : "s", moved);
+}
+
+/* :[range]sort[!] [n] [i] [N] */
+static void
+vi_ex_sort(Editor *e, size_t lo, size_t hi, int had_range, int bang,
+    const char *rest)
+{
+	Sortopt o;
+
+	memset(&o, 0, sizeof(o));
+	o.reverse = bang;
+	o.tblcol = e->tbl ? e->tbl->cx : -1;
+	if (sort_parse(e, rest, &o) < 0)
+		return;
+	if (!had_range) {			/* the whole buffer, or the rows */
+		lo = e->tbl ? tbl_first_row(e) : 0;
+		hi = text_lines(e->t) - 1;
+	}
+	sort_run(e, lo, hi, &o);
+}
+
+/* ---- the Sort Lines dialog ---- */
+
+typedef struct sort_ctx {
+	char	col[TBL_LABEL_MAX];	/* the key column as typed */
+	int	numeric, reverse, icase;
+	int	focus;			/* 0 column, 1 kind, 2 reverse, 3 case, 4 OK, 5 Cancel */
+	int	ok;
+	int	table;
+} Sortctx;
+
+static void
+dlg_sort_draw(Editor *e, const Modal *m, void *ctx)
+{
+	Sortctx *c = ctx;
+	Screen *d = e->d;
+	int x = m->x + 2, y = m->y + 1;
+	uint16_t sel = m->base ^ ATTR_REVERSE;
+	char line[64];
+
+	snprintf(line, sizeof(line), "Key %s: ", c->table ? "column" : "column");
+	scr_text(d, y, x, line, m->fg, m->bg, m->base);
+	snprintf(line, sizeof(line), "[%-6s]", c->col);
+	scr_text(d, y, x + 12, line, m->fg, m->bg, c->focus == 0 ? sel : m->base);
+	scr_text(d, y, x + 22, c->table ? "(A, B .. or 1, 2 ..)" :
+	    "(1 = whole line)", m->fg, m->bg, m->base | ATTR_DIM);
+	scr_text(d, y + 1, x, "Key type:   ", m->fg, m->bg, m->base);
+	snprintf(line, sizeof(line), "(%c) String  (%c) Decimal",
+	    c->numeric ? ' ' : '*', c->numeric ? '*' : ' ');
+	scr_text(d, y + 1, x + 12, line, m->fg, m->bg, c->focus == 1 ? sel : m->base);
+	snprintf(line, sizeof(line), "[%c] Reverse order", c->reverse ? 'x' : ' ');
+	scr_text(d, y + 2, x, line, m->fg, m->bg, c->focus == 2 ? sel : m->base);
+	snprintf(line, sizeof(line), "[%c] Ignore case", c->icase ? 'x' : ' ');
+	scr_text(d, y + 3, x, line, m->fg, m->bg, c->focus == 3 ? sel : m->base);
+	scr_text(d, y + 5, x + 10, "[ OK ]", m->fg, m->bg, c->focus == 4 ? sel : m->base);
+	scr_text(d, y + 5, x + 20, "[ Cancel ]", m->fg, m->bg, c->focus == 5 ? sel : m->base);
+	if (c->focus == 0) {
+		scr_cursor_vis(d, 1);
+		scr_cursor(d, y, x + 13 + (int)strlen(c->col));
+	}
+}
+
+static int
+dlg_sort_key(Editor *e, const Modal *m, const Event *ev, void *ctx)
+{
+	Sortctx *c = ctx;
+	const struct tkbd_seq *k = &ev->key;
+	size_t n;
+
+	(void)e;
+	(void)m;
+	if (k->type != TKBD_KEY)
+		return 0;
+	switch (k->key) {
+	case TKBD_KEY_ESC:
+		return 1;
+	case TKBD_KEY_TAB:
+		c->focus = (k->mod & TKBD_MOD_SHIFT) ? (c->focus + 5) % 6 :
+		    (c->focus + 1) % 6;
+		return 0;
+	case TKBD_KEY_DOWN:
+		c->focus = (c->focus + 1) % 6;
+		return 0;
+	case TKBD_KEY_UP:
+		c->focus = (c->focus + 5) % 6;
+		return 0;
+	case TKBD_KEY_LEFT:
+	case TKBD_KEY_RIGHT:
+		if (c->focus == 1)
+			c->numeric = !c->numeric;
+		else if (c->focus == 4 || c->focus == 5)
+			c->focus = 9 - c->focus;
+		return 0;
+	case TKBD_KEY_ENTER:
+		c->ok = c->focus != 5;
+		return 1;
+	case TKBD_KEY_BACKSPACE:
+	case TKBD_KEY_BACKSPACE2:
+		n = strlen(c->col);
+		if (c->focus == 0 && n > 0)
+			c->col[n - 1] = '\0';
+		return 0;
+	default:
+		break;
+	}
+	if (k->ch == TKBD_CH_NONE)
+		return 0;
+	if (k->ch == ' ') {
+		if (c->focus == 1)
+			c->numeric = !c->numeric;
+		else if (c->focus == 2)
+			c->reverse = !c->reverse;
+		else if (c->focus == 3)
+			c->icase = !c->icase;
+		else if (c->focus == 4 || c->focus == 5) {
+			c->ok = c->focus == 4;
+			return 1;
+		}
+		return 0;
+	}
+	if (c->focus == 0 && k->ch < 128 && isalnum((int)k->ch)) {
+		n = strlen(c->col);
+		if (n + 1 < sizeof(c->col)) {
+			c->col[n] = (char)k->ch;
+			c->col[n + 1] = '\0';
+		}
+		return 0;
+	}
+	/* a letter picks a field when the column field is not focused */
+	switch (tolower((int)k->ch)) {
+	case 's':
+		c->numeric = 0;
+		break;
+	case 'd':
+	case 'n':
+		c->numeric = 1;
+		break;
+	case 'r':
+		c->reverse = !c->reverse;
+		break;
+	case 'i':
+		c->icase = !c->icase;
+		break;
+	case 'o':
+		c->ok = 1;
+		return 1;
+	case 'c':
+		return 1;
+	default:
+		break;
+	}
+	return 0;
+}
+
+/* Edit > Sort Lines: the dialog, then a sort of the selected lines, the
+ * table's rows, or the whole buffer. */
+static void
+dlg_sort(Editor *e)
+{
+	Sortctx c;
+	Sortopt o;
+	size_t lo, hi, x1, x2;
+
+	memset(&c, 0, sizeof(c));
+	c.table = e->tbl != NULL;
+	if (c.table)
+		tbl_label(e->tbl->cx, c.col, sizeof(c.col));
+	else
+		snprintf(c.col, sizeof(c.col), "1");
+	dlg_run(e, 48, 9, &c, dlg_sort_draw, dlg_sort_key);
+	if (!c.ok) {
+		set_status(e, "sort cancelled");
+		return;
+	}
+	memset(&o, 0, sizeof(o));
+	o.numeric = c.numeric;
+	o.reverse = c.reverse;
+	o.icase = c.icase;
+	o.tblcol = c.table ? e->tbl->cx : -1;
+	if (sort_parse(e, c.col, &o) < 0)
+		return;
+	if (e->sel_active && !c.table) {
+		sel_bounds(e, &lo, &x1, &hi, &x2);
+		if (hi > lo && x2 == 0)		/* a selection ending at a line start */
+			hi--;
+	} else {
+		lo = c.table ? tbl_first_row(e) : 0;
+		hi = text_lines(e->t) - 1;
+	}
+	sort_run(e, lo, hi, &o);
+}
+
+/****************************************************************
  * Reusable list picker
  *
  * A modal panel that shows a scrollable list and lets the user pick a row.
@@ -14343,6 +14769,7 @@ static const struct {
 	{ ":set nu wrap list",	"Toggle line numbers, word wrap, show-tabs" },
 	{ ":set ai et ff=",	"Auto-indent, indent with spaces, line endings" },
 	{ ":retab  :set sw=N",	"Convert tabs <-> spaces; set the shift width" },
+	{ ":[range]sort[!] n i N",	"Sort lines: decimal, ignore case, key at col N" },
 	{ ":set swapfile bk",	"Crash-recovery swap file / keep a ~ backup" },
 #ifndef VEDIT_NO_TOOLS
 	{ ":format  :set fos",	"Run the formatter / format on every save" },
@@ -18879,6 +19306,9 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_TBL_COLDEL:
 		if (e->tbl)
 			tbl_col_del(e, 1);
+		break;
+	case MA_SORT:
+		dlg_sort(e);
 		break;
 	case MA_VI_MODE:
 		toggle_vi(e);
@@ -30630,7 +31060,7 @@ enum excmd {
 	EX_EDIT, EX_ENEW, EX_WRITE, EX_WQ, EX_XIT, EX_QUIT, EX_QALL, EX_WQALL,
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
 	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD,
-	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH, EX_CELL,
+	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH, EX_CELL, EX_SORT,
 	EX_ROWADD, EX_ROWDEL, EX_COLADD, EX_COLDEL,
 };
 
@@ -30674,6 +31104,7 @@ static const struct excmd_name {
 	{ "table",	3, EX_TABLE },
 	{ "colwidth",	4, EX_COLWIDTH },
 	{ "cell",	4, EX_CELL },
+	{ "sort",	3, EX_SORT },
 	{ "rowadd",	4, EX_ROWADD },
 	{ "rowdel",	4, EX_ROWDEL },
 	{ "coladd",	4, EX_COLADD },
@@ -31035,6 +31466,9 @@ vi_ex_exec(Editor *e, char *buf)
 		return REQ_CONTINUE;
 	case EX_CELL:
 		tbl_cell_goto(e, rest);
+		return REQ_CONTINUE;
+	case EX_SORT:
+		vi_ex_sort(e, lo, hi, had_range, bang, rest);
 		return REQ_CONTINUE;
 	case EX_ROWADD:
 	case EX_ROWDEL:
