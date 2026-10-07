@@ -867,6 +867,19 @@ t_pane_split(Test *t)
 	    "text %d, full %d, pane %d", text_height(&v->e), full, ph);
 	TAP_CHECKF(t, pt->rows == ph, "pane grid %d rows, want %d", pt->rows, ph);
 
+	/* Ctrl-W + and - and :set paneheight resize the pane and its grid */
+	pane_resize(&v->e, 2);
+	TAP_CHECKF(t, pane_height(&v->e) == ph + 2 && pt->rows == ph + 2 &&
+	    text_height(&v->e) == full - ph - 3, "grown to %d, grid %d",
+	    pane_height(&v->e), pt->rows);
+	pane_resize(&v->e, -1);
+	TAP_CHECK(t, pane_height(&v->e) == ph + 1 && pt->rows == ph + 1);
+	pane_set_rows(&v->e, 1);			/* clamps to the minimum */
+	TAP_CHECK(t, pane_height(&v->e) == PANE_MIN_ROWS && pt->rows == PANE_MIN_ROWS);
+	pane_set_rows(&v->e, 0);			/* back to a third */
+	TAP_CHECK(t, pane_height(&v->e) == ph && pt->rows == ph &&
+	    strstr(v->e.status, "a third") != NULL);
+
 	/* Ctrl-W then the scripted "w" focuses the pane */
 	pane_key(&v->e);
 	TAP_CHECK(t, v->e.pane_focus == 1 && term_focus(&v->e) == pt);

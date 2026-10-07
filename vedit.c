@@ -8288,6 +8288,41 @@ pane_height(const Editor *e)
 	return h < 1 ? 1 : h;
 }
 
+/* Set the pane's rows for the session (0 = back to a third of the area),
+ * within the limits pane_height keeps, and fit a terminal there to them. */
+static void
+pane_set_rows(Editor *e, int rows)
+{
+	int full = text_height_full(e);
+
+	if (rows < 0)
+		rows = 0;
+	if (rows > 0 && rows < PANE_MIN_ROWS)
+		rows = PANE_MIN_ROWS;
+	if (rows > full - 4)
+		rows = full - 4;
+	e->pane_rows = rows;
+	term_resize_all(e);
+	if (pane_shown(e))
+		set_status(e, "pane %d rows%s", pane_height(e),
+		    rows ? "" : " (a third of the area)");
+	else if (rows)
+		set_status(e, "the next pane gets %d rows", pane_height(e));
+	else
+		set_status(e, "the next pane gets a third of the area");
+}
+
+/* Ctrl-W + and -, Terminal > Taller / Shorter Pane: grow or shrink by delta. */
+static void
+pane_resize(Editor *e, int delta)
+{
+	if (!pane_shown(e)) {
+		set_status(e, "no pane to resize (Ctrl-W s opens one)");
+		return;
+	}
+	pane_set_rows(e, pane_height(e) + delta);
+}
+
 /* Whether the pane is on screen: it has a terminal or a text buffer, the
  * current buffer is text (a terminal buffer or the hex view takes the whole
  * area), the window is tall enough, and when the current buffer is itself
@@ -8445,6 +8480,7 @@ typedef enum menu_act {
 #endif
 #ifdef VEDIT_TERM
 	MA_TERM_NEW, MA_TERM_CLOSE, MA_TERM_SPLIT, MA_PANE_BUFFER, MA_PANE_CLOSE,
+	MA_PANE_GROW, MA_PANE_SHRINK,
 	MA_TERM_REPOST_TEXT, MA_TERM_REPOST_ART,
 #endif
 	MA_HELP, MA_TUTORIAL, MA_ABOUT,
@@ -8587,6 +8623,8 @@ static const Menuitem mi_term[] = {
 	{ "&Split Terminal",	"Ctrl-W s",	":split",	MA_TERM_SPLIT },
 	{ "&Buffer in Pane",	"Ctrl-W b",	":sbuffer",	MA_PANE_BUFFER },
 	{ "Close &Pane",	"Ctrl-W c",	"",		MA_PANE_CLOSE },
+	{ "Ta&ller Pane",	"Ctrl-W +",	"",		MA_PANE_GROW },
+	{ "Sh&orter Pane",	"Ctrl-W -",	"",		MA_PANE_SHRINK },
 	{ "",			"",	"",		MA_SEP },
 	{ "Repost as &Text",	"Ctrl-W r",	":repost",	MA_TERM_REPOST_TEXT },
 	{ "Repost as &Art",	"Ctrl-W R",	":repost art",	MA_TERM_REPOST_ART },
@@ -8954,6 +8992,9 @@ menu_item_enabled(const Editor *e, Menuact act)
 		return e->kind == BUF_TEXT && (e->in_pane || e->nbuf > 1);
 	case MA_PANE_CLOSE:
 		return pane_term(e, NULL) != NULL || pane_text_idx(e) >= 0;
+	case MA_PANE_GROW:
+	case MA_PANE_SHRINK:
+		return pane_shown(e);
 	case MA_TERM_REPOST_TEXT:
 	case MA_TERM_REPOST_ART:
 		return term_repost_src(e) != NULL;
@@ -15029,6 +15070,7 @@ static const struct {
 	{ "F8 / Shift+F8",	"Next / previous open buffer" },
 #ifdef VEDIT_TERM
 	{ "Ctrl-W s / b / w / c",	"Pane below: a shell / this buffer / focus / close" },
+	{ "Ctrl-W + / -  :set ph=N",	"Pane a row taller / shorter; set its rows" },
 	{ "Ctrl-W m",		"In a terminal buffer: open the menu (F1 for the rest)" },
 	{ "Ctrl-W r / R",	"Copy a terminal's output to a new buffer: text / art" },
 #endif
@@ -15091,6 +15133,7 @@ static const struct {
 	{ ":split [cmd]",	"Run a shell or cmd in a pane under the text" },
 	{ ":sbuffer [N]",	"Show buffer N (or this one) in the pane" },
 	{ "Ctrl-W s / b / w / c",	"Pane below: a shell / this buffer / focus / close" },
+	{ "Ctrl-W + / -  :set ph=N",	"Pane a row taller / shorter; set its rows" },
 	{ "Ctrl-W m / w / c",	"In a terminal: menu / next buffer / close" },
 	{ ":repost [art]",	"Copy a terminal's output to a new buffer" },
 	{ ":table [off|,|;|tab]",	"CSV/TSV grid view on this buffer (View menu too)" },
@@ -15282,12 +15325,14 @@ static const char *const tut_term[] = {
 	"      Ctrl-W b        show this buffer in the pane, another above",
 	"      Ctrl-W w        move the focus into the pane, or back",
 	"      Ctrl-W c        close the pane (a buffer stays open)",
+	"      Ctrl-W + / -    make the pane a row taller or shorter",
 	"      :split [cmd]    run cmd (default: a shell) in the pane",
 	"      :sbuffer [N]    show buffer N (default: this) in the pane",
 	"",
 	"  In a terminal pane, Ctrl-W w returns to the text and the other",
 	"  Ctrl-W keys below apply. The pane's title is reversed while it",
-	"  has the focus. ui.paneheight in the config sets its rows.",
+	"  has the focus. ui.paneheight in the config sets its rows and",
+	"  :set paneheight=N changes them (0 = a third of the area).",
 	"",
 	"Control keys",
 	"",
@@ -19693,6 +19738,12 @@ run_menu_act(Editor *e, Menuact act)
 		break;
 	case MA_PANE_CLOSE:
 		pane_close(e);
+		break;
+	case MA_PANE_GROW:
+		pane_resize(e, 1);
+		break;
+	case MA_PANE_SHRINK:
+		pane_resize(e, -1);
 		break;
 	case MA_TERM_REPOST_TEXT:
 		term_repost_text(e);
@@ -25170,7 +25221,7 @@ pane_key(Editor *e)
 	Event ev;
 	uint32_t ch;
 
-	set_status(e, "Ctrl-W: (s)hell below, (b)uffer below, (w) focus the pane, (c)lose it, (r)epost it");
+	set_status(e, "Ctrl-W: (s)hell below, (b)uffer below, (w) focus the pane, (c)lose it, (r)epost it, (+/-) resize it");
 	ed_render(e, e->d);
 	for (;;) {
 		switch (scr_wait(e->d, &ev)) {
@@ -25210,6 +25261,10 @@ pane_key(Editor *e)
 		term_repost_text(e);
 	} else if (ch == 'R') {
 		term_repost_art(e);
+	} else if (ch == '+' || ch == '=') {
+		pane_resize(e, 1);
+	} else if (ch == '-' || ch == '_') {
+		pane_resize(e, -1);
 	}
 }
 
@@ -25546,6 +25601,11 @@ term_loop_step(Editor *e)
 				term_repost_text(e);
 			else
 				term_repost_art(e);
+			ed_render(e, e->d);
+			return TERM_CONT;
+		}
+		if (b == '+' || b == '=' || b == '-' || b == '_') {
+			pane_resize(e, (b == '-' || b == '_') ? -1 : 1);
 			ed_render(e, e->d);
 			return TERM_CONT;
 		}
@@ -31309,6 +31369,18 @@ ex_set(Editor *e, const char *arg)
 		set_status(e, "ignorecase %s",
 		    e->search_icase ? "on" : "off");
 		return REQ_CONTINUE;
+#ifdef VEDIT_TERM
+	} else if (strncmp(arg, "paneheight=", 11) == 0 ||
+	    strncmp(arg, "ph=", 3) == 0) {
+		int v = atoi(strchr(arg, '=') + 1);
+
+		if (v < 0 || v > 500) {
+			set_status(e, "paneheight out of range (0-500)");
+			return REQ_CONTINUE;
+		}
+		pane_set_rows(e, v);
+		return REQ_CONTINUE;
+#endif
 	} else if (strncmp(arg, "tabstop=", 8) == 0 ||
 	    strncmp(arg, "ts=", 3) == 0) {
 		int v = atoi(strchr(arg, '=') + 1);

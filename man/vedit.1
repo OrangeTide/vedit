@@ -138,6 +138,14 @@ there), show the current buffer in the pane with another above it, move the
 focus into the pane or back, and close the pane. The build commands show
 their output in the same pane.
 .TP
+.BR Ctrl\-W " " + ", " \-
+Make the pane a row taller or shorter, from the text or from a terminal in
+the pane.
+.B :set paneheight=N
+sets its rows for the session (0 = a third of the area), as
+.B ui.paneheight
+does in the config.
+.TP
 .BR F1 ", " F2
 Show the key bindings, and toggle the vi personality.
 .TP

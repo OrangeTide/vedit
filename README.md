@@ -188,6 +188,7 @@ A gitconfig-style file sets the startup defaults. It is read from the first of
     clipboard = off      # also mirror every copy/yank to the terminal (OSC 52)
     tabs   = on          # mark hard tabs with a guide glyph
     paneheight = 0       # rows for the pane under the text; 0 = a third
+                         # (Ctrl-W + and - or :set ph=N change it later)
 
 [art]
     view  = on           # open .ans files in the art view (needs the emulator)
@@ -990,7 +991,10 @@ under [Build commands](#build-commands-a-primitive-ide).
 
 One buffer can be shown in a pane under the text, a third of the text area high
 (or `ui.paneheight = N` rows), so a build's output, a shell, a log, or a second
-file stays in view while you edit. Open a shell there with `Ctrl-W s`, Terminal >
+file stays in view while you edit. `Ctrl-W +` and `Ctrl-W -`, or Terminal >
+Taller Pane and Shorter Pane, change its height a row at a time, and
+`:set paneheight=N` (`:set ph=N`) sets it; 0 returns to a third. The keys work
+from the text and from a terminal in the pane. Open a shell there with `Ctrl-W s`, Terminal >
 Split Terminal, or the vi command `:split`; `:split cmd` runs `cmd` in the pane
 instead, as `:terminal cmd` would (`tail -f build.log`, say). The build commands
 put their output there by default. `Ctrl-W b`, Terminal > Buffer in Pane, or
@@ -1004,6 +1008,7 @@ buffer last on top, else the previous one, above it.
 | `Ctrl-W w`                | move the focus into the pane, or back out of it      |
 | `Ctrl-W c`                | close the pane (a terminal is closed, a buffer kept) |
 | `Ctrl-W r` / `Ctrl-W R`   | repost the pane terminal's output as text / as art   |
+| `Ctrl-W +` / `Ctrl-W -`   | make the pane a row taller / shorter                 |
 
 The pane's title is drawn reversed while the focus is there. With a terminal in
 the pane, keys then go to its program, with `Ctrl-W` as the prefix just as in a
