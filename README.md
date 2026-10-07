@@ -1597,3 +1597,10 @@ If you embed over raw telnet rather than a cooked pty, the host (not vedit)
 should handle telnet IAC negotiation and read the window size from NAWS, then
 pass it to `vedit_set_size()`. A read-only pager mode and a hard line-length cap
 for very small clients are reasonable additions at the editor layer.
+
+## How it was made
+
+This project was written primarily with Claude, mostly Claude Opus 4.8 and
+Claude Fable 5.1, working from the author's design decisions and review in
+Claude Code. The tests, screenshots, and documentation were produced the same
+way.
