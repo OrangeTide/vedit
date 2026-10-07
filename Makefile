@@ -118,8 +118,11 @@ $(TERMFAULTBIN): $(TESTDIR)/test_termfault.c $(TESTDIR)/testmain.c \
 	$(CC) $(TERMTESTCFLAGS) -o $@ $(TESTDIR)/test_termfault.c \
 	    $(TESTDIR)/testmain.c $(TERMFAULTLDFLAGS) $(LDFLAGS)
 
+# The tests never read a config file, but point the lookup at an empty
+# directory anyway so a developer's own settings can never leak in.
 test: $(TESTDIR)/taptest $(TESTBINS) $(TERMTESTBIN) $(TERMFAULTBIN)
-	$(TESTDIR)/taptest --self-test --exe $(TESTBINS) $(TERMTESTBIN) \
+	XDG_CONFIG_HOME=$(abspath $(TESTDIR))/no-config VEDIT_CONFIG= \
+	    $(TESTDIR)/taptest --self-test --exe $(TESTBINS) $(TERMTESTBIN) \
 	    $(TERMFAULTBIN)
 
 # Build and run the torture/fuzz suite.

@@ -174,12 +174,14 @@ changed row is cleared with one erase-to-EOL instead of a column of spaces.
 
 ### Configuration file
 
-A gitconfig-style file sets the startup defaults. It is read from the first of
-`$VEDIT_CONFIG`, `$XDG_CONFIG_HOME/vedit/config`, and `~/.veditrc` that exists;
-`--config FILE` points at a specific file and `--no-config` skips it.
+A gitconfig-style file sets the startup defaults. It is `$VEDIT_CONFIG` when
+that is set, else `$XDG_CONFIG_HOME/vedit/config`, which is
+`~/.config/vedit/config` when the variable is unset. `--config FILE` points at
+a specific file and `--no-config` skips it. A build for a platform without the
+XDG layout (`-DVEDIT_NO_XDG`) uses `~/.veditrc` instead.
 
 ```ini
-# ~/.veditrc
+# ~/.config/vedit/config
 [ui]
     scheme = black      # dos | black | plain
     number = on         # line-number gutter

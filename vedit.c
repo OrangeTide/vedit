@@ -20208,8 +20208,8 @@ usage(void)
 	    "  --config FILE read settings from FILE (gitconfig style)\n"
 	    "  --no-config   skip the config file\n"
 	    "                Default: $VEDIT_CONFIG, else $XDG_CONFIG_HOME/vedit/\n"
-	    "                config, else ~/.veditrc. Options > Edit Config opens\n"
-	    "                it, creating a new file at the XDG location.\n"
+	    "                config (~/.config when unset). Options > Edit Config\n"
+	    "                opens it, creating it when missing.\n"
 	    "\n"
 	    "Modeless (MS-EDIT) keys:\n"
 	    "  arrows        move the cursor\n"
@@ -27691,25 +27691,23 @@ cli_config_path(const char *opt, char *buf, size_t bufsz)
 		return 1;
 	}
 	buf[0] = '\0';
+#ifdef VEDIT_NO_XDG
+	env = getenv("HOME");
+	if (env && env[0])
+		snprintf(buf, bufsz, "%s/.veditrc", env);
+#else
 	env = getenv("XDG_CONFIG_HOME");
 	if (env && env[0]) {
 		snprintf(buf, bufsz, "%s/vedit/config", env);
-		if (access(buf, R_OK) == 0)
-			return 1;
-	}
-	env = getenv("HOME");
-	if (env && env[0]) {
-		char rc[PATH_MAX];
-
-		snprintf(rc, sizeof(rc), "%s/.veditrc", env);
-		if (access(rc, R_OK) == 0) {
-			snprintf(buf, bufsz, "%s", rc);
-			return 1;
-		}
-		if (buf[0] == '\0')
+	} else {
+		env = getenv("HOME");
+		if (env && env[0])
 			snprintf(buf, bufsz, "%s/.config/vedit/config", env);
 	}
-	return buf[0] ? 0 : -1;
+#endif
+	if (buf[0] == '\0')
+		return -1;
+	return access(buf, R_OK) == 0 ? 1 : 0;
 }
 
 #ifdef VEDIT_TERM

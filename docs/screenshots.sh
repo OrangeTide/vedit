@@ -154,6 +154,11 @@ export DISPLAY=$disp
 export VEDIT_COLORS=256
 export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 export VEDIT_CONFIG=$work/veditrc
+# and no fallback to the developer's own files, should VEDIT_CONFIG ever be
+# dropped from a render
+export XDG_CONFIG_HOME=$work/xdg
+export HOME=$work/home
+mkdir -p "$work/xdg" "$work/home"
 
 # render OUT FILE KEYSTEP...   each KEYSTEP is one xdotool key invocation.
 render() {

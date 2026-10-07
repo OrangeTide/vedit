@@ -549,6 +549,93 @@ t_mkdir_p(Test *t)
 	rmdir(dir);
 }
 
+/* cli_config_path: an explicit path as given; else $XDG_CONFIG_HOME/vedit/
+ * config, with ~/.config when the variable is unset, found or not. ~/.veditrc
+ * is not consulted on an XDG build. */
+static void
+t_cli_config_path(Test *t)
+{
+	char home[] = "/tmp/vedit_cpXXXXXX";
+	char buf[PATH_MAX], want[PATH_MAX], sub[PATH_MAX];
+	FILE *f;
+	const char *old_home = getenv("HOME"), *old_xdg = getenv("XDG_CONFIG_HOME");
+	const char *old_cfg = getenv("VEDIT_CONFIG");
+	char save_home[PATH_MAX] = "", save_xdg[PATH_MAX] = "", save_cfg[PATH_MAX] = "";
+
+	if (old_home)
+		snprintf(save_home, sizeof(save_home), "%s", old_home);
+	if (old_xdg)
+		snprintf(save_xdg, sizeof(save_xdg), "%s", old_xdg);
+	if (old_cfg)
+		snprintf(save_cfg, sizeof(save_cfg), "%s", old_cfg);
+
+	TAP_ASSERT(t, mkdtemp(home) != NULL);
+	setenv("HOME", home, 1);
+	unsetenv("XDG_CONFIG_HOME");
+	unsetenv("VEDIT_CONFIG");
+
+	/* nothing exists: the default location, flagged as missing */
+	snprintf(want, sizeof(want), "%s/.config/vedit/config", home);
+	TAP_CHECK(t, cli_config_path(NULL, buf, sizeof(buf)) == 0 &&
+	    strcmp(buf, want) == 0);
+
+	/* a ~/.veditrc is ignored on an XDG build */
+	snprintf(sub, sizeof(sub), "%s/.veditrc", home);
+	f = fopen(sub, "w");
+	TAP_ASSERT(t, f != NULL);
+	fclose(f);
+	TAP_CHECK(t, cli_config_path(NULL, buf, sizeof(buf)) == 0 &&
+	    strcmp(buf, want) == 0);
+	unlink(sub);
+
+	/* ~/.config/vedit/config exists: found and read, XDG unset */
+	snprintf(sub, sizeof(sub), "%s/.config/vedit", home);
+	mkdir_p(sub);
+	f = fopen(want, "w");
+	TAP_ASSERT(t, f != NULL);
+	fclose(f);
+	TAP_CHECKF(t, cli_config_path(NULL, buf, sizeof(buf)) == 1 &&
+	    strcmp(buf, want) == 0, "got %s", buf);
+
+	/* an explicit path wins as given, existing or not */
+	TAP_CHECK(t, cli_config_path("/nowhere/x", buf, sizeof(buf)) == 1 &&
+	    strcmp(buf, "/nowhere/x") == 0);
+	setenv("VEDIT_CONFIG", "/nowhere/y", 1);
+	TAP_CHECK(t, cli_config_path(NULL, buf, sizeof(buf)) == 1 &&
+	    strcmp(buf, "/nowhere/y") == 0);
+	unsetenv("VEDIT_CONFIG");
+
+	/* XDG_CONFIG_HOME set: that location, whether the file exists or not */
+	setenv("XDG_CONFIG_HOME", "/nonexistent-xdg", 1);
+	TAP_CHECK(t, cli_config_path(NULL, buf, sizeof(buf)) == 0 &&
+	    strcmp(buf, "/nonexistent-xdg/vedit/config") == 0);
+	unsetenv("XDG_CONFIG_HOME");
+
+	/* no HOME at all: no path */
+	unsetenv("HOME");
+	TAP_CHECK(t, cli_config_path(NULL, buf, sizeof(buf)) == -1);
+
+	unlink(want);
+	rmdir(sub);
+	snprintf(sub, sizeof(sub), "%s/.config", home);
+	rmdir(sub);
+	rmdir(home);
+
+	/* leave the process environment as it was for the other tests */
+	if (old_home)
+		setenv("HOME", save_home, 1);
+	else
+		unsetenv("HOME");
+	if (old_xdg)
+		setenv("XDG_CONFIG_HOME", save_xdg, 1);
+	else
+		unsetenv("XDG_CONFIG_HOME");
+	if (old_cfg)
+		setenv("VEDIT_CONFIG", save_cfg, 1);
+	else
+		unsetenv("VEDIT_CONFIG");
+}
+
 /* Serialize the whole buffer the way the file on disk would read: each line's
  * bytes in order, joined by '\n', with no trailing newline. Caller frees. */
 static char *
@@ -3025,6 +3112,7 @@ const Case tap_cases[] = {
 	{ "syntax_html", t_syntax_html },
 	{ "syntax_ini", t_syntax_ini },
 	{ "mkdir_p", t_mkdir_p },
+	{ "cli_config_path", t_cli_config_path },
 	{ "entry_scroll", t_entry_scroll },
 	{ "text_fp_roundtrip", t_text_fp_roundtrip },
 	{ "tbl_fields", t_tbl_fields },

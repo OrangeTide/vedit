@@ -208,10 +208,14 @@ Settings are read from a gitconfig-style file. Without
 .BR \-\-config ,
 vedit uses
 .BR $VEDIT_CONFIG ,
-then
-.BR $XDG_CONFIG_HOME/vedit/config ,
-then
-.BR ~/.veditrc .
+else
+.B $XDG_CONFIG_HOME/vedit/config
+.RB ( ~/.config/vedit/config
+when the variable is unset). A build for a platform without the XDG layout
+.RB ( \-DVEDIT_NO_XDG )
+uses
+.B ~/.veditrc
+instead.
 Keys are dotted and may be grouped under section headers. Booleans accept
 .BR on / off ,
 .BR yes / no ,
@@ -283,16 +287,17 @@ Per-key overrides for the project-varying config keys (see CONFIGURATION).
 .SH FILES
 .TP
 .B $XDG_CONFIG_HOME/vedit/config
-Configuration file, read when it exists and created there (or under
-.BR ~/.config )
-by Options > Edit Config or the
+Configuration file (under
+.B ~/.config
+when the variable is unset), read when it exists and created there by
+Options > Edit Config or the
 .B :config
-command when no config file exists yet.
+command. Overridden by
+.BR $VEDIT_CONFIG .
 .TP
 .B ~/.veditrc
-Alternative configuration file, read when the XDG one is absent (both rank
-after
-.BR $VEDIT_CONFIG ).
+The configuration file of a build without XDG support
+.RB ( \-DVEDIT_NO_XDG ).
 .TP
 .BI . name .swp
 Crash-recovery swap file written beside an edited file, unless relocated with
