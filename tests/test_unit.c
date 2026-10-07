@@ -516,6 +516,104 @@ t_syntax_ini(Test *t)
 	TAP_CHECK(t, syn_for_path("/x/main.c") == syn_for_ext("c"));
 }
 
+/* The git message grammar and the column rule behind it: the subject past
+ * column 50 and body lines past 72 are "over", comments and everything below
+ * a scissors line are comment, a tab counts to the next multiple of 8, a
+ * UTF-8 continuation byte adds no column, and the widths follow the config
+ * keys after a defaults rebuild. */
+static void
+t_syntax_gitcommit(Test *t)
+{
+	const Syntax *gc = syn_for_path("/repo/.git/COMMIT_EDITMSG");
+	uint16_t out[128];
+	uint32_t st;
+	char line[128];
+	int subj, over, com, txt, i;
+	Cfg *cfg;
+
+	TAP_ASSERT(t, gc != NULL && gc->fsm != NULL);
+	TAP_CHECK(t, syn_for_path("/x/MERGE_MSG") == gc);
+	TAP_CHECK(t, syn_for_path("/home/u/.gitmessage") == gc);
+	subj = fsm_class(gc->fsm, "subject");
+	over = fsm_class(gc->fsm, "over");
+	com = fsm_class(gc->fsm, "comment");
+	txt = fsm_class(gc->fsm, "text");
+	TAP_ASSERT(t, subj > 0 && over > 0 && com > 0);
+
+	/* a comment line before the subject leaves the subject a subject */
+	st = syn_line(gc, gc->start, "# please edit", 13, out);
+	TAP_CHECK(t, out[0] == com && out[12] == com);
+	st = syn_line(gc, st, "", 0, out);
+	for (i = 0; i < 60; i++)
+		line[i] = 'a' + i % 26;
+	st = syn_line(gc, st, line, 60, out);
+	TAP_CHECKF(t, out[0] == subj && out[49] == subj && out[50] == over &&
+	    out[59] == over, "subject [%d %d %d %d]", out[0], out[49], out[50],
+	    out[59]);
+
+	/* body lines: text to 72, then over; a comment; the scissors cut */
+	for (i = 0; i < 80; i++)
+		line[i] = 'b';
+	st = syn_line(gc, st, "", 0, out);
+	st = syn_line(gc, st, line, 80, out);
+	TAP_CHECKF(t, out[0] == txt && out[71] == txt && out[72] == over &&
+	    out[79] == over, "body [%d %d %d %d]", out[0], out[71], out[72],
+	    out[79]);
+	st = syn_line(gc, st, "# a comment", 11, out);
+	TAP_CHECK(t, out[0] == com && out[10] == com);
+	st = syn_line(gc, st, "# ------------------------ >8 ------------------------",
+	    54, out);
+	TAP_CHECK(t, out[53] == com);
+	st = syn_line(gc, st, "diff --git a/f b/f", 18, out);
+	TAP_CHECKF(t, out[0] == com && out[17] == com, "cut [%d %d]", out[0],
+	    out[17]);
+	st = syn_line(gc, st, "+a long line that would otherwise be marked past "
+	    "column seventy-two for sure", 77, out);
+	TAP_CHECK(t, out[76] == com);
+
+	/* a tab is 8 columns: the 73rd column is byte 65 after a leading tab */
+	line[0] = '\t';
+	for (i = 1; i < 80; i++)
+		line[i] = 'c';
+	st = syn_line(gc, gc->start, "s", 1, out);	/* a subject line */
+	st = syn_line(gc, st, "", 0, out);
+	st = syn_line(gc, st, line, 80, out);
+	TAP_CHECKF(t, out[64] == txt && out[65] == over, "tab [%d %d]", out[64],
+	    out[65]);
+
+	/* UTF-8: "é" is two bytes but one column */
+	for (i = 0; i < 49; i++)
+		line[i] = 'd';
+	line[49] = (char)0xc3;
+	line[50] = (char)0xa9;
+	line[51] = 'x';
+	st = syn_line(gc, gc->start, line, 52, out);
+	TAP_CHECKF(t, out[49] == subj && out[50] == subj && out[51] == over,
+	    "utf8 [%d %d %d]", out[49], out[50], out[51]);
+
+	/* the widths come from the config once the defaults are rebuilt */
+	cfg = vedit_cfg_new();
+	TAP_ASSERT(t, cfg != NULL);
+	cfg_set(cfg, "gitcommit.subject", "10");
+	g_cfg = cfg;
+	syntax_reload_defaults();
+	gc = syn_for_path("COMMIT_EDITMSG");
+	TAP_ASSERT(t, gc != NULL);
+	subj = fsm_class(gc->fsm, "subject");
+	over = fsm_class(gc->fsm, "over");
+	for (i = 0; i < 20; i++)
+		line[i] = 'e';
+	syn_line(gc, gc->start, line, 20, out);
+	TAP_CHECKF(t, out[9] == subj && out[10] == over, "cfg width [%d %d]",
+	    out[9], out[10]);
+	g_cfg = NULL;
+	syntax_reload_defaults();
+	vedit_cfg_free(cfg);
+	gc = syn_for_path("COMMIT_EDITMSG");
+	syn_line(gc, gc->start, line, 20, out);
+	TAP_CHECK(t, out[19] == fsm_class(gc->fsm, "subject"));
+}
+
 /* mkdir_p creates nested directories, accepts existing ones, and refuses a
  * path through a regular file. */
 static void
@@ -3354,6 +3452,7 @@ const Case tap_cases[] = {
 	{ "syntax_js", t_syntax_js },
 	{ "syntax_html", t_syntax_html },
 	{ "syntax_ini", t_syntax_ini },
+	{ "syntax_gitcommit", t_syntax_gitcommit },
 	{ "mkdir_p", t_mkdir_p },
 	{ "cli_config_path", t_cli_config_path },
 #ifdef VEDIT_MAIL

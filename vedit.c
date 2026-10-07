@@ -2835,7 +2835,8 @@ enum {
 	JSF_F_NOEAT = 1,	/* do not consume the byte; re-dispatch in next */
 	JSF_F_BUFFER = 2,	/* start a token here for a later keyword match */
 	JSF_F_MARK = 4,		/* set the region mark to the current position */
-	JSF_F_RECOLORMARK = 8	/* repaint [mark, here) with the target color */
+	JSF_F_RECOLORMARK = 8,	/* repaint [mark, here) with the target color */
+	JSF_F_COL = 16		/* fires at a display column instead of a byte set */
 };
 
 typedef struct jsf_kw { int group; uint8_t klass; } Jsfkw;
@@ -2845,6 +2846,7 @@ typedef struct jsf_rule {
 	uint16_t	next;		/* target state index */
 	uint8_t		flags;		/* JSF_F_* */
 	uint8_t		recolor;	/* 0 none; 255 whole token; else N bytes */
+	uint16_t	col;		/* JSF_F_COL: the column (0-based) it fires at */
 	int		kw_first, kw_n;	/* slice into Jsf.kws */
 } Jsfrule;
 
@@ -3072,6 +3074,19 @@ typedef struct jsf_stop {
 	size_t	tok, toklen;	/* the buffered token, toklen 0 when none */
 } Jsfstop;
 
+/* The display column after byte c at column cols: a tab reaches the next
+ * multiple of 8, a UTF-8 continuation byte adds nothing, any other byte one.
+ * Wide glyphs count one; the column rules are about line length, not cells. */
+static size_t
+jsf_col_step(size_t cols, unsigned char c)
+{
+	if (c == '\t')
+		return (cols / 8 + 1) * 8;
+	if ((c & 0xc0) == 0x80)
+		return cols;
+	return cols + 1;
+}
+
 /* Run grammar j over bytes[start..n) from state_in, writing a style per byte
  * into out[start..n) (NULL to carry state only). Each style is hi | class,
  * where hi tags the grammar for the renderer (0 for a buffer's own grammar).
@@ -3085,6 +3100,10 @@ jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
 	size_t i = start, tok = start, markpos = start;
 	uint16_t st = state_in < j->nstates ? state_in : j->start;
 	int buffering = 0, hops = 0;
+	size_t cols = 0;	/* display column of byte i (tabs to 8) */
+
+	for (i = 0; i < start && i < n; i++)	/* columns before start */
+		cols = jsf_col_step(cols, (unsigned char)bytes[i]);
 
 	/* Iterate one past the line and feed a virtual '\n' there, as joe does,
 	 * so a state can end a line (a "\n" rule returns a line comment to idle)
@@ -3106,7 +3125,9 @@ jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
 			for (r = 0; r < CS->rule_n; r++) {
 				const Jsfrule *cand = &j->rules[CS->rule_first + r];
 
-				if (cand->set[c >> 3] & (1 << (c & 7))) {
+				if ((cand->flags & JSF_F_COL) ? (i < n &&
+				    cols >= cand->col && (c & 0xc0) != 0x80) :
+				    (cand->set[c >> 3] & (1 << (c & 7)))) {
 					R = cand;
 					break;
 				}
@@ -3118,6 +3139,8 @@ jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
 		if (!R) {			/* no rule: color and consume */
 			if (out && i < n)
 				out[i] = hi | S->klass;
+			if (i < n)
+				cols = jsf_col_step(cols, c);
 			i++;
 			continue;
 		}
@@ -3182,6 +3205,8 @@ jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
 			if (++hops > 16) {	/* break a malformed noeat cycle */
 				if (out && i < n)
 					out[i] = hi | j->states[st].klass;
+				if (i < n)
+					cols = jsf_col_step(cols, c);
 				i++;
 				hops = 0;
 			}
@@ -3189,6 +3214,8 @@ jsf_line(const Jsf *j, uint16_t state_in, const char *bytes, size_t n,
 		}
 		st = R->next;
 		hops = 0;
+		if (i < n)
+			cols = jsf_col_step(cols, c);
 		i++;
 	}
 	return st;
@@ -3293,7 +3320,27 @@ jsf_parse_rule(Jsf *j, int st, const char *val)
 	for (tok = strtok_r(buf, " \t", &save); tok;
 	    tok = strtok_r(NULL, " \t", &save)) {
 		if (field == 0) {
-			if (!jsf_charset(tok, R->set))
+			if (strcmp(tok, "col") == 0) {
+				/* "col N" or "col key:N": fire at a display
+				 * column, N or the config value of key */
+				char *spec = strtok_r(NULL, " \t", &save);
+				char *colon = spec ? strchr(spec, ':') : NULL;
+				const char *v = NULL;
+				int n;
+
+				if (!spec)
+					return;
+				if (colon) {
+					*colon = '\0';
+					v = cfg_get(g_cfg, spec);
+					spec = colon + 1;
+				}
+				n = atoi(v && v[0] ? v : spec);
+				if (n < 1 || n > 65535)
+					return;
+				R->col = (uint16_t)n;
+				R->flags |= JSF_F_COL;
+			} else if (!jsf_charset(tok, R->set))
 				return;		/* drop a malformed rule */
 		} else if (field == 1) {
 			R->next = (uint16_t)jsf_state_idx(j, tok);
@@ -3496,6 +3543,8 @@ static const char g_default_grammar[] =
 	"	start = idle\n"
 	"[language \"ini\"]\n"
 	"	start = bol\n"
+	"[language \"gitcommit\"]\n"
+	"	start = sbol\n"
 	"\n"
 	"[syntax]\n"
 	"	h = c\n"
@@ -3523,6 +3572,11 @@ static const char g_default_grammar[] =
 	"	desktop = ini\n"
 	"	service = ini\n"
 	"	config = ini\n"
+	"	COMMIT_EDITMSG = gitcommit\n"
+	"	MERGE_MSG = gitcommit\n"
+	"	SQUASH_MSG = gitcommit\n"
+	"	TAG_EDITMSG = gitcommit\n"
+	"	gitmessage = gitcommit\n"
 	"\n"
 	"[color \"c\"]\n"
 	"	comment = 14\n"
@@ -4173,20 +4227,90 @@ static const char g_default_grammar[] =
 	"[state \"ini.string_esc\"]\n"
 	"	color = string\n"
 	"	rule = \"\\n\" bol\n"
-	"	rule = * string\n";
+	"	rule = * string\n"
+	/* gitcommit: a git message. The first non-blank, non-comment line is
+	 * the subject, marked past column gitcommit.subject (50); body lines
+	 * past gitcommit.body (72). '#' lines are comments, and a scissors
+	 * line (">8") turns the rest of the file, the diff git appends, into
+	 * comment too. Widths come from the config through the col rules. */
+	"[color \"gitcommit\"]\n"
+	"	subject = 15 bold\n"
+	"	over = 9 reverse\n"
+	"	comment = 14\n"
+	"[state \"gitcommit.sbol\"]\n"
+	"	color = subject\n"
+	"	rule = \"#\" scomment recolor\n"
+	"	rule = \"\\n\" sbol\n"
+	"	rule = * subject noeat\n"
+	"[state \"gitcommit.subject\"]\n"
+	"	color = subject\n"
+	"	rule = col gitcommit.subject:50 sover noeat\n"
+	"	rule = \"\\n\" bbol\n"
+	"	rule = * subject\n"
+	"[state \"gitcommit.sover\"]\n"
+	"	color = over\n"
+	"	rule = \"\\n\" bbol\n"
+	"	rule = * sover\n"
+	"[state \"gitcommit.scomment\"]\n"
+	"	color = comment\n"
+	"	rule = \">\" sc8\n"
+	"	rule = \"\\n\" sbol\n"
+	"	rule = * scomment\n"
+	"[state \"gitcommit.sc8\"]\n"
+	"	color = comment\n"
+	"	rule = \"8\" cut\n"
+	"	rule = \"\\n\" sbol\n"
+	"	rule = * scomment noeat\n"
+	"[state \"gitcommit.bbol\"]\n"
+	"	color = text\n"
+	"	rule = \"#\" comment recolor\n"
+	"	rule = \"\\n\" bbol\n"
+	"	rule = * body noeat\n"
+	"[state \"gitcommit.body\"]\n"
+	"	color = text\n"
+	"	rule = col gitcommit.body:72 bover noeat\n"
+	"	rule = \"\\n\" bbol\n"
+	"	rule = * body\n"
+	"[state \"gitcommit.bover\"]\n"
+	"	color = over\n"
+	"	rule = \"\\n\" bbol\n"
+	"	rule = * bover\n"
+	"[state \"gitcommit.comment\"]\n"
+	"	color = comment\n"
+	"	rule = \">\" c8\n"
+	"	rule = \"\\n\" bbol\n"
+	"	rule = * comment\n"
+	"[state \"gitcommit.c8\"]\n"
+	"	color = comment\n"
+	"	rule = \"8\" cut\n"
+	"	rule = \"\\n\" bbol\n"
+	"	rule = * comment noeat\n"
+	"[state \"gitcommit.cut\"]\n"
+	"	color = comment\n"
+	"	rule = * cut\n";
 
 /* The config that backs the default grammars; kept for the lifetime of the
  * process because the grammars' word slices point into it. */
 static Cfg *g_def_cfg;
+static void syntax_reload_defaults(void);
 
 /* Parse and load the built-in grammars into g_def, once. */
 static void
 syntax_load_defaults(void)
 {
+	if (!g_def_cfg)
+		syntax_reload_defaults();
+}
+
+/* (Re)build the built-in grammars. Needed again after the config changes,
+ * since a column rule can take its width from a config key. */
+static void
+syntax_reload_defaults(void)
+{
 	char *text;
 
-	if (g_def_cfg)
-		return;
+	jsf_reset(&g_def);
+	vedit_cfg_free(g_def_cfg);
 	g_def_cfg = vedit_cfg_new();
 	if (!g_def_cfg)
 		return;
@@ -22704,7 +22828,7 @@ ed_reload_config(Editor *e)
 	}
 	g_cfg = nc;
 	themes_load_cfg(nc);		/* before ed_apply_config resolves scheme */
-	syntax_load_defaults();		/* built-in C and shell grammars */
+	syntax_reload_defaults();	/* built-in grammars (some read the config) */
 	syntax_load_cfg(&g_user, nc);	/* user grammars override them */
 	ed_refresh_syntax(e);		/* re-point syn before ed_apply_config reads it */
 	if (e->term) {
@@ -22776,6 +22900,10 @@ static const char g_config_template[] =
 	"[syntax]\n"
 	"#	enable = on          # highlight recognized file types\n"
 	"\n"
+	"[gitcommit]\n"
+	"#	subject = 50         # mark a commit subject past this column\n"
+	"#	body = 72            # and body lines past this one\n"
+	"\n"
 	"[mail]\n"
 	"#	dir = ~/Maildir      # a Maildir++ tree; enables the Mail menu\n"
 	"#	from = Me <me@example.org>  # the From: line of new messages\n";
@@ -22827,7 +22955,7 @@ vedit_set_config(struct vedit *v, const struct cfg *c)
 {
 	g_cfg = c;
 	themes_load_cfg(c);		/* before ed_apply_config resolves scheme */
-	syntax_load_defaults();		/* built-in C and shell grammars */
+	syntax_reload_defaults();	/* built-in grammars (some read the config) */
 	syntax_load_cfg(&g_user, c);	/* user grammars override them */
 	if (v->e.term) {
 		v->e.term->box_mode = box_default();

@@ -235,6 +235,10 @@ XDG layout (`-DVEDIT_NO_XDG`) uses `~/.veditrc` instead.
 [syntax]
     enable = on          # highlight recognized file types
 
+[gitcommit]
+    subject = 50         # mark a commit subject past this column
+    body = 72            # and body lines past this one
+
 [mail]
     dir = ~/Maildir      # a Maildir++ tree; enables the Mail menu
     from = Jon <jon@example.org>  # the From: line of new messages
@@ -315,8 +319,8 @@ builds from `vedit_cfg_new()` / `vedit_cfg_load()`.
 
 ### Custom syntax highlighting
 
-Beyond the built-in C, shell, Markdown, JavaScript, HTML, and INI highlighters,
-the config file can
+Beyond the built-in C, shell, Markdown, JavaScript, HTML, INI, and git commit
+message highlighters, the config file can
 define a language as a small state machine (the model joe uses), authored in the same
 gitconfig format, no separate file. A language is a set of states; each state
 has an ordered list of transition `rule` lines keyed on a character set.
@@ -363,6 +367,11 @@ Each `rule` is `charset  target-state  [options]`:
   whose length is not known until its end is seen (see below). Colors accept
   attributes (`bold`, `underline`, `reverse`, `dim`, `italic`), e.g.
   `keyword = yellow bold`.
+- **column rules**: `rule = col 72 over noeat` fires instead when the line
+  has reached display column 72 (tabs count to the next multiple of 8), so a
+  grammar can mark overlong lines. `col gitcommit.body:72` takes the column
+  from that config key, with 72 when it is unset; the built-in grammars are
+  rebuilt on `:reload`, so such a key takes effect without restarting.
 
 A state may also set `include = <other-state>`: when none of its own rules
 match the byte, the machine falls through to the included state's rules (and
@@ -1273,7 +1282,12 @@ The language is chosen from the file extension: `.c .h .cc .cpp .cxx .hpp .hh
 .mkd` Markdown, `.js .mjs .cjs` JavaScript, `.html .htm .xhtml` HTML, and `.ini
 .cfg .conf .gitconfig .editorconfig .veditrc .desktop .service` INI. A file with
 no extension is matched by its name instead, so `config` (as in `.git/config`)
-is INI too; a `[syntax]` mapping in the config can add more names. Highlighting
+is INI, and `COMMIT_EDITMSG`, `MERGE_MSG`, `SQUASH_MSG`, `TAG_EDITMSG` and a
+`.gitmessage` template get the git message grammar: the subject line past
+column 50 and body lines past 72 are marked (`gitcommit.subject` and
+`gitcommit.body` change the widths), `#` lines are comments, and everything
+under a scissors line is too. A `[syntax]` mapping in the config can add more
+names. Highlighting
 is on by default when the type is recognized, and files with no match are left
 plain. Toggle it from the View menu, or with the vi `:syntax` command: `:syntax
 off`, `:syntax on`, or `:syntax c` / `:syntax sh` to force a language. The
