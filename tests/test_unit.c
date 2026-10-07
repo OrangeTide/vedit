@@ -1843,6 +1843,7 @@ t_cfg_theme(Test *t)
 	    "base = black\n"		/* borderless preset... */
 	    "content.fg = 250\n"
 	    "bar.bg = 244\n"
+	    "guide.fg = 60\n"
 	    "borderless = off\n";	/* ...overridden back on */
 	char path[256];
 	Cfg *c = load_cfg_text(text, path, sizeof(path));
@@ -1864,6 +1865,7 @@ t_cfg_theme(Test *t)
 	TAP_CHECK(t, p->content_fg.type == COLOR_INDEXED &&
 	    p->content_fg.index == 250);
 	TAP_CHECK(t, p->bar_bg.type == COLOR_INDEXED && p->bar_bg.index == 244);
+	TAP_CHECK(t, p->guide_fg.type == COLOR_INDEXED && p->guide_fg.index == 60);
 	TAP_CHECK(t, p->content_bg.type == COLOR_DEFAULT);	/* from black base */
 	TAP_CHECK(t, chrome_right(&e) == CHROME_RIGHT);	/* borderless=off wins */
 

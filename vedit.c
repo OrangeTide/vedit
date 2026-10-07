@@ -8232,6 +8232,8 @@ typedef struct chrome_pal {
 	Color	frame_fg, frame_bg;	/* window border + scrollbars */
 	Color	title_fg;		/* filename in the top border */
 	Color	bar_fg, bar_bg;		/* menu bar + status bar */
+	Color	guide_fg;		/* tab arrows and joined-line marks; default
+					 * = the text color dimmed */
 	int		reverse_bars;		/* draw the bars in reverse video */
 } Pal;
 
@@ -8243,6 +8245,7 @@ static Pal chrome_dos = {
 	.frame_fg = CIDX(15), .frame_bg = CIDX(4),
 	.title_fg = CIDX(15),
 	.bar_fg = CIDX(0), .bar_bg = CIDX(7),
+	.guide_fg = CIDX(27),	/* a blue a shade off the area; 12 at 16 colors */
 	.reverse_bars = 0,
 };
 /* Black look: the text area stays on the terminal default background, so
@@ -8253,6 +8256,7 @@ static const Pal chrome_black = {
 	.frame_fg = CIDX(6), .frame_bg = CDEF,
 	.title_fg = CIDX(15),
 	.bar_fg = CIDX(0), .bar_bg = CIDX(7),
+	.guide_fg = CIDX(240),	/* dark gray; 8 at 16 colors */
 	.reverse_bars = 0,
 };
 static const Pal chrome_plain = {
@@ -8260,6 +8264,7 @@ static const Pal chrome_plain = {
 	.frame_fg = CDEF, .frame_bg = CDEF,
 	.title_fg = CDEF,
 	.bar_fg = CDEF, .bar_bg = CDEF,
+	.guide_fg = CDEF,
 	.reverse_bars = 1,
 };
 #undef CIDX
@@ -8381,6 +8386,8 @@ themes_load_cfg(const Cfg *c)
 				cfg_color(val, &p->bar_fg);
 			else if (strcmp(field, "bar.bg") == 0)
 				cfg_color(val, &p->bar_bg);
+			else if (strcmp(field, "guide.fg") == 0)
+				cfg_color(val, &p->guide_fg);
 			else if (strcmp(field, "reverse-bars") == 0)
 				p->reverse_bars = str_bool(val, p->reverse_bars);
 			else if (strcmp(field, "borderless") == 0)
@@ -9568,11 +9575,13 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
  * expanding tabs. Trailing space pads the field to width. Display columns in
  * [hl_start, hl_end) are shown in reverse video for the selection; pass
  * hl_start >= hl_end for no highlight. When show_tabs is set, each hard tab's
- * first column carries a dim guide glyph. */
+ * first column carries a guide glyph in guide_fg (the text color dimmed when
+ * guide_fg is the default color). */
 static void
 scr_line(Screen *d, int row, int col0, const char *s, size_t len,
     int left, int width, int hl_start, int hl_end, const uint16_t *sty,
-    const Hlpal *hp, Color base_fg, Color base_bg, int show_tabs)
+    const Hlpal *hp, Color base_fg, Color base_bg, Color guide_fg,
+    int show_tabs)
 {
 	const unsigned char *p = (const unsigned char *)s;
 	size_t i = 0;
@@ -9640,16 +9649,21 @@ scr_line(Screen *d, int row, int col0, const char *s, size_t len,
 					continue;
 				if (drawn >= width)
 					break;
-				if (r == '\n') {	/* a joined CSV record */
-					ch = nlmark;
-					if (!rev)
-						a |= ATTR_DIM;
-				} else if (r == '\t' && tabmark && c == 0) {
-					ch = tabmark;
-					if (!rev)
-						a |= ATTR_DIM;
+				Color gfg = fg;
+
+				if ((r == '\n') || (r == '\t' && tabmark && c == 0)) {
+					/* a guide mark: the joined-record newline or
+					 * the tab arrow, in the scheme's guide color
+					 * (or the text color dimmed, when none) */
+					ch = r == '\n' ? nlmark : tabmark;
+					if (!rev) {
+						if (guide_fg.type == COLOR_DEFAULT)
+							a |= ATTR_DIM;
+						else
+							gfg = guide_fg;
+					}
 				}
-				scr_cell(d, row, col0 + drawn, ch, fg, base_bg, a);
+				scr_cell(d, row, col0 + drawn, ch, gfg, base_bg, a);
 				drawn++;
 			}
 		} else if (col < left) {
@@ -12091,7 +12105,7 @@ render_body_wrapped(Editor *e, Screen *d, const Pal *p, int row0, int text_h,
 			    p->content_bg);
 			scr_line(d, row, col0, "", 0, 0, text_w, -1, -1, NULL,
 			    &hp, p->content_fg, p->content_bg,
-			    e->show_tabs);
+			    p->guide_fg, e->show_tabs);
 			if (idx == e->cy) {
 				*cur_row = i;
 				*cur_col = col0;
@@ -12109,7 +12123,7 @@ render_body_wrapped(Editor *e, Screen *d, const Pal *p, int row0, int text_h,
 			    p->content_bg);
 			scr_line(d, row, col0, "", 0, 0, text_w, hs, he, NULL,
 			    &hp, p->content_fg, p->content_bg,
-			    e->show_tabs);
+			    p->guide_fg, e->show_tabs);
 			if (idx == e->cy) {
 				*cur_row = i;
 				*cur_col = col0;
@@ -12134,7 +12148,7 @@ render_body_wrapped(Editor *e, Screen *d, const Pal *p, int row0, int text_h,
 			    p->content_fg, p->content_bg);
 			scr_line(d, row, col0, s, end, acol, text_w, hs, he,
 			    sty, &hp, p->content_fg, p->content_bg,
-			    e->show_tabs);
+			    p->guide_fg, e->show_tabs);
 			if (idx == e->cy && (e->cx < next || next >= llen)) {
 				int cc = disp_cols(s, e->cx) - acol;
 
@@ -12227,11 +12241,13 @@ paint_rows(Editor *e, Screen *d, const Pal *p, int row0, int rows,
 				sty = hl_line(e, idx, s, llen);
 				scr_line(d, row, col0, s, llen, (int)e->left,
 				    text_w, hs, he, sty, &hp,
-				    p->content_fg, p->content_bg, e->show_tabs);
+				    p->content_fg, p->content_bg, p->guide_fg,
+				    e->show_tabs);
 			} else {
 				scr_line(d, row, col0, "", 0, (int)e->left,
 				    text_w, hs, he, NULL, &hp,
-				    p->content_fg, p->content_bg, e->show_tabs);
+				    p->content_fg, p->content_bg, p->guide_fg,
+				    e->show_tabs);
 			}
 		}
 		*cur_row = (int)(e->cy - e->top);

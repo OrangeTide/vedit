@@ -294,6 +294,7 @@ then selects, alongside the three built-ins:
     title.fg     = "#ffd787"  # file name in the top border (quote a hex color)
     bar.fg       = 231        # menu bar and status bar
     bar.bg       = 54
+    guide.fg     = 60         # the hard-tab arrows and joined-line marks
     reverse-bars = off        # draw the bars in reverse video
     borderless   = on         # drop the right border so text reaches the edge
 ```
@@ -470,9 +471,11 @@ and column.
 
 Tabs expand to 8-column stops on screen unless the buffer has a ruler (see
 "Tab stops" below). **View > Show Tabs** (on by default)
-marks each hard tab's first column with a dim guide glyph (an arrow in UTF-8
-mode, `>` in DEC or ASCII mode), so tabs and runs of spaces are easy to tell
-apart. In vi keys it is `:set list` / `:set nolist`.
+marks each hard tab's first column with a guide glyph (an arrow in UTF-8
+mode, `>` in DEC or ASCII mode) in a colour close to the background, so tabs
+and runs of spaces are easy to tell apart without the glyphs shouting. The
+colour is the `guide.fg` of the scheme (see "Configuration file" for themes);
+the plain scheme dims the text colour instead. In vi keys it is `:set list` / `:set nolist`.
 
 **View > Auto Indent** (on by default) starts each new line with the same
 leading whitespace as the line you left, for Enter and for vi's `o` and `O`. In

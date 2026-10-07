@@ -135,6 +135,41 @@ t_gutter_numbers(Test *t)
 	memio_free(&m);
 }
 
+/* The tab guide arrow is painted in the scheme's guide colour (27 on the DOS
+ * scheme) rather than the text colour, on a 256-colour client. */
+static void
+t_tab_guide_color(Test *t)
+{
+	static const char *const L[] = { "\tx" };
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	const char *arrow;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_colors(v, 256);
+	fill_lines(v->e.t, L, 1);
+	vedit_run(v);
+	arrow = strstr(m.out, "\xe2\x86\x92");	/* the UTF-8 arrow */
+	TAP_ASSERT(t, arrow != NULL);
+	/* the SGR that set the arrow's colour is the last 38;5 before it */
+	{
+		const char *p = m.out, *last = NULL;
+
+		while ((p = strstr(p, "\033[38;5;")) != NULL && p < arrow) {
+			last = p;
+			p++;
+		}
+		TAP_CHECKF(t, last && strncmp(last, "\033[38;5;27m", 10) == 0,
+		    "arrow colour sgr [%.12s]", last ? last : "(none)");
+	}
+	vedit_free(v);
+	memio_free(&m);
+}
+
 static void
 t_status_flags(Test *t)
 {
@@ -3324,6 +3359,7 @@ const Case tap_cases[] = {
 	{ "wrap_shows_tail", t_wrap_shows_tail },
 	{ "nowrap_truncates_tail", t_nowrap_truncates_tail },
 	{ "gutter_numbers", t_gutter_numbers },
+	{ "tab_guide_color", t_tab_guide_color },
 	{ "status_flags", t_status_flags },
 	{ "tab_key_expand", t_tab_key_expand },
 	{ "tag_jump", t_tag_jump },
