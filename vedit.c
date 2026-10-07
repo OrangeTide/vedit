@@ -15448,8 +15448,11 @@ static const char *const tut_art[] = {
 	"  - Alt+Up and Alt+Down cycle the foreground; Alt+Right and",
 	"    Alt+Left the background. Each runs default, then 0 to 15.",
 	"  - Alt+B bold, Alt+L blink, Alt+U underline, Alt+R plain.",
-	"  - Alt+C opens the colour palette: a grid of every foreground",
-	"    and background pair. Enter takes both, F or B just one.",
+	"  - Alt+C opens the colour palette. On a 16-colour terminal it is",
+	"    a grid of every foreground and background pair: Enter takes",
+	"    both, F or B just one. On a 256-colour terminal it is a swatch",
+	"    of all 256 colours in xterm order: Enter or F sets the",
+	"    foreground, B the background.",
 	"  - Alt+1 to Alt+0 and Alt+G use the glyph palette, as in draw",
 	"    mode; the glyphs take the pen.",
 	"  - Alt+P picks up the colours of the cell under the cursor.",
@@ -27060,16 +27063,13 @@ dlg_color_key(Editor *e, const Modal *m, const Event *ev, void *ctx)
 	return 0;
 }
 
-/* Alt+C in the art view (and Options > Colour Palette): pick the pen's
- * colours from the grid. The cursor starts on the current pair. */
+/* The 16-colour pair grid. The cursor starts on the current pair. */
 static void
-dlg_colors(Editor *e)
+dlg_colors16(Editor *e)
 {
 	Art *a = e->art;
 	Colorctx c;
 
-	if (!a)
-		return;
 	c.fy = art_pal_index(a->fg);
 	c.fx = art_pal_index(a->bg);
 	c.pick = 0;
@@ -27081,6 +27081,202 @@ dlg_colors(Editor *e)
 		a->bg = art_pal_color(c.fx);
 	if (c.pick)
 		art_pen_status(e);
+}
+
+/* ---- 256-colour swatch picker, for a 256-colour terminal ----
+ *
+ * One colour per cell, laid out the way xterm numbers them: row 0 is the
+ * default slot then the 16 base colours, rows 1 to 6 the 6x6x6 cube (one row
+ * per red level, 36 cells of green then blue), and row 7 the 24 greys. The
+ * pen's current foreground and background cells are marked F and B. */
+
+#define PAL256_ROWS	8
+#define PAL256_W	36		/* the widest row, a cube slice */
+
+typedef struct pal256_ctx {
+	int	row, col;	/* cursor */
+	int	pick;		/* 0 none, 2 foreground, 3 background */
+} Pal256ctx;
+
+static int
+pal256_row_len(int row)
+{
+	return row == 0 ? 17 : row == 7 ? 24 : PAL256_W;
+}
+
+/* The colour at a cell: the default for (0, 0), else an index. */
+static Color
+pal256_color(int row, int col)
+{
+	if (row == 0)
+		return col == 0 ? art_def() : art_idx(col - 1);
+	if (row == 7)
+		return art_idx(232 + col);
+	return art_idx(16 + (row - 1) * PAL256_W + col);
+}
+
+/* The cell showing c, (0, 0) for the default or anything not indexed. */
+static void
+pal256_find(Color c, int *row, int *col)
+{
+	*row = *col = 0;
+	if (c.type != COLOR_INDEXED)
+		return;
+	if (c.index < 16) {
+		*col = c.index + 1;
+	} else if (c.index >= 232) {
+		*row = 7;
+		*col = c.index - 232;
+	} else {
+		*row = 1 + (c.index - 16) / PAL256_W;
+		*col = (c.index - 16) % PAL256_W;
+	}
+}
+
+/* A marker colour that reads on c: white on a dark colour, black on light. */
+static Color
+pal256_ink(Color c)
+{
+	int light;
+
+	if (c.type != COLOR_INDEXED)
+		return art_def();
+	if (c.index < 16)
+		light = c.index == 7 || c.index >= 9;
+	else if (c.index >= 232)
+		light = c.index >= 244;
+	else {
+		int v = c.index - 16;
+
+		light = v / 36 + (v / 6) % 6 + v % 6 >= 8;
+	}
+	return art_idx(light ? 0 : 15);
+}
+
+static void
+dlg_pal256_draw(Editor *e, const Modal *m, void *ctx)
+{
+	Pal256ctx *c = ctx;
+	Screen *d = e->d;
+	Art *a = e->art;
+	int x0 = m->x + 2, gx = x0 + 2, r, k;
+	int fr, fc, br, bc;
+	static const char *const label[PAL256_ROWS] = {
+		"D ", "1 ", "2 ", "3 ", "4 ", "5 ", "6 ", "G "
+	};
+
+	pal256_find(a->fg, &fr, &fc);
+	pal256_find(a->bg, &br, &bc);
+	scr_text(d, m->y, m->x + 2, " Colour palette (256) ", m->fg, m->bg,
+	    m->base);
+	for (r = 0; r < PAL256_ROWS; r++) {
+		int row = m->y + 1 + r;
+
+		scr_text(d, row, x0, label[r], m->fg, m->bg, m->base | ATTR_BOLD);
+		for (k = 0; k < pal256_row_len(r); k++) {
+			Color col = pal256_color(r, k);
+			char mark[3] = "  ";
+
+			if (r == 0 && k == 0)
+				mark[0] = 'D';
+			if (r == fr && k == fc)
+				mark[0] = 'F';
+			if (r == br && k == bc)
+				mark[1] = 'B';
+			scr_text(d, row, gx + k * 2, mark, pal256_ink(col), col, 0);
+		}
+	}
+	scr_text(d, m->y + m->h - 2, x0,
+	    "Enter or F: foreground   B: background   Esc: keep",
+	    m->fg, m->bg, m->base);
+	scr_cursor_vis(d, 1);
+	scr_cursor(d, m->y + 1 + c->row, gx + c->col * 2);
+}
+
+static int
+dlg_pal256_key(Editor *e, const Modal *m, const Event *ev, void *ctx)
+{
+	Pal256ctx *c = ctx;
+	const struct tkbd_seq *k = &ev->key;
+
+	(void)e;
+	(void)m;
+	if (k->type != TKBD_KEY)
+		return 0;
+	switch (k->key) {
+	case TKBD_KEY_UP:
+		if (c->row > 0)
+			c->row--;
+		break;
+	case TKBD_KEY_DOWN:
+		if (c->row + 1 < PAL256_ROWS)
+			c->row++;
+		break;
+	case TKBD_KEY_LEFT:
+		if (c->col > 0)
+			c->col--;
+		return 0;
+	case TKBD_KEY_RIGHT:
+		if (c->col + 1 < pal256_row_len(c->row))
+			c->col++;
+		return 0;
+	case TKBD_KEY_HOME:
+		c->col = 0;
+		return 0;
+	case TKBD_KEY_END:
+		c->col = pal256_row_len(c->row) - 1;
+		return 0;
+	case TKBD_KEY_ENTER:
+		c->pick = 2;
+		return 1;
+	case TKBD_KEY_ESC:
+		return 1;
+	default:
+		if (k->ch == 'f' || k->ch == 'F') {
+			c->pick = 2;
+			return 1;
+		}
+		if (k->ch == 'b' || k->ch == 'B') {
+			c->pick = 3;
+			return 1;
+		}
+		return 0;
+	}
+	if (c->col >= pal256_row_len(c->row))	/* moved onto a shorter row */
+		c->col = pal256_row_len(c->row) - 1;
+	return 0;
+}
+
+static void
+dlg_colors256(Editor *e)
+{
+	Art *a = e->art;
+	Pal256ctx c;
+
+	pal256_find(a->fg, &c.row, &c.col);
+	c.pick = 0;
+	dlg_run(e, 2 + 2 + PAL256_W * 2 + 2, PAL256_ROWS + 4, &c,
+	    dlg_pal256_draw, dlg_pal256_key);
+	if (c.pick == 2)
+		a->fg = pal256_color(c.row, c.col);
+	else if (c.pick == 3)
+		a->bg = pal256_color(c.row, c.col);
+	if (c.pick)
+		art_pen_status(e);
+}
+
+/* Alt+C in the art view (and Options > Colour Palette): pick the pen's colours.
+ * A 16-colour terminal gets the pair grid, a 256-colour one the swatch
+ * picker, so the choice is always a colour the terminal can show. */
+static void
+dlg_colors(Editor *e)
+{
+	if (!e->art)
+		return;
+	if (e->term && e->term->colors >= 256)
+		dlg_colors256(e);
+	else
+		dlg_colors16(e);
 }
 
 /* ---- rendering ---- */

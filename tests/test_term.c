@@ -1585,6 +1585,63 @@ t_palettes(Test *t)
 	ev.key.ch = 'f';
 	TAP_CHECK(t, dlg_color_key(&v->e, &md, &ev, &cc) == 1 && cc.pick == 2);
 
+	/* the 256-colour swatch: cell <-> index both ways, and the keys */
+	{
+		Pal256ctx pc;
+		int r, c;
+
+		pal256_find(art_idx(0), &r, &c);
+		TAP_CHECK(t, r == 0 && c == 1);
+		pal256_find(art_def(), &r, &c);
+		TAP_CHECK(t, r == 0 && c == 0);
+		pal256_find(art_idx(16), &r, &c);
+		TAP_CHECK(t, r == 1 && c == 0);
+		pal256_find(art_idx(231), &r, &c);
+		TAP_CHECK(t, r == 6 && c == 35);
+		pal256_find(art_idx(232), &r, &c);
+		TAP_CHECK(t, r == 7 && c == 0);
+		pal256_find(art_idx(255), &r, &c);
+		TAP_CHECK(t, r == 7 && c == 23);
+		for (r = 0; r < PAL256_ROWS; r++)
+			for (c = 0; c < pal256_row_len(r); c++) {
+				int rr, cc2;
+
+				pal256_find(pal256_color(r, c), &rr, &cc2);
+				if (rr != r || cc2 != c) {
+					TAP_CHECKF(t, 0, "cell %d,%d maps back to %d,%d",
+					    r, c, rr, cc2);
+					r = PAL256_ROWS;
+					break;
+				}
+			}
+
+		/* Right then Down keep the column; a shorter row clamps it */
+		pc.row = 6;
+		pc.col = 35;
+		pc.pick = 0;
+		ev.key.ch = TKBD_CH_NONE;
+		ev.key.key = TKBD_KEY_DOWN;
+		TAP_CHECK(t, dlg_pal256_key(&v->e, &md, &ev, &pc) == 0 &&
+		    pc.row == 7 && pc.col == 23);
+		ev.key.key = TKBD_KEY_RIGHT;
+		TAP_CHECK(t, dlg_pal256_key(&v->e, &md, &ev, &pc) == 0 &&
+		    pc.col == 23);
+		ev.key.key = TKBD_KEY_NONE;
+		ev.key.ch = 'b';
+		TAP_CHECK(t, dlg_pal256_key(&v->e, &md, &ev, &pc) == 1 &&
+		    pc.pick == 3);
+		TAP_CHECK(t, pal256_color(pc.row, pc.col).index == 255);
+		ev.key.ch = TKBD_CH_NONE;
+		ev.key.key = TKBD_KEY_ENTER;
+		TAP_CHECK(t, dlg_pal256_key(&v->e, &md, &ev, &pc) == 1 &&
+		    pc.pick == 2);
+
+		/* the marker ink contrasts: black on white, white on black */
+		TAP_CHECK(t, pal256_ink(art_idx(231)).index == 0);
+		TAP_CHECK(t, pal256_ink(art_idx(16)).index == 15);
+		TAP_CHECK(t, pal256_ink(art_idx(232)).index == 15);
+	}
+
 	/* the glyph dialog's keys: a digit picks that slot and closes */
 	{
 		Glyphctx g = { 0, -1 };

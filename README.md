@@ -1124,7 +1124,7 @@ status line next to the mode:
 | Alt+B, Alt+L, Alt+U | toggle bold, blink, underline |
 | Alt+P | pick up the colours of the cell under the cursor |
 | Alt+R | reset the pen to plain |
-| Alt+C | the colour palette: a grid of every foreground and background pair; Enter takes both, F or B one of them |
+| Alt+C | the colour palette. 16 colours: a grid of every foreground and background pair, Enter takes both, F or B one of them. 256 colours: a swatch of every colour in xterm order (base 16, the 6x6x6 cube, the greys); Enter or F sets the foreground, B the background |
 | Alt+1 to Alt+0, Alt+G | the glyph palette, as in draw mode; glyphs take the pen |
 
 The grid is as wide as the widest line in the file but at least 80 columns,
