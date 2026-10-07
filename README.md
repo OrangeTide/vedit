@@ -1121,6 +1121,51 @@ Moving in the grid:
 F1, F2 and F8 work as in the text view. Leaving the view with `:table off`
 puts the text cursor on the cell you were on.
 
+Editing a cell happens in the prompt line: the cell's value is loaded into it,
+the cursor moves within it (Left, Right, Home, End, Backspace, Delete), Enter
+commits and Esc leaves the cell as it was. Alt+Enter inserts a newline into the
+value. On commit the value is written back with canonical quoting: quoted only
+when it holds the delimiter, a quote or a newline, with inner quotes doubled,
+and only the edited cell's bytes change. A tab file cannot quote, so a tab or
+newline typed there becomes a space. A cell on a row shorter than the column
+pads the row with delimiters first. Each commit is one undo step.
+
+| Action | EDIT style | vi style |
+|---|---|---|
+| edit the cell | Enter, cursor at the end | a (end), i (start) |
+| replace the cell | type a character | c or s, then type |
+| clear the cell | Delete | x |
+| copy, paste a cell | Ctrl+C, Ctrl+V | Ctrl+C, Ctrl+V |
+| search, again | Ctrl+F, F3, Shift+F3 | /, n, N |
+| go to a cell | `:cell C7` | `:cell C7` |
+
+A search starts from the current cell, the grid follows the match as you type,
+and the cell cursor lands on the match. `:cell C7` moves to column C, row 7;
+`:cell C` or `:cell 7` moves one way only.
+
+Rows and columns are inserted, not only appended. `:rowadd [N]` inserts N
+blank rows above the cursor row and `:rowadd! [N]` below it; `:rowdel [N]`
+deletes N rows from the cursor, copying them first. `:coladd [N]` inserts N
+empty columns left of the cursor column and `:coladd! [N]` right of it;
+`:coldel [N]` deletes N columns. A column operation edits every row in one
+undo step; a row too short to reach the column is left alone, and a row's
+only cell is cleared rather than removed. The Edit menu has the four
+operations, and its Undo, Redo, Copy and Paste act on the grid while it is up.
+
+| Action | EDIT style | vi style |
+|---|---|---|
+| insert a row above, below | Edit menu, `:rowadd`, `:rowadd!` | O, o |
+| delete the row | `:rowdel` | dd |
+| copy, paste rows | `:rowdel` (copies), then p or P | yy, p (below), P (above) |
+| insert a column left, right | Edit menu, `:coladd`, `:coladd!` | `:coladd`, `:coladd!` |
+| delete the column | Edit menu, `:coldel` | `:coldel` |
+| cut the cell | Ctrl+X | Ctrl+X |
+| undo, redo | Ctrl+Z, Ctrl+Y | u, Ctrl+R |
+
+Row copies go through the clipboard as lines, so a row cut with `:rowdel` or
+dd pastes back with p or P, and pasting into a cell with Ctrl+V pastes the
+clipboard as that one cell's value instead.
+
 Commands:
 
 - `:table` turns the view on for any buffer (sniffing the delimiter), or off
@@ -1224,15 +1269,15 @@ entirely.
 vedit has a text buffer with undo and redo, the modeless and vi personalities,
 the MS-EDIT chrome (menu bar, frame, scrollbars, dialogs), regex find and
 replace, selection and an internal clipboard, goto-line, multiple buffers, a hex
-view, a 2D/block draw mode, an art view for coloured .ans files, a table view for CSV and TSV, per-language
-build commands with a quickfix error list, selectable line endings (LF, CRLF,
-NUL), tab display with auto-indent and tab/space conversion, a symbol picker
-that merges a buffer scan with a ctags tags file, terminal buffers running a
-shell or a build through a built-in VT emulator, and lightweight syntax
-highlighting. It draws through a self-contained ANSI renderer over the io
-vtable, and decodes the keyboard with a compact decoder that covers UTF-8 text,
-control keys, arrows, navigation keys, function keys, CSI modifiers,
-Alt+letter, and bracketed paste.
+view, a 2D/block draw mode, an art view for coloured .ans files, a table view
+for CSV and TSV, per-language build commands with a quickfix error list,
+selectable line endings (LF, CRLF, NUL), tab display with auto-indent and
+tab/space conversion, a symbol picker that merges a buffer scan with a ctags
+tags file, terminal buffers running a shell or a build through a built-in VT
+emulator, and lightweight syntax highlighting. It draws through a
+self-contained ANSI renderer over the io vtable, and decodes the keyboard with
+a compact decoder that covers UTF-8 text, control keys, arrows, navigation
+keys, function keys, CSI modifiers, Alt+letter, and bracketed paste.
 
 It deliberately leaves out, as overworked for a primitive-terminal editor:
 

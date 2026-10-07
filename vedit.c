@@ -5893,6 +5893,7 @@ typedef struct tbl {
 	int	cx;			/* cell cursor column (the row is e->cy) */
 	int	left;			/* first visible column */
 	int	pending;		/* vi: a 'g' waiting for its second key */
+	int	searching;		/* a search is moving the text cursor */
 } Tbl;
 
 /* One open file. The editor keeps a list of these; the active buffer's fields
@@ -8309,6 +8310,7 @@ typedef enum menu_act {
 	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_TAG_POP, MA_OPEN_HEADER,
 	MA_GOTO,
 	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_HEX, MA_TABLE, MA_DRAW,
+	MA_TBL_ROWADD, MA_TBL_ROWDEL, MA_TBL_COLADD, MA_TBL_COLDEL,
 	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS,
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS,
 	MA_VI_MODE, MA_RELOAD_CONFIG, MA_GLYPHS, MA_COLORS,
@@ -8331,9 +8333,29 @@ static void tbl_detach(Editor *e);
 static void tbl_free(Tbl *tb);
 static void tbl_command(Editor *e, const char *arg);	/* :table */
 static void tbl_colwidth(Editor *e, const char *arg);	/* :colwidth */
+static void tbl_cell_goto(Editor *e, const char *arg);	/* :cell C7 */
 static void toggle_vi(Editor *e);		/* F2: vi <-> modeless */
 static int tbl_cell_off(const Editor *e, size_t row, int col, size_t *off,
     size_t *len);
+static void tbl_sync(Editor *e);		/* cell cursor from the text cursor */
+static int tbl_col_at(const Editor *e, size_t row, size_t x);
+static int tbl_set_cell(Editor *e, size_t row, int col, const char *val,
+    size_t n);
+static void tbl_edit_cell(Editor *e, uint32_t how);
+static void tbl_copy_cell(Editor *e);
+static void tbl_paste_cell(Editor *e);
+static void tbl_find_again(Editor *e, int dir);
+static void tbl_row_add(Editor *e, int n, int below);
+static void tbl_row_copy(Editor *e, int n);
+static void tbl_row_del(Editor *e, int n);
+static void tbl_row_paste(Editor *e, int below);
+static void tbl_col_add(Editor *e, int n, int after);
+static void tbl_col_del(Editor *e, int n);
+static void tbl_undo(Editor *e, int redo);
+static int tbl_count_arg(const char *arg);
+static void vi_delete_lines(Editor *e, size_t y1, size_t y2);
+static int prompt_edit(Editor *e, const char *q, char *buf, size_t bufsz,
+    int allow_empty, size_t pos, int allow_nl);
 static void tbl_cell_status(const Editor *e, char *buf, size_t n);
 static int glyph_alt_key(Editor *e, const struct tkbd_seq *seq);
 static void ed_reload_config(Editor *e);
@@ -8370,6 +8392,11 @@ static const Menuitem mi_edit[] = {
 	{ "Cu&t",	"Ctrl+X",	"dd",		MA_CUT },
 	{ "&Copy",	"Ctrl+C",	"yy",		MA_COPY },
 	{ "&Paste",	"Ctrl+V",	"p",		MA_PASTE },
+	{ "",		"",		"",		MA_SEP },
+	{ "Insert Ro&w",	"",	":rowadd",	MA_TBL_ROWADD },
+	{ "&Delete Row",	"",	":rowdel",	MA_TBL_ROWDEL },
+	{ "Insert Colu&mn",	"",	":coladd",	MA_TBL_COLADD },
+	{ "De&lete Column",	"",	":coldel",	MA_TBL_COLDEL },
 	{ "",		"",		"",		MA_SEP },
 	{ "Copy to T&erminal",	 "",	"",	MA_OSC_COPY },
 	{ "Copy &File to Terminal","",	"",	MA_OSC_COPY_FILE },
@@ -8752,6 +8779,11 @@ menu_item_enabled(const Editor *e, Menuact act)
 #else
 		return 0;
 #endif
+	case MA_TBL_ROWADD:
+	case MA_TBL_ROWDEL:
+	case MA_TBL_COLADD:
+	case MA_TBL_COLDEL:
+		return e->tbl != NULL;
 	case MA_PASTE:
 		return e->clip && e->clip_len > 0;
 	case MA_OSC_COPY_FILE:
@@ -9925,6 +9957,87 @@ tbl_label(int col, char *buf, size_t n)
 	return buf;
 }
 
+/* The column a label names, or -1. */
+static int
+tbl_label_col(const char *s)
+{
+	long v = 0;
+
+	if (!*s)
+		return -1;
+	for (; *s; s++) {
+		if (!isalpha((unsigned char)*s))
+			return -1;
+		v = v * 26 + (toupper((unsigned char)*s) - 'A' + 1);
+		if (v > 1000000)
+			return -1;
+	}
+	return (int)(v - 1);
+}
+
+/* Encode a value as a field: quoted, with inner quotes doubled, only when
+ * it holds the delimiter, a quote, or a line break. A tab file cannot quote,
+ * so a tab or newline there becomes a space. Returns a malloc'd string
+ * with its length in *n, or NULL. */
+static char *
+tbl_quote(char delim, const char *val, size_t n, size_t *outn, int *changed)
+{
+	int quoting = tbl_quoting(delim), need = 0;
+	size_t i, o = 0, nq = 0;
+	char *out;
+
+	*changed = 0;
+	for (i = 0; i < n; i++) {
+		char c = val[i];
+
+		if (c == delim || c == '\n' || c == '\r')
+			need = 1;
+		if (c == '"') {
+			need = 1;
+			nq++;
+		}
+	}
+	if (!quoting) {
+		out = malloc(n + 1);
+		if (!out)
+			return NULL;
+		for (i = 0; i < n; i++) {
+			char c = val[i];
+
+			if (c == delim || c == '\n' || c == '\r') {
+				c = ' ';
+				*changed = 1;
+			}
+			out[i] = c;
+		}
+		out[n] = '\0';
+		*outn = n;
+		return out;
+	}
+	if (!need) {
+		out = malloc(n + 1);
+		if (!out)
+			return NULL;
+		memcpy(out, val, n);
+		out[n] = '\0';
+		*outn = n;
+		return out;
+	}
+	out = malloc(n + nq + 3);
+	if (!out)
+		return NULL;
+	out[o++] = '"';
+	for (i = 0; i < n; i++) {
+		if (val[i] == '"')
+			out[o++] = '"';
+		out[o++] = val[i];
+	}
+	out[o++] = '"';
+	out[o] = '\0';
+	*outn = o;
+	return out;
+}
+
 /* Split one record into fields. A field that starts with a quote runs to
  * the matching quote (doubled quotes are literal) and then to the next
  * delimiter; an unterminated one runs to the end of the line, which keeps a
@@ -10496,6 +10609,8 @@ tbl_render(Editor *e, Screen *d)
 	char buf[256], label[TBL_LABEL_MAX];
 	char gut[32];
 
+	if (tb->searching)
+		tb->cx = tbl_col_at(e, e->cy, e->cx);
 	tbl_scroll(e, text_h, text_w);
 	gw = tbl_gutter(e);
 	first = tbl_first_row(e);
@@ -10586,6 +10701,18 @@ tbl_move(Editor *e, long dy, int dx)
 	tb->pending = 0;
 }
 
+/* A search starts at the current cell and, while it runs, moves the text
+ * cursor; the grid follows it and tbl_sync lands the cell cursor after. */
+static void
+tbl_search_from_cell(Editor *e)
+{
+	size_t off, len;
+
+	tbl_cell_off(e, e->cy, e->tbl->cx, &off, &len);
+	e->cx = off;
+	e->tbl->searching = 1;
+}
+
 /* Handle one key in the table view. Both personalities move by cell; vi
  * adds h j k l, 0, $, gg, G, Ctrl-B/F and the : and / prompts. Returns a
  * request for the main loop. */
@@ -10611,6 +10738,33 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 			return REQ_SAVE;
 		case TKBD_KEY_Q:
 			return REQ_QUIT;
+		case TKBD_KEY_C:
+			tbl_copy_cell(e);
+			return REQ_CONTINUE;
+		case TKBD_KEY_X:
+			tbl_copy_cell(e);
+			tbl_set_cell(e, e->cy, tb->cx, "", 0);
+			return REQ_CONTINUE;
+		case TKBD_KEY_V:
+			tbl_paste_cell(e);
+			return REQ_CONTINUE;
+		case TKBD_KEY_Z:
+			tbl_undo(e, 0);
+			return REQ_CONTINUE;
+		case TKBD_KEY_Y:
+			tbl_undo(e, 1);
+			return REQ_CONTINUE;
+		case TKBD_KEY_R:
+			if (vi)
+				tbl_undo(e, 1);
+			return REQ_CONTINUE;
+		case TKBD_KEY_F:
+			if (vi) {
+				tbl_move(e, page, 0);
+				return REQ_CONTINUE;
+			}
+			tbl_search_from_cell(e);
+			return REQ_FIND;
 		case TKBD_KEY_HOME:
 			tbl_move(e, -(long)e->cy, -tb->cx);
 			return REQ_CONTINUE;
@@ -10620,10 +10774,6 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 		case TKBD_KEY_B:
 			if (vi)
 				tbl_move(e, -page, 0);
-			return REQ_CONTINUE;
-		case TKBD_KEY_F:
-			if (vi)
-				tbl_move(e, page, 0);
 			return REQ_CONTINUE;
 		default:
 			return REQ_CONTINUE;
@@ -10663,8 +10813,17 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 	case TKBD_KEY_F2:
 		toggle_vi(e);
 		return REQ_CONTINUE;
+	case TKBD_KEY_F3:
+		tbl_find_again(e, shift ? -1 : 1);
+		return REQ_CONTINUE;
 	case TKBD_KEY_F8:
 		buf_cycle(e, shift ? -1 : 1);
+		return REQ_CONTINUE;
+	case TKBD_KEY_ENTER:
+		tbl_edit_cell(e, 'a');
+		return REQ_CONTINUE;
+	case TKBD_KEY_DEL:
+		tbl_set_cell(e, e->cy, tb->cx, "", 0);
 		return REQ_CONTINUE;
 	case TKBD_KEY_ESC:
 		tb->pending = 0;
@@ -10673,12 +10832,28 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 		break;
 	}
 
-	if (!vi || ch == TKBD_CH_NONE)
+	if (ch == TKBD_CH_NONE || ch < 0x20 || ch == 0x7f)
 		return REQ_CONTINUE;
+	if (!vi) {			/* typing replaces the cell */
+		tbl_edit_cell(e, ch);
+		return REQ_CONTINUE;
+	}
 	if (tb->pending == 'g') {		/* gg: the first row */
 		tb->pending = 0;
 		if (ch == 'g')
 			tbl_move(e, -(long)e->cy, 0);
+		return REQ_CONTINUE;
+	}
+	if (tb->pending == 'd' || tb->pending == 'y') {	/* dd, yy */
+		int op = tb->pending;
+
+		tb->pending = 0;
+		if (ch == (uint32_t)op) {
+			if (op == 'd')
+				tbl_row_del(e, 1);
+			else
+				tbl_row_copy(e, 1);
+		}
 		return REQ_CONTINUE;
 	}
 	switch (ch) {
@@ -10708,10 +10883,462 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 		break;
 	case ':':
 		return REQ_VI_COLON;
+	case '/':
+		tbl_search_from_cell(e);
+		return REQ_VI_SEARCH;
+	case 'n':
+		tbl_find_again(e, e->vi_search_dir ? e->vi_search_dir : 1);
+		break;
+	case 'N':
+		tbl_find_again(e, e->vi_search_dir ? -e->vi_search_dir : -1);
+		break;
+	case 'i':
+	case 'a':
+	case 'c':
+		tbl_edit_cell(e, ch);
+		break;
+	case 's':
+		tbl_edit_cell(e, 'c');
+		break;
+	case 'x':
+		tbl_set_cell(e, e->cy, tb->cx, "", 0);
+		break;
+	case 'd':
+	case 'y':
+		tb->pending = (int)ch;
+		break;
+	case 'o':
+		tbl_row_add(e, 1, 1);
+		break;
+	case 'O':
+		tbl_row_add(e, 1, 0);
+		break;
+	case 'p':
+		tbl_row_paste(e, 1);
+		break;
+	case 'P':
+		tbl_row_paste(e, 0);
+		break;
+	case 'u':
+		tbl_undo(e, 0);
+		break;
 	default:
 		break;
 	}
 	return REQ_CONTINUE;
+}
+
+/* ---- editing cells ---- */
+
+#define TBL_CELL_MAX	4096		/* bytes a cell can hold in the prompt */
+
+/* The column whose field covers byte x of the row (a delimiter belongs to
+ * the field before it); past the last field, the last column. */
+static int
+tbl_col_at(const Editor *e, size_t row, size_t x)
+{
+	size_t llen;
+	const char *s = text_line(e->t, row, &llen);
+	Tblfield *f;
+	int nf, c, col = 0;
+
+	if (!s)
+		return 0;
+	nf = tbl_fields(e->tbl->delim, s, llen, NULL, 0);
+	f = malloc((size_t)nf * sizeof(*f));
+	if (!f)
+		return 0;
+	tbl_fields(e->tbl->delim, s, llen, f, nf);
+	col = nf - 1;
+	for (c = 0; c < nf; c++)
+		if (x <= f[c].off + f[c].len) {
+			col = c;
+			break;
+		}
+	free(f);
+	return col;
+}
+
+/* After a search moved the text cursor, put the cell cursor on it. */
+static void
+tbl_sync(Editor *e)
+{
+	Tbl *tb = e->tbl;
+
+	if (!tb || !tb->searching)
+		return;
+	tb->cx = tbl_col_at(e, e->cy, e->cx);
+	tb->searching = 0;
+}
+
+/* Replace cell (row, col) with val: the field's bytes go, the canonical
+ * encoding of val comes, and a row too short for the column gets padded
+ * with delimiters first. One undo step. Returns 0, or -1. */
+static int
+tbl_set_cell(Editor *e, size_t row, int col, const char *val, size_t n)
+{
+	Tbl *tb = e->tbl;
+	size_t off, len, outn;
+	int nf = tbl_cell_off(e, row, col, &off, &len), changed;
+	char *enc = tbl_quote(tb->delim, val, n, &outn, &changed);
+
+	if (!enc)
+		return -1;
+	text_undo_group_begin(e->t);
+	if (col >= nf) {			/* pad the short row */
+		size_t llen = text_line_len(e->t, row);
+		int k;
+
+		for (k = nf; k <= col; k++)
+			text_insert(e->t, row, llen++, &tb->delim, 1);
+		off = llen;
+		len = 0;
+	}
+	if (len)
+		text_delete(e->t, row, off, len);
+	if (outn)
+		text_insert(e->t, row, off, enc, outn);
+	text_undo_group_end(e->t);
+	free(enc);
+	e->cx = off;
+	if (changed)
+		set_status(e, "a tab or newline became a space (tab files cannot quote)");
+	return 0;
+}
+
+/* Edit the current cell in the prompt line. how: 'a' puts the cursor at the
+ * end, 'i' at the start, 'c' starts from an empty cell, and a character
+ * starts from that character typed over the cell. */
+static void
+tbl_edit_cell(Editor *e, uint32_t how)
+{
+	Tbl *tb = e->tbl;
+	char label[TBL_LABEL_MAX], q[TBL_LABEL_MAX + 24];
+	char *buf = malloc(TBL_CELL_MAX), *old;
+	size_t pos, oldn;
+
+	if (!buf)
+		return;
+	tbl_cell_value(e, e->cy, tb->cx, buf, TBL_CELL_MAX);
+	oldn = strlen(buf);
+	if (oldn + 1 >= TBL_CELL_MAX) {
+		set_status(e, "cell too long to edit here; use the text view");
+		free(buf);
+		return;
+	}
+	old = malloc(oldn + 1);
+	if (!old) {
+		free(buf);
+		return;
+	}
+	memcpy(old, buf, oldn + 1);
+	if (how == 'c') {
+		buf[0] = '\0';
+	} else if (how != 'a' && how != 'i') {
+		int n = utf8_encode((unsigned char *)buf, how);
+
+		buf[n > 0 ? n : 0] = '\0';
+	}
+	pos = how == 'i' ? 0 : strlen(buf);
+	snprintf(q, sizeof(q), "%s%zu: ", tbl_label(tb->cx, label,
+	    sizeof(label)), e->cy + 1);
+	if (prompt_edit(e, q, buf, TBL_CELL_MAX, 1, pos, 1)) {
+		if (strcmp(buf, old) != 0)
+			tbl_set_cell(e, e->cy, tb->cx, buf, strlen(buf));
+	} else {
+		set_status(e, "cell unchanged");
+	}
+	free(old);
+	free(buf);
+}
+
+/* Copy the current cell's value to the clipboard. */
+static void
+tbl_copy_cell(Editor *e)
+{
+	char *buf = malloc(TBL_CELL_MAX);
+	size_t n;
+
+	if (!buf)
+		return;
+	tbl_cell_value(e, e->cy, e->tbl->cx, buf, TBL_CELL_MAX);
+	n = strlen(buf);
+	clip_set(e, buf, n);
+	set_status(e, "copied the cell");
+}
+
+/* Paste the clipboard into the current cell, as one value. */
+static void
+tbl_paste_cell(Editor *e)
+{
+	if (!e->clip || e->clip_len == 0) {
+		set_status(e, "nothing to paste");
+		return;
+	}
+	tbl_set_cell(e, e->cy, e->tbl->cx, e->clip, e->clip_len);
+}
+
+/* Repeat the last search in direction dir and land on the cell. */
+static void
+tbl_find_again(Editor *e, int dir)
+{
+	size_t off, len;
+
+	if (!e->last_find[0]) {
+		set_status(e, "no previous search");
+		return;
+	}
+	tbl_cell_off(e, e->cy, e->tbl->cx, &off, &len);
+	e->cx = off;
+	ed_find_dir(e, e->last_find, dir);
+	e->tbl->cx = tbl_col_at(e, e->cy, e->cx);
+}
+
+/* ---- rows and columns ---- */
+
+/* Insert n blank rows above the cursor row, or below it. The cursor lands
+ * on the first new row. One undo step. */
+static void
+tbl_row_add(Editor *e, int n, int below)
+{
+	size_t y = e->cy;
+	int i;
+
+	if (n < 1)
+		n = 1;
+	text_undo_group_begin(e->t);
+	for (i = 0; i < n; i++) {
+		if (below)
+			text_split(e->t, y, text_line_len(e->t, y));
+		else
+			text_split(e->t, y, 0);
+	}
+	text_undo_group_end(e->t);
+	hl_touch(e, y);
+	e->cy = below ? y + 1 : y;
+	e->cx = 0;
+	set_status(e, "%d row%s inserted %s", n, n == 1 ? "" : "s",
+	    below ? "below" : "above");
+}
+
+/* The rows [y, y + n) as text, one per line with a newline after each. */
+static char *
+tbl_rows_text(const Editor *e, size_t y, int n, size_t *outn)
+{
+	size_t nl = text_lines(e->t), total = 0, i, o = 0;
+	char *buf;
+
+	for (i = 0; i < (size_t)n && y + i < nl; i++)
+		total += text_line_len(e->t, y + i) + 1;
+	buf = malloc(total + 1);
+	if (!buf)
+		return NULL;
+	for (i = 0; i < (size_t)n && y + i < nl; i++) {
+		size_t len = 0;
+		const char *s = text_line(e->t, y + i, &len);
+
+		memcpy(buf + o, s, len);
+		o += len;
+		buf[o++] = '\n';
+	}
+	buf[o] = '\0';
+	*outn = o;
+	return buf;
+}
+
+/* Copy n rows from the cursor to the clipboard. */
+static void
+tbl_row_copy(Editor *e, int n)
+{
+	size_t len;
+	char *buf;
+
+	if (n < 1)
+		n = 1;
+	buf = tbl_rows_text(e, e->cy, n, &len);
+	if (!buf)
+		return;
+	clip_set(e, buf, len);
+	set_status(e, "copied %d row%s", n, n == 1 ? "" : "s");
+}
+
+/* Delete n rows from the cursor, after copying them. One undo step. */
+static void
+tbl_row_del(Editor *e, int n)
+{
+	size_t y = e->cy, nl = text_lines(e->t);
+
+	if (n < 1)
+		n = 1;
+	if (y + (size_t)n > nl)
+		n = (int)(nl - y);
+	tbl_row_copy(e, n);
+	text_undo_group_begin(e->t);
+	vi_delete_lines(e, y, y + (size_t)n - 1);
+	text_undo_group_end(e->t);
+	e->cx = 0;
+	set_status(e, "%d row%s deleted (Ctrl+V or p pastes them back)", n,
+	    n == 1 ? "" : "s");
+}
+
+/* Paste the clipboard as rows below the cursor row, or above it: each line
+ * of it becomes a row. One undo step. */
+static void
+tbl_row_paste(Editor *e, int below)
+{
+	size_t i = 0, y = e->cy, first;
+	int n = 0;
+
+	if (!e->clip || e->clip_len == 0) {
+		set_status(e, "nothing to paste");
+		return;
+	}
+	text_undo_group_begin(e->t);
+	first = below ? y + 1 : y;
+	while (i < e->clip_len) {
+		size_t j = i;
+
+		while (j < e->clip_len && e->clip[j] != '\n')
+			j++;
+		if (below) {
+			text_split(e->t, y, text_line_len(e->t, y));
+			y++;
+		} else {
+			text_split(e->t, y, 0);
+		}
+		text_insert(e->t, y, 0, e->clip + i, j - i);
+		if (!below)
+			y++;
+		n++;
+		i = j + 1;
+	}
+	text_undo_group_end(e->t);
+	hl_touch(e, first);
+	e->cy = first;
+	e->cx = 0;
+	e->tbl->ncols = tbl_count_cols(e->t, e->tbl->delim);
+	set_status(e, "%d row%s pasted", n, n == 1 ? "" : "s");
+}
+
+/* Make room in the width array for n columns at c, or close it up. */
+static void
+tbl_width_shift(Tbl *tb, int c, int n)
+{
+	int i;
+
+	if (c >= tb->width_n)
+		return;
+	if (n > 0) {
+		if (tbl_set_width(tb, tb->width_n + n - 1, 0) < 0)
+			return;
+		for (i = tb->width_n - 1; i >= c + n; i--)
+			tb->width[i] = tb->width[i - n];
+		for (i = c; i < c + n; i++)
+			tb->width[i] = 0;
+	} else {
+		n = -n;
+		for (i = c; i + n < tb->width_n; i++)
+			tb->width[i] = tb->width[i + n];
+		for (; i < tb->width_n; i++)
+			tb->width[i] = 0;
+	}
+}
+
+/* Insert n empty columns left of the cursor column, or right of it. A row
+ * too short to reach the column is left alone: the new column is empty
+ * there already. One undo step. */
+static void
+tbl_col_add(Editor *e, int n, int after)
+{
+	Tbl *tb = e->tbl;
+	size_t nl = text_lines(e->t), y;
+	int c = tb->cx, k;
+
+	if (n < 1)
+		n = 1;
+	text_undo_group_begin(e->t);
+	for (y = 0; y < nl; y++) {
+		size_t off, len, at;
+		int nf = tbl_cell_off(e, y, c, &off, &len);
+
+		if (c >= nf)
+			continue;
+		at = after ? off + len : off;
+		for (k = 0; k < n; k++)
+			text_insert(e->t, y, at, &tb->delim, 1);
+	}
+	text_undo_group_end(e->t);
+	hl_touch(e, 0);
+	tbl_width_shift(tb, after ? c + 1 : c, n);
+	tb->ncols = tbl_count_cols(e->t, tb->delim);
+	if (after)
+		tb->cx = c + 1;
+	set_status(e, "%d column%s inserted %s", n, n == 1 ? "" : "s",
+	    after ? "right" : "left");
+}
+
+/* Delete n columns from the cursor column. A row's only field is cleared
+ * rather than removed, so every row keeps at least one cell. One undo
+ * step. */
+static void
+tbl_col_del(Editor *e, int n)
+{
+	Tbl *tb = e->tbl;
+	size_t nl = text_lines(e->t), y;
+	int c = tb->cx, k;
+
+	if (n < 1)
+		n = 1;
+	if (c + n > tb->ncols)
+		n = tb->ncols - c;
+	text_undo_group_begin(e->t);
+	for (y = 0; y < nl; y++) {
+		for (k = 0; k < n; k++) {
+			size_t off, len;
+			int nf = tbl_cell_off(e, y, c, &off, &len);
+
+			if (c >= nf)
+				break;
+			if (nf == 1)
+				text_delete(e->t, y, off, len);
+			else if (c + 1 < nf)
+				text_delete(e->t, y, off, len + 1);
+			else
+				text_delete(e->t, y, off - 1, len + 1);
+		}
+	}
+	text_undo_group_end(e->t);
+	hl_touch(e, 0);
+	tbl_width_shift(tb, c, -n);
+	tb->ncols = tbl_count_cols(e->t, tb->delim);
+	if (tb->cx >= tb->ncols)
+		tb->cx = tb->ncols - 1;
+	set_status(e, "%d column%s deleted", n, n == 1 ? "" : "s");
+}
+
+/* Undo or redo, then put the cell cursor where the text cursor landed. */
+static void
+tbl_undo(Editor *e, int redo)
+{
+	int rc = redo ? text_redo(e->t, &e->cy, &e->cx) :
+	    text_undo(e->t, &e->cy, &e->cx);
+
+	if (rc != 0) {
+		set_status(e, redo ? "nothing to redo" : "nothing to undo");
+		return;
+	}
+	hl_touch(e, 0);
+	e->tbl->ncols = tbl_count_cols(e->t, e->tbl->delim);
+	e->tbl->cx = tbl_col_at(e, e->cy, e->cx);
+}
+
+/* The count argument of :rowadd and friends: N, or 1. */
+static int
+tbl_count_arg(const char *arg)
+{
+	long n = strtol(arg, NULL, 10);
+
+	return n >= 1 && n <= 100000 ? (int)n : 1;
 }
 
 /* "-- TABLE --  C7: value" for the status line: the cell under the cursor
@@ -10728,6 +11355,39 @@ tbl_cell_status(const Editor *e, char *buf, size_t n)
 			val[i] = ' ';
 	snprintf(buf, n, "-- TABLE --  %s%zu: %s",
 	    tbl_label(e->tbl->cx, label, sizeof(label)), e->cy + 1, val);
+}
+
+/* :cell C7 (or C, or 7) -- move the cell cursor by label and row. */
+static void
+tbl_cell_goto(Editor *e, const char *arg)
+{
+	char label[TBL_LABEL_MAX];
+	size_t i = 0, nl = text_lines(e->t);
+	long row;
+	int col;
+
+	if (!e->tbl) {
+		set_status(e, "not a table (:table turns the view on)");
+		return;
+	}
+	while (arg[i] && isalpha((unsigned char)arg[i]) && i + 1 < sizeof(label)) {
+		label[i] = arg[i];
+		i++;
+	}
+	label[i] = '\0';
+	col = i ? tbl_label_col(label) : -1;
+	row = isdigit((unsigned char)arg[i]) ? strtol(arg + i, NULL, 10) : 0;
+	if ((!i && !row) || (i && col < 0) || row < 0 || arg[i + strspn(arg + i, "0123456789")]) {
+		set_status(e, "E474: :cell C7 (a column label, a row number, or both)");
+		return;
+	}
+	if (col >= e->tbl->ncols)
+		col = e->tbl->ncols - 1;
+	if (col >= 0)
+		e->tbl->cx = col;
+	if (row > 0)
+		e->cy = (size_t)row > nl ? (nl ? nl - 1 : 0) : (size_t)row - 1;
+	e->tbl->pending = 0;
 }
 
 /* :colwidth N [all] -- set the current column's width, or every column's. */
@@ -12515,37 +13175,78 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 
 /* Draw the editor frame, then overlay a prompt on the status row and leave
  * the cursor at the end of the typed text. */
+/* Paint q and buf on the status row with the cursor at byte pos of buf. A
+ * newline in buf shows as a return mark; when the line is longer than the
+ * row, the window slides so the cursor stays in view. */
 static void
-ui_prompt(Editor *e, const char *q, const char *buf)
+ui_prompt_at(Editor *e, const char *q, const char *buf, size_t pos)
 {
 	const Pal *p = ed_chrome(e);
 	uint16_t at = (p->reverse_bars ? ATTR_REVERSE : 0) | ATTR_BOLD;
-	char line[512];
-	int col;
+	const char *nl = (e->d->t->box_mode == VEDIT_BOX_UTF8) ? "\xe2\x86\xb5" : "~";
+	char line[1024], shown[1024];
+	size_t o = 0, i, cpos = 0, ql = strlen(q), skip = 0;
+	int col, width = e->cols > 1 ? e->cols - 1 : 1;
 	int status_row = (e->rows > 0 ? e->rows : 24) - 1;
 
 	ed_render(e, e->d);		/* paint the frame under the prompt */
-	col = snprintf(line, sizeof(line), "%s%s", q, buf ? buf : "");
-	ui_field(e->d, status_row, 0, e->cols, line, p->bar_fg, p->bar_bg, at);
+	for (i = 0; buf && buf[i] && o + 4 < sizeof(line); i++) {
+		if (i == pos)
+			cpos = o;
+		if (buf[i] == '\n') {
+			size_t nn = strlen(nl);
+
+			memcpy(line + o, nl, nn);
+			o += nn;
+		} else {
+			line[o++] = buf[i];
+		}
+	}
+	if (buf && pos >= i)
+		cpos = o;
+	line[o] = '\0';
+	/* slide the window so the cursor column fits after the label */
+	while (ql + (size_t)disp_cols(line + skip, cpos - skip) >= (size_t)width &&
+	    skip < cpos) {
+		skip++;
+		while (skip < cpos && ((unsigned char)line[skip] & 0xc0) == 0x80)
+			skip++;
+	}
+	snprintf(shown, sizeof(shown), "%s%s", q, line + skip);
+	ui_field(e->d, status_row, 0, e->cols, shown, p->bar_fg, p->bar_bg, at);
+	col = (int)ql + disp_cols(line + skip, cpos - skip);
 	if (col >= e->cols)
 		col = e->cols - 1;
 	scr_cursor(e->d, status_row, col);
 	scr_present(e->d);
 }
 
-/* Read a line of text. buf is edited in place, so a caller may pre-fill it
- * with a default. Returns 1 with buf filled, or 0 if cancelled; when
- * allow_empty is 0 an empty line reads as a cancel, else it is accepted. */
+static void
+ui_prompt(Editor *e, const char *q, const char *buf)
+{
+	ui_prompt_at(e, q, buf, buf ? strlen(buf) : 0);
+}
+
+/* Edit a line of text in the status row with a moving cursor: Left, Right,
+ * Home and End move it, Backspace and Delete erase around it, typing inserts
+ * at it, and Alt+Enter inserts a newline when allow_nl is set. buf is edited
+ * in place (so a caller may pre-fill it) starting with the cursor at byte
+ * pos. Returns 1 with buf filled, or 0 if cancelled; when allow_empty is 0
+ * an empty line reads as a cancel, else it is accepted. */
 static int
-prompt_line(Editor *e, const char *q, char *buf, size_t bufsz, int allow_empty)
+prompt_edit(Editor *e, const char *q, char *buf, size_t bufsz,
+    int allow_empty, size_t pos, int allow_nl)
 {
 	size_t len = strlen(buf);
 
+	if (pos > len)
+		pos = len;
 	for (;;) {
 		Event ev;
 		struct tkbd_seq seq;
+		size_t k;
 
-		ui_prompt(e, q, buf);
+		ui_prompt_at(e, q, buf, pos);
 		if (scr_wait(e->d, &ev) == EVENT_EOF)
 			return 0;
 		if (ev.type != EVENT_KEY) {
@@ -12555,20 +13256,63 @@ prompt_line(Editor *e, const char *q, char *buf, size_t bufsz, int allow_empty)
 		seq = ev.key;
 		if (seq.type != TKBD_KEY)
 			continue;
+		if ((seq.mod & TKBD_MOD_ALT) && allow_nl &&
+		    (seq.key == TKBD_KEY_ENTER || seq.ch == '\r' || seq.ch == '\n')) {
+			if (len + 1 < bufsz) {
+				memmove(buf + pos + 1, buf + pos, len - pos + 1);
+				buf[pos++] = '\n';
+				len++;
+			}
+			continue;
+		}
 		if (seq.key == TKBD_KEY_ENTER)
 			return allow_empty ? 1 : (len > 0);
 		if (seq.key == TKBD_KEY_ESC ||
 		    ((seq.mod & TKBD_MOD_CTRL) && seq.key == TKBD_KEY_C))
 			return 0;
-		if (seq.key == TKBD_KEY_BACKSPACE ||
-		    seq.key == TKBD_KEY_BACKSPACE2) {
-			while (len > 0 &&
-			    ((unsigned char)buf[len - 1] & 0xc0) == 0x80)
-				len--;		/* drop UTF-8 continuation */
-			if (len > 0)
-				len--;
-			buf[len] = '\0';
+		switch (seq.key) {
+		case TKBD_KEY_LEFT:
+			if (pos > 0) {
+				pos--;
+				while (pos > 0 && ((unsigned char)buf[pos] & 0xc0) == 0x80)
+					pos--;
+			}
 			continue;
+		case TKBD_KEY_RIGHT:
+			if (pos < len) {
+				pos++;
+				while (pos < len && ((unsigned char)buf[pos] & 0xc0) == 0x80)
+					pos++;
+			}
+			continue;
+		case TKBD_KEY_HOME:
+			pos = 0;
+			continue;
+		case TKBD_KEY_END:
+			pos = len;
+			continue;
+		case TKBD_KEY_DEL:
+			if (pos < len) {
+				k = pos + 1;
+				while (k < len && ((unsigned char)buf[k] & 0xc0) == 0x80)
+					k++;
+				memmove(buf + pos, buf + k, len - k + 1);
+				len -= k - pos;
+			}
+			continue;
+		case TKBD_KEY_BACKSPACE:
+		case TKBD_KEY_BACKSPACE2:
+			if (pos > 0) {
+				k = pos - 1;
+				while (k > 0 && ((unsigned char)buf[k] & 0xc0) == 0x80)
+					k--;
+				memmove(buf + k, buf + pos, len - pos + 1);
+				len -= pos - k;
+				pos = k;
+			}
+			continue;
+		default:
+			break;
 		}
 		if (!(seq.mod & TKBD_MOD_CTRL) && seq.ch != TKBD_CH_NONE &&
 		    seq.ch >= 0x20 && seq.ch != 0x7f) {
@@ -12576,12 +13320,21 @@ prompt_line(Editor *e, const char *q, char *buf, size_t bufsz, int allow_empty)
 			int el = utf8_encode(enc, seq.ch);
 
 			if (el > 0 && len + (size_t)el < bufsz) {
-				memcpy(buf + len, enc, (size_t)el);
+				memmove(buf + pos + (size_t)el, buf + pos,
+				    len - pos + 1);
+				memcpy(buf + pos, enc, (size_t)el);
+				pos += (size_t)el;
 				len += (size_t)el;
-				buf[len] = '\0';
 			}
 		}
 	}
+}
+
+/* Read a line of text with the cursor at its end; see prompt_edit. */
+static int
+prompt_line(Editor *e, const char *q, char *buf, size_t bufsz, int allow_empty)
+{
+	return prompt_edit(e, q, buf, bufsz, allow_empty, strlen(buf), 0);
 }
 
 int
@@ -13604,6 +14357,9 @@ static const struct {
 	{ ":repost [art]",	"Copy a terminal's output to a new buffer" },
 	{ ":table [off|,|;|tab]",	"CSV/TSV grid view on this buffer (View menu too)" },
 	{ ":colwidth N [all]",	"Table view: width of this column, or every column" },
+	{ ":cell C7",		"Table view: go to a cell by label and row" },
+	{ ":rowadd[!] [N]",	"Table view: insert N rows above (! below); :rowdel" },
+	{ ":coladd[!] [N]",	"Table view: insert N columns left (! right); :coldel" },
 #endif
 	{ ":reload",		"Re-read the config file (also Options menu)" },
 	{ "F1 / F2",		"Show this help / back to modeless keys" },
@@ -13821,6 +14577,53 @@ static const char *const tut_term[] = {
 };
 #endif
 
+static const char *const tut_table[] = {
+	"The table view shows a CSV or TSV file as a grid of cells. A file",
+	"named *.csv, *.tsv or *.tab opens in it; :table turns it on for",
+	"any buffer and :table off turns it off. The text stays the file:",
+	"a row is a line and a cell is a piece of it, so undo, search and",
+	"saving work as they do on text.",
+	"",
+	"Moving",
+	"",
+	"  - Arrows or Tab and Shift+Tab move by cell; vi h j k l do too.",
+	"  - Home and End (vi 0 and $) go to the row's ends; Ctrl+Home and",
+	"    Ctrl+End (vi gg and G) to the first and last row.",
+	"  - :cell C7 jumps to column C, row 7. :cell C or :cell 7 moves",
+	"    one way only.",
+	"  - The header row stays put while the rows scroll; the status",
+	"    line names the cell and shows its whole value.",
+	"",
+	"Editing a cell",
+	"",
+	"  - Enter (vi a or i) loads the cell into the prompt line, where",
+	"    the cursor moves with the arrows. Enter commits, Esc leaves",
+	"    the cell alone, Alt+Enter puts a newline in the value.",
+	"  - Typing a character (vi c or s) starts the cell over.",
+	"  - Delete (vi x) clears it. Ctrl+C and Ctrl+V copy and paste a",
+	"    cell; Ctrl+X cuts one.",
+	"  - Quotes are added only when the value needs them, and only",
+	"    the edited cell's bytes change in the file.",
+	"",
+	"Rows and columns",
+	"",
+	"  - :rowadd inserts a row above, :rowadd! below (vi O and o).",
+	"    :rowdel deletes the row and copies it (vi dd); vi yy copies",
+	"    a row and p or P pastes rows below or above.",
+	"  - :coladd and :coladd! insert a column left or right of the",
+	"    cursor; :coldel deletes one. A count follows any of them.",
+	"  - :colwidth N sets the column's width; :colwidth N all every",
+	"    column's. Widths are fixed, not fitted to the text.",
+	"  - Ctrl+Z and Ctrl+Y (vi u and Ctrl+R) undo and redo.",
+	"",
+	"Searching",
+	"",
+	"  - Ctrl+F (vi /) searches from the current cell; F3 and",
+	"    Shift+F3 (vi n and N) repeat. The grid follows the match.",
+	"",
+	"Set table.view = off in the config to open these files as text.",
+};
+
 static const char *const tut_recover[] = {
 	"vedit guards against losing unsaved work when the editor or the",
 	"connection dies. While you edit a named file it keeps a swap",
@@ -13871,6 +14674,7 @@ static const Tutorial g_tutorials[] = {
 	{ "Terminal Buffers",	TUT(tut_term) },
 	{ "Art View (.ans)",	TUT(tut_art) },
 #endif
+	{ "Table View (CSV)",	TUT(tut_table) },
 	{ "Crash Recovery",	TUT(tut_recover) },
 };
 #undef TUT
@@ -17926,19 +18730,31 @@ run_menu_act(Editor *e, Menuact act)
 			return 1;
 		break;
 	case MA_UNDO:
-		(void)ed_dispatch(e, CMD_UNDO, NULL);
+		if (e->tbl)		/* the table view keeps its cell cursor */
+			tbl_undo(e, 0);
+		else
+			(void)ed_dispatch(e, CMD_UNDO, NULL);
 		break;
 	case MA_REDO:
-		(void)ed_dispatch(e, CMD_REDO, NULL);
+		if (e->tbl)
+			tbl_undo(e, 1);
+		else
+			(void)ed_dispatch(e, CMD_REDO, NULL);
 		break;
 	case MA_CUT:
 		(void)ed_dispatch(e, CMD_CUT, NULL);
 		break;
 	case MA_COPY:
-		(void)ed_dispatch(e, CMD_COPY, NULL);
+		if (e->tbl)
+			tbl_copy_cell(e);
+		else
+			(void)ed_dispatch(e, CMD_COPY, NULL);
 		break;
 	case MA_PASTE:
-		(void)ed_dispatch(e, CMD_PASTE, NULL);
+		if (e->tbl)
+			tbl_paste_cell(e);
+		else
+			(void)ed_dispatch(e, CMD_PASTE, NULL);
 		break;
 	case MA_OSC_COPY:
 		osc_copy_selection(e);
@@ -18047,6 +18863,22 @@ run_menu_act(Editor *e, Menuact act)
 		break;
 	case MA_TABLE:
 		tbl_command(e, "");
+		break;
+	case MA_TBL_ROWADD:
+		if (e->tbl)
+			tbl_row_add(e, 1, 0);
+		break;
+	case MA_TBL_ROWDEL:
+		if (e->tbl)
+			tbl_row_del(e, 1);
+		break;
+	case MA_TBL_COLADD:
+		if (e->tbl)
+			tbl_col_add(e, 1, 0);
+		break;
+	case MA_TBL_COLDEL:
+		if (e->tbl)
+			tbl_col_del(e, 1);
 		break;
 	case MA_VI_MODE:
 		toggle_vi(e);
@@ -19228,7 +20060,9 @@ editor_loop(Editor *e)
 
 		/* The table view takes every key; its : prompt is vi's. */
 		if (e->tbl) {
-			switch (tbl_key(e, &seq)) {
+			Req tr = tbl_key(e, &seq);
+
+			switch (tr) {
 			case REQ_VI_COLON:
 				switch (vi_colon(e)) {
 				case REQ_FORCE_QUIT:
@@ -19245,10 +20079,11 @@ editor_loop(Editor *e)
 			case REQ_FORCE_QUIT:
 				return 0;
 			default:
-				if (run_req(e, REQ_CONTINUE))
+				if (run_req(e, tr))
 					return 0;
 				break;
 			}
+			tbl_sync(e);
 			ed_render(e, e->d);
 			continue;
 		}
@@ -29795,7 +30630,8 @@ enum excmd {
 	EX_EDIT, EX_ENEW, EX_WRITE, EX_WQ, EX_XIT, EX_QUIT, EX_QALL, EX_WQALL,
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
 	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD,
-	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH,
+	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH, EX_CELL,
+	EX_ROWADD, EX_ROWDEL, EX_COLADD, EX_COLDEL,
 };
 
 static const struct excmd_name {
@@ -29837,6 +30673,11 @@ static const struct excmd_name {
 	{ "draw",	2, EX_DRAW },
 	{ "table",	3, EX_TABLE },
 	{ "colwidth",	4, EX_COLWIDTH },
+	{ "cell",	4, EX_CELL },
+	{ "rowadd",	4, EX_ROWADD },
+	{ "rowdel",	4, EX_ROWDEL },
+	{ "coladd",	4, EX_COLADD },
+	{ "coldel",	4, EX_COLDEL },
 	{ "reload",	3, EX_RELOAD },
 	{ "marks",	3, EX_MARKS },
 	{ "delmarks",	4, EX_DELMARKS },
@@ -30191,6 +31032,26 @@ vi_ex_exec(Editor *e, char *buf)
 		return REQ_CONTINUE;
 	case EX_COLWIDTH:
 		tbl_colwidth(e, rest);
+		return REQ_CONTINUE;
+	case EX_CELL:
+		tbl_cell_goto(e, rest);
+		return REQ_CONTINUE;
+	case EX_ROWADD:
+	case EX_ROWDEL:
+	case EX_COLADD:
+	case EX_COLDEL:
+		if (!e->tbl) {
+			set_status(e, "not a table (:table turns the view on)");
+			return REQ_CONTINUE;
+		}
+		if (id == EX_ROWADD)
+			tbl_row_add(e, tbl_count_arg(rest), bang);
+		else if (id == EX_ROWDEL)
+			tbl_row_del(e, tbl_count_arg(rest));
+		else if (id == EX_COLADD)
+			tbl_col_add(e, tbl_count_arg(rest), bang);
+		else
+			tbl_col_del(e, tbl_count_arg(rest));
 		return REQ_CONTINUE;
 	case EX_RELOAD:
 		ed_reload_config(e);

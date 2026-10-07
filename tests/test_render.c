@@ -2410,6 +2410,348 @@ t_tbl_grid(Test *t)
 	rmdir(dir);
 }
 
+/* The prompt editor moves its cursor; a cell edit commits with canonical
+ * quoting, pads short rows, clears, copies and pastes; a search lands on
+ * the cell; :cell jumps by label. */
+static void
+t_tbl_edit(Test *t)
+{
+	char dir[] = "/tmp/vedit-tbl-XXXXXX";
+	char path[PATH_MAX];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	FILE *f;
+	struct tkbd_seq seq;
+	size_t len;
+	const char *line;
+	char buf[64];
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/e.csv", dir);
+	f = fopen(path, "wb");
+	TAP_ASSERT(t, f != NULL);
+	fputs("id,name,note\n1,Ann,x\n2,Bob\n3,\"Cy, jr\",needle here\n", f);
+	fclose(f);
+
+	/* the prompt: Left twice, insert, Alt+Enter, Delete, End, type, Enter */
+	memio_init(&m, "\033[D\033[DX\033\r\033[3~\033[FZ\r", 18, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	snprintf(buf, sizeof(buf), "abc");
+	TAP_CHECK(t, prompt_edit(&v->e, "> ", buf, sizeof(buf), 1, 3, 1) == 1);
+	TAP_CHECKF(t, strcmp(buf, "aX\ncZ") == 0, "prompt gave [%s]", buf);
+	vedit_free(v);
+	memio_free(&m);
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	TAP_ASSERT(t, v->e.tbl != NULL);
+
+	/* set: quoting only when needed, a short row padded, one undo step */
+	TAP_CHECK(t, tbl_set_cell(&v->e, 1, 1, "Ann, PhD", 8) == 0);
+	line = text_line(v->e.t, 1, &len);
+	TAP_CHECKF(t, strcmp(line, "1,\"Ann, PhD\",x") == 0, "row 2 [%s]", line);
+	TAP_CHECK(t, tbl_set_cell(&v->e, 1, 1, "Ann", 3) == 0);
+	line = text_line(v->e.t, 1, &len);
+	TAP_CHECKF(t, strcmp(line, "1,Ann,x") == 0, "row 2 [%s]", line);
+	TAP_CHECK(t, tbl_set_cell(&v->e, 2, 2, "say \"hi\"\nthere", 14) == 0);
+	line = text_line(v->e.t, 2, &len);
+	TAP_CHECKF(t, strcmp(line, "2,Bob,\"say \"\"hi\"\"\nthere\"") == 0, "row 3 [%s]", line);
+	TAP_CHECK(t, text_undo(v->e.t, &v->e.cy, &v->e.cx) == 0);
+	line = text_line(v->e.t, 2, &len);
+	TAP_CHECKF(t, strcmp(line, "2,Bob") == 0, "after undo [%s]", line);
+	TAP_CHECK(t, text_dirty(v->e.t));
+
+	/* keys: Delete clears; typing replaces through the prompt; Ctrl+C/V */
+	memset(&seq, 0, sizeof(seq));
+	seq.type = TKBD_KEY;
+	seq.ch = TKBD_CH_NONE;
+	v->e.cy = 1;
+	v->e.tbl->cx = 2;
+	seq.key = TKBD_KEY_DEL;
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	line = text_line(v->e.t, 1, &len);
+	TAP_CHECKF(t, strcmp(line, "1,Ann,") == 0, "cleared [%s]", line);
+	v->e.tbl->cx = 1;
+	seq.key = TKBD_KEY_C;
+	seq.mod = TKBD_MOD_CTRL;
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	TAP_CHECK(t, v->e.clip && v->e.clip_len == 3 && memcmp(v->e.clip, "Ann", 3) == 0);
+	v->e.tbl->cx = 2;
+	seq.key = TKBD_KEY_V;
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	line = text_line(v->e.t, 1, &len);
+	TAP_CHECKF(t, strcmp(line, "1,Ann,Ann") == 0, "pasted [%s]", line);
+	seq.mod = 0;
+	vedit_free(v);
+	memio_free(&m);
+
+	/* typing 'Q' then "x" Enter replaces the cell with Qx (modeless) */
+	memio_init(&m, "x\r", 2, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	v->e.cy = 1;
+	v->e.tbl->cx = 1;
+	seq.key = TKBD_KEY_Q;
+	seq.ch = 'Q';
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	line = text_line(v->e.t, 1, &len);
+	TAP_CHECKF(t, strcmp(line, "1,Qx,x") == 0, "replaced [%s]", line);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* vi: 'a' appends through the prompt; 'x' clears; search lands on a cell */
+	memio_init(&m, "!\r", 2, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	v->e.mode = MODE_NORMAL;
+	v->e.cy = 1;
+	v->e.tbl->cx = 1;
+	seq.key = TKBD_KEY_A;
+	seq.ch = 'a';
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	line = text_line(v->e.t, 1, &len);
+	TAP_CHECKF(t, strcmp(line, "1,Ann!,x") == 0, "appended [%s]", line);
+	seq.key = TKBD_KEY_X;
+	seq.ch = 'x';
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	line = text_line(v->e.t, 1, &len);
+	TAP_CHECKF(t, strcmp(line, "1,,x") == 0, "x cleared [%s]", line);
+	snprintf(v->e.last_find, sizeof(v->e.last_find), "needle");
+	v->e.vi_search_dir = 1;
+	seq.key = TKBD_KEY_N;
+	seq.ch = 'n';
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	TAP_CHECKF(t, v->e.cy == 3 && v->e.tbl->cx == 2, "search landed on row %zu col %d",
+	    v->e.cy, v->e.tbl->cx);
+	TAP_CHECK(t, tbl_col_at(&v->e, 3, 0) == 0 && tbl_col_at(&v->e, 3, 5) == 1 &&
+	    tbl_col_at(&v->e, 3, 99) == 2);
+
+	/* :cell */
+	tbl_cell_goto(&v->e, "B2");
+	TAP_CHECK(t, v->e.cy == 1 && v->e.tbl->cx == 1);
+	tbl_cell_goto(&v->e, "c");
+	TAP_CHECK(t, v->e.cy == 1 && v->e.tbl->cx == 2);
+	tbl_cell_goto(&v->e, "99");
+	TAP_CHECK(t, v->e.cy == 3 && v->e.tbl->cx == 2);
+	tbl_cell_goto(&v->e, "ZZ1");
+	TAP_CHECK(t, v->e.cy == 0 && v->e.tbl->cx == 2);
+	tbl_cell_goto(&v->e, "7x");
+	TAP_CHECK(t, strncmp(v->e.status, "E474", 4) == 0);
+	TAP_CHECK(t, tbl_label_col("A") == 0 && tbl_label_col("aa") == 26 &&
+	    tbl_label_col("ZZ") == 701 && tbl_label_col("A1") == -1);
+
+	vedit_free(v);
+	memio_free(&m);
+	unlink(path);
+	rmdir(dir);
+}
+
+/* Through the main loop: Ctrl+F searches from the grid and lands on the
+ * cell, Enter edits, Ctrl+Q quits a clean buffer. */
+static void
+t_tbl_loop(Test *t)
+{
+	char dir[] = "/tmp/vedit-tbl-XXXXXX";
+	char path[PATH_MAX];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	FILE *f;
+	size_t len;
+	const char *line;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/l.csv", dir);
+	f = fopen(path, "wb");
+	TAP_ASSERT(t, f != NULL);
+	fputs("id,name,note\n1,Ann,x\n2,Bob,y\n", f);
+	fclose(f);
+
+	/* Ctrl+F "Bob" Enter; Right; Enter "!" Enter; Ctrl+S; Ctrl+Q */
+	memio_init(&m, "\006Bob\r\033[C\r!\r\023\021", 13, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	TAP_ASSERT(t, v->e.tbl != NULL);
+	TAP_CHECK(t, vedit_run(v) == 0);
+	TAP_CHECKF(t, v->e.cy == 2 && v->e.tbl->cx == 2, "ended on row %zu col %d",
+	    v->e.cy, v->e.tbl->cx);
+	line = text_line(v->e.t, 2, &len);
+	TAP_CHECKF(t, strcmp(line, "2,Bob,y!") == 0, "row 3 [%s]", line);
+	TAP_CHECK(t, !text_dirty(v->e.t));
+	vedit_free(v);
+	memio_free(&m);
+	unlink(path);
+	rmdir(dir);
+}
+
+/* Rows and columns: insert above and below, delete with copy, paste rows,
+ * insert and delete columns with short rows and a BOM, the ex forms with
+ * a bang and a count, and undo keeping the cell cursor. */
+static void
+t_tbl_rows(Test *t)
+{
+	char dir[] = "/tmp/vedit-tbl-XXXXXX";
+	char path[PATH_MAX];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	FILE *f;
+	struct tkbd_seq seq;
+	char exbuf[32];
+	size_t len;
+	const char *line;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/r.csv", dir);
+	f = fopen(path, "wb");
+	TAP_ASSERT(t, f != NULL);
+	fputs("\xef\xbb\xbfid,name,note\n1,Ann,x\n2\n3,Cy,z\n", f);
+	fclose(f);
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	TAP_ASSERT(t, v->e.tbl != NULL && v->e.tbl->ncols == 3);
+
+	/* rows: above, below, delete, paste back */
+	v->e.cy = 1;
+	tbl_row_add(&v->e, 2, 0);
+	TAP_CHECKF(t, text_lines(v->e.t) == 6 && v->e.cy == 1, "%zu lines, row %zu",
+	    text_lines(v->e.t), v->e.cy);
+	line = text_line(v->e.t, 3, &len);
+	TAP_CHECK(t, strcmp(line, "1,Ann,x") == 0 && text_line_len(v->e.t, 1) == 0);
+	TAP_CHECK(t, text_undo(v->e.t, &v->e.cy, &v->e.cx) == 0 && text_lines(v->e.t) == 4);
+	v->e.cy = 3;
+	tbl_row_add(&v->e, 1, 1);
+	TAP_CHECK(t, text_lines(v->e.t) == 5 && v->e.cy == 4 && text_line_len(v->e.t, 4) == 0);
+	v->e.cy = 1;
+	tbl_row_del(&v->e, 2);
+	TAP_CHECKF(t, text_lines(v->e.t) == 3 && v->e.cy == 1, "%zu lines after rowdel",
+	    text_lines(v->e.t));
+	line = text_line(v->e.t, 1, &len);
+	TAP_CHECK(t, strcmp(line, "3,Cy,z") == 0);
+	TAP_CHECK(t, v->e.clip_len == 10 && memcmp(v->e.clip, "1,Ann,x\n2\n", 10) == 0);
+	tbl_row_paste(&v->e, 0);		/* above: back where they were */
+	TAP_CHECK(t, text_lines(v->e.t) == 5 && v->e.cy == 1);
+	line = text_line(v->e.t, 2, &len);
+	TAP_CHECKF(t, strcmp(line, "2") == 0, "pasted row 3 [%s]", line);
+	line = text_line(v->e.t, 3, &len);
+	TAP_CHECK(t, strcmp(line, "3,Cy,z") == 0);
+	v->e.cy = 4;
+	tbl_row_paste(&v->e, 1);		/* below the last row */
+	TAP_CHECK(t, text_lines(v->e.t) == 7 && v->e.cy == 5);
+	TAP_CHECK(t, text_undo(v->e.t, &v->e.cy, &v->e.cx) == 0 && text_lines(v->e.t) == 5);
+
+	/* columns: insert left of B; the short row "2" is untouched */
+	v->e.cy = 0;
+	v->e.tbl->cx = 1;
+	tbl_col_add(&v->e, 1, 0);
+	TAP_CHECK(t, v->e.tbl->ncols == 4 && v->e.tbl->cx == 1);
+	line = text_line(v->e.t, 0, &len);
+	TAP_CHECKF(t, strcmp(line, "\xef\xbb\xbfid,,name,note") == 0, "header [%s]", line);
+	line = text_line(v->e.t, 2, &len);
+	TAP_CHECK(t, strcmp(line, "2") == 0);
+	/* insert right of A on row 0 keeps the BOM ahead of A */
+	v->e.tbl->cx = 0;
+	tbl_set_width(v->e.tbl, 0, 5);
+	tbl_set_width(v->e.tbl, 1, 7);
+	tbl_col_add(&v->e, 1, 1);
+	line = text_line(v->e.t, 0, &len);
+	TAP_CHECKF(t, strcmp(line, "\xef\xbb\xbfid,,,name,note") == 0, "header [%s]", line);
+	TAP_CHECK(t, v->e.tbl->cx == 1 && v->e.tbl->ncols == 5);
+	TAP_CHECK(t, tbl_width(v->e.tbl, 0) == 5 && tbl_width(v->e.tbl, 1) == 10 &&
+	    tbl_width(v->e.tbl, 2) == 7);
+	/* delete the two empty columns; then the last column; then the only one */
+	tbl_col_del(&v->e, 2);
+	line = text_line(v->e.t, 0, &len);
+	TAP_CHECKF(t, strcmp(line, "\xef\xbb\xbfid,name,note") == 0, "header [%s]", line);
+	TAP_CHECK(t, v->e.tbl->ncols == 3 && tbl_width(v->e.tbl, 1) == 10 && tbl_width(v->e.tbl, 0) == 5);
+	v->e.tbl->cx = 2;
+	tbl_col_del(&v->e, 1);
+	line = text_line(v->e.t, 1, &len);
+	TAP_CHECKF(t, strcmp(line, "1,Ann") == 0, "row 2 [%s]", line);
+	TAP_CHECK(t, v->e.tbl->ncols == 2 && v->e.tbl->cx == 1);
+	tbl_col_del(&v->e, 5);
+	line = text_line(v->e.t, 0, &len);
+	TAP_CHECKF(t, strcmp(line, "\xef\xbb\xbfid") == 0, "header [%s]", line);
+	v->e.tbl->cx = 0;
+	tbl_col_del(&v->e, 1);			/* the only column: cleared */
+	line = text_line(v->e.t, 0, &len);
+	TAP_CHECKF(t, strcmp(line, "\xef\xbb\xbf") == 0 && v->e.tbl->ncols == 1, "header [%s]", line);
+
+	/* undo from the keys keeps the cell cursor sane */
+	memset(&seq, 0, sizeof(seq));
+	seq.type = TKBD_KEY;
+	seq.ch = TKBD_CH_NONE;
+	seq.key = TKBD_KEY_Z;
+	seq.mod = TKBD_MOD_CTRL;
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	line = text_line(v->e.t, 0, &len);
+	TAP_CHECKF(t, strcmp(line, "\xef\xbb\xbfid") == 0, "after undo [%s]", line);
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	TAP_CHECKF(t, v->e.tbl->ncols == 3, "ncols %d after undos", v->e.tbl->ncols);
+	TAP_CHECK(t, v->e.tbl->cx < v->e.tbl->ncols);
+
+	/* ex: the bang form and a count, the vi keys o O dd yy p */
+	v->e.cy = 1;
+	v->e.tbl->cx = 0;
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "rowadd! 2")) == REQ_CONTINUE);
+	TAP_CHECK(t, text_lines(v->e.t) == 7 && v->e.cy == 2);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "rowdel 2")) == REQ_CONTINUE);
+	TAP_CHECK(t, text_lines(v->e.t) == 5 && v->e.cy == 2);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "coladd")) == REQ_CONTINUE && v->e.tbl->ncols == 4);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "coldel")) == REQ_CONTINUE && v->e.tbl->ncols == 3);
+	v->e.mode = MODE_NORMAL;
+	seq.mod = 0;
+	seq.key = TKBD_KEY_O;
+	seq.ch = 'O';
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	TAP_CHECK(t, text_lines(v->e.t) == 6 && v->e.cy == 2 && text_line_len(v->e.t, 2) == 0);
+	seq.ch = 'd';
+	seq.key = TKBD_KEY_D;
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	TAP_CHECK(t, v->e.tbl->pending == 'd');
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	TAP_CHECK(t, text_lines(v->e.t) == 5 && v->e.tbl->pending == 0);
+	seq.ch = 'y';
+	seq.key = TKBD_KEY_Y;
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	TAP_CHECK(t, v->e.clip_len == 2 && memcmp(v->e.clip, "2\n", 2) == 0);
+	seq.ch = 'p';
+	seq.key = TKBD_KEY_P;
+	run_req(&v->e, tbl_key(&v->e, &seq));
+	TAP_CHECK(t, text_lines(v->e.t) == 6 && v->e.cy == 3);
+	line = text_line(v->e.t, 3, &len);
+	TAP_CHECK(t, strcmp(line, "2") == 0);
+
+	/* the Edit menu knows the table */
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_TBL_ROWADD) == 1);
+	tbl_command(&v->e, "off");
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_TBL_COLDEL) == 0);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "rowadd")) == REQ_CONTINUE &&
+	    strncmp(v->e.status, "not a table", 11) == 0);
+
+	vedit_free(v);
+	memio_free(&m);
+	unlink(path);
+	rmdir(dir);
+}
+
 const Case tap_cases[] = {
 	{ "resize_grid", t_resize_grid },
 	{ "resize_signal", t_resize_signal },
@@ -2467,6 +2809,9 @@ const Case tap_cases[] = {
 	{ "menu_terminal", t_menu_terminal },
 	{ "tbl_attach", t_tbl_attach },
 	{ "tbl_grid", t_tbl_grid },
+	{ "tbl_edit", t_tbl_edit },
+	{ "tbl_loop", t_tbl_loop },
+	{ "tbl_rows", t_tbl_rows },
 #endif
 	{ NULL, NULL },
 };

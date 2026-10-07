@@ -140,6 +140,22 @@ their output in the same pane.
 .TP
 .BR F1 ", " F2
 Show the key bindings, and toggle the vi personality.
+.TP
+.B Table view
+A .csv, .tsv or .tab file opens as a grid (also
+.B :table
+on any buffer). Arrows, Tab and Shift+Tab move by cell; Enter edits the cell
+in the prompt line, typing replaces it, Delete clears it, Ctrl\-C and Ctrl\-V
+copy and paste a cell, Ctrl\-F searches from it. The ex commands
+.BR :rowadd [ ! ] ", " :rowdel ", " :coladd [ ! ] ", " :coldel ", " :colwidth
+and
+.B :cell
+insert and delete rows and columns, set a column width, and jump to a cell;
+in vi style
+.BR "h j k l" ", " "a i c s x" ", " "O o dd yy p P"
+and
+.B u
+work on cells and rows.
 .SS vi
 NORMAL mode has the usual motions
 .RB ( "h j k l" ", " "0 ^ $" ", " "w b e" ", " "gg G" ", " "f F t T" )
