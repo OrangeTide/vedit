@@ -237,6 +237,9 @@ XDG layout (`-DVEDIT_NO_XDG`) uses `~/.veditrc` instead.
 [syntax]
     enable = on          # highlight recognized file types
 
+[insert]
+    dateformat = %Y-%m-%d  # strftime pattern Insert > Date starts on
+
 [gitcommit]
     subject = 50         # mark a commit subject past this column
     body = 72            # and body lines past this one
@@ -935,6 +938,10 @@ backwards) cycles the formats, from the ISO `2026-10-07` through `07 Oct
 `07/10/2026`. Enter inserts the text at the cursor and Esc closes the picker.
 The format chosen is kept for the rest of the session, and `:date` inserts
 today in it without the dialog, or a given day with `:date 2026-12-25`.
+`insert.dateformat` in the config names a `strftime` pattern of your own; it
+leads the cycle, so the picker and `:date` start on it. `:set dateformat=%d %b
+%Y` (or `df=`) does the same for the session, and an empty value returns to
+the built-in list.
 
 Insert > File browses for a file and reads its lines below the cursor line,
 the same as the vi `:read file` command. Both items are grayed in the table

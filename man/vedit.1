@@ -185,7 +185,11 @@ asks the same in a dialog.
 .TP
 .BI :date " [YYYY-MM-DD]"
 Insert today, or the given day, at the cursor in the format last chosen in
-the calendar of Insert > Date (ISO by default). Insert > File reads a chosen
+the calendar of Insert > Date (ISO by default,
+.B insert.dateformat
+or
+.B :set dateformat=PATTERN
+to change it). Insert > File reads a chosen
 file below the cursor line, as
 .B :read
 does.
@@ -263,6 +267,10 @@ The main sections are
 (dir, a Maildir++ tree that enables the Mail menu, and from),
 .B [gitcommit]
 (subject and body, the columns past which a commit message is marked),
+.B [insert]
+(dateformat, a strftime pattern the Date picker and
+.B :date
+start on),
 and per-language
 .BI [command\  """lang"""]
 sections for the compile, build, run, and format commands. See

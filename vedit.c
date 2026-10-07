@@ -15691,7 +15691,7 @@ static const struct {
 	{ ":coladd[!] [N]",	"Table view: insert N columns left (! right); :coldel" },
 #endif
 	{ ":config  :reload",	"Edit the config file / re-read it (Options menu too)" },
-	{ ":date [YYYY-MM-DD]",	"Insert today or a day; Insert menu has the calendar" },
+	{ ":date [YYYY-MM-DD]",	"Insert today or a day; :set df=PATTERN its format" },
 #ifdef VEDIT_MAIL
 	{ ":mail [folder|.]",	"Mail: pick a folder, or list one (. = the last)" },
 	{ ":compose [to]  :reply",	"Start a message / answer the one shown" },
@@ -20012,6 +20012,34 @@ static const char *const date_formats[] = {
 #define DATE_FORMATS ((int)(sizeof(date_formats) / sizeof(date_formats[0])))
 
 static int g_date_fmt;			/* the format picked last, for the session */
+static char g_date_user[64];		/* insert.dateformat: leads the cycle when set */
+
+/* The formats to cycle through: the configured pattern first, then the
+ * built-in list. */
+static int
+date_fmt_count(void)
+{
+	return DATE_FORMATS + (g_date_user[0] != 0);
+}
+
+static const char *
+date_fmt_str(int i)
+{
+	if (g_date_user[0]) {
+		if (i == 0)
+			return g_date_user;
+		i--;
+	}
+	return date_formats[i];
+}
+
+/* Set the configured pattern (empty clears it) and start the cycle on it. */
+static void
+date_set_format(const char *pat)
+{
+	snprintf(g_date_user, sizeof(g_date_user), "%s", pat ? pat : "");
+	g_date_fmt = 0;
+}
 
 typedef struct datectx {
 	struct tm	tm;		/* the highlighted day, normalised */
@@ -20030,7 +20058,8 @@ date_norm(struct tm *tm)
 		*tm = t;
 }
 
-/* Format a day with the session's format. The clock fields are now's. */
+/* Format a day (NULL = today) with the session's format. The clock fields
+ * are now's. */
 static void
 date_text(const struct tm *day, char *out, size_t outsz)
 {
@@ -20038,11 +20067,13 @@ date_text(const struct tm *day, char *out, size_t outsz)
 	struct tm tm;
 
 	localtime_r(&now, &tm);
-	tm.tm_year = day->tm_year;
-	tm.tm_mon = day->tm_mon;
-	tm.tm_mday = day->tm_mday;
-	date_norm(&tm);
-	if (strftime(out, outsz, date_formats[g_date_fmt], &tm) == 0)
+	if (day) {
+		tm.tm_year = day->tm_year;
+		tm.tm_mon = day->tm_mon;
+		tm.tm_mday = day->tm_mday;
+		date_norm(&tm);
+	}
+	if (strftime(out, outsz, date_fmt_str(g_date_fmt), &tm) == 0)
 		out[0] = '\0';
 }
 
@@ -20153,7 +20184,7 @@ dlg_date_key(Editor *e, const Modal *m, const Event *ev, void *ctx)
 		c->tm.tm_year++;
 		break;
 	case TKBD_KEY_TAB:
-		g_date_fmt = (g_date_fmt + 1) % DATE_FORMATS;
+		g_date_fmt = (g_date_fmt + 1) % date_fmt_count();
 		return 0;
 	case TKBD_KEY_ENTER:
 		c->pick = 1;
@@ -20162,9 +20193,10 @@ dlg_date_key(Editor *e, const Modal *m, const Event *ev, void *ctx)
 		return 1;
 	default:
 		if (k->ch == 'f')
-			g_date_fmt = (g_date_fmt + 1) % DATE_FORMATS;
+			g_date_fmt = (g_date_fmt + 1) % date_fmt_count();
 		else if (k->ch == 'F')
-			g_date_fmt = (g_date_fmt + DATE_FORMATS - 1) % DATE_FORMATS;
+			g_date_fmt = (g_date_fmt + date_fmt_count() - 1) %
+			    date_fmt_count();
 		else if (k->ch == 't') {
 			now = time(NULL);
 			localtime_r(&now, &c->tm);
@@ -23341,6 +23373,7 @@ ed_apply_config(Editor *e)
 	e->tool_in_pane = cfg_bool(g_cfg, "command.split", e->tool_in_pane);
 #endif
 	e->search_icase = cfg_bool(g_cfg, "edit.ignorecase", e->search_icase);
+	date_set_format(cfg_get(g_cfg, "insert.dateformat"));
 #ifdef VEDIT_TERM
 	s = cfg_get(g_cfg, "ui.paneheight");
 	if (s) {
@@ -23504,6 +23537,9 @@ static const char g_config_template[] =
 	"\n"
 	"[syntax]\n"
 	"#	enable = on          # highlight recognized file types\n"
+	"\n"
+	"[insert]\n"
+	"#	dateformat = %Y-%m-%d # strftime pattern Insert > Date starts on\n"
 	"\n"
 	"[gitcommit]\n"
 	"#	subject = 50         # mark a commit subject past this column\n"
@@ -34346,6 +34382,14 @@ ex_set(Editor *e, const char *arg)
 		pane_set_rows(e, v);
 		return REQ_CONTINUE;
 #endif
+	} else if (strncmp(arg, "dateformat=", 11) == 0 ||
+	    strncmp(arg, "df=", 3) == 0) {
+		char text[64];
+
+		date_set_format(strchr(arg, '=') + 1);
+		date_text(NULL, text, sizeof(text));
+		set_status(e, "date format: %s", text);
+		return REQ_CONTINUE;
 	} else if (strncmp(arg, "tabstop=", 8) == 0 ||
 	    strncmp(arg, "ts=", 3) == 0) {
 		int v = atoi(strchr(arg, '=') + 1);

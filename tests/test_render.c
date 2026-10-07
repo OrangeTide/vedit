@@ -311,6 +311,69 @@ t_insert_date_file(Test *t)
 	unlink(tmpf);
 }
 
+/* insert.dateformat leads the format cycle: :date uses it, :set dateformat=
+ * replaces it for the session, an empty one returns to ISO, and in the
+ * picker one Tab moves from it to the first built-in format. */
+static void
+t_insert_dateformat(Test *t)
+{
+	const char cal[] = "\t\r";		/* Tab Enter: the first built-in */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Cfg *cfg;
+	time_t now;
+	struct tm tm;
+	char want[64], exbuf[64];
+
+	cfg = cfg_from_text("[insert]\ndateformat = %d.%m.%Y\n");
+	TAP_ASSERT(t, cfg != NULL);
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config(v, cfg);
+	vedit_run(v);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "date 2026-03-15")) ==
+	    REQ_CONTINUE);
+	TAP_CHECK(t, vline_is(v, 0, "15.03.2026"));
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "set df=%Y/%m/%d")) ==
+	    REQ_CONTINUE);
+	TAP_CHECKF(t, strncmp(v->e.status, "date format: ", 13) == 0,
+	    "status: %s", v->e.status);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "date 2026-03-15")) ==
+	    REQ_CONTINUE);
+	TAP_CHECK(t, vline_is(v, 0, "15.03.20262026/03/15"));
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "set dateformat=")) ==
+	    REQ_CONTINUE);
+	v->e.cx = 0;
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "date 2026-03-15")) ==
+	    REQ_CONTINUE);
+	TAP_CHECK(t, vline_is(v, 0, "2026-03-1515.03.20262026/03/15"));
+	vedit_free(v);
+	memio_free(&m);
+
+	/* the picker: the configured pattern, then Tab to ISO */
+	memio_init(&m, cal, sizeof(cal) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config(v, cfg);
+	TAP_CHECK(t, g_date_fmt == 0 && strcmp(g_date_user, "%d.%m.%Y") == 0);
+	ed_insert_date(&v->e);
+	now = time(NULL);
+	localtime_r(&now, &tm);
+	strftime(want, sizeof(want), "%Y-%m-%d", &tm);
+	TAP_CHECKF(t, vline_is(v, 0, want), "picked \"%s\", want \"%s\"",
+	    text_line(v->e.t, 0, NULL), want);
+	TAP_CHECK(t, g_date_fmt == 1);
+	vedit_free(v);
+	memio_free(&m);
+	g_cfg = NULL;			/* the config is borrowed: unhook before freeing */
+	vedit_cfg_free(cfg);
+	date_set_format("");
+}
+
 /* Under soft wrap a click on the second row of a wrapped line lands in that
  * segment, and a click below the last line goes to its end. */
 static void
@@ -3561,6 +3624,7 @@ const Case tap_cases[] = {
 	{ "mouse_click_wrap", t_mouse_click_wrap },
 #endif
 	{ "insert_date_file", t_insert_date_file },
+	{ "insert_dateformat", t_insert_dateformat },
 	{ "status_flags", t_status_flags },
 	{ "tab_key_expand", t_tab_key_expand },
 	{ "tag_jump", t_tag_jump },
