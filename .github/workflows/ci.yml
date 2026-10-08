@@ -136,19 +136,38 @@ jobs:
           make tests/taptest tests/test_unit tests/test_render tests/test_term
           tests/taptest --self-test --exe tests/test_unit tests/test_render tests/test_term
 
+  # The graphical build. The ubuntu-24.04 runners have no SDL3 package, so
+  # it runs in a newer container that does; a link failure here means the
+  # window binding drifted from the vendored guterm.h or the core.
+  gvedit:
+    name: gvedit
+    runs-on: ubuntu-latest
+    container: ubuntu:25.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install the toolchain and SDL3
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential pkg-config libsdl3-dev
+      - name: Build
+        run: make gvedit
+      - name: Check that it links and starts
+        run: ./gvedit --version
+
   # Single required status check for the branch ruleset. It passes only when
   # every other job passed, so the ruleset gates on this one name and the job
   # list can change without touching the ruleset.
   ci-ok:
     name: ci-ok
-    needs: [build-test, sanitize, torture, cross, static, no-term, macos]
+    needs: [build-test, sanitize, torture, cross, static, no-term, macos, gvedit]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Check that the required jobs succeeded
         run: |
-          results="${{ needs.build-test.result }} ${{ needs.sanitize.result }} ${{ needs.torture.result }} ${{ needs.cross.result }} ${{ needs.static.result }} ${{ needs.no-term.result }} ${{ needs.macos.result }}"
+          results="${{ needs.build-test.result }} ${{ needs.sanitize.result }} ${{ needs.torture.result }} ${{ needs.cross.result }} ${{ needs.static.result }} ${{ needs.no-term.result }} ${{ needs.macos.result }} ${{ needs.gvedit.result }}"
           echo "results: $results"
           for r in $results; do
             if [ "$r" != "success" ]; then

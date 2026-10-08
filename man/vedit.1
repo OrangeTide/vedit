@@ -25,6 +25,13 @@ detour, switches to the existing buffer instead of loading a second copy. When
 run from the command line, vedit requires a terminal on both standard input and
 standard output.
 .PP
+.B gvedit
+is the same editor in a window of its own, built with
+.B make gvedit
+(it needs SDL3). It draws the screen with a bitmap font and behaves as if
+run in a terminal; closing the window asks about unsaved changes as File >
+Exit does, and a second close while that question is pending ends the run.
+.PP
 Press
 .B F1
 inside the editor for the key bindings of the active personality, and open the
@@ -88,6 +95,13 @@ instead of the default locations.
 .TP
 .B \-\-no\-config
 Skip the configuration file entirely.
+.TP
+.BI \-\-scale " N"
+.RB ( gvedit
+only) Draw the font
+.I N
+times its size, 1 to 8. The default is 1, or the display scale on a high
+density display.
 .SH KEYS
 This is a brief orientation. Press
 .B F1

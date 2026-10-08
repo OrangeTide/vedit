@@ -51,8 +51,9 @@ make guterm-sync GUTERM_DIR=../guterm   # refresh the vendored header
 
 Resizing the window resizes the editor, never the font. Mouse, paste,
 the terminal panel, and the clipboard through OSC 52 all work as in a
-terminal, because to the editor it is one.
-
+terminal, because to the editor it is one. Closing the window asks about
+unsaved changes the way File > Exit does; closing it again while that
+question is still pending ends the run at once.
 
 ### Windows
 

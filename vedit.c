@@ -5119,6 +5119,12 @@ static void (*g_scr_blit)(Scrbuf *t);
  * embedded host manages its own signals and never touches this. */
 static volatile sig_atomic_t g_sig_quit;
 
+/* A host asked to close politely (a window's close button): the editor loop
+ * runs File > Exit, which asks about unsaved changes, instead of unwinding
+ * like end-of-input. A second request while this one is still pending is
+ * the host's business (gvedit then quits hard). */
+static volatile sig_atomic_t g_close_req;
+
 static void
 scr_reserve(Scrbuf *t, size_t need)
 {
@@ -23968,6 +23974,15 @@ editor_loop(Editor *e)
 		Event ev;
 		struct tkbd_seq seq;
 
+		/* The host asked to close: File > Exit, with its prompt. */
+		if (g_close_req) {
+			int quit = run_menu_act(e, MA_EXIT);
+
+			g_close_req = 0;	/* stays set while the prompt is up */
+			if (quit)
+				return 0;
+			ed_render(e, e->d);
+		}
 #if defined(VEDIT_TERM) && !defined(VEDIT_NO_TOOLS)
 		/* A build in a background terminal buffer finished during the
 		 * last wait: report it and land on its first error. */
@@ -24775,6 +24790,34 @@ vedit_free(struct vedit *v)
  * and SIGWINCH. This is the only part that touches termios and
  * signals; an embedded host supplies its own io instead.
  ****************************************************************/
+#if defined(_WIN32) && (!defined(VEDIT_GUI) || defined(VEDIT_TERM))
+/* Console trouble is invisible once the editor owns the screen, so with
+ * VEDIT_WIN_LOG naming a file the Windows bindings note their failures
+ * there. Shared by the console binding and the pseudo console layer. */
+static void
+tty_log(const char *fmt, ...)
+{
+	static FILE *fp;
+	static int tried;
+	va_list ap;
+
+	if (!tried) {
+		const char *p = getenv("VEDIT_WIN_LOG");
+
+		tried = 1;
+		if (p && p[0])
+			fp = fopen(p, "a");
+	}
+	if (!fp)
+		return;
+	va_start(ap, fmt);
+	vfprintf(fp, fmt, ap);
+	va_end(ap);
+	fputc('\n', fp);
+	fflush(fp);
+}
+#endif /* _WIN32 console or pseudo console */
+
 #ifndef VEDIT_GUI
 #ifndef _WIN32
 
@@ -25082,31 +25125,6 @@ typedef struct tty_io {
 } Ttyio;
 
 static Ttyio g_tty;	/* the CLI runs a single editor */
-
-/* Console trouble is invisible once the editor owns the screen, so with
- * VEDIT_WIN_LOG naming a file the binding notes its failures there. */
-static void
-tty_log(const char *fmt, ...)
-{
-	static FILE *fp;
-	static int tried;
-	va_list ap;
-
-	if (!tried) {
-		const char *p = getenv("VEDIT_WIN_LOG");
-
-		tried = 1;
-		if (p && p[0])
-			fp = fopen(p, "a");
-	}
-	if (!fp)
-		return;
-	va_start(ap, fmt);
-	vfprintf(fp, fmt, ap);
-	va_end(ap);
-	fputc('\n', fp);
-	fflush(fp);
-}
 
 static void
 tty_restore(Ttyio *t)
@@ -25705,6 +25723,8 @@ typedef struct gui_io {
 	size_t		 in_len, in_cap;
 	int		 dirty;		/* changed since the last present */
 	int		 quit;		/* the window was closed */
+	unsigned	 pass;		/* pump cycles, to tell closes apart */
+	unsigned	 close_pass;	/* the cycle that saw the last close */
 } Guiio;
 
 static Guiio g_gui;
@@ -25769,7 +25789,18 @@ gui_event(Guiio *g, const struct gut_event *ev)
 
 	switch (ev->type) {
 	case GUT_EVENT_QUIT:
-		g->quit = 1;
+		/* the close button: ask once (File > Exit, so a dirty buffer
+		 * gets its prompt); a later close while that request still
+		 * waits, as with a dialog open, ends the run like a hangup.
+		 * One click arrives as two events (SDL's close request and
+		 * its quit), so only a close from an earlier pump cycle, which
+		 * the editor has had a chance to act on, counts as the second. */
+		if (g_close_req && g->close_pass != g->pass)
+			g->quit = 1;
+		else if (!g_close_req) {
+			g_close_req = 1;
+			g->close_pass = g->pass;
+		}
 		return;
 	case GUT_EVENT_RESIZE:
 		g_winch = 1;	/* scr_wait asks getsize, as after SIGWINCH */
@@ -25814,6 +25845,7 @@ gui_pump(Guiio *g, int timeout_ms)
 	struct gut_event ev;
 	int got;
 
+	g->pass++;
 	if (g->dirty) {
 		gut_present(g->w, &g->buf);
 		g->dirty = 0;
@@ -25866,10 +25898,17 @@ gui_poll(void *ctx, int timeout_ms)
 	return gui_pump(ctx, timeout_ms);
 }
 
+#if defined(VEDIT_TERM) && defined(_WIN32)
+static int gui_poll_fds(void *ctx, int timeout_ms, const int *extra,
+    int nextra, int *ready, int *nready);	/* with the pseudo console layer */
+#endif
 #ifndef _WIN32
 /* The window cannot be waited on together with file descriptors, so the
  * wait alternates: a short poll() on the terminal panels' ptys, then the
- * window's queue, until something is ready or the timeout passes. */
+ * window's queue, in 16 ms slices until something is ready or the timeout
+ * passes. With a terminal open the idle editor therefore ticks at frame
+ * rate rather than blocking; that is the price of one thread and no
+ * self-pipe, not a busy loop. */
 static int
 gui_poll_fds(void *ctx, int timeout_ms, const int *extra, int nextra,
     int *ready, int *nready)
@@ -25984,7 +26023,7 @@ gui_open(Guiio *g, struct vedit_io *io, int scale)
 	io->begin = gui_begin;
 	io->end = gui_end;
 	io->getsize = gui_getsize;
-#if defined(VEDIT_TERM) && !defined(_WIN32)
+#ifdef VEDIT_TERM
 	io->poll_fds = gui_poll_fds;
 #endif
 	return 0;
@@ -29427,12 +29466,88 @@ pty_wait(int pid, int *status, int nohang)
 	return 1;
 }
 
-/* Wait on the keyboard and every live session at once: the console handle,
- * each session's output event, and the process handle of one whose exit
- * has not been seen. An exit closes the pseudo console, which ends the
- * output pipe, so the reader thread then flags the end and the session is
- * drained to its EOF like a closed PTY. Returns 1 when translated keyboard
- * bytes wait, 0 on timeout (with ready[] filled), -1 on error. */
+/* One wait on every live session, and on wake_h (a console input handle,
+ * or NULL) with them: each session's output event and the process handle
+ * of one whose exit has not been seen. An exit closes the pseudo console,
+ * which ends the output pipe, so the reader thread then flags the end and
+ * the session is drained to its EOF like a closed PTY. Sessions with
+ * output waiting go to ready[] and the wait is skipped. Returns 1 when
+ * wake_h was signalled, 0 otherwise (a timeout, a session event, or an
+ * exit noted), -1 on error. */
+static int
+winpty_wait(HANDLE wake_h, DWORD timeout, const int *extra, int nextra,
+    int *ready, int *nready)
+{
+	HANDLE hs[1 + 2 * VEDIT_TERM_MAX];
+	int slot[1 + 2 * VEDIT_TERM_MAX];
+	DWORD nh = 0, r;
+	int i;
+
+	*nready = 0;
+	if (wake_h) {
+		hs[nh] = wake_h;
+		slot[nh++] = -1;
+	}
+	for (i = 0; i < nextra && i < VEDIT_TERM_MAX; i++) {
+		Winpty *p = winpty_get(extra[i]);
+
+		if (!p)
+			continue;
+		EnterCriticalSection(&p->cs);
+		if (p->len > 0 || p->eof)
+			ready[(*nready)++] = extra[i];
+		LeaveCriticalSection(&p->cs);
+		hs[nh] = p->ev;
+		slot[nh++] = extra[i];
+		if (!p->exited && p->proc) {
+			hs[nh] = p->proc;
+			slot[nh++] = extra[i] + VEDIT_TERM_MAX;
+		}
+	}
+	if (*nready > 0)
+		return 0;
+	if (nh == 0) {
+		Sleep(timeout == INFINITE ? 0 : timeout);
+		return 0;
+	}
+	r = WaitForMultipleObjects(nh, hs, FALSE, timeout);
+	if (r == WAIT_TIMEOUT)
+		return 0;
+	if (r >= WAIT_OBJECT_0 + nh) {
+		tty_log("WaitForMultipleObjects: %lu (%lu)",
+		    (unsigned long)r, (unsigned long)GetLastError());
+		return -1;
+	}
+	i = slot[r - WAIT_OBJECT_0];
+	if (i < 0)
+		return 1;
+	if (i >= VEDIT_TERM_MAX) {		/* a process exited */
+		Winpty *p = winpty_get(i - VEDIT_TERM_MAX);
+
+		if (p) {
+			p->exited = 1;
+			if (p->hpc) {
+				g_pcon_close(p->hpc);
+				p->hpc = NULL;
+			}
+		}
+	} else {				/* output arrived: collect it */
+		Winpty *p = winpty_get(i);
+
+		if (p) {
+			EnterCriticalSection(&p->cs);
+			if (p->len > 0 || p->eof)
+				ready[(*nready)++] = i;
+			LeaveCriticalSection(&p->cs);
+		}
+	}
+	return 0;
+}
+
+#ifndef VEDIT_GUI
+/* Wait on the keyboard and every live session at once. Returns 1 when
+ * translated keyboard bytes wait, 0 on timeout (with ready[] filled), -1
+ * on error. */
 static int
 tty_poll_fds(void *ctx, int timeout_ms, const int *extra, int nextra,
     int *ready, int *nready)
@@ -29442,35 +29557,13 @@ tty_poll_fds(void *ctx, int timeout_ms, const int *extra, int nextra,
 
 	*nready = 0;
 	for (;;) {
-		HANDLE hs[1 + 2 * VEDIT_TERM_MAX];
-		int slot[1 + 2 * VEDIT_TERM_MAX];
-		DWORD nh = 0, r, wait = INFINITE;
-		int i;
+		DWORD wait = INFINITE;
+		int r;
 
 		if (t->npend == 0 && tty_drain(t) < 0)
 			return -1;
-		hs[nh] = t->in;
-		slot[nh++] = -1;
-		for (i = 0; i < nextra && i < VEDIT_TERM_MAX; i++) {
-			Winpty *p = winpty_get(extra[i]);
-
-			if (!p)
-				continue;
-			EnterCriticalSection(&p->cs);
-			if (p->len > 0 || p->eof)
-				ready[(*nready)++] = extra[i];
-			LeaveCriticalSection(&p->cs);
-			hs[nh] = p->ev;
-			slot[nh++] = extra[i];
-			if (!p->exited && p->proc) {
-				hs[nh] = p->proc;
-				slot[nh++] = extra[i] + VEDIT_TERM_MAX;
-			}
-		}
 		if (t->npend > 0)
 			return 1;
-		if (*nready > 0)
-			return 0;
 		if (timeout_ms >= 0) {
 			DWORD used = GetTickCount() - start;
 
@@ -29478,29 +29571,59 @@ tty_poll_fds(void *ctx, int timeout_ms, const int *extra, int nextra,
 				return 0;
 			wait = (DWORD)timeout_ms - used;
 		}
-		r = WaitForMultipleObjects(nh, hs, FALSE, wait);
-		if (r == WAIT_TIMEOUT)
-			return 0;
-		if (r >= WAIT_OBJECT_0 + nh) {
-			tty_log("WaitForMultipleObjects: %lu (%lu)",
-			    (unsigned long)r, (unsigned long)GetLastError());
+		r = winpty_wait(t->in, wait, extra, nextra, ready, nready);
+		if (r < 0)
 			return -1;
-		}
-		i = slot[r - WAIT_OBJECT_0];
-		if (i >= VEDIT_TERM_MAX) {	/* a process exited */
-			Winpty *p = winpty_get(i - VEDIT_TERM_MAX);
-
-			if (p) {
-				p->exited = 1;
-				if (p->hpc) {
-					g_pcon_close(p->hpc);
-					p->hpc = NULL;
-				}
-			}
-		}
-		/* the console or an event: the next pass collects it */
+		if (*nready > 0)
+			return 0;
+		if (r == 0 && timeout_ms >= 0 &&
+		    GetTickCount() - start >= (DWORD)timeout_ms)
+			return 0;
+		/* the console woke us, or an exit was noted: go round */
 	}
 }
+#else /* VEDIT_GUI */
+/* The window binding's wait: the window cannot be waited on together with
+ * the sessions' events, so the two alternate in 16 ms slices (an idle tick
+ * at frame rate, not a busy loop) until something is ready or the timeout
+ * passes. */
+static int
+gui_poll_fds(void *ctx, int timeout_ms, const int *extra, int nextra,
+    int *ready, int *nready)
+{
+	Guiio *g = ctx;
+	uint64_t deadline = gut_ticks(g->w) + (uint64_t)(timeout_ms > 0 ?
+	    timeout_ms : 0);
+
+	*nready = 0;
+	for (;;) {
+		int wait;
+
+		if (gui_pump(g, 0))
+			wait = 0;
+		else if (timeout_ms < 0)
+			wait = 16;
+		else {
+			uint64_t now = gut_ticks(g->w);
+
+			wait = now >= deadline ? 0 : (int)(deadline - now);
+			if (wait > 16)
+				wait = 16;
+		}
+		if (nextra > 0) {
+			if (winpty_wait(NULL, (DWORD)wait, extra, nextra, ready,
+			    nready) < 0)
+				return -1;
+		} else if (wait > 0) {
+			gui_pump(g, wait);
+		}
+		if (*nready > 0 || g->in_len > 0 || g->quit)
+			return g->in_len > 0 || g->quit;
+		if (timeout_ms >= 0 && gut_ticks(g->w) >= deadline)
+			return 0;
+	}
+}
+#endif /* VEDIT_GUI */
 #endif /* _WIN32 */
 
 static int
@@ -33118,6 +33241,16 @@ main(int argc, char **argv)
 		signal(sig, SIG_DFL);
 		raise(sig);
 	}
+#ifdef VEDIT_GUI
+	if (rc != 0 && g_gui.quit) {
+		/* The window was closed hard (a second close while the exit
+		 * prompt was up): keep the swaps, as for a signal, and skip the
+		 * clean teardown that would delete them. */
+		swap_flush_all(&v->e);
+		gui_close(&g_gui);
+		return rc;
+	}
+#endif
 	vedit_free(v);
 	vedit_cfg_free(cfg);
 #ifdef VEDIT_GUI

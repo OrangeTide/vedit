@@ -29,8 +29,10 @@ BIN     = $(OUTBIN)/$(PROG)$(EXE)
 # with `make gvedit`, so a plain build never needs it.
 GPROG   = gvedit
 GBIN    = $(OUTBIN)/$(GPROG)$(EXE)
-SDL_CFLAGS := $(shell pkg-config --cflags sdl3 2>/dev/null)
-SDL_LIBS   := $(shell pkg-config --libs sdl3 2>/dev/null)
+# Asked of pkg-config only when the gvedit recipe runs (recursive
+# assignment), so a plain make never calls it.
+SDL_CFLAGS = $(shell pkg-config --cflags sdl3 2>/dev/null)
+SDL_LIBS   = $(shell pkg-config --libs sdl3 2>/dev/null)
 # Where the vendored guterm.h is refreshed from with `make guterm-sync`.
 GUTERM_DIR ?= ../guterm
 
@@ -234,7 +236,7 @@ screenshots: all
 
 clean:
 	rm -rf $(OUT)
-	rm -f $(PROG) $(TESTDIR)/taptest $(TESTBINS) $(TERMTESTBIN) \
+	rm -f $(PROG) $(GPROG) $(TESTDIR)/taptest $(TESTBINS) $(TERMTESTBIN) \
 	    $(TERMFAULTBIN) $(TESTDIR)/test_termfault-cov \
 	    $(TESTDIR)/torturet \
 	    $(TESTDIR)/test_unit-asan $(TESTDIR)/test_render-asan \
