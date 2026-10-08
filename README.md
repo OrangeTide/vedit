@@ -55,6 +55,20 @@ terminal, because to the editor it is one. Closing the window asks about
 unsaved changes the way File > Exit does; closing it again while that
 question is still pending ends the run at once.
 
+On Windows the window build links against the SDL3 development package for
+mingw (`SDL3-devel-<version>-mingw.tar.gz` from the SDL releases) and runs
+with `SDL3.dll` beside it:
+
+```sh
+make gvedit CC=x86_64-w64-mingw32-gcc SDL_CFLAGS=-I<sdl>/include SDL_LIBS="-L<sdl>/lib -lSDL3"
+```
+
+Terminal buffers work there too. Under wine the pseudo console attaches a
+child only when the parent owns a console, so the window build allocates a
+hidden one on first use and parks its window off screen; real Windows needs
+no such thing and gets none. `VEDIT_GUI_TRACE=file` saves the byte stream
+the editor feeds the window, the counterpart of `VEDIT_WIN_TRACE`.
+
 ### Windows
 
 The same source builds a native Windows console program with mingw-w64, from
@@ -72,8 +86,9 @@ console can type works, including on the command line. Output has two
 paths: on a real Windows console the editor sends its usual ANSI stream
 through the console's virtual-terminal processing (full 256 colours); under
 wine, whose VT processing is partial, it draws the cell grid directly through
-the console API instead, with colours reduced to the sixteen console
-attributes. `VEDIT_WIN_RENDER=console` or `=vt` forces one or the other.
+the console API instead. That path has the console's sixteen colours: each
+256-colour or RGB value goes to the nearest entry of the console's own
+colour table, so it follows the user's console scheme. `VEDIT_WIN_RENDER=console` or `=vt` forces one or the other.
 
 The configuration file lives at `%APPDATA%\vedit\config` (Options > Edit
 Config creates it). The build commands, `:!`, the formatter, and the version

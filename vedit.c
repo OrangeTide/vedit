@@ -6152,24 +6152,36 @@ rgb_to_ansi16(int r, int g, int b)
 
 /* Map an xterm-256 palette index to the nearest ANSI 16 color. Indices 0-15
  * are already ANSI; 16-231 are the 6x6x6 cube; 232-255 the grayscale ramp. */
+/* The RGB value of an xterm-256 palette index 16-255 (the 6x6x6 cube, then
+ * the grayscale ramp). 0 for an index outside that range. */
+static int
+color256_rgb(int idx, int *r, int *g, int *b)
+{
+	static const unsigned char cube[6] = { 0, 95, 135, 175, 215, 255 };
+
+	if (idx >= 16 && idx < 232) {
+		idx -= 16;
+		*r = cube[(idx / 36) % 6];
+		*g = cube[(idx / 6) % 6];
+		*b = cube[idx % 6];
+		return 1;
+	}
+	if (idx >= 232 && idx < 256) {
+		*r = *g = *b = 8 + (idx - 232) * 10;
+		return 1;
+	}
+	return 0;
+}
+
 static int
 color256_to_16(int idx)
 {
-	static const unsigned char cube[6] = { 0, 95, 135, 175, 215, 255 };
 	int r, g, b;
 
 	if (idx < 16)
 		return idx < 0 ? 7 : idx;
-	if (idx < 232) {
-		idx -= 16;
-		r = cube[(idx / 36) % 6];
-		g = cube[(idx / 6) % 6];
-		b = cube[idx % 6];
-	} else if (idx < 256) {
-		r = g = b = 8 + (idx - 232) * 10;
-	} else {
+	if (!color256_rgb(idx, &r, &g, &b))
 		return 7;
-	}
 	return rgb_to_ansi16(r, g, b);
 }
 
@@ -27260,20 +27272,78 @@ tty_poll(void *ctx, int timeout_ms)
  * attributes: bold brightens, reverse swaps, underline uses the console's
  * underscore flag. The editor draws into a screen buffer of its own, the
  * console's version of the alternate screen, when one can be made. */
+/* ANSI orders the colour bits as red, green, blue; the console as blue,
+ * green, red. */
+static WORD
+win_ansi_bits(int idx)
+{
+	return (WORD)(((idx & 1) << 2) | (idx & 2) | ((idx & 4) >> 2) |
+	    (idx & 8));
+}
+
+/* The console's own sixteen colours. A 256-colour or RGB cell goes to the
+ * entry that looks most like it, which follows the user's console scheme,
+ * instead of to a guess at a stock palette. Read once per session; an old
+ * console without the call keeps the stock mapping. */
+static COLORREF g_win_ct[16];
+static int g_win_ct_state;		/* 0 unread, 1 read, -1 unavailable */
+static unsigned char g_win_map256[256];
+
+static WORD
+win_nearest(int r, int g, int b)
+{
+	int i, best = 7;
+	long bestd = -1;
+
+	for (i = 0; i < 16; i++) {
+		int dr = r - GetRValue(g_win_ct[i]);
+		int dg = g - GetGValue(g_win_ct[i]);
+		int db = b - GetBValue(g_win_ct[i]);
+		long d = (long)dr * dr + (long)dg * dg + (long)db * db;
+
+		if (bestd < 0 || d < bestd) {
+			bestd = d;
+			best = i;
+		}
+	}
+	return (WORD)best;
+}
+
+static void
+win_palette_load(HANDLE h)
+{
+	CONSOLE_SCREEN_BUFFER_INFOEX ex;
+	int i, r, g, b;
+
+	if (g_win_ct_state)
+		return;
+	memset(&ex, 0, sizeof(ex));
+	ex.cbSize = sizeof(ex);
+	if (!GetConsoleScreenBufferInfoEx(h, &ex)) {
+		tty_log("GetConsoleScreenBufferInfoEx: %lu",
+		    (unsigned long)GetLastError());
+		g_win_ct_state = -1;
+		return;
+	}
+	memcpy(g_win_ct, ex.ColorTable, sizeof(g_win_ct));
+	for (i = 0; i < 256; i++)
+		g_win_map256[i] = (unsigned char)(color256_rgb(i, &r, &g, &b) ?
+		    win_nearest(r, g, b) : win_ansi_bits(i));
+	g_win_ct_state = 1;
+}
+
 static WORD
 win_attr_index(Color c, int is_bg)
 {
-	int idx;
-
 	if (c.type == COLOR_DEFAULT)
 		return is_bg ? 0 : 7;
 	if (c.type == COLOR_RGB)
-		idx = rgb_to_ansi16(c.rgb.r, c.rgb.g, c.rgb.b);
-	else
-		idx = c.index < 16 ? c.index : color256_to_16(c.index);
-	/* ANSI orders bits as red, green, blue; the console as blue, green, red */
-	return (WORD)(((idx & 1) << 2) | (idx & 2) | ((idx & 4) >> 2) |
-	    (idx & 8));
+		return g_win_ct_state > 0 ?
+		    win_nearest(c.rgb.r, c.rgb.g, c.rgb.b) :
+		    win_ansi_bits(rgb_to_ansi16(c.rgb.r, c.rgb.g, c.rgb.b));
+	if (g_win_ct_state > 0)
+		return g_win_map256[c.index & 255];
+	return win_ansi_bits(c.index < 16 ? c.index : color256_to_16(c.index));
 }
 
 static WORD
@@ -27307,6 +27377,7 @@ win_blit(Scrbuf *t)
 	COORD size, org = { 0, 0 }, pos;
 	int r, c;
 
+	win_palette_load(h);
 	if (cicap < t->cols) {
 		CHAR_INFO *p = realloc(ci, (size_t)t->cols * sizeof(*ci));
 
@@ -27659,6 +27730,22 @@ gui_write(void *ctx, const void *buf, long n)
 {
 	Guiio *g = ctx;
 
+	{				/* VEDIT_GUI_TRACE: the raw stream, for replay */
+		static FILE *tf;
+		static int tried;
+
+		if (!tried) {
+			const char *tp = getenv("VEDIT_GUI_TRACE");
+
+			tried = 1;
+			if (tp && tp[0])
+				tf = fopen(tp, "wb");
+		}
+		if (tf) {
+			fwrite(buf, 1, (size_t)n, tf);
+			fflush(tf);
+		}
+	}
 	gut_vt_feed(&g->vt, buf, (size_t)n);
 	g->dirty = 1;
 	return n;
@@ -30879,6 +30966,41 @@ winpty_api(void)
 	k = GetModuleHandleA("kernel32.dll");
 	if (!k)
 		return 0;
+	/* Under wine a child gets the pseudo console only when its parent owns
+	 * a console, which a windowed build does not: give it a hidden one.
+	 * Real Windows needs none, and showing one would flash a window. */
+#ifdef VEDIT_GUI
+	if (GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version")) {
+		static const WCHAR title[] = L"vedit pseudo console host";
+		HWND h;
+		int i;
+
+		FreeConsole();		/* one inherited from a shell has file handles */
+		if (!AllocConsole()) {
+			tty_log("AllocConsole: %lu", (unsigned long)GetLastError());
+			return 0;
+		}
+		/* wine shows the console as a window of its own and may not
+		 * report it through GetConsoleWindow: find it by title. */
+		SetConsoleTitleW(title);
+		for (h = GetConsoleWindow(), i = 0; !h && i < 40; i++) {
+			Sleep(25);
+			h = FindWindowW(NULL, title);
+		}
+		if (!h) {
+			tty_log("console window not found");
+			return 0;
+		}
+		/* its host may map it again after the first hide: push it off
+		 * the screen and under everything as well, and hide it twice */
+		for (i = 0; i < 2; i++) {
+			SetWindowPos(h, HWND_BOTTOM, -4000, -4000, 0, 0,
+			    SWP_NOSIZE | SWP_NOACTIVATE);
+			ShowWindow(h, SW_HIDE);
+			Sleep(100);
+		}
+	}
+#endif
 	g_pcon_create = (pfn_create_pcon)(void *)GetProcAddress(k,
 	    "CreatePseudoConsole");
 	g_pcon_resize = (pfn_resize_pcon)(void *)GetProcAddress(k,
