@@ -279,7 +279,7 @@ XDG layout (`-DVEDIT_NO_XDG`) uses `~/.veditrc` instead.
     shiftwidth = 0       # >> / << indent width in columns; 0 = one tab stop
     tabstop = 8          # the interval between tab stops
     tabstops =           # a ruler of stops, e.g. "5 9 17"; empty = none
-    swap = on            # write a .swp crash-recovery snapshot (on by default)
+    swap = on            # keep a crash-recovery swap beside the file (on by default)
     swapdir =            # where swap files go; empty = beside the file
     backup = off         # keep the previous version as a "~" file on save
     backupdir =          # where backups go; empty = beside the file
@@ -623,16 +623,31 @@ the global `[indent] expand`, which wins over the built-in default of tabs.
 
 ### Crash recovery (swap and backup files)
 
-While you edit a named file, vedit keeps a swap file beside it, `.name.swp`,
-refreshed whenever input goes quiet. It is a full snapshot of the buffer, so if
-the editor or the connection dies with unsaved changes, the work is still on
-disk. Open the file again and vedit notices the swap and asks: `(r)ecover`
-loads the snapshot into a buffer you can then save, `(o)pen` ignores it, `(d)elete`
-removes it, and `(q)uit` leaves the file unopened. If the swap was left by a
-process that is still running, the prompt says so, in case the file is open in
-another session. A clean save or quit removes the swap; only a crash leaves one
-behind. A file that is not ours (for example a swap from Vim at the same name)
-is never read or overwritten.
+While you edit a named file, vedit keeps a swap beside it as two sidecars.
+`.name.swpf` is the base, a copy of the text as it was when you started
+editing. On a filesystem that supports reflinks (Btrfs, XFS, APFS, ReFS) the
+base is a clone of the file that shares its blocks, so it costs no time and no
+space however big the file is; elsewhere it is an ordinary copy. `.name.swpm`
+is the journal: every edit you make is appended to it as a small checksummed
+record the moment it happens, so if the editor or the connection dies with
+unsaved changes, the work is still on disk. Open the file again and vedit
+notices the swap and asks: `(r)ecover` loads the base, replays the journal on
+top of it, and leaves the result in a buffer you can then save; `(o)pen`
+ignores the swap, `(d)elete` removes it, and `(q)uit` leaves the file
+unopened. Replay stops at the first damaged record, so a crash in the middle
+of a write costs at most that one edit. A clean save or quit removes the
+swap; only a crash leaves one behind. A journal that is not ours (another
+program's file at the same name) is never read or overwritten.
+
+Beside the swap, vedit also marks the file as being edited with an Emacs-style
+lock, `.#name`, a symlink whose target names the owner as `user.pid:boot`
+(a plain file on Windows and on filesystems without symlinks). Emacs honors
+the same lock, so the two editors warn about each other. Opening a file whose
+lock belongs to a process that is still running asks what to do: `(s)teal`
+takes the file over, `(r)ead-only` opens it without the right to save (`:w!`
+still forces a write), and
+`(q)uit` leaves it unopened. A lock left by a process that has exited, or from
+an earlier boot of this machine, is stale and is quietly replaced.
 
 Swap files are on by default. `edit.swap = off` turns them off, as does
 `:set noswapfile`, which is the right choice for a host that must not write to
@@ -648,15 +663,17 @@ leaves the file half-written, and the previous version survives until the new
 one is complete. With `edit.backup = on` (or `:set backup`) that previous
 version is also kept afterward as `name~`, or in `edit.backupdir` when set.
 
-The idle snapshot is the baseline, but it is not the only time a swap is written.
-When vedit is killed by `SIGTERM` or `SIGHUP`, for example because the window
-closed or the system is shutting down, it flushes every dirty buffer to its swap
-before exiting, so nothing is lost. On an out-of-memory abort or a fatal fault
-such as a segfault it attempts the same flush on a best-effort basis, since the
-program state may already be damaged by then. Only an uncatchable `SIGKILL` or a
-power loss falls back to the last idle snapshot, losing just the edits made since
-the last quiet moment. A new buffer that has never been saved has no name yet, so
-it gets no swap until its first save.
+Edits go to the journal as they happen, so a crash loses nothing that the
+kernel had already accepted. Whenever input goes quiet vedit asks the kernel to
+flush the journal to disk, and when it is killed by `SIGTERM` or `SIGHUP`, for
+example because the window closed or the system is shutting down, it does the
+same for every dirty buffer before exiting. On an out-of-memory abort or a fatal
+fault such as a segfault it attempts that flush on a best-effort basis, since
+the program state may already be damaged by then. Only a power loss can lose
+edits made since the last quiet moment. Once the journal grows past a few
+megabytes vedit compacts it: the base is rewritten from the current text and
+the journal starts over. A new buffer that has never been saved has no name
+yet, so it gets no swap until its first save.
 
 ### File browser
 

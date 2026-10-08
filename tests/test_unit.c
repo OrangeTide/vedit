@@ -1198,10 +1198,10 @@ t_swap_paths(Test *t)
 	char out[PATH_MAX], want[PATH_MAX];
 
 	TAP_ASSERT(t, swap_path_for("/a/b/foo.c", out, sizeof(out)));
-	TAP_CHECKF(t, strcmp(out, "/a/b/.foo.c.swp") == 0, "beside swap: %s",
+	TAP_CHECKF(t, strcmp(out, "/a/b/.foo.c.swpm") == 0, "beside swap: %s",
 	    out);
 	TAP_ASSERT(t, swap_path_for("foo.c", out, sizeof(out)));
-	TAP_CHECKF(t, strcmp(out, ".foo.c.swp") == 0, "no-dir swap: %s", out);
+	TAP_CHECKF(t, strcmp(out, ".foo.c.swpm") == 0, "no-dir swap: %s", out);
 	TAP_ASSERT(t, backup_path_for("/a/b/foo.c", out, sizeof(out)));
 	TAP_CHECKF(t, strcmp(out, "/a/b/foo.c~") == 0, "beside backup: %s",
 	    out);
@@ -1210,7 +1210,7 @@ t_swap_paths(Test *t)
 	TAP_ASSERT(t, mkdtemp(dir) != NULL);
 	setenv("VEDIT_EDIT_SWAPDIR", dir, 1);
 	TAP_ASSERT(t, swap_path_for("/a/b/foo.c", out, sizeof(out)));
-	snprintf(want, sizeof(want), "%s/%%a%%b%%foo.c.swp", dir);
+	snprintf(want, sizeof(want), "%s/%%a%%b%%foo.c.swpm", dir);
 	TAP_CHECKF(t, strcmp(out, want) == 0, "swapdir name: %s", out);
 	unsetenv("VEDIT_EDIT_SWAPDIR");
 	rmdir(dir);
@@ -1342,17 +1342,16 @@ t_backup_save(Test *t)
 	rmdir(dir);
 }
 
-/* swap_write lays down a parseable snapshot; a save then clears it. */
+/* swap_write lays down a base and a journal that recover to the text; an
+ * edit appends to the journal; a save then clears both and the lock. */
 static void
 t_swap_write_clear(Test *t)
 {
 	char dir[] = "/tmp/vedit_swXXXXXX";
-	char path[PATH_MAX], line[256];
+	char path[PATH_MAX], base[PATH_MAX], lock[PATH_MAX];
 	static const char *const L[] = { "swapme" };
 	Editor e;
-	FILE *fp;
 	Text *rd;
-	long body;
 
 	TAP_ASSERT(t, mkdtemp(dir) != NULL);
 	snprintf(path, sizeof(path), "%s/s.txt", dir);
@@ -1365,48 +1364,55 @@ t_swap_write_clear(Test *t)
 	e.has_name = 1;
 	swap_write(&e);
 	TAP_CHECK(t, e.swap_on && e.swap_path[0]);
+	TAP_ASSERT(t, swap_base_for(path, base, sizeof(base)));
+	TAP_ASSERT(t, lock_path_for(path, lock, sizeof(lock)));
 	TAP_CHECK(t, access(e.swap_path, F_OK) == 0);
+	TAP_CHECK(t, access(base, F_OK) == 0);
+	{ struct stat ls; TAP_CHECK(t, lstat(lock, &ls) == 0); }	/* the Emacs-style lock, a symlink */
 
-	/* parse the swap header, then load its body back */
-	fp = fopen(e.swap_path, "rb");
-	TAP_ASSERT(t, fp != NULL);
-	TAP_ASSERT(t, fgets(line, sizeof(line), fp) &&
-	    strncmp(line, SWAP_MAGIC, strlen(SWAP_MAGIC)) == 0);
-	while (fgets(line, sizeof(line), fp) && line[0] != '\n')
-		;
-	body = ftell(fp);
+	/* the base alone recovers the text as it was */
 	rd = text_new();
-	TAP_ASSERT(t, rd && fseek(fp, body, SEEK_SET) == 0);
-	TAP_CHECK(t, text_load_fp(rd, fp) == OK);
+	TAP_ASSERT(t, rd != NULL);
+	TAP_CHECK(t, swap_recover_text(rd, base, e.swap_path) == 0);
 	TAP_CHECK(t, dump_is(rd, "swapme"));
 	text_free(rd);
-	fclose(fp);
 
-	/* a successful save removes the now-redundant swap */
+	/* an edit is journaled and replays on top of the base */
+	TAP_CHECK(t, text_insert(e.t, 0, 6, "!", 1) == OK);
+	swap_maybe_write(&e);
+	rd = text_new();
+	TAP_ASSERT(t, rd != NULL);
+	TAP_CHECK(t, swap_recover_text(rd, base, e.swap_path) == 0);
+	TAP_CHECK(t, dump_is(rd, "swapme!"));
+	text_free(rd);
+
+	/* a successful save removes the now-redundant swap and the lock */
 	TAP_CHECK(t, ed_save_file(&e) == OK);
 	TAP_CHECK(t, !e.swap_on);
 	TAP_CHECK(t, access(e.swap_path, F_OK) != 0);
+	TAP_CHECK(t, access(base, F_OK) != 0);
+	{ struct stat ls; TAP_CHECK(t, lstat(lock, &ls) != 0); }
 
+	swap_detach(e.t, e.swapj);
 	text_free(e.t);
 	unlink(path);
 	rmdir(dir);
 }
 
-/* The crash/OOM flush writes a swap for every dirty buffer: the active one from
- * the flat editor state and the parked ones from their slots (deriving a swap
- * path when the slot never had one). */
+/* The crash/OOM flush syncs the journal of every dirty buffer: the active
+ * one from the flat editor state and the parked ones from their slots, and
+ * each recovers to its own text. */
 static void
 t_swap_flush_all(Test *t)
 {
 	char dir[] = "/tmp/vedit_flushXXXXXX";
-	char pa[PATH_MAX], pb[PATH_MAX], spa[PATH_MAX], spb[PATH_MAX], line[256];
+	char pa[PATH_MAX], pb[PATH_MAX], spa[PATH_MAX], spb[PATH_MAX];
+	char ba[PATH_MAX], bb[PATH_MAX], la[PATH_MAX], lb[PATH_MAX];
 	static const char *const A[] = { "active-dirty" };
 	static const char *const B[] = { "parked-dirty" };
 	Editor e;
 	Buf bufs[2];
-	FILE *fp;
 	Text *rd;
-	long body;
 
 	TAP_ASSERT(t, mkdtemp(dir) != NULL);
 	snprintf(pa, sizeof(pa), "%s/a.txt", dir);
@@ -1418,52 +1424,67 @@ t_swap_flush_all(Test *t)
 	e.nbuf = 2;
 	e.cur = 0;
 
+	/* buffer 1 first: attached and edited as if active, then parked */
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, B, 1);
+	e.t->final_newline = 1;
+	e.has_name = 1;
+	snprintf(e.path, sizeof(e.path), "%s", pb);
+	swap_attach(&e);
+	TAP_CHECK(t, text_insert(e.t, 0, 12, "!", 1) == OK);	/* starts the journal */
+	bufs[1].t = e.t;
+	bufs[1].swapj = e.swapj;
+	bufs[1].has_name = 1;
+	snprintf(bufs[1].path, sizeof(bufs[1].path), "%s", pb);
+
 	/* buffer 0: active, named, dirty -- flushed from the flat state */
 	e.t = text_new();
+	e.swapj = NULL;
 	TAP_ASSERT(t, e.t != NULL);
 	tx_fill(e.t, A, 1);
 	e.t->final_newline = 1;
-	e.has_name = 1;
 	snprintf(e.path, sizeof(e.path), "%s", pa);
+	swap_attach(&e);
+	TAP_CHECK(t, text_insert(e.t, 0, 12, "!", 1) == OK);
 	bufs[0].t = e.t;
 	bufs[0].has_name = 1;
 	snprintf(bufs[0].path, sizeof(bufs[0].path), "%s", pa);
 
-	/* buffer 1: parked, named, dirty, no swap path yet -- derived on flush */
-	bufs[1].t = text_new();
-	TAP_ASSERT(t, bufs[1].t != NULL);
-	tx_fill(bufs[1].t, B, 1);
-	bufs[1].t->final_newline = 1;
-	bufs[1].has_name = 1;
-	snprintf(bufs[1].path, sizeof(bufs[1].path), "%s", pb);
-
 	TAP_ASSERT(t, swap_path_for(pa, spa, sizeof(spa)));
 	TAP_ASSERT(t, swap_path_for(pb, spb, sizeof(spb)));
+	TAP_ASSERT(t, swap_base_for(pa, ba, sizeof(ba)));
+	TAP_ASSERT(t, swap_base_for(pb, bb, sizeof(bb)));
+	TAP_ASSERT(t, lock_path_for(pa, la, sizeof(la)));
+	TAP_ASSERT(t, lock_path_for(pb, lb, sizeof(lb)));
 
 	swap_flush_all(&e);
 
 	TAP_CHECK(t, access(spa, F_OK) == 0);	/* active buffer flushed */
 	TAP_CHECK(t, access(spb, F_OK) == 0);	/* parked buffer flushed */
 
-	/* the parked snapshot carries that buffer's text, not the active one's */
-	fp = fopen(spb, "rb");
-	TAP_ASSERT(t, fp != NULL);
-	TAP_ASSERT(t, fgets(line, sizeof(line), fp) &&
-	    strncmp(line, SWAP_MAGIC, strlen(SWAP_MAGIC)) == 0);
-	while (fgets(line, sizeof(line), fp) && line[0] != '\n')
-		;
-	body = ftell(fp);
+	/* each swap carries its own buffer's text */
 	rd = text_new();
-	TAP_ASSERT(t, rd && fseek(fp, body, SEEK_SET) == 0);
-	TAP_CHECK(t, text_load_fp(rd, fp) == OK);
-	TAP_CHECK(t, dump_is(rd, "parked-dirty"));
+	TAP_ASSERT(t, rd != NULL);
+	TAP_CHECK(t, swap_recover_text(rd, bb, spb) == 0);
+	TAP_CHECK(t, dump_is(rd, "parked-dirty!"));
 	text_free(rd);
-	fclose(fp);
+	rd = text_new();
+	TAP_ASSERT(t, rd != NULL);
+	TAP_CHECK(t, swap_recover_text(rd, ba, spa) == 0);
+	TAP_CHECK(t, dump_is(rd, "active-dirty!"));
+	text_free(rd);
 
+	swap_detach(bufs[0].t, e.swapj);
+	swap_detach(bufs[1].t, bufs[1].swapj);
 	text_free(bufs[0].t);
 	text_free(bufs[1].t);
 	unlink(spa);
 	unlink(spb);
+	unlink(ba);
+	unlink(bb);
+	unlink(la);
+	unlink(lb);
 	unlink(pa);
 	unlink(pb);
 	rmdir(dir);

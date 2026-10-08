@@ -378,9 +378,18 @@ The configuration file of a build without XDG support
 .B %APPDATA%\\vedit\\config
 The configuration file on Windows.
 .TP
-.BI . name .swp
-Crash-recovery swap file written beside an edited file, unless relocated with
+.BI . name .swpf
+Crash-recovery base, a copy (a reflink clone where the filesystem allows) of
+an edited file as it was when editing began, written beside it unless
+relocated with
 .BR edit.swapdir .
+.TP
+.BI . name .swpm
+Crash-recovery journal of the edits made since the base was taken.
+.TP
+.BI .# name
+Emacs-style lock naming the session editing the file, as
+.IR user.pid:boot .
 .TP
 .IB name ~
 Previous version kept on save when
@@ -397,6 +406,7 @@ command exits with a non-zero status on purpose.
 Project documentation in
 .BR README.md .
 .SH NOTES
-Dirty buffers are snapshotted to swap files while the editor is idle and flushed
-again when it is terminated by a signal, so a crash or a kill loses little or no
-unsaved work. Reopen the file afterward to recover from the swap.
+Every edit to a dirty buffer is appended to its swap journal as it happens; the
+journal is flushed to disk while the editor is idle and again when it is
+terminated by a signal, so a crash or a kill loses little or no unsaved work.
+Reopen the file afterward to recover from the swap.

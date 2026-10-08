@@ -1140,8 +1140,9 @@ plant_swap(const char *path, const char *body)
 	e.t->final_newline = 1;
 	snprintf(e.path, sizeof(e.path), "%s", path);
 	e.has_name = 1;
-	swap_write(&e);				/* writes <dir>/.<base>.swp */
-	text_free(e.t);				/* no teardown: keep the swap */
+	swap_write(&e);				/* writes <dir>/.<base>.swpf + .swpm */
+	swap_detach(e.t, e.swapj);		/* no teardown: keep the swap */
+	text_free(e.t);
 }
 
 /* A dirty buffer gets a swap snapshot on the idle tick, and a clean quit
@@ -1254,6 +1255,63 @@ t_swap_recover_delete(Test *t)
 
 	vedit_free(v);
 	memio_free(&m);
+	unlink(path);
+	rmdir(dir);
+}
+
+/* A live lock from another session (the Emacs-style .#name symlink naming a
+ * running process on this host) asks before opening. Answering 'r' opens the
+ * file read-only: :w is refused, :w! still writes, and the foreign lock is
+ * left in place. */
+static void
+t_swap_lock_readonly(Test *t)
+{
+	char dir[] = "/tmp/vedit_swlXXXXXX";
+	char path[PATH_MAX], lock[PATH_MAX], self[256], owner[256], got[256];
+	char exbuf[64];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	FILE *f;
+	char *dot;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/doc.txt", dir);
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("orig\n", f);
+	fclose(f);
+
+	/* the owner string of a live foreign process: ours with the parent's pid */
+	lock_owner_self(self, sizeof(self));
+	dot = strrchr(self, '.');
+	TAP_ASSERT(t, dot != NULL);
+	*dot = '\0';
+	snprintf(owner, sizeof(owner), "%s.%ld:%lld", self, (long)getppid(),
+	    lock_boot_time());
+	TAP_ASSERT(t, lock_path_for(path, lock, sizeof(lock)));
+	TAP_ASSERT(t, symlink(owner, lock) == 0);
+	TAP_CHECK(t, lock_owner_live(owner));
+
+	memio_init(&m, "r", 1, 24, 80);	/* (r)ead-only */
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	vedit_run(v);
+
+	TAP_CHECK(t, vline_is(v, 0, "orig"));
+	TAP_CHECK(t, v->e.t->readonly);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "w")) == REQ_CONTINUE);
+	TAP_CHECK(t, strstr(v->e.status, "E45") != NULL);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "w!")) == REQ_CONTINUE);
+	TAP_CHECK(t, strstr(v->e.status, "wrote") != NULL);
+	TAP_CHECK(t, lock_read(lock, got, sizeof(got)) && strcmp(got, owner) == 0);
+
+	vedit_free(v);
+	TAP_CHECK(t, lock_read(lock, got, sizeof(got)));	/* still theirs */
+	memio_free(&m);
+	unlink(lock);
 	unlink(path);
 	rmdir(dir);
 }
@@ -3927,6 +3985,7 @@ const Case tap_cases[] = {
 	{ "swap_file_created", t_swap_file_created },
 	{ "swap_recover_key", t_swap_recover_key },
 	{ "swap_recover_delete", t_swap_recover_delete },
+	{ "swap_recover_readonly", t_swap_lock_readonly },
 	{ "search_icase", t_search_icase },
 	{ "search_word", t_search_word },
 	{ "shiftwidth", t_shiftwidth },

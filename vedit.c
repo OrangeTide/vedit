@@ -220,6 +220,7 @@ typedef struct vfile Vfile;		/* an open file, opaque */
 
 enum vf_flags {
 	VF_READ = 1, VF_WRITE = 2, VF_CREATE = 4, VF_TRUNC = 8, VF_EXCL = 16,
+	VF_APPEND = 32,
 };
 enum vf_access { VF_R = 1, VF_W = 2, VF_X = 4 };
 
@@ -293,6 +294,8 @@ vfd_open(const char *path, int flags, unsigned perm)
 		oflags |= O_TRUNC;
 	if (flags & VF_EXCL)
 		oflags |= O_EXCL;
+	if (flags & VF_APPEND)
+		oflags |= O_APPEND;
 #ifdef O_CLOEXEC
 	oflags |= O_CLOEXEC;
 #endif
@@ -583,6 +586,8 @@ win_open(const char *path, int flags, unsigned perm)
 	HANDLE h;
 
 	(void)perm;
+	if (flags & VF_APPEND)
+		access = (access & ~(DWORD)GENERIC_WRITE) | FILE_APPEND_DATA;
 	if (flags & VF_READ)
 		access |= GENERIC_READ;
 	if (flags & VF_CREATE)
@@ -7496,6 +7501,7 @@ typedef struct ebuf {
 	char		label[64];	/* title of an unnamed buffer, or "" */
 	char		vcs_src[PATH_MAX];	/* blame: "name:path" it annotates, or "" */
 	int		vcs_kind;	/* 1 blame buffer, 2 commit message, else 0 */
+	struct swapj	*swapj;		/* its swap journal state, or NULL */
 	int		swap_on;	/* a swap file exists on disk for it */
 	size_t		swap_rev;	/* text rev at the last swap write */
 	time_t		load_mtime;	/* file mtime at load (swap staleness check) */
@@ -7648,7 +7654,8 @@ typedef struct editor {
 	int		auto_indent;	/* a new line copies the previous indent */
 	int		expand_tabs;	/* Tab and auto-indent use spaces (per buffer) */
 	int		shiftwidth;	/* >> / << shift size in columns; 0 = a tab stop */
-	int		swap_enabled;	/* write .swp crash-recovery snapshots */
+	int		swap_enabled;	/* keep a crash-recovery swap (base + journal) */
+	int		save_force;	/* :w! in progress: save despite readonly */
 	int		backup_enabled;	/* keep the previous version on save */
 	int		format_on_save;	/* run the format command before each save */
 	char		swap_path[PATH_MAX];	/* active buffer's swap file, or "" */
@@ -7656,6 +7663,7 @@ typedef struct editor {
 	char		label[64];	/* active buffer's title when unnamed, or "" */
 	char		vcs_src[PATH_MAX];	/* active blame buffer's "name:path", or "" */
 	int		vcs_kind;	/* active buffer: 1 blame, 2 commit message */
+	struct swapj	*swapj;		/* active buffer's swap journal state */
 	int		swap_on;	/* a swap file exists on disk for it */
 	size_t		swap_rev;	/* text rev at the last swap write */
 	time_t		load_mtime;	/* file mtime at load (swap staleness check) */
@@ -7993,6 +8001,11 @@ struct text {
 	unsigned	cur_group;
 	unsigned	group_depth;
 	unsigned	group_seq;
+
+	/* Called before every primitive is applied (the swap journal); the
+	 * text is still as it was. NULL when nothing listens. */
+	void		(*edit_cb)(void *ctx, const struct text *t, const Erec *op);
+	void		*edit_ctx;
 };
 
 /****************************************************************
@@ -8564,11 +8577,27 @@ estack_push(Estack *s, const Erec *rec)
 	return OK;
 }
 
+/* Whether in names a place in t, so a listener is told only of primitives
+ * that will apply (short of an allocation failure). */
+static int
+op_valid(const Text *t, const Erec *in)
+{
+	if (in->line >= t->nlines)
+		return 0;
+	if (in->op == OP_JOIN)
+		return in->line + 1 < t->nlines;
+	return in->col <= t->lines[in->line].len;
+}
+
 /* Apply one primitive to the buffer and fill inv with the primitive that
  * reverses it. inv->bytes, when set, is owned by the caller. */
 static int
 apply_op(Text *t, const Erec *in, Erec *inv)
 {
+	if (!op_valid(t, in))
+		return ERR;
+	if (t->edit_cb)
+		t->edit_cb(t->edit_ctx, t, in);
 	inv->bytes = NULL;
 	inv->n = 0;
 	inv->col = 0;
@@ -15984,26 +16013,56 @@ replace_prompt(Editor *e)
 /****************************************************************
  * Swap and backup files (optional crash recovery, Vim-style).
  *
- * A swap file is a full snapshot of a dirty buffer, rewritten whenever the
- * editor goes idle (editor_loop's tick), so a crash or a dropped connection
- * leaves the last idle state on disk. Opening a file that has a swap beside it
- * offers to recover. A clean save or quit removes the swap. Backups keep the
- * previous on-disk version as a "~" file across a save. Both are off unless
- * configured (swap on by default, backup off); both locations are
- * configurable. The snapshot reuses text_write_fp/text_load_fp, so there is no
- * second serializer.
+ * The swap for a dirty buffer is a pair of sidecars: a base (.name.swpf), a
+ * copy of the text as it was when editing began, made by a filesystem clone
+ * (reflink) when the file is unchanged on disk and by a plain write
+ * otherwise; and a journal (.name.swpm) that records every edit applied to
+ * the Text since, through the edit_cb hook, as a checksummed binary record.
+ * Edits reach the journal as they happen; the idle tick (editor_loop) only
+ * fsyncs it, and compacts the pair once the journal grows large. Recovery
+ * loads the base and replays the journal, stopping at the first damaged
+ * record. Beside the swap, an Emacs-style lock (.#name, a symlink whose
+ * target names user.pid:boot) marks the file as being edited, so a
+ * second session can tell a live owner from a stale one. A clean save or
+ * quit removes all three. Backups keep the previous on-disk version as a
+ * "~" file across a save. Swap is on by default, backup off; both
+ * locations are configurable.
  ****************************************************************/
 
-#define SWAP_MAGIC "VEDIT-SWAP"
+#define SWAP_MAGIC	"VEDIT-JOURNAL"
+#define SWAP_COMPACT_BYTES	(4 * 1024 * 1024)	/* rewrite the base past this */
 
 enum {
-	SWAP_NONE,		/* no swap file beside the target */
+	SWAP_NONE,		/* no swap beside the target */
 	SWAP_FOREIGN,		/* a file is there but not ours; leave it alone */
 	SWAP_OPEN,		/* user chose to open the file anyway */
-	SWAP_RECOVERED,		/* user recovered; the buffer now holds the swap */
+	SWAP_RECOVERED,		/* user recovered; the buffer holds base + journal */
 	SWAP_DELETED,		/* user deleted the swap; the file is loaded */
 	SWAP_ABORT		/* user declined to open the file at all */
 };
+
+/* The swap of a named buffer: a base file (.swpf), the text as it was when
+ * the first unsaved edit happened, and a journal (.swpm) of every primitive
+ * since, appended as the edits happen. Recovery loads the base and replays
+ * the journal. The base is a clone of the file when the file still matches
+ * what was loaded (a reflink where the filesystem has them), else the text
+ * written out. A lock file in Emacs's format (.#name, holding
+ * user@host.pid:boot) sits beside the file while the buffer is dirty, so
+ * two editors, this one or Emacs, see each other. */
+typedef struct swapj {
+	Editor		*e;		/* for swap_enabled */
+	Vfile		*f;		/* the open journal, or NULL */
+	char		path[PATH_MAX];		/* the journal, .swpm */
+	char		base[PATH_MAX];		/* the base, .swpf */
+	char		lock[PATH_MAX];		/* the lock, .#name */
+	char		file[PATH_MAX];		/* the file it protects */
+	long long	bytes;		/* journal size, for compaction */
+	int		pending;	/* records appended since the last sync */
+	int		failed;		/* a write failed: leave what is there */
+	int		lock_held;
+	long long	disk_size;	/* the file as loaded or last saved, so a */
+	long long	disk_mtime_ns;	/* matching file can be cloned as the base */
+} Swapj;
 
 /* Copy a path into out with every '/' turned into '%', for a collision-free
  * name when swap or backup files share one directory (Vim's convention). */
@@ -16044,8 +16103,8 @@ resolve_dir_opt(const char *key, char *out, size_t sz)
 }
 
 /* Build the swap or backup path for file_path into out. dir_key selects the
- * directory option; sep is the beside-the-file prefix ('.' for swap, 0 for
- * backup) and suffix is appended (".swp" or "~"). Returns 1 on success. */
+ * directory option; dotted hides the beside-the-file name with a '.' and
+ * suffix is appended. Returns 1 on success. */
 static int
 aux_path_for(const char *file_path, const char *dir_key, int dotted,
     const char *suffix, char *out, size_t sz)
@@ -16070,10 +16129,17 @@ aux_path_for(const char *file_path, const char *dir_key, int dotted,
 	return n > 0 && (size_t)n < sz;
 }
 
+/* The journal path for file_path (the base sits beside it as .swpf). */
 static int
 swap_path_for(const char *file_path, char *out, size_t sz)
 {
-	return aux_path_for(file_path, "edit.swapdir", 1, ".swp", out, sz);
+	return aux_path_for(file_path, "edit.swapdir", 1, ".swpm", out, sz);
+}
+
+static int
+swap_base_for(const char *file_path, char *out, size_t sz)
+{
+	return aux_path_for(file_path, "edit.swapdir", 1, ".swpf", out, sz);
 }
 
 static int
@@ -16082,99 +16148,516 @@ backup_path_for(const char *file_path, char *out, size_t sz)
 	return aux_path_for(file_path, "edit.backupdir", 0, "~", out, sz);
 }
 
-/* Set e->swap_path from the active buffer's name when swap is enabled and the
- * buffer has one, otherwise clear it (which makes swap_write a no-op). */
-static void
-swap_set_path(Editor *e)
+/* The lock lives beside the file, where Emacs looks for it: .#name. */
+static int
+lock_path_for(const char *file_path, char *out, size_t sz)
 {
-	e->swap_path[0] = '\0';
-	if (e->swap_enabled && e->has_name)
-		swap_path_for(e->path, e->swap_path, sizeof(e->swap_path));
+	const char *slash = strrchr(file_path, '/');
+	int n;
+
+	if (slash)
+		n = snprintf(out, sz, "%.*s/.#%s", (int)(slash - file_path),
+		    file_path, slash + 1);
+	else
+		n = snprintf(out, sz, ".#%s", file_path);
+	return n > 0 && (size_t)n < sz;
 }
 
-/* Write a snapshot of `t` to `swap_path` atomically, via a sibling temp and a
- * rename. Returns 1 on success. Best effort: a failure just leaves the swap
- * stale. Shared by the active buffer and the flush-all crash path, so it takes
- * the per-buffer fields by value rather than reading the flat editor. */
-static int
-swap_write_snapshot(const char *swap_path, const char *path, time_t mtime,
-    const Text *t)
-{
-	char tmp[PATH_MAX];
-	FILE *fp;
-	int ok;
+/* ---- the lock: Emacs's user@host.pid:boot ---- */
 
-	if (!swap_path[0])
+/* Seconds since the epoch the system booted, for telling a reused pid from
+ * the process that took the lock; 0 where unknown. */
+static long long
+lock_boot_time(void)
+{
+#if defined(__linux__)
+	static long long boot = -1;
+
+	if (boot < 0) {
+		char *s;
+		size_t n;
+
+		boot = 0;
+		if (vf_read_file("/proc/stat", &s, &n) == 0) {
+			const char *p = strstr(s, "\nbtime ");
+
+			if (p)
+				boot = atoll(p + 7);
+			free(s);
+		}
+	}
+	return boot;
+#else
+	return 0;
+#endif
+}
+
+static void
+lock_owner_self(char *out, size_t sz)
+{
+	const char *user = getenv("USER");
+	char host[256];
+
+	if (!user || !user[0])
+		user = getenv("LOGNAME");
+	if (!user || !user[0])
+		user = getenv("USERNAME");
+	if (!user || !user[0])
+		user = "unknown";
+	if (gethostname(host, sizeof(host)) != 0 || !host[0])
+		snprintf(host, sizeof(host), "localhost");
+	host[sizeof(host) - 1] = '\0';
+	snprintf(out, sz, "%s@%s.%ld:%lld", user, host, (long)getpid(),
+	    lock_boot_time());
+}
+
+/* Read the lock's owner string into out. 1 when a lock is there, 0 when
+ * not (or unreadable). A symlink carries it as its target; a plain file
+ * (Windows, where Emacs does the same) as its contents. */
+static int
+lock_read(const char *lock, char *out, size_t sz)
+{
+#ifndef _WIN32
+	ssize_t n = readlink(lock, out, sz - 1);
+
+	if (n >= 0) {
+		out[n] = '\0';
+		return 1;
+	}
+#endif
+	{
+		char *s;
+		size_t n;
+
+		if (vf_read_file(lock, &s, &n) != 0)
+			return 0;
+		snprintf(out, sz, "%.*s", (int)strcspn(s, "\r\n"), s);
+		free(s);
+		return 1;
+	}
+}
+
+/* Whether the owner string names a live session other than this one: a
+ * pid on this host that still runs (with the same boot, when both record
+ * one), or any session on another host, which cannot be checked. */
+static int
+lock_owner_live(const char *owner)
+{
+	char host[256];
+	const char *at = strchr(owner, '@'), *dot, *colon;
+	long pid;
+
+	if (!at)
 		return 0;
-	if ((size_t)snprintf(tmp, sizeof(tmp), "%s.new", swap_path) >=
-	    sizeof(tmp))
+	dot = strrchr(at, '.');
+	if (!dot)
 		return 0;
-	fp = fopen(tmp, "wb");
-	if (!fp)
+	pid = atol(dot + 1);
+	colon = strchr(dot, ':');
+	if (gethostname(host, sizeof(host)) != 0)
+		host[0] = '\0';
+	host[sizeof(host) - 1] = '\0';
+	if ((size_t)(dot - at - 1) != strlen(host) ||
+	    strncmp(at + 1, host, (size_t)(dot - at - 1)) != 0)
+		return 1;			/* another host: assume live */
+	if (pid == (long)getpid())
+		return 0;			/* our own */
+	if (colon && lock_boot_time() > 0 && atoll(colon + 1) > 0 &&
+	    atoll(colon + 1) != lock_boot_time())
+		return 0;			/* from before a reboot */
+	return pid > 0 && (kill((pid_t)pid, 0) == 0 || errno == EPERM);
+}
+
+/* Take the lock for j, replacing a stale one. Best effort. */
+static void
+lock_take(Swapj *j)
+{
+	char owner[512];
+
+	if (j->lock_held || !j->lock[0])
+		return;
+	lock_owner_self(owner, sizeof(owner));
+#ifndef _WIN32
+	if (symlink(owner, j->lock) == 0 || (errno == EEXIST &&
+	    g_vfs->remove(j->lock) == 0 && symlink(owner, j->lock) == 0)) {
+		j->lock_held = 1;
+		return;
+	}
+	if (errno != EPERM && errno != ENOSYS && errno != EOPNOTSUPP)
+		return;		/* a plain file only where symlinks are not had */
+#endif
+	{
+		Vfile *f = g_vfs->open(j->lock, VF_WRITE | VF_CREATE | VF_TRUNC,
+		    0644);
+
+		if (!f)
+			return;
+		vf_write_all(f, owner, strlen(owner));
+		g_vfs->close(f);
+		j->lock_held = 1;
+	}
+}
+
+static void
+lock_release(Swapj *j)
+{
+	if (j->lock_held && j->lock[0])
+		g_vfs->remove(j->lock);
+	j->lock_held = 0;
+}
+
+/* ---- the journal ---- */
+
+static void
+put_u32(unsigned char *p, uint32_t v)
+{
+	p[0] = (unsigned char)v;
+	p[1] = (unsigned char)(v >> 8);
+	p[2] = (unsigned char)(v >> 16);
+	p[3] = (unsigned char)(v >> 24);
+}
+
+static void
+put_u64(unsigned char *p, uint64_t v)
+{
+	put_u32(p, (uint32_t)v);
+	put_u32(p + 4, (uint32_t)(v >> 32));
+}
+
+static uint32_t
+get_u32(const unsigned char *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+	    ((uint32_t)p[3] << 24);
+}
+
+static uint64_t
+get_u64(const unsigned char *p)
+{
+	return (uint64_t)get_u32(p) | ((uint64_t)get_u32(p + 4) << 32);
+}
+
+static uint32_t
+fnv1a32(const unsigned char *p, size_t n)
+{
+	uint32_t h = 2166136261u;
+
+	while (n-- > 0) {
+		h ^= *p++;
+		h *= 16777619u;
+	}
+	return h;
+}
+
+#define SWAP_REC_HEAD	8	/* length + checksum */
+#define SWAP_REC_FIXED	25	/* op + line + col + n */
+
+/* Write the journal header: the magic, the file, the base's identity (its
+ * size, checked at recovery), the file's mtime at load for the "changed
+ * since" note, and the owner. A blank line ends it. */
+static int
+swap_write_header(Swapj *j, time_t load_mtime)
+{
+	char hdr[PATH_MAX + 640], owner[512];
+	Vstat st;
+	int n;
+
+	if (g_vfs->stat(j->base, &st) != 0)
+		return -1;
+	lock_owner_self(owner, sizeof(owner));
+	n = snprintf(hdr, sizeof(hdr),
+	    "%s\t1\npath\t%s\nbase_size\t%lld\nfile_mtime\t%ld\nowner\t%s\n\n",
+	    SWAP_MAGIC, j->file, st.size, (long)load_mtime, owner);
+	if (n < 0 || (size_t)n >= sizeof(hdr))
+		return -1;
+	if (vf_write_all(j->f, hdr, (size_t)n) != 0)
+		return -1;
+	j->bytes = n;
+	return 0;
+}
+
+/* Lay down the base for t: a clone of the file when the text is clean and
+ * the file is still the one loaded or saved, else the text written out. */
+static int
+swap_write_base(Swapj *j, const Text *t)
+{
+	Vstat st;
+	Vfile *f;
+
+	if (!text_dirty(t) && g_vfs->stat(j->file, &st) == 0 && st.is_reg &&
+	    st.size == j->disk_size && st.mtime_ns == j->disk_mtime_ns &&
+	    vf_copy(j->file, j->base, 0600) == 0)
 		return 0;
-	ok = fprintf(fp, "%s\t1\npath\t%s\nmtime\t%ld\neol\t%d\n"
-	    "final_newline\t%d\npid\t%ld\n\n", SWAP_MAGIC, path,
-	    (long)mtime, t->eol, t->final_newline,
-	    (long)getpid()) >= 0 && text_write_fp(t, fp) == OK;
-	if (fflush(fp) != 0 || fsync(fileno(fp)) != 0)
-		ok = 0;
-	if (fclose(fp) != 0)
-		ok = 0;
-	if (!ok || rename(tmp, swap_path) != 0) {
-		unlink(tmp);
+	f = g_vfs->open(j->base, VF_WRITE | VF_CREATE | VF_TRUNC, 0600);
+	if (!f)
+		return -1;
+	if (text_write_vf(t, f) != OK) {
+		g_vfs->close(f);
+		g_vfs->remove(j->base);
+		return -1;
+	}
+	return g_vfs->close(f);
+}
+
+/* Start the journal for t: the base, then an empty journal with its header,
+ * then the lock. 0, or -1 (and the journal stays closed). */
+static int
+swap_journal_start(Swapj *j, const Text *t, time_t load_mtime)
+{
+	if (swap_write_base(j, t) != 0)
+		return -1;
+	j->f = g_vfs->open(j->path, VF_WRITE | VF_CREATE | VF_TRUNC, 0600);
+	if (!j->f) {
+		g_vfs->remove(j->base);
+		return -1;
+	}
+	if (swap_write_header(j, load_mtime) != 0) {
+		g_vfs->close(j->f);
+		j->f = NULL;
+		g_vfs->remove(j->path);
+		g_vfs->remove(j->base);
+		return -1;
+	}
+	j->pending = 1;			/* the header wants a sync too */
+	lock_take(j);
+	return 0;
+}
+
+/* Append one primitive: a length and checksum, then op, line, col, n and
+ * the inserted bytes. */
+static int
+swap_journal_append(Swapj *j, const Erec *op)
+{
+	unsigned char head[SWAP_REC_HEAD + SWAP_REC_FIXED];
+	size_t n = op->op == OP_INSERT ? op->n : 0;
+	uint32_t sum;
+
+	head[SWAP_REC_HEAD] = (unsigned char)op->op;
+	put_u64(head + SWAP_REC_HEAD + 1, (uint64_t)op->line);
+	put_u64(head + SWAP_REC_HEAD + 9, (uint64_t)op->col);
+	put_u64(head + SWAP_REC_HEAD + 17, (uint64_t)op->n);
+	sum = fnv1a32(head + SWAP_REC_HEAD, SWAP_REC_FIXED);
+	if (n > 0) {
+		const unsigned char *p = (const unsigned char *)op->bytes;
+		size_t i;
+
+		for (i = 0; i < n; i++) {	/* continue the hash over the bytes */
+			sum ^= p[i];
+			sum *= 16777619u;
+		}
+	}
+	put_u32(head, (uint32_t)(SWAP_REC_FIXED + n));
+	put_u32(head + 4, sum);
+	if (vf_write_all(j->f, head, sizeof(head)) != 0 ||
+	    (n > 0 && vf_write_all(j->f, op->bytes, n) != 0))
+		return -1;
+	j->bytes += (long long)(sizeof(head) + n);
+	j->pending++;
+	return 0;
+}
+
+/* The pre-edit hook from apply_op: the first edit lays down the base from
+ * the text as it still is, then every primitive is appended. A failure
+ * stops the journal for this buffer rather than disturbing the edit. */
+static void
+swap_on_edit(void *ctx, const Text *t, const Erec *op)
+{
+	Swapj *j = ctx;
+
+	if (j->failed || !j->e->swap_enabled || !j->path[0])
+		return;
+	if (!j->f && swap_journal_start(j, t, j->e->load_mtime) != 0) {
+		j->failed = 1;
+		return;
+	}
+	if (swap_journal_append(j, op) != 0)
+		j->failed = 1;
+}
+
+/* Sync the journal when records wait. Returns 1 when the swap is on disk. */
+static int
+swap_sync(Swapj *j)
+{
+	if (!j || !j->f)
 		return 0;
+	if (j->pending) {
+		if (g_vfs->sync(j->f) != 0)
+			return 1;		/* the bytes are written anyway */
+		j->pending = 0;
 	}
 	return 1;
 }
 
-/* Write a snapshot of the active buffer to its swap file. Best effort: a
- * failure never disturbs editing, it just leaves the swap stale. */
+/* Rewrite the base from the current text and empty the journal: after a
+ * whole-text replacement the journal no longer describes the buffer, and
+ * past SWAP_COMPACT_BYTES a replay would take longer than a reload. */
+static void
+swap_compact(Swapj *j, const Text *t)
+{
+	if (!j->f)
+		return;
+	g_vfs->close(j->f);
+	j->f = NULL;
+	j->pending = 0;
+	if (swap_journal_start(j, t, j->e->load_mtime) != 0)
+		j->failed = 1;
+}
+
+/* Attach a swap to the active buffer for e->path (replacing any previous
+ * one on the same text) and remember the file's identity. The journal
+ * itself opens at the first edit. */
+static void
+swap_attach(Editor *e)
+{
+	Swapj *j = e->swapj;
+	Vstat st;
+
+	if (!e->has_name) {
+		e->swap_path[0] = '\0';
+		return;
+	}
+	if (!j) {
+		j = calloc(1, sizeof(*j));
+		if (!j)
+			return;
+		e->swapj = j;
+	}
+	j->e = e;
+	j->failed = 0;
+	snprintf(j->file, sizeof(j->file), "%s", e->path);
+	if (!swap_path_for(e->path, j->path, sizeof(j->path)) ||
+	    !swap_base_for(e->path, j->base, sizeof(j->base)))
+		j->path[0] = j->base[0] = '\0';
+	if (!lock_path_for(e->path, j->lock, sizeof(j->lock)))
+		j->lock[0] = '\0';
+	snprintf(e->swap_path, sizeof(e->swap_path), "%s", j->path);
+	if (g_vfs->stat(e->path, &st) == 0) {
+		j->disk_size = st.size;
+		j->disk_mtime_ns = st.mtime_ns;
+	} else {
+		j->disk_size = -1;
+		j->disk_mtime_ns = -1;
+	}
+	e->t->edit_cb = swap_on_edit;
+	e->t->edit_ctx = j;
+}
+
+/* After e->t was replaced wholesale (a reload, a reformat, an export): hook
+ * the new text and, if a journal was running, start it over from the new
+ * text so a replay matches. */
+static void
+swap_rebind(Editor *e)
+{
+	Swapj *j = e->swapj;
+
+	if (!j)
+		return;
+	e->t->edit_cb = swap_on_edit;
+	e->t->edit_ctx = j;
+	if (j->f)
+		swap_compact(j, e->t);
+}
+
+/* Close the journal and remove the swap and the lock (a save, a clean
+ * close, or the feature turned off). The attachment stays, so the next
+ * edit starts a fresh swap. */
+static void
+swap_drop(Swapj *j)
+{
+	if (!j)
+		return;
+	if (j->f) {
+		g_vfs->close(j->f);
+		j->f = NULL;
+	}
+	if (j->path[0])
+		g_vfs->remove(j->path);
+	if (j->base[0])
+		g_vfs->remove(j->base);
+	lock_release(j);
+	j->bytes = 0;
+	j->pending = 0;
+	j->failed = 0;
+}
+
+/* Free the attachment without touching what is on disk (a crash flush
+ * keeps the swap; a clean exit called swap_drop first). */
+static void
+swap_detach(Text *t, Swapj *j)
+{
+	if (t && t->edit_ctx == j) {
+		t->edit_cb = NULL;
+		t->edit_ctx = NULL;
+	}
+	if (j && j->f)
+		g_vfs->close(j->f);
+	free(j);
+}
+
+/* Make sure the active buffer's swap is on disk now: used by the tests and
+ * by a buffer that becomes dirty without an edit (a recovery). */
 static void
 swap_write(Editor *e)
 {
+	Swapj *j;
+
 	if (!e->swap_enabled || !e->has_name)
 		return;
-	if (!e->swap_path[0])
-		swap_set_path(e);
-	if (swap_write_snapshot(e->swap_path, e->path, e->load_mtime, e->t)) {
+	if (!e->swapj || e->t->edit_ctx != e->swapj)
+		swap_attach(e);
+	j = e->swapj;
+	if (!j || !j->path[0])
+		return;
+	if (!j->f && swap_journal_start(j, e->t, e->load_mtime) != 0)
+		return;
+	if (swap_sync(j)) {
 		e->swap_on = 1;
 		e->swap_rev = e->t->rev;
 	}
 }
 
-/* Remove the active buffer's swap file, if one exists. */
+/* Remove the active buffer's swap, if one exists. */
 static void
 swap_remove(Editor *e)
 {
-	if (e->swap_on && e->swap_path[0])
-		unlink(e->swap_path);
+	swap_drop(e->swapj);
 	e->swap_on = 0;
+	if (e->swapj && e->has_name) {	/* the file as it is now, for a clone */
+		Vstat st;
+
+		if (g_vfs->stat(e->path, &st) == 0) {
+			e->swapj->disk_size = st.size;
+			e->swapj->disk_mtime_ns = st.mtime_ns;
+		}
+	}
 }
 
-/* The idle tick: refresh the swap only when the buffer is dirty and has
- * changed since the last snapshot. Called when the event loop goes quiet. */
+/* The idle tick: sync the journal when records wait, and rewrite the base
+ * when the journal has grown long. Called when the event loop goes quiet. */
 static void
 swap_maybe_write(Editor *e)
 {
-	if (e->swap_enabled && e->has_name && text_dirty(e->t) &&
-	    e->t->rev != e->swap_rev)
-		swap_write(e);
+	Swapj *j = e->swapj;
+
+	if (!e->swap_enabled || !e->has_name || !j || !j->f)
+		return;
+	if (j->bytes > SWAP_COMPACT_BYTES)
+		swap_compact(j, e->t);
+	if (swap_sync(j)) {
+		e->swap_on = 1;
+		e->swap_rev = e->t->rev;
+	}
 }
 
 /* The running editor, recorded while vedit_run drives the event loop so the
  * out-of-memory and crash paths can find it. NULL when nothing is running. */
 static Editor *g_crash_ed;
 
-/* Flush every dirty buffer (the active one from the flat editor, the rest from
- * their parked slots) to its swap file. Runs at most once, and writes directly
- * from each buffer's own fields so it never disturbs editor state. This is the
- * body behind vedit_flush_swaps; call that from the crash paths.
- *
- * Reached from vedit_oom and, on the CLI, from the fatal-signal handler. It
- * calls stdio (fopen/fprintf/rename), which is not async-signal-safe, so from a
- * signal handler this is a best-effort recovery aid, not a guarantee. The
- * handler resets the signal to its default first, so a fault while flushing
- * dumps core instead of looping. */
+/* Sync every buffer's journal (the active one from the flat editor, the
+ * rest from their parked slots). Runs at most once and touches nothing but
+ * the file descriptors, so it is safe from the fatal-signal handler: the
+ * records are already written, this only pushes them to stable storage.
+ * This is the body behind vedit_flush_swaps. */
 static void
 swap_flush_all(Editor *e)
 {
@@ -16184,28 +16667,13 @@ swap_flush_all(Editor *e)
 	if (!e || done || !e->swap_enabled)
 		return;
 	done = 1;
-
-	/* active buffer: the flat fields are authoritative */
-	if (e->has_name && e->t && text_dirty(e->t)) {
-		if (!e->swap_path[0])
-			swap_set_path(e);
-		swap_write_snapshot(e->swap_path, e->path, e->load_mtime, e->t);
-	}
-
-	/* parked buffers: snapshot from each slot */
+	if (e->swapj && e->swapj->f)
+		g_vfs->sync(e->swapj->f);
 	for (i = 0; i < e->nbuf; i++) {
 		const Buf *b = &e->bufs[i];
-		char sp[PATH_MAX];
-		const char *swap = b->swap_path;
 
-		if (i == e->cur || !b->has_name || !b->t || !text_dirty(b->t))
-			continue;
-		if (!swap[0]) {		/* never snapshotted while active */
-			if (!swap_path_for(b->path, sp, sizeof(sp)))
-				continue;
-			swap = sp;
-		}
-		swap_write_snapshot(swap, b->path, b->load_mtime, b->t);
+		if (i != e->cur && b->swapj && b->swapj->f)
+			g_vfs->sync(b->swapj->f);
 	}
 }
 
@@ -16215,83 +16683,208 @@ vedit_flush_swaps(void)
 	swap_flush_all(g_crash_ed);
 }
 
-/* Record swap state on the active buffer after an open or recovery decision:
- * the swap path for e->path, whether a swap file is now on disk, and the rev
- * it reflects. Called once e->path is set to the opened file. */
+/* Record swap state on the active buffer after an open or recovery decision.
+ * Called once e->path is set to the opened file. */
 static void
 swap_adopt(Editor *e, time_t orig_mtime, int action)
 {
-	swap_set_path(e);
 	e->load_mtime = orig_mtime;
-	e->swap_on = (action == SWAP_RECOVERED || action == SWAP_OPEN);
+	e->swap_on = 0;
+	if (!e->swap_enabled || action == SWAP_FOREIGN) {
+		e->swap_path[0] = '\0';	/* someone else's file: never touch it */
+		return;
+	}
+	swap_attach(e);
 	e->swap_rev = e->t->rev;
-	if (action == SWAP_FOREIGN) {	/* someone else's .swp: never touch it */
-		e->swap_path[0] = '\0';
-		e->swap_on = 0;
+	if (action == SWAP_RECOVERED) {
+		/* the buffer holds base + journal: keep them, and continue the
+		 * journal from its end so nothing recovered is unprotected */
+		Swapj *j = e->swapj;
+
+		if (j && j->path[0]) {
+			Vstat st;
+
+			j->f = g_vfs->open(j->path, VF_WRITE | VF_APPEND, 0600);
+			if (j->f && g_vfs->fstat(j->f, &st) == 0) {
+				j->bytes = st.size;
+				lock_take(j);
+				e->swap_on = 1;
+			} else if (j->f) {
+				g_vfs->close(j->f);
+				j->f = NULL;
+			}
+		}
 	}
 }
 
-/* Check for a swap file beside path. When one of ours is found, prompt and act
- * on the choice: recover into t (marking it dirty), open anyway, delete the
- * swap, or abort the open. Returns a SWAP_* action for the caller to adopt. */
+/* memmem, which mingw lacks. */
+static const char *
+mem_find(const char *s, size_t n, const char *pat, size_t plen)
+{
+	size_t i;
+
+	if (plen == 0 || n < plen)
+		return NULL;
+	for (i = 0; i + plen <= n; i++)
+		if (memcmp(s + i, pat, plen) == 0)
+			return s + i;
+	return NULL;
+}
+
+/* Parse a journal header. Returns the offset of the first record, or -1
+ * when it is not ours. Fills the fields it finds. */
+static long
+swap_parse_header(const char *s, size_t n, long long *base_size,
+    long *file_mtime, char *owner, size_t ownersz)
+{
+	const char *p = s, *end = s + n, *blank;
+	size_t mlen = strlen(SWAP_MAGIC);
+
+	*base_size = -1;
+	*file_mtime = -1;
+	owner[0] = '\0';
+	if (n < mlen + 1 || memcmp(s, SWAP_MAGIC, mlen) != 0 || s[mlen] != '\t')
+		return -1;
+	blank = mem_find(s, n, "\n\n", 2);
+	if (!blank)
+		return -1;
+	end = blank + 1;
+	while (p < end) {
+		const char *nl = memchr(p, '\n', (size_t)(end - p));
+		size_t len = nl ? (size_t)(nl - p) : (size_t)(end - p);
+
+		if (len > 10 && strncmp(p, "base_size\t", 10) == 0)
+			*base_size = atoll(p + 10);
+		else if (len > 11 && strncmp(p, "file_mtime\t", 11) == 0)
+			*file_mtime = atol(p + 11);
+		else if (len > 6 && strncmp(p, "owner\t", 6) == 0)
+			snprintf(owner, ownersz, "%.*s", (int)(len - 6), p + 6);
+		if (!nl)
+			break;
+		p = nl + 1;
+	}
+	return (long)(blank + 2 - s);
+}
+
+/* Replay the records of a journal (from off) onto t. Stops at the first
+ * short or corrupt record. Returns the number applied. */
+static long
+swap_replay(Text *t, const unsigned char *s, size_t n, size_t off)
+{
+	long applied = 0;
+
+	while (off + SWAP_REC_HEAD + SWAP_REC_FIXED <= n) {
+		uint32_t len = get_u32(s + off), sum = get_u32(s + off + 4);
+		const unsigned char *rec = s + off + SWAP_REC_HEAD;
+		Erec op, inv;
+
+		if (len < SWAP_REC_FIXED || off + SWAP_REC_HEAD + len > n ||
+		    fnv1a32(rec, len) != sum)
+			break;
+		op.op = (Eop)rec[0];
+		op.line = (size_t)get_u64(rec + 1);
+		op.col = (size_t)get_u64(rec + 9);
+		op.n = (size_t)get_u64(rec + 17);
+		op.bytes = (char *)(rec + SWAP_REC_FIXED);
+		op.group = 0;
+		if (op.op == OP_INSERT && op.n != len - SWAP_REC_FIXED)
+			break;
+		if (apply_op(t, &op, &inv) != OK)
+			break;
+		free(inv.bytes);
+		applied++;
+		off += SWAP_REC_HEAD + len;
+	}
+	return applied;
+}
+
+/* Rebuild the text a journal describes into t: the base, then the records.
+ * 0, or -1. */
+static int
+swap_recover_text(Text *t, const char *base, const char *jnl)
+{
+	char *s;
+	size_t n;
+	long long base_size;
+	long file_mtime, off;
+	char owner[512];
+	Vstat st;
+
+	if (vf_read_file(jnl, &s, &n) != 0)
+		return -1;
+	off = swap_parse_header(s, n, &base_size, &file_mtime, owner,
+	    sizeof(owner));
+	if (off < 0 || g_vfs->stat(base, &st) != 0 || st.size != base_size ||
+	    text_load(t, base) != OK) {
+		free(s);
+		return -1;
+	}
+	swap_replay(t, (const unsigned char *)s, n, (size_t)off);
+	free(s);
+	t->dirty = 1;
+	return 0;
+}
+
+/* Check for a swap and a lock beside path. A live lock from another
+ * session asks first: steal it, open read-only, or quit. Then a journal of
+ * ours asks: recover into t, open anyway, delete it, or abort. Returns a
+ * SWAP_* action for the caller to adopt. */
 static int
 swap_recover(Editor *e, const char *path, Text *t, time_t orig_mtime)
 {
-	char swap[PATH_MAX], line[PATH_MAX + 64], msg[256];
-	FILE *fp;
-	long body = 0, hdr_mtime = -1, hdr_pid = -1;
-	int other = 0, key;
+	char jnl[PATH_MAX], base[PATH_MAX], lock[PATH_MAX], owner[512], msg[320];
+	char *s;
+	size_t n;
+	long long base_size;
+	long file_mtime, off;
+	int key;
 
-	if (!e->swap_enabled || !swap_path_for(path, swap, sizeof(swap)))
+	if (!e->swap_enabled)
 		return SWAP_NONE;
-	fp = fopen(swap, "rb");
-	if (!fp)
+	if (lock_path_for(path, lock, sizeof(lock)) &&
+	    lock_read(lock, owner, sizeof(owner)) && lock_owner_live(owner)) {
+		snprintf(msg, sizeof(msg),
+		    "%.80s is editing this file. (s)teal (r)ead-only (q)uit? ",
+		    owner);
+		key = dlg_prompt_key(e, msg);
+		if (key == 's')
+			g_vfs->remove(lock);
+		else if (key == 'r')
+			t->readonly = 1;
+		else
+			return SWAP_ABORT;
+	}
+	if (!swap_path_for(path, jnl, sizeof(jnl)) ||
+	    !swap_base_for(path, base, sizeof(base)))
 		return SWAP_NONE;
-	if (!fgets(line, sizeof(line), fp) ||
-	    strncmp(line, SWAP_MAGIC, strlen(SWAP_MAGIC)) != 0) {
-		fclose(fp);		/* not our file; leave it untouched */
-		return SWAP_FOREIGN;
-	}
-	while (fgets(line, sizeof(line), fp)) {
-		if (line[0] == '\n')
-			break;		/* blank line ends the header */
-		if (strncmp(line, "mtime\t", 6) == 0)
-			hdr_mtime = atol(line + 6);
-		else if (strncmp(line, "pid\t", 4) == 0)
-			hdr_pid = atol(line + 4);
-	}
-	body = ftell(fp);
-	if (hdr_pid > 0 && hdr_pid != (long)getpid() &&
-	    (kill((pid_t)hdr_pid, 0) == 0 || errno == EPERM))
-		other = 1;
+	if (vf_read_file(jnl, &s, &n) != 0)
+		return SWAP_NONE;
+	off = swap_parse_header(s, n, &base_size, &file_mtime, owner,
+	    sizeof(owner));
+	free(s);
+	if (off < 0)
+		return SWAP_FOREIGN;	/* not our file; leave it untouched */
 	snprintf(msg, sizeof(msg),
-	    "Swap file found%s%s. (r)ecover (o)pen (d)elete (q)uit? ",
-	    other ? ", maybe open elsewhere" : "",
-	    (hdr_mtime >= 0 && hdr_mtime != (long)orig_mtime) ?
+	    "Unsaved changes found%s%s. (r)ecover (o)pen (d)elete (q)uit? ",
+	    lock_owner_live(owner) ? ", maybe open elsewhere" : "",
+	    (file_mtime >= 0 && file_mtime != (long)orig_mtime) ?
 	    ", file changed since" : "");
 	key = dlg_prompt_key(e, msg);
 	switch (key) {
 	case 'r':
-		if (body >= 0 && fseek(fp, body, SEEK_SET) == 0 &&
-		    text_load_fp(t, fp) == OK) {
-			t->dirty = 1;
-			fclose(fp);
-			set_status(e,
-			    "recovered from swap; not yet saved");
+		if (swap_recover_text(t, base, jnl) == 0) {
+			set_status(e, "recovered from the journal; not yet saved");
 			return SWAP_RECOVERED;
 		}
-		fclose(fp);
 		set_status(e, "swap recovery failed");
 		return SWAP_OPEN;
 	case 'd':
-		fclose(fp);
-		unlink(swap);
+		g_vfs->remove(jnl);
+		g_vfs->remove(base);
 		return SWAP_DELETED;
 	case 'o':
-		fclose(fp);
 		return SWAP_OPEN;
 	default:			/* q, Esc, Ctrl-C, EOF */
-		fclose(fp);
 		return SWAP_ABORT;
 	}
 }
@@ -16400,6 +16993,10 @@ save_ensure_dir(Editor *e)
 static int
 save_named(Editor *e)
 {
+	if (e->t->readonly && !e->save_force) {
+		set_status(e, "E45: read-only buffer (:w! overrides)");
+		return -1;
+	}
 	if (!save_ensure_dir(e)) {
 		set_status(e, "save cancelled");
 		return -1;
@@ -17126,26 +17723,28 @@ static const char *const tut_table[] = {
 static const char *const tut_recover[] = {
 	"vedit guards against losing unsaved work when the editor or the",
 	"connection dies. While you edit a named file it keeps a swap",
-	"file beside it, a full snapshot refreshed whenever typing pauses",
-	"and again if the process is killed by a signal.",
+	"beside it: a base copy of the text as it was when you started",
+	"(.name.swpf) and a journal (.name.swpm) that records each edit",
+	"the moment you make it. A lock, .#name, marks the file as open.",
 	"",
 	"Recovering after a crash",
 	"",
 	"  - Reopen the file. If a swap sits beside it, vedit asks:",
-	"      (r)ecover  load the snapshot into a buffer you can save",
+	"      (r)ecover  replay the journal into a buffer you can save",
 	"      (o)pen     ignore the swap and open the file as saved",
 	"      (d)elete   discard the swap and open the file",
 	"      (q)uit     leave the file unopened",
-	"  - After (r)ecover, save if the snapshot is the version you",
-	"    want. A swap left by a process that is still running is",
-	"    flagged, in case the file is open in another session.",
+	"  - After (r)ecover, save if the result is the version you want.",
+	"  - If the lock belongs to a session that is still running, vedit",
+	"    asks first: (s)teal the file, open it (r)ead-only, or (q)uit.",
+	"    Emacs uses the same lock, so the two warn about each other.",
 	"",
 	"What is kept",
 	"",
-	"  - A clean save or quit removes the swap; only a crash or a",
-	"    kill leaves one behind.",
-	"  - A swap that is not ours, such as a Vim .swp of the same",
-	"    name, is never read or overwritten.",
+	"  - A clean save or quit removes the swap and the lock; only a",
+	"    crash or a kill leaves them behind.",
+	"  - A journal that is not ours, another program's file of the",
+	"    same name, is never read or overwritten.",
 	"  - Swap files are on by default. Turn them off with :set",
 	"    noswapfile, or edit.swap = off for a host that must not",
 	"    write to disk.",
@@ -17536,7 +18135,7 @@ buffer_reset(Editor *e)
 #define BUF_STATE_SCALARS(X) \
 	X(t) X(has_name) X(cy) X(cx) X(top) X(left) X(sel_active) X(ay) X(ax) \
 	X(syn) X(line_state) X(line_state_cap) X(hl_valid) X(hex_view) \
-	X(hex_top) X(expand_tabs) X(vi_marks_set) X(swap_on) X(swap_rev) \
+	X(hex_top) X(expand_tabs) X(vi_marks_set) X(swap_on) X(swap_rev) X(swapj) \
 	X(load_mtime) X(kind) X(vterm) X(in_pane) X(top_last) X(art) X(tbl) X(tabs) \
 	X(vcs_kind) \
 	BUF_MAIL_SCALARS(X)
@@ -17741,6 +18340,7 @@ buf_open(Editor *e, const char *path)
 		e->swap_path[0] = '\0';
 		e->swap_on = 0;
 		e->swap_rev = e->t->rev;
+		e->swapj = NULL;
 		e->load_mtime = 0;
 	}
 	buf_save(e, &e->bufs[i]);		/* keep the slot consistent */
@@ -17773,6 +18373,8 @@ buf_close(Editor *e, int i)
 		tbl_detach(e);
 		tabs_detach(e);
 		mail_detach(e);
+		swap_detach(e->t, e->swapj);
+		e->swapj = NULL;
 		buf_free_fields(e->t, e->line_state);
 		memmove(&e->bufs[i], &e->bufs[i + 1],
 		    (size_t)(e->nbuf - i - 1) * sizeof(*e->bufs));
@@ -17781,8 +18383,9 @@ buf_close(Editor *e, int i)
 		buf_load(e, &e->bufs[e->cur]);
 		vcs_refresh(e);
 	} else {
-		if (e->bufs[i].swap_on && e->bufs[i].swap_path[0])
-			unlink(e->bufs[i].swap_path);
+		swap_drop(e->bufs[i].swapj);
+		swap_detach(e->bufs[i].t, e->bufs[i].swapj);
+		e->bufs[i].swapj = NULL;
 #ifdef VEDIT_TERM
 		term_buf_free(&e->bufs[i]);	/* no-op unless it is a terminal */
 #endif
@@ -19630,6 +20233,9 @@ ed_new(Editor *e)
 		set_status(e, "out of memory");
 		return;
 	}
+	swap_remove(e);
+	swap_detach(e->t, e->swapj);
+	e->swapj = NULL;
 	text_free(e->t);
 	e->t = nt;
 	e->has_name = 0;
@@ -21023,9 +21629,9 @@ ed_save_as(Editor *e)
 	if (!dlg_save_file(e, path, sizeof(path)))
 		return;
 	swap_remove(e);			/* the old name's swap no longer applies */
-	e->swap_path[0] = '\0';		/* recompute for the new name on next edit */
 	snprintf(e->path, sizeof(e->path), "%s", path);
 	e->has_name = 1;
+	swap_attach(e);			/* the new name's, from the next edit */
 	e->syn = syn_for_path(e->path);
 	e->hl_valid = 0;
 	(void)save_editor(e);
@@ -25007,9 +25613,11 @@ editor_teardown(Editor *e)
 	if (e->nbuf > 0) {
 		buf_save(e, &e->bufs[e->cur]);
 		for (i = 0; i < e->nbuf; i++) {
-			if (i != e->cur && e->bufs[i].swap_on &&
-			    e->bufs[i].swap_path[0])
-				unlink(e->bufs[i].swap_path);
+			if (i != e->cur) {
+				swap_drop(e->bufs[i].swapj);
+				swap_detach(e->bufs[i].t, e->bufs[i].swapj);
+				e->bufs[i].swapj = NULL;
+			}
 #ifdef VEDIT_TERM
 			term_buf_free(&e->bufs[i]);	/* reap any child */
 #endif
@@ -25027,6 +25635,8 @@ editor_teardown(Editor *e)
 #endif
 		tbl_detach(e);
 		tabs_detach(e);
+		swap_detach(e->t, e->swapj);
+		e->swapj = NULL;
 		buf_free_fields(e->t, e->line_state);
 	}
 	free(e->bufs);
@@ -25343,7 +25953,7 @@ static const char g_config_template[] =
 	"#	shiftwidth = 0       # >> / << indent width; 0 = one tab stop\n"
 	"#	tabstop = 8          # the interval between tab stops\n"
 	"#	tabstops =           # a ruler of stops, e.g. \"5 9 17\"\n"
-	"#	swap = on            # write a .swp crash-recovery snapshot\n"
+	"#	swap = on            # keep a crash-recovery swap (.swpf base, .swpm journal)\n"
 	"#	swapdir =            # where swap files go; empty = beside the file\n"
 	"#	backup = off         # keep the previous version as a \"~\" file\n"
 	"#	backupdir =          # where backups go; empty = beside the file\n"
@@ -31064,6 +31674,7 @@ term_install(Editor *e, Term *t)
 	e->cur = i;
 	e->t = nt;
 	e->path[0] = '\0';
+	e->swapj = NULL;
 	e->has_name = 0;
 	e->syn = NULL;
 	e->expand_tabs = 0;
@@ -31713,6 +32324,7 @@ art_export(Editor *e)
 	nt->dirty = 1;
 	text_free(e->t);
 	e->t = nt;
+	swap_rebind(e);
 	e->cy = e->cx = e->top = e->left = 0;
 	e->hl_valid = 0;
 	return 0;
@@ -37934,8 +38546,11 @@ ex_set(Editor *e, const char *arg)
 			e->swap_enabled = !e->swap_enabled;
 			if (!e->swap_enabled)
 				swap_remove(e);
-		} else
+		} else {
 			e->swap_enabled = 1;
+			if (text_dirty(e->t))
+				swap_write(e);	/* protect what is unsaved now */
+		}
 		set_status(e, "swap file %s",
 		    e->swap_enabled ? "on" : "off");
 		return REQ_CONTINUE;
@@ -38354,6 +38969,7 @@ vi_ex_exec(Editor *e, char *buf)
 			}
 			text_free(e->t);
 			e->t = nt;
+			swap_rebind(e);
 			e->cy = e->cx = e->top = e->left = 0;
 			e->sel_active = 0;
 			e->hl_valid = 0;
@@ -38374,11 +38990,16 @@ vi_ex_exec(Editor *e, char *buf)
 			snprintf(e->path, sizeof(e->path), "%s", rest);
 			e->has_name = 1;
 		}
+		e->save_force = bang;
 		(void)ex_write_current(e);	/* sets the status */
+		e->save_force = 0;
 		return REQ_CONTINUE;
 	case EX_WQ:
 	case EX_XIT:
-		if (ex_write_current(e) != 0)
+		e->save_force = bang;
+		rr = ex_write_current(e);
+		e->save_force = 0;
+		if (rr != 0)
 			return REQ_CONTINUE;
 		return REQ_FORCE_QUIT;
 	case EX_QUIT:
