@@ -119,7 +119,8 @@ gvedit: $(GBIN)
 	$(if $(EXE),,ln -sfn $(GBIN) $(GPROG))
 
 $(GBIN): $(SRC) $(HDR) guterm.h | $(OUTBIN)
-	$(CC) $(CFLAGS) -DVEDIT_GUI $(SDL_CFLAGS) -o $@ $(SRC) $(SDL_LIBS) -lm \
+	$(CC) $(CFLAGS) -DVEDIT_GUI $(if $(EXE),,-pthread) $(SDL_CFLAGS) -o $@ \
+	    $(SRC) $(SDL_LIBS) -lm \
 	    $(LDFLAGS)
 
 # Refresh the vendored header from a guterm checkout and stamp its commit.

@@ -27668,6 +27668,7 @@ tty_getsize(void *ctx, int *rows, int *cols)
 #include "guterm.h"
 #ifndef _WIN32
 #include <poll.h>
+#include <pthread.h>
 #endif
 
 typedef struct gui_io {
@@ -27680,6 +27681,11 @@ typedef struct gui_io {
 	int		 quit;		/* the window was closed */
 	unsigned	 pass;		/* pump cycles, to tell closes apart */
 	unsigned	 close_pass;	/* the cycle that saw the last close */
+#if defined(VEDIT_TERM) && !defined(_WIN32)
+	pthread_t	 watcher;	/* polls the terminal panels' ptys */
+	int		 watching;	/* the thread runs */
+	int		 ctrl[2];	/* main loop to watcher: the set to watch */
+#endif
 } Guiio;
 
 static Guiio g_gui;
@@ -27874,61 +27880,200 @@ static int gui_poll_fds(void *ctx, int timeout_ms, const int *extra,
     int nextra, int *ready, int *nready);	/* with the pseudo console layer */
 #endif
 #ifndef _WIN32
-/* The window cannot be waited on together with file descriptors, so the
- * wait alternates: a short poll() on the terminal panels' ptys, then the
- * window's queue, in 16 ms slices until something is ready or the timeout
- * passes. With a terminal open the idle editor therefore ticks at frame
- * rate rather than blocking; that is the price of one thread and no
- * self-pipe, not a busy loop. */
+/* The window cannot be waited on together with file descriptors, so a
+ * watcher thread does it. The main loop hands it the terminal panels'
+ * ptys before each wait; it polls them and calls gut_wake() when one is
+ * ready, then watches nothing until it is handed a set again, so a
+ * descriptor that stays readable never wakes the editor twice for the
+ * same data. The main loop finds which ones are ready with a poll of
+ * its own that does not wait. A set travels over a pipe in one write,
+ * which is atomic below PIPE_BUF. */
+struct gui_watch {
+	int n;			/* -1 ends the thread, 0 watches nothing */
+	int fds[VEDIT_TERM_MAX];
+};
+
+static int
+gui_watch_read(int fd, struct gui_watch *m)
+{
+	char *p = (char *)m;
+	size_t got = 0;
+
+	while (got < sizeof(*m)) {
+		ssize_t r = read(fd, p + got, sizeof(*m) - got);
+
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0)
+			return -1;
+		got += (size_t)r;
+	}
+	return 0;
+}
+
+static int
+gui_watch_send(Guiio *g, const int *fds, int n)
+{
+	struct gui_watch m;
+	const char *p = (const char *)&m;
+	size_t done = 0;
+
+	if (n > VEDIT_TERM_MAX)
+		n = VEDIT_TERM_MAX;
+	memset(&m, 0, sizeof(m));
+	m.n = n;
+	if (n > 0)
+		memcpy(m.fds, fds, (size_t)n * sizeof(*fds));
+	while (done < sizeof(m)) {
+		ssize_t r = write(g->ctrl[1], p + done, sizeof(m) - done);
+
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r < 0)
+			return -1;
+		done += (size_t)r;
+	}
+	return 0;
+}
+
+static void *
+gui_watcher(void *arg)
+{
+	Guiio *g = arg;
+	struct gui_watch m = {0};
+	struct pollfd pfd[VEDIT_TERM_MAX + 1];
+
+	for (;;) {
+		int n = 0, i, r;
+
+		if (m.n == 0 && gui_watch_read(g->ctrl[0], &m) < 0)
+			return NULL;
+		if (m.n < 0)
+			return NULL;
+		for (i = 0; i < m.n; i++) {
+			if (m.fds[i] < 0)
+				continue;
+			pfd[n].fd = m.fds[i];
+			pfd[n].events = POLLIN;
+			pfd[n].revents = 0;
+			n++;
+		}
+		pfd[n].fd = g->ctrl[0];		/* a new set replaces this one */
+		pfd[n].events = POLLIN;
+		pfd[n].revents = 0;
+		r = poll(pfd, (nfds_t)n + 1, -1);
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			return NULL;
+		}
+		if (pfd[n].revents) {
+			if (gui_watch_read(g->ctrl[0], &m) < 0)
+				return NULL;
+			continue;
+		}
+		gut_wake(g->w);
+		m.n = 0;
+	}
+}
+
+static int
+gui_watcher_start(Guiio *g)
+{
+	if (pipe(g->ctrl) != 0)
+		return -1;
+	if (pthread_create(&g->watcher, NULL, gui_watcher, g) != 0) {
+		close(g->ctrl[0]);
+		close(g->ctrl[1]);
+		return -1;
+	}
+	g->watching = 1;
+	return 0;
+}
+
+static void
+gui_watcher_stop(Guiio *g)
+{
+	if (!g->watching)
+		return;
+	gui_watch_send(g, NULL, -1);
+	pthread_join(g->watcher, NULL);
+	close(g->ctrl[0]);
+	close(g->ctrl[1]);
+	g->watching = 0;
+}
+
+/* Poll the panels' ptys for up to wait ms and list the ready ones.
+ * Returns -1 on an error other than a signal. */
+static int
+gui_fds_ready(const int *extra, int nextra, int wait, int *ready,
+    int *nready)
+{
+	struct pollfd pfd[VEDIT_TERM_MAX];
+	int i, n, r;
+
+	*nready = 0;
+	for (i = 0, n = 0; i < nextra; i++) {
+		if (extra[i] < 0)
+			continue;
+		pfd[n].fd = extra[i];
+		pfd[n].events = POLLIN;
+		pfd[n].revents = 0;
+		n++;
+	}
+	if (n == 0)
+		return 0;
+	r = poll(pfd, (nfds_t)n, wait);
+	if (r < 0)
+		return errno == EINTR ? 0 : -1;
+	for (i = 0; i < n; i++)
+		if (pfd[i].revents)
+			ready[(*nready)++] = pfd[i].fd;
+	return 0;
+}
+
 static int
 gui_poll_fds(void *ctx, int timeout_ms, const int *extra, int nextra,
     int *ready, int *nready)
 {
 	Guiio *g = ctx;
-	struct pollfd pfd[VEDIT_TERM_MAX * 2 + 1];
 	uint64_t deadline = gut_ticks(g->w) + (uint64_t)(timeout_ms > 0 ?
 	    timeout_ms : 0);
-	int i, n;
 
 	*nready = 0;
-	if (nextra > (int)(sizeof(pfd) / sizeof(pfd[0])))
-		nextra = (int)(sizeof(pfd) / sizeof(pfd[0]));
+	if (nextra > VEDIT_TERM_MAX)
+		nextra = VEDIT_TERM_MAX;
 	for (;;) {
 		int wait, r;
 
-		if (gui_pump(g, 0))
-			wait = 0;
-		else if (timeout_ms < 0)
-			wait = 16;
-		else {
-			uint64_t now = gut_ticks(g->w);
-
-			wait = now >= deadline ? 0 : (int)(deadline - now);
-			if (wait > 16)
-				wait = 16;
-		}
-		for (i = 0, n = 0; i < nextra; i++) {
-			if (extra[i] < 0)
-				continue;
-			pfd[n].fd = extra[i];
-			pfd[n].events = POLLIN;
-			pfd[n].revents = 0;
-			n++;
-		}
-		r = n > 0 ? poll(pfd, (nfds_t)n, wait) : 0;
-		if (r < 0 && errno != EINTR)
+		if (gui_fds_ready(extra, nextra, 0, ready, nready) < 0)
 			return -1;
-		if (r > 0) {
-			for (i = 0; i < n; i++)
-				if (pfd[i].revents)
-					ready[(*nready)++] = pfd[i].fd;
-		}
-		if (n == 0 && wait > 0)
-			gui_pump(g, wait);
 		if (*nready > 0 || g->in_len > 0 || g->quit)
 			return g->in_len > 0 || g->quit;
-		if (timeout_ms >= 0 && gut_ticks(g->w) >= deadline)
-			return 0;
+		if (timeout_ms < 0) {
+			wait = -1;
+		} else {
+			uint64_t now = gut_ticks(g->w);
+
+			if (now >= deadline)
+				return 0;
+			wait = (int)(deadline - now);
+		}
+		if (g->watching) {
+			/* block in the window wait; the watcher wakes it */
+			gui_watch_send(g, extra, nextra);
+			r = gui_pump(g, wait);
+			gui_watch_send(g, NULL, 0);
+		} else {
+			/* no watcher could start: alternate short waits */
+			if (wait < 0 || wait > 16)
+				wait = 16;
+			if (gui_fds_ready(extra, nextra, wait, ready, nready) < 0)
+				return -1;
+			r = gui_pump(g, 0);
+		}
+		if (r)
+			return 1;
 	}
 }
 #endif /* _WIN32 */
@@ -27997,12 +28142,20 @@ gui_open(Guiio *g, struct vedit_io *io, int scale)
 #ifdef VEDIT_TERM
 	io->poll_fds = gui_poll_fds;
 #endif
+#if defined(VEDIT_TERM) && !defined(_WIN32)
+	if (gui_watcher_start(g) != 0)
+		fprintf(stderr, "%s: no watcher thread; terminal panels will "
+		    "poll\n", progname);
+#endif
 	return 0;
 }
 
 static void
 gui_close(Guiio *g)
 {
+#if defined(VEDIT_TERM) && !defined(_WIN32)
+	gui_watcher_stop(g);
+#endif
 	gut_vt_free(&g->vt);
 	gut_buf_free(&g->buf);
 	if (g->w)
