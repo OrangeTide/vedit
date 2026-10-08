@@ -51,9 +51,15 @@ The configuration file lives at `%APPDATA%\vedit\config` (Options > Edit
 Config creates it). The build commands, `:!`, the formatter, and the version
 control menu run their lines through `cmd.exe`, so write them in its syntax
 (`$(file)` and the other variables expand as usual). Mail works on a Maildir
-tree given as a Windows path. What is left out: the terminal buffers and the
-pane, which need a pseudo-terminal, so `:terminal` and the output pane are not
-there and build output opens in the dialog instead.
+tree given as a Windows path.
+
+Terminal buffers and the pane run the child under a pseudo console
+(ConPTY, Windows 10 1809 and later; older consoles report "failed to start
+terminal"). `:terminal` starts `%COMSPEC%`, and the build commands run in
+the pane through `cmd.exe /d /c` as on Unix they run through `/bin/sh -c`.
+A pipe cannot be waited on, so a reader thread per terminal moves the
+child's output into a buffer and the input loop waits on the console with
+the terminals' events. Wine 10 supports the pseudo console as well.
 
 For debugging a console problem, `VEDIT_WIN_LOG=file` records the console
 calls that fail and the translated input bytes, and `VEDIT_WIN_TRACE=file`

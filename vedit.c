@@ -19,12 +19,8 @@
  */
 
 #ifdef _WIN32
-/* mingw: use its own printf family so %zu and friends work on every CRT, and
- * leave out the PTY-based terminal panel, which has no Windows port. */
+/* mingw: use its own printf family so %zu and friends work on every CRT. */
 #define __USE_MINGW_ANSI_STDIO 1
-#ifndef VEDIT_NO_TERM
-#define VEDIT_NO_TERM 1
-#endif
 #endif
 /* The format attribute must name the C99 family the build actually uses. */
 #if defined(_WIN32) && defined(__GNUC__)
@@ -21648,7 +21644,7 @@ tool_use_term(Editor *e)
 static int
 tool_term_start(Editor *e, const char *cmd, const char *dir, const char *label)
 {
-	char *argv[4];
+	char *argv[5];
 	Term *old = tool_term_find(e, NULL);
 	int i;
 
@@ -21661,10 +21657,17 @@ tool_term_start(Editor *e, const char *cmd, const char *dir, const char *label)
 	snprintf(e->tool_title, sizeof(e->tool_title), "%s", label);
 	e->tool_done_pending = 0;
 	e->tool_result[0] = '\0';
+#ifdef _WIN32
+	argv[0] = "cmd.exe";
+	argv[1] = "/d";
+	argv[2] = "/c";
+#else
 	argv[0] = "/bin/sh";
 	argv[1] = "-c";
-	argv[2] = (char *)cmd;
-	argv[3] = NULL;
+	argv[2] = NULL;
+#endif
+	argv[argv[2] ? 3 : 2] = (char *)cmd;
+	argv[argv[2] ? 4 : 3] = NULL;
 	if ((e->tool_in_pane ? pane_open(e, argv, dir, label)
 	    : term_open_argv(e, argv, dir, label, 0)) < 0)
 		return -1;
@@ -25631,6 +25634,8 @@ tty_getsize(void *ctx, int *rows, int *cols)
 #endif /* _WIN32 */
 
 #ifdef VEDIT_TERM
+static long pty_write(int fd, const void *buf, size_t n);	/* the PTY layer, below */
+
 /* ============================================================
  * Embedded VT terminal emulator.
  * Amalgamated from the lumi libvt sources (vt_buf, vt_parse,
@@ -27123,7 +27128,7 @@ vt_reply(struct vt_state *st, const char *data, size_t len)
 	if (st->reply_fd < 0)
 		return;
 	while (len > 0) {
-		ssize_t n = write(st->reply_fd, data, len);
+		long n = pty_write(st->reply_fd, data, len);
 		if (n < 0) {
 			if (errno == EINTR)
 				continue;
@@ -28517,6 +28522,16 @@ vt_parse_feed(struct vt_parse *p, const char *data, size_t len)
  * happen. PTY handling follows lumi libpty/pty.c and libsession/window.c.
  ****************************************************************/
 
+/* ---- the PTY layer: a POSIX pty, or a Windows pseudo console ----
+ *
+ * The terminal code addresses a session by two ints, a master "fd" to read
+ * and write and a child "pid" to hang up and reap, through pty_* calls. On
+ * POSIX they are the real fd and pid. On Windows both are the index of a
+ * slot that holds the ConPTY handles: a reader thread moves the child's
+ * output from the pipe into a ring buffer, because a pipe cannot be waited
+ * on, and tty_poll_fds waits on the console with the slots' events. */
+
+#ifndef _WIN32
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -28585,6 +28600,530 @@ pty_spawn(int *child_pid, char *const argv[], const char *dir, int rows,
 	return master;
 }
 
+/* Read the child's output: > 0 bytes, 0 at end (the child is gone), or -1
+ * with errno EAGAIN when nothing is waiting. */
+static long
+pty_read(int fd, void *buf, size_t n)
+{
+	return (long)read(fd, buf, n);
+}
+
+static long
+pty_write(int fd, const void *buf, size_t n)
+{
+	return (long)write(fd, buf, n);
+}
+
+static void
+pty_close(int fd)
+{
+	close(fd);
+}
+
+static void
+pty_hangup(int pid)
+{
+	kill(pid, SIGHUP);
+}
+
+/* Reap the child: 1 with its exit status (128 + the signal for a killed
+ * one), 0 when it still runs and nohang is set, -1 on error. */
+static int
+pty_wait(int pid, int *status, int nohang)
+{
+	int st, r;
+
+	while ((r = waitpid(pid, &st, nohang ? WNOHANG : 0)) < 0 &&
+	    errno == EINTR)
+		;
+	if (r <= 0)
+		return r < 0 ? -1 : 0;
+	if (WIFEXITED(st))
+		*status = WEXITSTATUS(st);
+	else if (WIFSIGNALED(st))
+		*status = 128 + WTERMSIG(st);
+	return 1;
+}
+
+#else /* _WIN32: ConPTY */
+/* CreatePseudoConsole is Windows 10 1809 and later, so it is looked up at
+ * run time rather than linked, and an older console gets "failed to start
+ * terminal" instead of a missing-entry-point dialog. */
+typedef void *HPCON_;
+typedef HRESULT (WINAPI *pfn_create_pcon)(COORD, HANDLE, HANDLE, DWORD,
+    HPCON_ *);
+typedef HRESULT (WINAPI *pfn_resize_pcon)(HPCON_, COORD);
+typedef void (WINAPI *pfn_close_pcon)(HPCON_);
+#define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE_ 0x20016
+
+#define WINPTY_RING	65536
+
+typedef struct winpty {
+	int		used;
+	HPCON_		hpc;		/* NULL once closed */
+	HANDLE		in_wr;		/* the child's input, written here */
+	HANDLE		out_rd;		/* the child's output, read by the thread */
+	HANDLE		proc;
+	HANDLE		thread;
+	HANDLE		ev;		/* manual-reset: output waits, or eof */
+	HANDLE		ev_space;	/* auto-reset: the ring was drained */
+	CRITICAL_SECTION cs;
+	char		*ring;
+	int		head, len;
+	int		eof;		/* the output pipe is done */
+	int		exited;		/* the process exit has been noticed */
+} Winpty;
+
+static Winpty g_winpty[VEDIT_TERM_MAX];
+static pfn_create_pcon g_pcon_create;
+static pfn_resize_pcon g_pcon_resize;
+static pfn_close_pcon g_pcon_close;
+
+static int
+winpty_api(void)
+{
+	HMODULE k;
+
+	if (g_pcon_create)
+		return 1;
+	k = GetModuleHandleA("kernel32.dll");
+	if (!k)
+		return 0;
+	g_pcon_create = (pfn_create_pcon)(void *)GetProcAddress(k,
+	    "CreatePseudoConsole");
+	g_pcon_resize = (pfn_resize_pcon)(void *)GetProcAddress(k,
+	    "ResizePseudoConsole");
+	g_pcon_close = (pfn_close_pcon)(void *)GetProcAddress(k,
+	    "ClosePseudoConsole");
+	return g_pcon_create && g_pcon_resize && g_pcon_close;
+}
+
+static Winpty *
+winpty_get(int id)
+{
+	if (id < 0 || id >= VEDIT_TERM_MAX || !g_winpty[id].used)
+		return NULL;
+	return &g_winpty[id];
+}
+
+/* The reader thread: move the pipe into the ring, waiting for room when the
+ * editor falls behind, and flag the end when the pipe breaks. */
+static DWORD WINAPI
+winpty_reader(LPVOID arg)
+{
+	Winpty *p = arg;
+	char buf[4096];
+
+	for (;;) {
+		DWORD r = 0;
+		int off = 0;
+
+		if (!ReadFile(p->out_rd, buf, sizeof(buf), &r, NULL) || r == 0)
+			break;
+		while (off < (int)r) {
+			int n, tail;
+
+			EnterCriticalSection(&p->cs);
+			n = WINPTY_RING - p->len;
+			if (n > (int)r - off)
+				n = (int)r - off;
+			if (n > 0) {
+				tail = (p->head + p->len) % WINPTY_RING;
+				if (tail + n > WINPTY_RING) {
+					int first = WINPTY_RING - tail;
+
+					memcpy(p->ring + tail, buf + off,
+					    (size_t)first);
+					memcpy(p->ring, buf + off + first,
+					    (size_t)(n - first));
+				} else {
+					memcpy(p->ring + tail, buf + off,
+					    (size_t)n);
+				}
+				p->len += n;
+				off += n;
+				SetEvent(p->ev);
+			}
+			LeaveCriticalSection(&p->cs);
+			if (n == 0)
+				WaitForSingleObject(p->ev_space, 100);
+		}
+	}
+	EnterCriticalSection(&p->cs);
+	p->eof = 1;
+	SetEvent(p->ev);
+	LeaveCriticalSection(&p->cs);
+	return 0;
+}
+
+/* Join argv into a CreateProcess command line. A word with a space or a
+ * quote is quoted, except the one after /c or /k: cmd.exe takes the rest of
+ * the line as the command and would keep the quotes. */
+static WCHAR *
+winpty_cmdline(char *const argv[])
+{
+	size_t cap = 0, len = 0;
+	char *line, *out;
+	WCHAR *w;
+	int i, n;
+
+	for (i = 0; argv[i]; i++)
+		cap += strlen(argv[i]) * 2 + 4;
+	line = malloc(cap + 1);
+	if (!line)
+		return NULL;
+	out = line;
+	for (i = 0; argv[i]; i++) {
+		const char *a = argv[i];
+		int raw = i > 0 && (_stricmp(argv[i - 1], "/c") == 0 ||
+		    _stricmp(argv[i - 1], "/k") == 0);
+		int quote = !raw && (a[0] == '\0' || strpbrk(a, " \t\"") != NULL);
+
+		if (i > 0)
+			*out++ = ' ';
+		if (quote)
+			*out++ = '"';
+		for (; *a; a++) {
+			if (quote && *a == '"')
+				*out++ = '\\';
+			*out++ = *a;
+		}
+		if (quote)
+			*out++ = '"';
+	}
+	*out = '\0';
+	len = (size_t)(out - line);
+	n = MultiByteToWideChar(CP_UTF8, 0, line, (int)len, NULL, 0);
+	w = malloc(((size_t)n + 1) * sizeof(WCHAR));
+	if (w) {
+		MultiByteToWideChar(CP_UTF8, 0, line, (int)len, w, n);
+		w[n] = 0;
+	}
+	free(line);
+	return w;
+}
+
+static void
+winpty_free(Winpty *p)
+{
+	if (p->hpc)
+		g_pcon_close(p->hpc);
+	if (p->in_wr)
+		CloseHandle(p->in_wr);
+	if (p->thread) {
+		if (WaitForSingleObject(p->thread, 2000) != WAIT_OBJECT_0) {
+			CancelSynchronousIo(p->thread);
+			WaitForSingleObject(p->thread, 1000);
+		}
+		CloseHandle(p->thread);
+	}
+	if (p->out_rd)
+		CloseHandle(p->out_rd);
+	if (p->ev)
+		CloseHandle(p->ev);
+	if (p->ev_space)
+		CloseHandle(p->ev_space);
+	if (p->proc)
+		CloseHandle(p->proc);
+	if (p->ring) {
+		DeleteCriticalSection(&p->cs);
+		free(p->ring);
+	}
+	memset(p, 0, sizeof(*p));
+}
+
+static void
+pty_resize(int fd, int rows, int cols)
+{
+	Winpty *p = winpty_get(fd);
+	COORD sz;
+
+	if (!p || !p->hpc)
+		return;
+	sz.X = (SHORT)cols;
+	sz.Y = (SHORT)rows;
+	g_pcon_resize(p->hpc, sz);
+}
+
+/* Start argv (NULL = %COMSPEC%) under a new pseudo console in dir (NULL =
+ * inherit). Returns the slot id for both the fd and the pid, or -1. */
+static int
+pty_spawn(int *child_pid, char *const argv[], const char *dir, int rows,
+    int cols)
+{
+	static char *const shell_argv[] = { NULL, NULL };
+	char *const *av = argv && argv[0] ? argv : shell_argv;
+	char *shell_words[2] = { NULL, NULL };
+	HANDLE in_rd = NULL, out_wr = NULL;
+	STARTUPINFOEXW si;
+	PROCESS_INFORMATION pi;
+	SIZE_T attrsz = 0;
+	WCHAR *cmd, wdir[PATH_MAX];
+	COORD sz;
+	Winpty *p = NULL;
+	int id, ok = 0;
+
+	if (!winpty_api())
+		return -1;
+	for (id = 0; id < VEDIT_TERM_MAX; id++)
+		if (!g_winpty[id].used)
+			break;
+	if (id == VEDIT_TERM_MAX)
+		return -1;
+	p = &g_winpty[id];
+	memset(p, 0, sizeof(*p));
+	p->used = 1;
+	p->ring = malloc(WINPTY_RING);
+	if (!p->ring) {
+		p->used = 0;
+		return -1;
+	}
+	InitializeCriticalSection(&p->cs);
+	p->ev = CreateEventW(NULL, TRUE, FALSE, NULL);
+	p->ev_space = CreateEventW(NULL, FALSE, FALSE, NULL);
+	if (!p->ev || !p->ev_space)
+		goto out;
+	if (!CreatePipe(&in_rd, &p->in_wr, NULL, 0) ||
+	    !CreatePipe(&p->out_rd, &out_wr, NULL, 0))
+		goto out;
+	sz.X = (SHORT)(cols > 0 ? cols : 80);
+	sz.Y = (SHORT)(rows > 0 ? rows : 24);
+	if (g_pcon_create(sz, in_rd, out_wr, 0, &p->hpc) != S_OK) {
+		p->hpc = NULL;
+		goto out;
+	}
+	CloseHandle(in_rd);
+	CloseHandle(out_wr);
+	in_rd = out_wr = NULL;
+
+	if (av == shell_argv) {
+		const char *cs = getenv("COMSPEC");
+
+		shell_words[0] = (char *)(cs && cs[0] ? cs : "cmd.exe");
+		av = shell_words;
+	}
+	cmd = winpty_cmdline(av);
+	if (!cmd)
+		goto out;
+	memset(&si, 0, sizeof(si));
+	si.StartupInfo.cb = sizeof(si);
+	InitializeProcThreadAttributeList(NULL, 1, 0, &attrsz);
+	si.lpAttributeList = malloc(attrsz);
+	if (!si.lpAttributeList ||
+	    !InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0,
+	    &attrsz) ||
+	    !UpdateProcThreadAttribute(si.lpAttributeList, 0,
+	    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE_, p->hpc, sizeof(p->hpc),
+	    NULL, NULL)) {
+		free(si.lpAttributeList);
+		free(cmd);
+		goto out;
+	}
+	wdir[0] = 0;
+	if (dir && dir[0])
+		MultiByteToWideChar(CP_UTF8, 0, dir, -1, wdir, PATH_MAX);
+	memset(&pi, 0, sizeof(pi));
+	ok = CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
+	    EXTENDED_STARTUPINFO_PRESENT, NULL, wdir[0] ? wdir : NULL,
+	    &si.StartupInfo, &pi);
+	DeleteProcThreadAttributeList(si.lpAttributeList);
+	free(si.lpAttributeList);
+	free(cmd);
+	if (!ok) {
+		tty_log("CreateProcessW: %lu", (unsigned long)GetLastError());
+		goto out;
+	}
+	CloseHandle(pi.hThread);
+	p->proc = pi.hProcess;
+	p->thread = CreateThread(NULL, 0, winpty_reader, p, 0, NULL);
+	if (!p->thread) {
+		ok = 0;
+		goto out;
+	}
+	*child_pid = id;
+	return id;
+out:
+	if (in_rd)
+		CloseHandle(in_rd);
+	if (out_wr)
+		CloseHandle(out_wr);
+	if (p->proc)
+		TerminateProcess(p->proc, 1);
+	winpty_free(p);
+	return -1;
+}
+
+static long
+pty_read(int fd, void *buf, size_t n)
+{
+	Winpty *p = winpty_get(fd);
+	int take, first;
+
+	if (!p) {
+		errno = EBADF;
+		return -1;
+	}
+	EnterCriticalSection(&p->cs);
+	take = p->len < (int)n ? p->len : (int)n;
+	if (take > 0) {
+		first = WINPTY_RING - p->head;
+		if (first > take)
+			first = take;
+		memcpy(buf, p->ring + p->head, (size_t)first);
+		if (take > first)
+			memcpy((char *)buf + first, p->ring,
+			    (size_t)(take - first));
+		p->head = (p->head + take) % WINPTY_RING;
+		p->len -= take;
+		SetEvent(p->ev_space);
+	}
+	if (p->len == 0 && !p->eof)
+		ResetEvent(p->ev);
+	LeaveCriticalSection(&p->cs);
+	if (take > 0)
+		return take;
+	if (p->eof)
+		return 0;
+	errno = EAGAIN;
+	return -1;
+}
+
+static long
+pty_write(int fd, const void *buf, size_t n)
+{
+	Winpty *p = winpty_get(fd);
+	DWORD w = 0;
+
+	if (!p || !p->in_wr) {
+		errno = EBADF;
+		return -1;
+	}
+	if (!WriteFile(p->in_wr, buf, (DWORD)n, &w, NULL)) {
+		errno = EIO;
+		return -1;
+	}
+	return (long)w;
+}
+
+/* Close the session's pipes and console; the slot stays until pty_wait so
+ * the process can still be reaped. */
+static void
+pty_close(int fd)
+{
+	Winpty *p = winpty_get(fd);
+	HANDLE proc;
+
+	if (!p)
+		return;
+	proc = p->proc;
+	p->proc = NULL;
+	winpty_free(p);
+	p->used = 1;
+	p->proc = proc;
+}
+
+static void
+pty_hangup(int pid)
+{
+	Winpty *p = winpty_get(pid);
+
+	if (p && p->proc)
+		TerminateProcess(p->proc, 1);
+}
+
+static int
+pty_wait(int pid, int *status, int nohang)
+{
+	Winpty *p = winpty_get(pid);
+	DWORD code = 0;
+
+	if (!p || !p->proc)
+		return -1;
+	if (WaitForSingleObject(p->proc, nohang ? 0 : INFINITE) !=
+	    WAIT_OBJECT_0)
+		return 0;
+	GetExitCodeProcess(p->proc, &code);
+	*status = (int)code;
+	winpty_free(p);
+	return 1;
+}
+
+/* Wait on the keyboard and every live session at once: the console handle,
+ * each session's output event, and the process handle of one whose exit
+ * has not been seen. An exit closes the pseudo console, which ends the
+ * output pipe, so the reader thread then flags the end and the session is
+ * drained to its EOF like a closed PTY. Returns 1 when translated keyboard
+ * bytes wait, 0 on timeout (with ready[] filled), -1 on error. */
+static int
+tty_poll_fds(void *ctx, int timeout_ms, const int *extra, int nextra,
+    int *ready, int *nready)
+{
+	Ttyio *t = ctx;
+	DWORD start = GetTickCount();
+
+	*nready = 0;
+	for (;;) {
+		HANDLE hs[1 + 2 * VEDIT_TERM_MAX];
+		int slot[1 + 2 * VEDIT_TERM_MAX];
+		DWORD nh = 0, r, wait = INFINITE;
+		int i;
+
+		if (t->npend == 0 && tty_drain(t) < 0)
+			return -1;
+		hs[nh] = t->in;
+		slot[nh++] = -1;
+		for (i = 0; i < nextra && i < VEDIT_TERM_MAX; i++) {
+			Winpty *p = winpty_get(extra[i]);
+
+			if (!p)
+				continue;
+			EnterCriticalSection(&p->cs);
+			if (p->len > 0 || p->eof)
+				ready[(*nready)++] = extra[i];
+			LeaveCriticalSection(&p->cs);
+			hs[nh] = p->ev;
+			slot[nh++] = extra[i];
+			if (!p->exited && p->proc) {
+				hs[nh] = p->proc;
+				slot[nh++] = extra[i] + VEDIT_TERM_MAX;
+			}
+		}
+		if (t->npend > 0)
+			return 1;
+		if (*nready > 0)
+			return 0;
+		if (timeout_ms >= 0) {
+			DWORD used = GetTickCount() - start;
+
+			if (used >= (DWORD)timeout_ms)
+				return 0;
+			wait = (DWORD)timeout_ms - used;
+		}
+		r = WaitForMultipleObjects(nh, hs, FALSE, wait);
+		if (r == WAIT_TIMEOUT)
+			return 0;
+		if (r >= WAIT_OBJECT_0 + nh) {
+			tty_log("WaitForMultipleObjects: %lu (%lu)",
+			    (unsigned long)r, (unsigned long)GetLastError());
+			return -1;
+		}
+		i = slot[r - WAIT_OBJECT_0];
+		if (i >= VEDIT_TERM_MAX) {	/* a process exited */
+			Winpty *p = winpty_get(i - VEDIT_TERM_MAX);
+
+			if (p) {
+				p->exited = 1;
+				if (p->hpc) {
+					g_pcon_close(p->hpc);
+					p->hpc = NULL;
+				}
+			}
+		}
+		/* the console or an event: the next pass collects it */
+	}
+}
+#endif /* _WIN32 */
+
 static int
 term_is_active(const Editor *e)
 {
@@ -28611,14 +29150,13 @@ term_buf_free(Buf *b)
 		return;
 	t = b->vterm;
 	if (t->master_fd >= 0)
-		close(t->master_fd);
-	if (t->child_pid > 0) {		/* reap even if term_reap already flagged dead */
+		pty_close(t->master_fd);
+	if (t->child_pid >= 0) {	/* reap even if term_reap already flagged dead */
 		int st;
 
 		if (!t->dead)
-			kill(t->child_pid, SIGHUP);
-		while (waitpid(t->child_pid, &st, 0) < 0 && errno == EINTR)
-			;
+			pty_hangup(t->child_pid);
+		pty_wait(t->child_pid, &st, 0);
 	}
 	vt_parse_free(t->parser);
 	vt_state_free(t->vt);
@@ -28667,16 +29205,12 @@ term_reap(Term *t)
 	int st;
 
 	if (t->master_fd >= 0) {
-		close(t->master_fd);
+		pty_close(t->master_fd);
 		t->master_fd = -1;
 	}
-	if (!t->dead && t->child_pid > 0 &&
-	    waitpid(t->child_pid, &st, WNOHANG) == t->child_pid) {
-		if (WIFEXITED(st))
-			t->exit_status = WEXITSTATUS(st);
-		else if (WIFSIGNALED(st))
-			t->exit_status = 128 + WTERMSIG(st);
-	}
+	if (!t->dead && t->child_pid >= 0 &&
+	    pty_wait(t->child_pid, &st, 1) == 1)
+		t->exit_status = st;
 	t->dead = 1;
 }
 
@@ -28706,7 +29240,7 @@ term_drain(void *ctx, int fd)
 	active = (t == e->vterm) || t->pane;	/* on screen: repaint */
 	for (;;) {
 		char buf[4096];
-		ssize_t r = read(fd, buf, sizeof(buf));
+		long r = pty_read(fd, buf, sizeof(buf));
 
 		if (r > 0) {
 			vt_parse_feed(t->parser, buf, (size_t)r);
@@ -29215,7 +29749,7 @@ term_write(Term *t, const char *buf, int n)
 	if (!t || t->dead || t->master_fd < 0)
 		return;
 	while (off < n) {
-		ssize_t w = write(t->master_fd, buf + off, (size_t)(n - off));
+		long w = pty_write(t->master_fd, buf + off, (size_t)(n - off));
 
 		if (w < 0) {
 			if (errno == EINTR || errno == EAGAIN)
@@ -29234,9 +29768,9 @@ term_discard(Term *t)
 	if (!t)
 		return;
 	if (t->master_fd >= 0)
-		close(t->master_fd);
-	if (t->child_pid > 0)
-		kill(t->child_pid, SIGHUP);
+		pty_close(t->master_fd);
+	if (t->child_pid >= 0)
+		pty_hangup(t->child_pid);
 	vt_parse_free(t->parser);
 	vt_state_free(t->vt);
 	free(t);
