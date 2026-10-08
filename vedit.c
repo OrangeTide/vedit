@@ -31016,15 +31016,26 @@ pty_hangup(int pid)
 }
 
 /* Reap the child: 1 with its exit status (128 + the signal for a killed
- * one), 0 when it still runs and nohang is set, -1 on error. */
+ * one), 0 when it still runs after timeout_ms (0 = do not wait, -1 = wait
+ * for it), -1 on error. */
 static int
-pty_wait(int pid, int *status, int nohang)
+pty_wait(int pid, int *status, int timeout_ms)
 {
-	int st, r;
+	int st, r, waited = 0;
 
-	while ((r = waitpid(pid, &st, nohang ? WNOHANG : 0)) < 0 &&
-	    errno == EINTR)
-		;
+	for (;;) {
+		while ((r = waitpid(pid, &st, timeout_ms < 0 ? 0 : WNOHANG)) < 0 &&
+		    errno == EINTR)
+			;
+		if (r != 0 || waited >= timeout_ms)
+			break;
+		{				/* not yet: poll in small steps */
+			struct timespec ts = { 0, 2000000L };
+
+			nanosleep(&ts, NULL);
+			waited += 2;
+		}
+	}
 	if (r <= 0)
 		return r < 0 ? -1 : 0;
 	if (WIFEXITED(st))
@@ -31456,15 +31467,15 @@ pty_hangup(int pid)
 }
 
 static int
-pty_wait(int pid, int *status, int nohang)
+pty_wait(int pid, int *status, int timeout_ms)
 {
 	Winpty *p = winpty_get(pid);
 	DWORD code = 0;
 
 	if (!p || !p->proc)
 		return -1;
-	if (WaitForSingleObject(p->proc, nohang ? 0 : INFINITE) !=
-	    WAIT_OBJECT_0)
+	if (WaitForSingleObject(p->proc,
+	    timeout_ms < 0 ? INFINITE : (DWORD)timeout_ms) != WAIT_OBJECT_0)
 		return 0;
 	GetExitCodeProcess(p->proc, &code);
 	*status = (int)code;
@@ -31664,7 +31675,7 @@ term_buf_free(Buf *b)
 
 		if (!t->dead)
 			pty_hangup(t->child_pid);
-		pty_wait(t->child_pid, &st, 0);
+		pty_wait(t->child_pid, &st, -1);
 	}
 	vt_parse_free(t->parser);
 	vt_state_free(t->vt);
@@ -31716,8 +31727,11 @@ term_reap(Term *t)
 		pty_close(t->master_fd);
 		t->master_fd = -1;
 	}
+	/* The EOF that brought us here can arrive before the exit is
+	 * collectible (macOS does this), so give the child a moment: a
+	 * non-blocking wait would read its status as 0. */
 	if (!t->dead && t->child_pid >= 0 &&
-	    pty_wait(t->child_pid, &st, 1) == 1)
+	    pty_wait(t->child_pid, &st, 1000) == 1)
 		t->exit_status = st;
 	t->dead = 1;
 }
