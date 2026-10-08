@@ -2341,7 +2341,8 @@ t_vcs_commit(Test *t)
 	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "commit")) == REQ_CONTINUE);
 
 	TAP_CHECKF(t, strncmp(g_fake_commit,
-	    "git commit --only -F /tmp/vedit-msg.", 36) == 0 &&
+	    "git commit --only -F ", 21) == 0 &&
+	    strstr(g_fake_commit, "/vedit-msg.") != NULL &&	/* in $TMPDIR */
 	    strstr(g_fake_commit, "-- /tmp/vedit_cm") != NULL, "ran '%s'",
 	    g_fake_commit);
 	TAP_CHECKF(t, strcmp(g_fake_msg, "Fix the thing\n\nA body line.\n") == 0,

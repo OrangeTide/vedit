@@ -1499,9 +1499,10 @@ t_map_remap(Test *t)
 	rmdir(dir);
 }
 
-#ifndef _WIN32
+#ifdef __linux__
 /* Another program truncating a mapped file: the guard turns the fault
- * into a torn map and a blank page instead of a crash. */
+ * into a torn map and a blank page instead of a crash. Linux only: macOS
+ * keeps the truncated pages readable, so nothing faults there. */
 static void
 t_map_torn(Test *t)
 {
@@ -3786,7 +3787,7 @@ const Case tap_cases[] = {
 	{ "backup_save", t_backup_save },
 	{ "map_load", t_map_load },
 	{ "map_remap", t_map_remap },
-#ifndef _WIN32
+#ifdef __linux__
 	{ "map_torn", t_map_torn },
 #endif
 	{ "swap_write_clear", t_swap_write_clear },

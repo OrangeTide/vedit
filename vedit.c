@@ -18694,6 +18694,7 @@ buf_open(Editor *e, const char *path)
 	}
 	buf_save(e, &e->bufs[e->cur]);		/* park the current buffer */
 	e->cur = i;
+	e->swapj = NULL;		/* parked with its buffer; the new slot gets its own */
 	e->t = nt;				/* set up the flat new buffer */
 #ifdef VEDIT_TERM
 	e->kind = BUF_TEXT;		/* parked a terminal: this slot is text */
@@ -26027,11 +26028,10 @@ editor_teardown(Editor *e)
 	if (e->nbuf > 0) {
 		buf_save(e, &e->bufs[e->cur]);
 		for (i = 0; i < e->nbuf; i++) {
-			if (i != e->cur) {
+			if (i != e->cur)	/* the active one: swap_remove above */
 				swap_drop(e->bufs[i].swapj);
-				swap_detach(e->bufs[i].t, e->bufs[i].swapj);
-				e->bufs[i].swapj = NULL;
-			}
+			swap_detach(e->bufs[i].t, e->bufs[i].swapj);
+			e->bufs[i].swapj = NULL;
 #ifdef VEDIT_TERM
 			term_buf_free(&e->bufs[i]);	/* reap any child */
 #endif
@@ -26043,6 +26043,7 @@ editor_teardown(Editor *e)
 			mail_ref_free(&e->bufs[i]);
 			buf_free_fields(e->bufs[i].t, e->bufs[i].line_state);
 		}
+		e->swapj = NULL;		/* freed with its slot above */
 	} else {
 #ifdef VEDIT_ART
 		art_detach(e);
