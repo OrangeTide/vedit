@@ -21,6 +21,9 @@ OUT    ?= _out
 TARGET ?= $(shell $(CC) -dumpmachine)
 OUTBIN  = $(OUT)/$(TARGET)/bin
 # A Windows cross build (make CC=x86_64-w64-mingw32-gcc) gets the .exe suffix.
+# gvedit needs the SDL3 mingw package as well: make gvedit CC=... with
+# SDL_CFLAGS=-I<pkg>/include and SDL_LIBS="-L<pkg>/lib -lSDL3 -lmingw32
+# -mwindows", as the gvedit-windows CI job does.
 EXE     = $(if $(findstring mingw,$(TARGET)),.exe,)
 BIN     = $(OUTBIN)/$(PROG)$(EXE)
 
