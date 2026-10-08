@@ -20,7 +20,9 @@ HDR  = vedit.h
 OUT    ?= _out
 TARGET ?= $(shell $(CC) -dumpmachine)
 OUTBIN  = $(OUT)/$(TARGET)/bin
-BIN     = $(OUTBIN)/$(PROG)
+# A Windows cross build (make CC=x86_64-w64-mingw32-gcc) gets the .exe suffix.
+EXE     = $(if $(findstring mingw,$(TARGET)),.exe,)
+BIN     = $(OUTBIN)/$(PROG)$(EXE)
 
 # Static build against musl, handy for dropping the binary onto a server:
 #   make static            (or: make STATIC=1)
@@ -91,7 +93,7 @@ $(OUTBIN):
 # Point the top-level symlink at this target's binary. Always rerun, so
 # `make static` and a plain `make` each leave ./vedit on the build just made.
 link: $(BIN)
-	ln -sfn $(BIN) $(PROG)
+	$(if $(EXE),,ln -sfn $(BIN) $(PROG))
 
 static: all
 

@@ -318,6 +318,18 @@ Override the box-drawing mode.
 Override the color depth
 .RB ( 256 " or " 16 ).
 .TP
+.B VEDIT_WIN_RENDER
+On Windows: draw through the console API
+.RB ( console ,
+the default under wine) or send the ANSI stream through the console's VT
+processing
+.RB ( vt ,
+the default on a real console).
+.TP
+.BR VEDIT_WIN_LOG ", " VEDIT_WIN_TRACE
+On Windows: files that record failing console calls with the translated
+input, and the raw output stream.
+.TP
 .B VEDIT_MOUSE
 Enable
 .RB ( 1 )
@@ -348,6 +360,9 @@ command. Overridden by
 .B ~/.veditrc
 The configuration file of a build without XDG support
 .RB ( \-DVEDIT_NO_XDG ).
+.TP
+.B %APPDATA%\\vedit\\config
+The configuration file on Windows.
 .TP
 .BI . name .swp
 Crash-recovery swap file written beside an edited file, unless relocated with

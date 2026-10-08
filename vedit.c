@@ -18,6 +18,20 @@
  * and finally the embed API and the command-line entry point.
  */
 
+#ifdef _WIN32
+/* mingw: use its own printf family so %zu and friends work on every CRT, and
+ * leave out the PTY-based terminal panel, which has no Windows port. */
+#define __USE_MINGW_ANSI_STDIO 1
+#ifndef VEDIT_NO_TERM
+#define VEDIT_NO_TERM 1
+#endif
+#endif
+/* The format attribute must name the C99 family the build actually uses. */
+#if defined(_WIN32) && defined(__GNUC__)
+#define VEDIT_PRINTF gnu_printf
+#else
+#define VEDIT_PRINTF printf
+#endif
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -30,12 +44,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <time.h>
-#include <termios.h>
 #include <unistd.h>
+#ifndef _WIN32
+#include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <termios.h>
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -43,6 +59,182 @@
 
 /* Public interface (struct vedit_io, enum vedit_box_mode, the embed API). */
 #include "vedit.h"
+
+#ifdef _WIN32
+/****************************************************************
+ * Windows (mingw) compatibility. The editor core is plain C; what
+ * it borrows from POSIX beyond that is a handful of calls with
+ * direct Win32 or CRT equivalents, provided here, plus the two
+ * memory streams, built on temporary files with an fclose wrapper
+ * that hands the bytes back. The console binding and the tool
+ * runner have Win32 versions of their own further down.
+ ****************************************************************/
+#include <windows.h>
+#include <direct.h>
+#include <io.h>
+#include <process.h>
+
+#define mkdir(p, m)	_mkdir(p)
+#define fsync(fd)	_commit(fd)
+#define setenv(n, v, o)	_putenv_s(n, v)
+#define realpath(p, r)	_fullpath((r), (p), PATH_MAX)
+#ifndef S_IRUSR
+#define S_IRUSR 0400
+#define S_IWUSR 0200
+#endif
+typedef unsigned short mode_t;
+
+/* No file modes to speak of: umask and chmod are accepted and ignored. */
+static mode_t
+win_umask(mode_t m)
+{
+	(void)m;
+	return 0;
+}
+#define umask win_umask
+
+static int
+win_chmod(const char *p, mode_t m)
+{
+	(void)p;
+	(void)m;
+	return 0;
+}
+#define chmod win_chmod
+
+/* rename() on Windows refuses an existing target; the save and swap paths
+ * rely on the POSIX replace. */
+static int
+win_rename(const char *from, const char *to)
+{
+	if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
+		return 0;
+	errno = (GetLastError() == ERROR_ACCESS_DENIED) ? EACCES : EEXIST;
+	return -1;
+}
+#define rename win_rename
+
+static struct tm *
+localtime_r(const time_t *t, struct tm *out)
+{
+	struct tm *tm = localtime(t);
+
+	if (!tm)
+		return NULL;
+	*out = *tm;
+	return out;
+}
+
+static int
+win_gethostname(char *buf, size_t n)
+{
+	DWORD sz = (DWORD)n;
+
+	if (GetComputerNameA(buf, &sz))
+		return 0;
+	snprintf(buf, n, "localhost");
+	return 0;
+}
+#define gethostname win_gethostname
+
+/* Only kill(pid, 0), "does this process exist", is needed (swap recovery). */
+static int
+kill(pid_t pid, int sig)
+{
+	HANDLE h;
+
+	if (sig != 0) {
+		errno = ENOSYS;
+		return -1;
+	}
+	h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+	if (!h) {
+		errno = (GetLastError() == ERROR_ACCESS_DENIED) ? EPERM : ESRCH;
+		return -1;
+	}
+	CloseHandle(h);
+	return 0;
+}
+
+/* Memory streams over temporary files. open_memstream registers the stream;
+ * the fclose wrapper below reads the file back into a malloc'd buffer for
+ * the registered pointers before closing it. fmemopen copies the bytes into
+ * a temporary file positioned at its start (reading only). */
+#define WIN_MEMSTREAMS 8
+static struct win_memstream {
+	FILE	*fp;
+	char	**bufp;
+	size_t	*lenp;
+} g_memstreams[WIN_MEMSTREAMS];
+
+static FILE *
+open_memstream(char **bufp, size_t *lenp)
+{
+	int i;
+
+	for (i = 0; i < WIN_MEMSTREAMS; i++)
+		if (!g_memstreams[i].fp)
+			break;
+	if (i == WIN_MEMSTREAMS) {
+		errno = EMFILE;
+		return NULL;
+	}
+	g_memstreams[i].fp = tmpfile();
+	if (!g_memstreams[i].fp)
+		return NULL;
+	g_memstreams[i].bufp = bufp;
+	g_memstreams[i].lenp = lenp;
+	*bufp = NULL;
+	*lenp = 0;
+	return g_memstreams[i].fp;
+}
+
+static FILE *
+fmemopen(void *buf, size_t len, const char *mode)
+{
+	FILE *fp = tmpfile();
+
+	(void)mode;
+	if (!fp)
+		return NULL;
+	if (len > 0 && fwrite(buf, 1, len, fp) != len) {
+		fclose(fp);
+		return NULL;
+	}
+	rewind(fp);
+	return fp;
+}
+
+static int
+win_fclose(FILE *fp)
+{
+	int i;
+
+	for (i = 0; i < WIN_MEMSTREAMS; i++)
+		if (g_memstreams[i].fp == fp)
+			break;
+	if (i < WIN_MEMSTREAMS) {
+		struct win_memstream *m = &g_memstreams[i];
+		long sz;
+		char *b;
+
+		fflush(fp);
+		sz = ftell(fp);
+		if (sz < 0)
+			sz = 0;
+		b = malloc((size_t)sz + 1);
+		if (b) {
+			rewind(fp);
+			*m->lenp = fread(b, 1, (size_t)sz, fp);
+			b[*m->lenp] = '\0';
+			*m->bufp = b;
+		}
+		m->fp = NULL;
+	}
+	return fclose(fp);
+}
+#define fclose win_fclose
+#endif /* _WIN32 */
 
 /* The embedded VT terminal panel (shell / build output in a buffer) is built by
  * default. A primitive embedding host that wants none of the PTY and emulator
@@ -4886,6 +5078,16 @@ typedef struct draw { Scrbuf *t; } Screen;
  * instead and never touches this. */
 static volatile sig_atomic_t g_winch;
 
+/* Leave the bottom-right cell undrawn: a console that wraps at once when the
+ * last column is written (wine's) would scroll the whole frame on it. */
+static int g_scr_skip_corner;
+
+/* A native renderer: when set, the presenter hands it the cell grid instead
+ * of emitting the ANSI stream (the Win32 console binding uses this), and
+ * the stream for the terminal is discarded. */
+typedef struct draw_term Scrbuf;
+static void (*g_scr_blit)(Scrbuf *t);
+
 /* The pending termination signal (SIGTERM/SIGHUP), or 0. The command-line
  * binding's handler sets it and wakes the poll through a self-pipe; scr_wait
  * then reports end-of-input so the editor unwinds to the top of the run, where
@@ -4932,6 +5134,8 @@ scr_flush(Scrbuf *t)
 {
 	size_t off = 0;
 
+	if (g_scr_blit)
+		t->outlen = 0;	/* the native renderer draws; nothing to send */
 	while (off < t->outlen) {
 		long w = t->io.write(t->io.ctx, t->out + off,
 		    (long)(t->outlen - off));
@@ -5400,12 +5604,17 @@ scr_present(Screen *d)
 	char mv[32];
 	Pen pen;
 
+	if (g_scr_blit) {
+		g_scr_blit(t);
+		t->shadow_valid = 1;
+		return;
+	}
 	scr_str(t, "\033[?25l");		/* hide cursor during the paint */
 	for (r = 0; r < t->rows; r++) {
 		Cell *row = &t->cur[(size_t)r * t->cols];
 		Cell *srow = &t->shadow[(size_t)r * t->cols];
 		int acs = 0;		/* DEC line-drawing charset is active */
-		int first, last, g0 = 0, run, gap0 = 0, gap1 = 0;
+		int first, last, g0 = 0, run, gap0 = 0, gap1 = 0, lim;
 
 		/* first and last columns that differ from the shadow */
 		first = 0;
@@ -5424,6 +5633,17 @@ scr_present(Screen *d)
 			first--;
 		if (last + 1 < t->cols && row[last + 1].codepoint == CELL_CONT)
 			last++;
+		lim = t->cols;
+		if (g_scr_skip_corner && r == t->rows - 1) {
+			lim = t->cols - 1;
+			if (last >= lim)
+				last = lim - 1;
+			if (last < first) {	/* only the corner changed */
+				t->rowdirty[r] = 0;
+				memcpy(srow, row, (size_t)t->cols * sizeof(*row));
+				continue;
+			}
+		}
 
 		/* longest run of default-background blanks within the changed
 		 * span, as a candidate for erase-to-EOL */
@@ -5459,7 +5679,7 @@ scr_present(Screen *d)
 			scr_str(t, "\033[0m");	/* default bg, so EL clears right */
 			scr_str(t, "\033[K");
 			pen_reset(&pen);
-			for (c = gap1; c < t->cols; c++) {
+			for (c = gap1; c < lim; c++) {
 				if (cell_is_blank_default(&row[c]) ||
 				    row[c].codepoint == CELL_CONT)
 					continue;
@@ -5467,7 +5687,7 @@ scr_present(Screen *d)
 				    c + 1);
 				scr_str(t, mv);
 				pen_reset(&pen);
-				while (c < t->cols &&
+				while (c < lim &&
 				    !cell_is_blank_default(&row[c])) {
 					scr_emit_cell(t, &pen, &acs, &row[c]);
 					c++;
@@ -5579,6 +5799,9 @@ scr_begin(Screen *d)
 	for (i = 0; i < t->rows; i++)
 		t->rowdirty[i] = 1;
 	t->shadow_valid = 0;		/* screen just cleared; do not scroll yet */
+	if (g_scr_blit)			/* nothing drawn yet: every cell differs */
+		memset(t->shadow, 0, (size_t)t->rows * (size_t)t->cols *
+		    sizeof(*t->shadow));
 	scr_flush(t);
 }
 
@@ -6793,7 +7016,7 @@ static void term_drain(void *ctx, int fd);		/* aux_ready hook */
 /* Set the one-line status message (printf-style). The single choke point for
  * e->status, so every message is bounded by its size the same way. */
 static void set_status(Editor *e, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)));
+    __attribute__((format(VEDIT_PRINTF, 2, 3)));
 static void
 set_status(Editor *e, const char *fmt, ...)
 {
@@ -9102,15 +9325,13 @@ static const Menuitem mi_run[] = {
 	{ "&Next Error",	"F4",		"",	MA_ERR_NEXT },
 	{ "&Prev Error",	"Shift+F4",	"",	MA_ERR_PREV },
 };
-#endif
-#ifdef VEDIT_TERM
-#ifndef VEDIT_NO_TOOLS
 static const Menuitem mi_vcs[] = {
 	{ "&History...",	"",	":log",	MA_VCS_LOG },
 	{ "&Blame",	"",	":blame",	MA_VCS_BLAME },
 	{ "&Commit...",	"",	":commit",	MA_VCS_COMMIT },
 };
 #endif
+#ifdef VEDIT_TERM
 static const Menuitem mi_term[] = {
 	{ "&New Terminal",	"",	":terminal",	MA_TERM_NEW },
 	{ "&Close Terminal",	"",	"",		MA_TERM_CLOSE },
@@ -23660,7 +23881,7 @@ placed:
  * and the wheel scrolls three lines. Terminal buffers, the pane, and the
  * hex, table and art views take nothing from the mouse yet. */
 static Menuact
-mouse_event(Editor *e, const struct tkbd_seq *m)
+ed_mouse_event(Editor *e, const struct tkbd_seq *m)
 {
 	int text_h = text_height(e), gutter = gutter_width(e);
 	int col0 = CHROME_LEFT + gutter, text_w = text_width(e) - gutter;
@@ -23748,7 +23969,7 @@ editor_loop(Editor *e)
 
 #ifndef VEDIT_NO_MOUSE
 		if (seq.type == TKBD_MOUSE) {
-			if (e->mouse && run_menu_act(e, mouse_event(e, &seq)))
+			if (e->mouse && run_menu_act(e, ed_mouse_event(e, &seq)))
 				return 0;
 			ed_render(e, e->d);
 			continue;
@@ -24502,6 +24723,7 @@ vedit_free(struct vedit *v)
  * and SIGWINCH. This is the only part that touches termios and
  * signals; an embedded host supplies its own io instead.
  ****************************************************************/
+#ifndef _WIN32
 
 typedef struct tty_io {
 	int		in_fd, out_fd;
@@ -24785,6 +25007,628 @@ tty_getsize(void *ctx, int *rows, int *cols)
 	}
 	return -1;
 }
+#else /* _WIN32 */
+/* The Win32 console. Output goes through the console's own VT processing
+ * (Windows 10 and later, and wine), so the editor's ANSI stream is drawn as
+ * it is. Input is read as console records and translated into the same byte
+ * sequences a terminal would send: the console translates most keys itself
+ * once virtual-terminal input is on; the rest (and every key on a console
+ * without that mode) is mapped from the virtual key code here. A resize
+ * record sets g_winch like SIGWINCH does. */
+typedef struct tty_io {
+	HANDLE	in, out;
+	HANDLE	active;		/* the session's own screen buffer, or NULL */
+	DWORD	in_mode, out_mode;
+	UINT	cp_in, cp_out;
+	int	raw;
+	char	pend[64];	/* translated bytes not yet handed out */
+	int	npend;
+	char	carry[4];	/* an incomplete UTF-8 sequence awaiting its rest */
+	int	ncarry;
+	WCHAR	hi;		/* a high surrogate awaiting its low half */
+} Ttyio;
+
+static Ttyio g_tty;	/* the CLI runs a single editor */
+
+/* Console trouble is invisible once the editor owns the screen, so with
+ * VEDIT_WIN_LOG naming a file the binding notes its failures there. */
+static void
+tty_log(const char *fmt, ...)
+{
+	static FILE *fp;
+	static int tried;
+	va_list ap;
+
+	if (!tried) {
+		const char *p = getenv("VEDIT_WIN_LOG");
+
+		tried = 1;
+		if (p && p[0])
+			fp = fopen(p, "a");
+	}
+	if (!fp)
+		return;
+	va_start(ap, fmt);
+	vfprintf(fp, fmt, ap);
+	va_end(ap);
+	fputc('\n', fp);
+	fflush(fp);
+}
+
+static void
+tty_restore(Ttyio *t)
+{
+	static const char restore[] =
+	    "\033[0m\033[?1006l\033[?1000l\033[?2004l\033[?25h\033[?1049l";
+	DWORD w;
+
+	if (!t->raw)
+		return;
+	if (t->active) {
+		SetConsoleActiveScreenBuffer(t->out);
+		t->active = NULL;
+	}
+	WriteFile(t->out, restore, sizeof(restore) - 1, &w, NULL);
+	SetConsoleMode(t->in, t->in_mode);
+	SetConsoleMode(t->out, t->out_mode);
+	SetConsoleOutputCP(t->cp_out);
+	SetConsoleCP(t->cp_in);
+	t->raw = 0;
+}
+
+/* The window is being closed or the user logs off: keep the work. */
+static BOOL WINAPI
+tty_on_ctrl(DWORD type)
+{
+	if (type == CTRL_CLOSE_EVENT || type == CTRL_LOGOFF_EVENT ||
+	    type == CTRL_SHUTDOWN_EVENT) {
+		vedit_flush_swaps();
+		tty_restore(&g_tty);
+		return TRUE;
+	}
+	return FALSE;
+}
+
+static void
+tty_on_fatal(int sig)
+{
+	signal(sig, SIG_DFL);
+	vedit_flush_swaps();
+	tty_restore(&g_tty);
+	raise(sig);
+}
+
+static void
+tty_push(Ttyio *t, const char *s, size_t n)
+{
+	if (getenv("VEDIT_WIN_LOG")) {		/* input trace */
+		char hex[200];
+		size_t i, o = 0;
+
+		for (i = 0; i < n && o + 4 < sizeof(hex); i++)
+			o += (size_t)snprintf(hex + o, sizeof(hex) - o, "%02x ",
+			    (unsigned char)s[i]);
+		tty_log("in: %s", hex);
+	}
+	if (n > sizeof(t->pend) - (size_t)t->npend)
+		n = sizeof(t->pend) - (size_t)t->npend;
+	memcpy(t->pend + t->npend, s, n);
+	t->npend += (int)n;
+}
+
+static void
+tty_push_cp(Ttyio *t, uint32_t cp)
+{
+	char u[4];
+	int n = utf8_encode((unsigned char *)u, cp);
+
+	if (n > 0)
+		tty_push(t, u, (size_t)n);
+}
+
+/* A key the console did not translate: the terminal sequence for its
+ * virtual key, with the xterm modifier parameter when one is held. */
+static void
+tty_push_vk(Ttyio *t, WORD vk, DWORD ctl)
+{
+	const char *csi = NULL, *ss3 = NULL;
+	int tilde = 0, mod = 1;
+	char seq[16];
+
+	if (ctl & SHIFT_PRESSED)
+		mod += 1;
+	if (ctl & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED))
+		mod += 2;
+	if (ctl & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED))
+		mod += 4;
+	switch (vk) {
+	case VK_UP: csi = "A"; break;
+	case VK_DOWN: csi = "B"; break;
+	case VK_RIGHT: csi = "C"; break;
+	case VK_LEFT: csi = "D"; break;
+	case VK_HOME: csi = "H"; break;
+	case VK_END: csi = "F"; break;
+	case VK_INSERT: tilde = 2; break;
+	case VK_DELETE: tilde = 3; break;
+	case VK_PRIOR: tilde = 5; break;
+	case VK_NEXT: tilde = 6; break;
+	case VK_F1: ss3 = "P"; break;
+	case VK_F2: ss3 = "Q"; break;
+	case VK_F3: ss3 = "R"; break;
+	case VK_F4: ss3 = "S"; break;
+	case VK_F5: tilde = 15; break;
+	case VK_F6: tilde = 17; break;
+	case VK_F7: tilde = 18; break;
+	case VK_F8: tilde = 19; break;
+	case VK_F9: tilde = 20; break;
+	case VK_F10: tilde = 21; break;
+	case VK_F11: tilde = 23; break;
+	case VK_F12: tilde = 24; break;
+	default: return;
+	}
+	if (csi) {
+		if (mod > 1)
+			snprintf(seq, sizeof(seq), "\033[1;%d%s", mod, csi);
+		else
+			snprintf(seq, sizeof(seq), "\033[%s", csi);
+	} else if (ss3) {
+		if (mod > 1)
+			snprintf(seq, sizeof(seq), "\033[1;%d%s", mod, ss3);
+		else
+			snprintf(seq, sizeof(seq), "\033O%s", ss3);
+	} else {
+		if (mod > 1)
+			snprintf(seq, sizeof(seq), "\033[%d;%d~", tilde, mod);
+		else
+			snprintf(seq, sizeof(seq), "\033[%d~", tilde);
+	}
+	tty_push(t, seq, strlen(seq));
+}
+
+/* Translate one console record into bytes (none for most of them). */
+static void
+tty_record(Ttyio *t, const INPUT_RECORD *r)
+{
+	if (r->EventType == WINDOW_BUFFER_SIZE_EVENT) {
+		g_winch = 1;
+	} else if (r->EventType == KEY_EVENT) {
+		const KEY_EVENT_RECORD *k = &r->Event.KeyEvent;
+		int i;
+
+		if (!k->bKeyDown)
+			return;
+		for (i = 0; i < k->wRepeatCount; i++) {
+			WCHAR wc = k->uChar.UnicodeChar;
+
+			if (wc == 0) {
+				tty_push_vk(t, k->wVirtualKeyCode,
+				    k->dwControlKeyState);
+				continue;
+			}
+			if (wc >= 0xd800 && wc < 0xdc00) {
+				t->hi = wc;
+				continue;
+			}
+			if (wc >= 0xdc00 && wc < 0xe000 && t->hi) {
+				uint32_t cp = 0x10000 + (((uint32_t)t->hi - 0xd800)
+				    << 10) + ((uint32_t)wc - 0xdc00);
+
+				t->hi = 0;
+				tty_push_cp(t, cp);
+				continue;
+			}
+			t->hi = 0;
+			if ((k->dwControlKeyState &
+			    (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) &&
+			    !(k->dwControlKeyState &
+			    (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) && wc < 128)
+				tty_push(t, "\033", 1);	/* Alt+key as ESC key */
+			tty_push_cp(t, (uint32_t)wc);
+		}
+	} else if (r->EventType == MOUSE_EVENT) {
+		const MOUSE_EVENT_RECORD *m = &r->Event.MouseEvent;
+		static DWORD last_buttons;
+		int x = m->dwMousePosition.X + 1, y = m->dwMousePosition.Y + 1;
+		char seq[32];
+		CONSOLE_SCREEN_BUFFER_INFO sb;
+
+		/* report positions relative to the visible window */
+		if (GetConsoleScreenBufferInfo(t->out, &sb))
+			y -= sb.srWindow.Top;
+		if (m->dwEventFlags & MOUSE_WHEELED) {
+			int up = (short)HIWORD(m->dwButtonState) > 0;
+
+			snprintf(seq, sizeof(seq), "\033[<%d;%d;%dM", up ? 64 : 65,
+			    x, y);
+			tty_push(t, seq, strlen(seq));
+		} else if (m->dwEventFlags == 0 || m->dwEventFlags == DOUBLE_CLICK) {
+			DWORD now = m->dwButtonState & 7, was = last_buttons & 7;
+
+			/* SGR 1000: press and release of the left button */
+			if ((now & FROM_LEFT_1ST_BUTTON_PRESSED) &&
+			    !(was & FROM_LEFT_1ST_BUTTON_PRESSED)) {
+				snprintf(seq, sizeof(seq), "\033[<0;%d;%dM", x, y);
+				tty_push(t, seq, strlen(seq));
+			} else if (!(now & FROM_LEFT_1ST_BUTTON_PRESSED) &&
+			    (was & FROM_LEFT_1ST_BUTTON_PRESSED)) {
+				snprintf(seq, sizeof(seq), "\033[<0;%d;%dm", x, y);
+				tty_push(t, seq, strlen(seq));
+			}
+			last_buttons = m->dwButtonState;
+		}
+	}
+}
+
+/* Pull every record the console holds through the translator. Returns -1
+ * when the console cannot be read any more. */
+static int
+tty_drain(Ttyio *t)
+{
+	for (;;) {
+		DWORD avail = 0, nr = 0;
+		INPUT_RECORD rec;
+
+		if (!GetNumberOfConsoleInputEvents(t->in, &avail)) {
+			tty_log("GetNumberOfConsoleInputEvents failed: %lu",
+			    (unsigned long)GetLastError());
+			return -1;
+		}
+		if (avail == 0)
+			return 0;
+		if (!ReadConsoleInputW(t->in, &rec, 1, &nr) || nr == 0) {
+			tty_log("ReadConsoleInputW failed: %lu",
+			    (unsigned long)GetLastError());
+			return -1;
+		}
+		tty_record(t, &rec);
+		if (t->npend >= (int)sizeof(t->pend) - 8)
+			return 0;	/* room for the rest later */
+	}
+}
+
+static long
+tty_read(void *ctx, void *buf, long n)
+{
+	Ttyio *t = ctx;
+	long take;
+
+	if (t->npend == 0 && tty_drain(t) < 0)
+		return -1;
+	take = t->npend < n ? t->npend : n;
+	memcpy(buf, t->pend, (size_t)take);
+	memmove(t->pend, t->pend + take, (size_t)(t->npend - take));
+	t->npend -= (int)take;
+	return take;		/* 0 only when nothing is ready */
+}
+
+/* The stream is UTF-8; the console wants UTF-16, so convert in chunks. A
+ * multibyte sequence cut by the chunk boundary (or by the caller) is carried
+ * over to the next call. */
+static long
+tty_write(void *ctx, const void *buf, long n)
+{
+	Ttyio *t = ctx;
+	const char *p = buf;
+	long off = 0;
+
+	{				/* VEDIT_WIN_TRACE: the raw stream, for replay */
+		static FILE *trace;
+		static int tried;
+
+		if (!tried) {
+			const char *tp = getenv("VEDIT_WIN_TRACE");
+
+			tried = 1;
+			if (tp && tp[0])
+				trace = fopen(tp, "ab");
+		}
+		if (trace) {
+			fwrite(p, 1, (size_t)n, trace);
+			fflush(trace);
+		}
+	}
+	while (off < n || t->ncarry) {
+		char chunk[4096];
+		WCHAR wide[4096];
+		long take = n - off, keep = 0, i;
+		int clen, wl;
+
+		if (take > (long)sizeof(chunk) - t->ncarry)
+			take = (long)sizeof(chunk) - t->ncarry;
+		memcpy(chunk, t->carry, (size_t)t->ncarry);
+		memcpy(chunk + t->ncarry, p + off, (size_t)take);
+		clen = t->ncarry + (int)take;
+		off += take;
+		t->ncarry = 0;
+		/* hold back an incomplete trailing sequence */
+		for (i = clen - 1; i >= 0 && i >= clen - 4; i--) {
+			unsigned char c = (unsigned char)chunk[i];
+			int need;
+
+			if ((c & 0xc0) == 0x80)
+				continue;
+			need = (c & 0x80) == 0 ? 1 : (c & 0xe0) == 0xc0 ? 2 :
+			    (c & 0xf0) == 0xe0 ? 3 : 4;
+			if (clen - i < need) {
+				keep = clen - i;
+				memcpy(t->carry, chunk + i, (size_t)keep);
+				t->ncarry = (int)keep;
+				clen = (int)i;
+			}
+			break;
+		}
+		if (clen == 0)
+			break;
+		wl = MultiByteToWideChar(CP_UTF8, 0, chunk, clen, wide, 4096);
+		if (wl > 0) {
+			DWORD w = 0, done = 0;
+
+			while (done < (DWORD)wl) {
+				if (!WriteConsoleW(t->out, wide + done, (DWORD)wl - done,
+				    &w, NULL))
+					return -1;
+				done += w;
+			}
+		}
+	}
+	return n;
+}
+
+/* Readable means translated bytes are waiting: a record that yields none
+ * (a key release, a focus change) is consumed here, so a wake never reads
+ * as end of input. */
+static int
+tty_poll(void *ctx, int timeout_ms)
+{
+	Ttyio *t = ctx;
+	DWORD start = GetTickCount();
+
+	for (;;) {
+		DWORD r, wait = INFINITE;
+
+		if (t->npend > 0)
+			return 1;
+		if (tty_drain(t) < 0)
+			return -1;
+		if (t->npend > 0)
+			return 1;
+		if (timeout_ms >= 0) {
+			DWORD used = GetTickCount() - start;
+
+			if (used >= (DWORD)timeout_ms)
+				return 0;
+			wait = (DWORD)timeout_ms - used;
+		}
+		r = WaitForSingleObject(t->in, wait);
+		if (r == WAIT_TIMEOUT)
+			return 0;
+		if (r != WAIT_OBJECT_0) {
+			tty_log("WaitForSingleObject: %lu (%lu)", (unsigned long)r,
+			    (unsigned long)GetLastError());
+			return -1;
+		}
+	}
+}
+
+
+/* The native renderer: the cell grid goes to the console with
+ * WriteConsoleOutputW, a row at a time, so no VT processing is needed from
+ * the console (wine's lacks much of it). Colours map onto the 16 console
+ * attributes: bold brightens, reverse swaps, underline uses the console's
+ * underscore flag. The editor draws into a screen buffer of its own, the
+ * console's version of the alternate screen, when one can be made. */
+static WORD
+win_attr_index(Color c, int is_bg)
+{
+	int idx;
+
+	if (c.type == COLOR_DEFAULT)
+		return is_bg ? 0 : 7;
+	if (c.type == COLOR_RGB)
+		idx = rgb_to_ansi16(c.rgb.r, c.rgb.g, c.rgb.b);
+	else
+		idx = c.index < 16 ? c.index : color256_to_16(c.index);
+	/* ANSI orders bits as red, green, blue; the console as blue, green, red */
+	return (WORD)(((idx & 1) << 2) | (idx & 2) | ((idx & 4) >> 2) |
+	    (idx & 8));
+}
+
+static WORD
+win_attr(const Cell *cell)
+{
+	WORD fg = win_attr_index(cell->fg, 0), bg = win_attr_index(cell->bg, 1);
+	WORD a;
+
+	if (cell->attrs & ATTR_BOLD)
+		fg |= 8;
+	if (cell->attrs & ATTR_REVERSE) {
+		WORD x = fg;
+
+		fg = bg;
+		bg = x;
+	}
+	a = (WORD)(fg | (bg << 4));
+	if (cell->attrs & ATTR_UNDERLINE)
+		a |= COMMON_LVB_UNDERSCORE;
+	return a;
+}
+
+static void
+win_blit(Scrbuf *t)
+{
+	Ttyio *w = &g_tty;
+	HANDLE h = w->active ? w->active : w->out;
+	static CHAR_INFO *ci;
+	static int cicap;
+	CONSOLE_CURSOR_INFO cur;
+	COORD size, org = { 0, 0 }, pos;
+	int r, c;
+
+	if (cicap < t->cols) {
+		CHAR_INFO *p = realloc(ci, (size_t)t->cols * sizeof(*ci));
+
+		if (!p)
+			return;
+		ci = p;
+		cicap = t->cols;
+	}
+	size.X = (SHORT)t->cols;
+	size.Y = 1;
+	for (r = 0; r < t->rows; r++) {
+		Cell *row = &t->cur[(size_t)r * t->cols];
+		Cell *srow = &t->shadow[(size_t)r * t->cols];
+		SMALL_RECT rect;
+
+		if (memcmp(row, srow, (size_t)t->cols * sizeof(*row)) == 0)
+			continue;
+		for (c = 0; c < t->cols; c++) {
+			uint32_t cp = row[c].codepoint;
+
+			if (BOX_IS(cp)) {	/* frame glyphs: Unicode or ASCII */
+				const BoxDef *b = &box_tab[BOX_ID(cp)];
+
+				cp = (t->box_mode == VEDIT_BOX_UTF8) ? b->uni :
+				    (uint32_t)b->ascii;
+			}
+			if (cp == CELL_CONT || cp == 0)
+				cp = ' ';
+			else if (cp > 0xffff)
+				cp = '?';
+			ci[c].Char.UnicodeChar = (WCHAR)cp;
+			ci[c].Attributes = win_attr(&row[c]);
+		}
+		rect.Left = 0;
+		rect.Top = (SHORT)r;
+		rect.Right = (SHORT)(t->cols - 1);
+		rect.Bottom = (SHORT)r;
+		if (!WriteConsoleOutputW(h, ci, size, org, &rect))
+			tty_log("WriteConsoleOutputW row %d: %lu", r,
+			    (unsigned long)GetLastError());
+		t->rowdirty[r] = 0;
+		memcpy(srow, row, (size_t)t->cols * sizeof(*row));
+	}
+	pos.X = (SHORT)t->cursor_c;
+	pos.Y = (SHORT)t->cursor_r;
+	SetConsoleCursorPosition(h, pos);
+	if (GetConsoleCursorInfo(h, &cur)) {
+		cur.bVisible = t->cursor_vis ? TRUE : FALSE;
+		SetConsoleCursorInfo(h, &cur);
+	}
+}
+
+/* Switch to a screen buffer of the window's size for the session. */
+static void
+win_alt_screen(Ttyio *t)
+{
+	CONSOLE_SCREEN_BUFFER_INFO sb;
+	HANDLE h;
+
+	t->active = NULL;
+	if (!GetConsoleScreenBufferInfo(t->out, &sb))
+		return;
+	h = CreateConsoleScreenBuffer(GENERIC_READ | GENERIC_WRITE,
+	    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CONSOLE_TEXTMODE_BUFFER,
+	    NULL);
+	if (h == INVALID_HANDLE_VALUE || !h) {
+		tty_log("CreateConsoleScreenBuffer: %lu",
+		    (unsigned long)GetLastError());
+		return;
+	}
+	{
+		COORD size;
+
+		size.X = (SHORT)(sb.srWindow.Right - sb.srWindow.Left + 1);
+		size.Y = (SHORT)(sb.srWindow.Bottom - sb.srWindow.Top + 1);
+		if (size.X > 0 && size.Y > 0)
+			SetConsoleScreenBufferSize(h, size);
+	}
+	if (!SetConsoleActiveScreenBuffer(h)) {
+		tty_log("SetConsoleActiveScreenBuffer: %lu",
+		    (unsigned long)GetLastError());
+		CloseHandle(h);
+		return;
+	}
+	t->active = h;
+}
+static void
+tty_begin(void *ctx)
+{
+	Ttyio *t = ctx;
+	DWORD mode;
+
+	g_sig_quit = 0;
+	t->npend = 0;
+	t->ncarry = 0;
+	t->hi = 0;
+	GetConsoleMode(t->in, &t->in_mode);
+	GetConsoleMode(t->out, &t->out_mode);
+	t->cp_in = GetConsoleCP();
+	t->cp_out = GetConsoleOutputCP();
+	SetConsoleCP(CP_UTF8);
+	SetConsoleOutputCP(CP_UTF8);
+	mode = ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS;
+	if (!SetConsoleMode(t->in, mode | ENABLE_VIRTUAL_TERMINAL_INPUT))
+		SetConsoleMode(t->in, mode);	/* an old console: VK mapping */
+	/* DISABLE_NEWLINE_AUTO_RETURN gives the deferred wrap at the last
+	 * column that a terminal has, so drawing the bottom-right cell does not
+	 * scroll; a console without it (wine) is handled by skipping that cell. */
+	mode = t->out_mode | ENABLE_PROCESSED_OUTPUT |
+	    ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+	if (!SetConsoleMode(t->out, mode | DISABLE_NEWLINE_AUTO_RETURN))
+		SetConsoleMode(t->out, mode);
+	t->raw = 1;
+	if (g_scr_blit)
+		win_alt_screen(t);
+	SetConsoleCtrlHandler(tty_on_ctrl, TRUE);
+	signal(SIGSEGV, tty_on_fatal);
+	signal(SIGILL, tty_on_fatal);
+	signal(SIGFPE, tty_on_fatal);
+	signal(SIGABRT, tty_on_fatal);
+}
+
+static void
+tty_end(void *ctx)
+{
+	Ttyio *t = ctx;
+
+	signal(SIGSEGV, SIG_DFL);
+	signal(SIGILL, SIG_DFL);
+	signal(SIGFPE, SIG_DFL);
+	signal(SIGABRT, SIG_DFL);
+	SetConsoleCtrlHandler(tty_on_ctrl, FALSE);
+	if (t->active) {
+		SetConsoleActiveScreenBuffer(t->out);
+		CloseHandle(t->active);
+		t->active = NULL;
+	}
+	if (t->raw) {
+		SetConsoleMode(t->in, t->in_mode);
+		SetConsoleMode(t->out, t->out_mode);
+		SetConsoleOutputCP(t->cp_out);
+		SetConsoleCP(t->cp_in);
+		t->raw = 0;
+	}
+}
+
+static int
+tty_getsize(void *ctx, int *rows, int *cols)
+{
+	Ttyio *t = ctx;
+	CONSOLE_SCREEN_BUFFER_INFO sb;
+
+	if (!GetConsoleScreenBufferInfo(t->active ? t->active : t->out, &sb))
+		return -1;
+	/* the visible window; a console that reports none sensibly (wine's
+	 * before its first draw) gets the buffer size instead */
+	*rows = sb.srWindow.Bottom - sb.srWindow.Top + 1;
+	*cols = sb.srWindow.Right - sb.srWindow.Left + 1;
+	if (*rows <= 0 || *rows > sb.dwSize.Y)
+		*rows = sb.dwSize.Y;
+	if (*cols <= 0 || *cols > sb.dwSize.X)
+		*cols = sb.dwSize.X;
+	return (*rows > 0 && *cols > 0) ? 0 : -1;
+}
+#endif /* _WIN32 */
 
 #ifdef VEDIT_TERM
 /* ============================================================
@@ -30261,6 +31105,91 @@ art_key(Editor *e, const struct tkbd_seq *seq)
  * (for example to run the command inside a sandbox), or passes NULL to disable
  * building entirely. */
 
+#ifdef _WIN32
+/* The Windows runner goes through cmd.exe: _popen for the captured forms
+ * (stderr folded into stdout), system() for the foreground one. The
+ * directory is applied with a leading cd, and a filter's input is written
+ * to a temporary file the command reads from. */
+static void
+win_cmdline(char *out, size_t outsz, const char *cmd, const char *dir,
+    const char *tail)
+{
+	if (dir && dir[0])
+		snprintf(out, outsz, "cd /d \"%s\" && (%s) %s", dir, cmd, tail);
+	else
+		snprintf(out, outsz, "(%s) %s", cmd, tail);
+}
+
+static int
+win_popen_run(const char *line,
+    void (*emit)(void *sink, const char *buf, size_t n), void *sink)
+{
+	FILE *fp = _popen(line, "rb");
+	char buf[4096];
+	size_t n;
+	int rc;
+
+	if (!fp)
+		return -1;
+	while ((n = fread(buf, 1, sizeof(buf), fp)) > 0)
+		emit(sink, buf, n);
+	rc = _pclose(fp);
+	return rc < 0 ? -1 : rc;
+}
+
+static int
+cli_run_capture(void *ctx, const char *cmd, const char *dir,
+    void (*emit)(void *sink, const char *buf, size_t n), void *sink)
+{
+	char line[8192];
+
+	(void)ctx;
+	win_cmdline(line, sizeof(line), cmd, dir, "2>&1");
+	return win_popen_run(line, emit, sink);
+}
+
+static int
+cli_run_foreground(void *ctx, const char *cmd, const char *dir)
+{
+	char line[8192];
+	int rc;
+
+	(void)ctx;
+	fflush(stdout);
+	win_cmdline(line, sizeof(line), cmd, dir, "");
+	rc = system(line);
+	return rc < 0 ? -1 : rc;
+}
+
+static int
+cli_run_filter(void *ctx, const char *cmd, const char *dir,
+    const char *input, size_t inlen,
+    void (*emit)(void *sink, const char *buf, size_t n), void *sink)
+{
+	char line[8192], tail[PATH_MAX + 32], tmp[PATH_MAX];
+	const char *tmpdir = getenv("TEMP");
+	int fd, rc;
+
+	(void)ctx;
+	if (!tmpdir || !tmpdir[0])
+		tmpdir = ".";
+	snprintf(tmp, sizeof(tmp), "%s\\vedit-in.XXXXXX", tmpdir);
+	fd = mkstemp(tmp);
+	if (fd < 0)
+		return -1;
+	if (inlen > 0 && (size_t)_write(fd, input, (unsigned)inlen) != inlen) {
+		_close(fd);
+		_unlink(tmp);
+		return -1;
+	}
+	_close(fd);
+	snprintf(tail, sizeof(tail), "< \"%s\" 2>NUL", tmp);
+	win_cmdline(line, sizeof(line), cmd, dir, tail);
+	rc = win_popen_run(line, emit, sink);
+	_unlink(tmp);
+	return rc;
+}
+#else /* POSIX: fork and exec through /bin/sh */
 /* Run cmd in dir, piping its combined stdout and stderr to emit(). Returns the
  * child's exit status, or -1 if it could not be started. */
 static int
@@ -30435,6 +31364,8 @@ cli_run_filter(void *ctx, const char *cmd, const char *dir,
 		return 128 + WTERMSIG(status);
 	return -1;
 }
+
+#endif /* _WIN32 */
 
 static const struct vedit_tool_api cli_tools = {
 	NULL, cli_run_capture, cli_run_foreground, cli_run_filter,
@@ -30951,7 +31882,13 @@ cli_config_path(const char *opt, char *buf, size_t bufsz)
 		return 1;
 	}
 	buf[0] = '\0';
-#ifdef VEDIT_NO_XDG
+#if defined(_WIN32)
+	env = getenv("APPDATA");
+	if (!env || !env[0])
+		env = getenv("USERPROFILE");
+	if (env && env[0])
+		snprintf(buf, bufsz, "%s\\vedit\\config", env);
+#elif defined(VEDIT_NO_XDG)
 	env = getenv("HOME");
 	if (env && env[0])
 		snprintf(buf, bufsz, "%s/.veditrc", env);
@@ -31136,10 +32073,30 @@ main(int argc, char **argv)
 		return 1;
 	}
 
+#ifdef _WIN32
+	g_tty.in = GetStdHandle(STD_INPUT_HANDLE);
+	g_tty.out = GetStdHandle(STD_OUTPUT_HANDLE);
+	g_tty.raw = 0;
+	/* The console API renderer is the default under wine, whose VT
+	 * processing is partial; a real console keeps the VT stream (full
+	 * colour). VEDIT_WIN_RENDER=console|vt overrides. */
+	{
+		const char *rm = getenv("VEDIT_WIN_RENDER");
+		int wine = GetProcAddress(GetModuleHandleA("ntdll.dll"),
+		    "wine_get_version") != NULL;
+
+		if ((rm && strcmp(rm, "console") == 0) ||
+		    (wine && !(rm && strcmp(rm, "vt") == 0)))
+			g_scr_blit = win_blit;
+		else if (wine)
+			g_scr_skip_corner = 1;
+	}
+#else
 	g_tty.in_fd = STDIN_FILENO;
 	g_tty.out_fd = STDOUT_FILENO;
 	g_tty.raw = 0;
 	g_tty.sig_rd = g_tty.sig_wr = -1;
+#endif
 	memset(&io, 0, sizeof(io));
 	io.ctx = &g_tty;
 	io.read = tty_read;

@@ -25,8 +25,41 @@ make static install     # install that one instead
 make install            # install to ~/.local/bin (override PREFIX)
 ```
 
-The only requirement is a C11 compiler and a POSIX system. There are no library
-dependencies.
+The only requirement is a C11 compiler and a POSIX system, or mingw-w64 for
+Windows (below). There are no library dependencies.
+
+
+### Windows
+
+The same source builds a native Windows console program with mingw-w64, from
+Linux as a cross build or on Windows itself:
+
+```sh
+make CC=x86_64-w64-mingw32-gcc    # _out/x86_64-w64-mingw32/bin/vedit.exe
+```
+
+It runs in Windows Terminal, the classic console, and under wine. Input comes
+from the console as key records, translated into the same sequences a
+terminal sends, so every key and the mouse work as on Unix. Output has two
+paths: on a real Windows console the editor sends its usual ANSI stream
+through the console's virtual-terminal processing (full 256 colours); under
+wine, whose VT processing is partial, it draws the cell grid directly through
+the console API instead, with colours reduced to the sixteen console
+attributes. `VEDIT_WIN_RENDER=console` or `=vt` forces one or the other.
+
+The configuration file lives at `%APPDATA%\vedit\config` (Options > Edit
+Config creates it). The build commands, `:!`, the formatter, and the version
+control menu run their lines through `cmd.exe`, so write them in its syntax
+(`$(file)` and the other variables expand as usual). Mail works on a Maildir
+tree given as a Windows path. What is left out: the terminal buffers and the
+pane, which need a pseudo-terminal, so `:terminal` and the output pane are not
+there and build output opens in the dialog instead.
+
+For debugging a console problem, `VEDIT_WIN_LOG=file` records the console
+calls that fail and the translated input bytes, and `VEDIT_WIN_TRACE=file`
+saves the raw output stream of the VT path. Under wine from a Unix terminal,
+a lone Escape never reaches the program (wine's console waits for the rest of
+a sequence that never comes); real consoles deliver it.
 
 ## Testing
 
