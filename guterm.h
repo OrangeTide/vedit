@@ -1,5 +1,5 @@
 /* guterm.h : graphical micro terminal, a single-header cell grid window */
-/* vendored from guterm 44ed555 */
+/* vendored from guterm v0.1.1-10-g03ea4dc */
 
 /*
  * guterm gives a text-based program a window: a grid of character cells
@@ -7,7 +7,8 @@
  *
  * The primary interface is the cell buffer, struct gut_buf. A program
  * fills it with gut_buf_put() and friends, or lets the optional VT layer
- * fill it from a byte stream, then hands it to gut_present() to draw.
+ * fill it from a byte stream, sixel pictures included, then hands it to
+ * gut_present() to draw.
  * Input comes back as struct gut_event records from gut_poll(), and
  * gut_encode_event() turns those into xterm style key bytes for programs
  * that speak the terminal protocol.
@@ -24,6 +25,14 @@
  *                        buffer, font tables, key encoder and VT layer
  *                        remain, with no dependency beyond libc.
  *     GUTERM_NO_VT       leave out the VT escape sequence layer.
+ *     GUTERM_NO_IMAGES   leave out pictures: the buffer placements, the
+ *                        renderer's textures and the sixel decoder.
+ *     GUTERM_NO_SIXEL    leave out the sixel decoder only; a program may
+ *                        still place its own pictures.
+ *     GUTERM_NO_GAMEPAD  leave out game controller support.
+ *     GUTERM_NO_DEFAULT_FONT
+ *                        leave out the built-in font; gut_desc.font is
+ *                        then required.
  *     GUT_API            linkage for the public functions (default extern).
  *
  * Linking needs SDL3 unless GUTERM_NO_WINDOW is set. OpenGL entry points
@@ -45,7 +54,12 @@ extern "C" {
 #define GUT_API extern
 #endif
 
-#define GUT_VERSION "0.1.0"
+/* No pictures at all means no sixel decoder either. */
+#if defined(GUTERM_NO_IMAGES) && !defined(GUTERM_NO_SIXEL)
+#define GUTERM_NO_SIXEL
+#endif
+
+#define GUT_VERSION "0.1.1"
 
 /****************************************************************
  * Cells
@@ -99,6 +113,49 @@ GUT_API void gut_cell_erase(struct gut_cell *c, struct gut_color bg);
  * Cell buffer
  ****************************************************************/
 
+#ifndef GUTERM_NO_IMAGES
+/* ---- images ---- */
+
+/** A picture: w by h pixels of RGBA, row major, 4 bytes each, alpha 0
+ * where nothing was painted. */
+struct gut_image {
+    int w, h;
+    uint8_t *rgba;
+};
+
+GUT_API void gut_image_free(struct gut_image *img);
+
+/* Pixels shared by the placements that show parts of one picture. */
+struct gut_image_ref {
+    int id;                     /* unique for the process, from 1 */
+    int refs;
+    struct gut_image img;
+};
+
+/** A picture, or a horizontal band of one, pinned to the grid. The band
+ * is the image rows from src_y for rows * cell_h pixels, or to the
+ * bottom of the picture, drawn with its top left at cell (row, col),
+ * one image pixel per cell_w by cell_h pixel of the cell. */
+struct gut_placement {
+    struct gut_image_ref *ref;
+    int row, col;
+    int rows, cols;             /* cells covered */
+    int cell_w, cell_h;         /* pixels per cell when placed */
+    int src_y;
+    unsigned seq;               /* placement order, lowest is oldest */
+};
+
+struct gut_image_list {
+    struct gut_placement *v;
+    int n, cap;
+    size_t pixels;              /* held by the pictures referenced */
+};
+
+#define GUT_BUF_IMAGE_BUDGET (1 << 24)      /* pixels, 64 MiB of RGBA */
+#define GUT_BUF_IMAGE_MAX_PLACEMENTS 1024  /* bands on screen at once */
+
+#endif /* GUTERM_NO_IMAGES */
+
 enum gut_cursor_shape {
     GUT_CURSOR_BLOCK,
     GUT_CURSOR_UNDERLINE,
@@ -112,6 +169,11 @@ struct gut_buf {
     int cursor_row, cursor_col;
     int cursor_visible;
     int cursor_shape;           /* enum gut_cursor_shape */
+#ifndef GUTERM_NO_IMAGES
+    struct gut_image_list images;
+    size_t image_budget;        /* pixels the list may hold */
+    unsigned image_seq;
+#endif /* GUTERM_NO_IMAGES */
 };
 
 /** Allocate a rows by cols grid of blank cells. Returns 0 or -1. */
@@ -158,6 +220,44 @@ GUT_API void gut_buf_scroll(struct gut_buf *b, int top, int bot, int count,
 
 GUT_API void gut_buf_dirty_all(struct gut_buf *b);
 
+#ifndef GUTERM_NO_IMAGES
+/** Pin a picture to the grid with its top left at cell (row, col), each
+ * cell showing cell_w by cell_h of its pixels. The buffer takes the
+ * pixels whether or not it keeps them: img is empty afterwards. Rows
+ * above the grid, for a negative row, and below it are cut off. Older
+ * pictures are discarded, oldest first, until the budget has room; a
+ * picture larger than the whole budget is dropped. Returns the
+ * picture's id, or -1 when it was not placed. Scrolling moves
+ * placements with their rows and cuts off what leaves the region,
+ * clearing rows cuts the rows cleared, and a resize drops every
+ * placement. */
+GUT_API int gut_buf_place_image(struct gut_buf *b, struct gut_image *img,
+                                int row, int col, int cell_w, int cell_h);
+
+/** Pixels the placements may hold between them, 0 for the default
+ * GUT_BUF_IMAGE_BUDGET. Shrinking discards the oldest to fit. */
+GUT_API void gut_buf_set_image_budget(struct gut_buf *b, size_t pixels);
+
+/** The placements, for a renderer. n receives the count. */
+GUT_API const struct gut_placement *gut_buf_images(const struct gut_buf *b,
+                                                   int *n);
+
+/** Cut rows from (inclusive) to to (exclusive) out of every placement,
+ * as clearing those rows does. */
+GUT_API void gut_buf_cut_images(struct gut_buf *b, int from, int to);
+
+/** Drop every placement. */
+GUT_API void gut_buf_drop_images(struct gut_buf *b);
+
+/** Exchange the buffer's placements with a list held elsewhere, so a
+ * screen can be parked and brought back. A parked list keeps its
+ * pixels outside the budget; free it with gut_image_list_free. */
+GUT_API void gut_buf_swap_images(struct gut_buf *b,
+                                 struct gut_image_list *other);
+GUT_API void gut_image_list_free(struct gut_image_list *list);
+
+#endif /* GUTERM_NO_IMAGES */
+
 enum gut_copy_mode {
     GUT_COPY_STREAM,    /* reading order from start to end, inclusive */
     GUT_COPY_RECT,      /* the rectangle with those corners */
@@ -203,8 +303,10 @@ struct gut_font {
     const uint32_t *cmap;
 };
 
+#ifndef GUTERM_NO_DEFAULT_FONT
 /** The built-in 8x16 face (unscii-16, public domain, 491 glyphs). */
 GUT_API const struct gut_font *gut_font_default(void);
+#endif /* GUTERM_NO_DEFAULT_FONT */
 
 /** Glyph index of cp in font, or -1 when the font has no glyph for it. */
 GUT_API int gut_font_lookup(const struct gut_font *font, uint32_t cp);
@@ -232,6 +334,8 @@ enum gut_event_type {
     GUT_EVENT_PAD_DOWN,     /* pad, button: enum gut_pad_button */
     GUT_EVENT_PAD_UP,
     GUT_EVENT_PAD_AXIS,     /* pad, axis: enum gut_pad_axis, value */
+    GUT_EVENT_KEY_UP,       /* key, mods: a key was released */
+    GUT_EVENT_WAKE,         /* gut_wake() was called */
 };
 
 enum gut_mod {
@@ -445,6 +549,13 @@ GUT_API void gut_present(gut_window *w, struct gut_buf *b);
  * an event. Returns 1 with ev filled, or 0 when the timeout passed. */
 GUT_API int gut_poll(gut_window *w, struct gut_event *ev, int timeout_ms);
 
+/** Make a gut_poll() in progress, or the next one, return a
+ * GUT_EVENT_WAKE event. The one call that may be made from another
+ * thread, for a reader that waits on a descriptor or socket and wants
+ * the main loop to act on what arrived. Wakes queued before gut_poll()
+ * delivers one collapse into a single event. */
+GUT_API void gut_wake(gut_window *w);
+
 /** Grid cells that fit in the window at its current size. */
 GUT_API void gut_grid_size(const gut_window *w, int *cols, int *rows);
 
@@ -483,6 +594,7 @@ GUT_API void gut_set_compose_overlay(gut_window *w, int on);
  * cell colors swapped. The struct is copied; NULL clears it. */
 GUT_API void gut_set_selection(gut_window *w, const struct gut_sel *sel);
 
+#ifndef GUTERM_NO_GAMEPAD
 /* Game controllers. Up to GUT_MAX_PADS are tracked in slots 0 to 3,
  * assigned in connection order; a slot is reused after its pad leaves.
  * Changes arrive as GUT_EVENT_PAD_* events and the whole state can be
@@ -501,6 +613,26 @@ GUT_API int gut_pad_get(const gut_window *w, int slot, struct gut_pad *out);
  * -1 when the slot is empty or the pad cannot rumble. */
 GUT_API int gut_pad_rumble(gut_window *w, int slot, uint16_t low,
                            uint16_t high, uint32_t ms);
+
+#endif /* GUTERM_NO_GAMEPAD */
+
+/* Key state, for programs that act on what is held rather than on
+ * key presses: a game moving while W is down. The state is kept from
+ * the key events gut_poll() has delivered, so it is as current as the
+ * last poll, and every key is released when the window loses focus. */
+
+/** Whether a key is held: a gut_key code, lowercase for a letter. */
+GUT_API int gut_key_held(const gut_window *w, int key);
+
+/** Whether a mouse button is held, by enum gut_button. */
+GUT_API int gut_mouse_held(const gut_window *w, int button);
+
+/** The modifiers held now, as GUT_MOD_* bits. */
+GUT_API int gut_mods_held(const gut_window *w);
+
+/** Keys held right now, up to n of them, into keys. Returns the count
+ * held, which may exceed n. */
+GUT_API int gut_keys_held(const gut_window *w, int *keys, int n);
 
 /** Milliseconds since gut_open(). */
 GUT_API uint64_t gut_ticks(const gut_window *w);
@@ -527,6 +659,7 @@ GUT_API const char *gut_error(void);
 #define GUT_VT_MODE_MOUSE        (1u << 7)
 #define GUT_VT_MODE_MOUSE_SGR    (1u << 8)
 #define GUT_VT_MODE_FOCUS        (1u << 9)
+#define GUT_VT_MODE_SIXEL_DISPLAY (1u << 10) /* DECSDM: pictures at home */
 
 #define GUT_VT_MAX_PARAMS 16
 #define GUT_VT_OSC_MAX    (1 << 20)   /* longest OSC string kept */
@@ -541,6 +674,53 @@ struct gut_vt_saved {
     uint16_t attrs;
     struct gut_color fg, bg;
 };
+
+#ifndef GUTERM_NO_SIXEL
+#define GUT_SIXEL_COLORS 256
+#define GUT_VT_IMAGE_MAX_PIXELS (1 << 22)   /* 2048 by 2048 */
+#define GUT_SIXEL_MAX_DIM 4096              /* widest or tallest */
+
+/* Streaming sixel decoder. The bytes between DCS q and ST go in one at
+ * a time, so a picture is never buffered as text before it is decoded.
+ * The canvas grows as the pen moves and is bounded by max_pixels and
+ * by GUT_SIXEL_MAX_DIM on each side: a picture that would exceed either
+ * is dropped and the rest of its data is ignored. The pixel aspect ratio in the DCS parameters is ignored;
+ * the one in the raster attributes stretches the picture vertically. */
+struct gut_sixel {
+    uint8_t *rgba;
+    int w, h;                   /* canvas allocated */
+    int max_w, max_h;           /* extent painted or asked for */
+    size_t max_pixels;
+    uint32_t palette[GUT_SIXEL_COLORS];  /* 0xRRGGBB */
+    int color;
+    int x, y;                   /* pen column and top of the sixel band */
+    int vstretch;               /* rows per sixel bit, from the aspect */
+    int opaque;                 /* P2 != 1: unpainted pixels get color 0 */
+    int cmd;                    /* '"', '#' or '!' while collecting */
+    int params[5];
+    int nparam;
+    int cur_param;
+    int has_digit;
+    int repeat;
+    int active;
+    int failed;
+};
+
+/** Start a picture with the DCS parameters P1 (aspect, ignored), P2
+ * (1 leaves unpainted pixels transparent, anything else fills them with
+ * color 0) and P3 (ignored). max_pixels bounds the canvas, 0 for the
+ * default. The struct must be zeroed before its first use; afterwards a
+ * begin discards whatever the last picture left. */
+GUT_API void gut_sixel_begin(struct gut_sixel *s, int p1, int p2, int p3,
+                             size_t max_pixels);
+GUT_API void gut_sixel_put(struct gut_sixel *s, unsigned char c);
+/** Finish the picture. Returns 1 with out filled, which the caller frees
+ * with gut_image_free, or 0 when nothing was painted or the picture was
+ * over the limit. The decoder is idle afterwards either way. */
+GUT_API int gut_sixel_end(struct gut_sixel *s, struct gut_image *out);
+GUT_API void gut_sixel_abort(struct gut_sixel *s);
+
+#endif /* GUTERM_NO_SIXEL */
 
 /* One scrollback line: the cells up to the last non-blank one. */
 struct gut_vt_line {
@@ -592,6 +772,14 @@ struct gut_vt {
     int osc_overflow;           /* string too long: dropped at the end */
     unsigned char utf8_buf[4];
     int utf8_len, utf8_need;
+#ifndef GUTERM_NO_SIXEL
+    struct gut_sixel sixel;     /* picture being decoded */
+    size_t image_max_pixels;
+#endif /* GUTERM_NO_SIXEL */
+#ifndef GUTERM_NO_IMAGES
+    int cell_w, cell_h;         /* pixels per cell, for placing pictures */
+    struct gut_image_list alt_images; /* primary pictures while alt is up */
+#endif /* GUTERM_NO_IMAGES */
 
     /* callbacks */
     void (*reply)(void *ctx, const char *data, size_t len);
@@ -637,6 +825,19 @@ GUT_API size_t gut_vt_mouse(struct gut_vt *vt, const struct gut_event *ev,
 /** Set how many lines the scrollback keeps, 0 to disable. The newest
  * lines survive a shrink. Returns 0 or -1. */
 GUT_API int gut_vt_set_scrollback(struct gut_vt *vt, int lines);
+
+#ifndef GUTERM_NO_SIXEL
+/** Largest picture the sixel decoder will build, in pixels; a larger
+ * one is dropped. 0 restores GUT_VT_IMAGE_MAX_PIXELS. */
+GUT_API void gut_vt_set_image_limit(struct gut_vt *vt, size_t max_pixels);
+#endif /* GUTERM_NO_SIXEL */
+
+#ifndef GUTERM_NO_IMAGES
+/** Pixels per cell, used to turn a picture's size into cells. Give
+ * the font's glyph size, 8 by 16 by default; a window that zooms the
+ * font scales pictures the same way. */
+GUT_API void gut_vt_set_cell_size(struct gut_vt *vt, int w, int h);
+#endif /* GUTERM_NO_IMAGES */
 
 /** Lines currently held in the scrollback. */
 GUT_API int gut_vt_scrollback_lines(const struct gut_vt *vt);
@@ -698,6 +899,7 @@ GUT_API void gut_vt_set_clipboard_cb(struct gut_vt *vt,
 
 #ifdef GUTERM_IMPLEMENTATION
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -911,6 +1113,370 @@ gut_rune_width(uint32_t cp)
  * Cell buffer
  ****************************************************************/
 
+#ifndef GUTERM_NO_IMAGES
+/* ---- images ---- */
+
+/* Picture ids are one sequence for the process, so a renderer that
+ * caches by id never confuses pictures from two buffers. */
+static int gut_image_serial;
+
+void
+gut_image_free(struct gut_image *img)
+{
+    free(img->rgba);
+    img->rgba = NULL;
+    img->w = 0;
+    img->h = 0;
+}
+
+/* Placements in the list that show ref. */
+static int
+gut_images_holding(const struct gut_image_list *l,
+                   const struct gut_image_ref *ref)
+{
+    int n = 0;
+
+    for (int i = 0; i < l->n; i++)
+        if (l->v[i].ref == ref)
+            n++;
+    return n;
+}
+
+/* Release one placement's hold on ref. The list counts a picture's
+ * pixels once however many bands show it, so the count drops when the
+ * last band in this list goes. */
+static void
+gut_image_ref_drop(struct gut_image_list *l, struct gut_image_ref *ref)
+{
+    if (gut_images_holding(l, ref) == 1)
+        l->pixels -= (size_t)ref->img.w * (size_t)ref->img.h;
+    if (--ref->refs > 0)
+        return;
+    gut_image_free(&ref->img);
+    free(ref);
+}
+
+static void
+gut_images_crop_top(struct gut_placement *p, int k)
+{
+    p->row += k;
+    p->rows -= k;
+    p->src_y += k * p->cell_h;
+}
+
+static void
+gut_images_dirty(struct gut_buf *b, const struct gut_placement *p)
+{
+    int from = p->row < 0 ? 0 : p->row;
+    int to = p->row + p->rows > b->rows ? b->rows : p->row + p->rows;
+
+    for (int r = from; r < to; r++)
+        b->dirty[r] = 1;
+}
+
+static void
+gut_images_remove(struct gut_buf *b, int i)
+{
+    struct gut_image_list *l = &b->images;
+
+    gut_images_dirty(b, &l->v[i]);
+    gut_image_ref_drop(l, l->v[i].ref);
+    l->v[i] = l->v[l->n - 1];
+    l->n--;
+}
+
+static struct gut_placement *
+gut_images_append(struct gut_buf *b)
+{
+    struct gut_image_list *l = &b->images;
+
+    if (l->n == l->cap) {
+        int cap = l->cap ? l->cap * 2 : 8;
+        struct gut_placement *v = realloc(l->v, (size_t)cap * sizeof(*v));
+
+        if (!v)
+            return NULL;
+        l->v = v;
+        l->cap = cap;
+    }
+    return &l->v[l->n++];
+}
+
+/* Discard the oldest placements until the list holds at most keep
+ * pixels and has room for one more below the placement cap. */
+static void
+gut_images_evict(struct gut_buf *b, size_t keep)
+{
+    struct gut_image_list *l = &b->images;
+
+    while ((l->pixels > keep || l->n >= GUT_BUF_IMAGE_MAX_PLACEMENTS) &&
+           l->n > 0) {
+        int oldest = 0;
+
+        for (int i = 1; i < l->n; i++)
+            if (l->v[i].seq < l->v[oldest].seq)
+                oldest = i;
+        gut_images_remove(b, oldest);
+    }
+}
+
+/* Split any placement that spans row so none crosses it; the halves
+ * share the pixels. */
+static int
+gut_images_split(struct gut_buf *b, int row)
+{
+    struct gut_image_list *l = &b->images;
+    int n = l->n;
+
+    for (int i = 0; i < n; i++) {
+        struct gut_placement *p = &l->v[i], *q;
+        int above;
+
+        if (row <= p->row || row >= p->row + p->rows)
+            continue;
+        above = row - p->row;
+        q = gut_images_append(b);
+        if (!q)
+            return -1;
+        p = &l->v[i];       /* the append may have moved the array */
+        *q = *p;
+        q->ref->refs++;
+        q->row = row;
+        q->rows = p->rows - above;
+        q->src_y = p->src_y + above * p->cell_h;
+        p->rows = above;
+    }
+    return 0;
+}
+
+void
+gut_buf_cut_images(struct gut_buf *b, int from, int to)
+{
+    struct gut_image_list *l = &b->images;
+
+    if (from >= to)
+        return;
+    /* a cut strictly inside a placement leaves two bands; on an
+     * allocation failure the whole placement goes instead */
+    if (gut_images_split(b, to) != 0) {
+        for (int i = l->n - 1; i >= 0; i--)
+            if (l->v[i].row < to && l->v[i].row + l->v[i].rows > from)
+                gut_images_remove(b, i);
+        return;
+    }
+    for (int i = l->n - 1; i >= 0; i--) {
+        struct gut_placement *p = &l->v[i];
+        int end = p->row + p->rows;
+
+        if (p->row >= to || end <= from)
+            continue;
+        if (from <= p->row && to >= end) {
+            gut_images_remove(b, i);
+        } else if (from <= p->row) {
+            gut_images_dirty(b, p);
+            gut_images_crop_top(p, to - p->row);
+        } else {
+            gut_images_dirty(b, p);
+            p->rows = from - p->row;
+        }
+    }
+}
+
+/* Move the placements inside rows top to bot by count lines, upward
+ * for a positive count, cutting what leaves the region. Placements
+ * are split at the region's edges first so a straddling one keeps the
+ * part outside where it is. */
+static void
+gut_images_scroll(struct gut_buf *b, int top, int bot, int count)
+{
+    struct gut_image_list *l = &b->images;
+
+    if (l->n == 0)
+        return;
+    if (gut_images_split(b, top) != 0 || gut_images_split(b, bot) != 0) {
+        gut_buf_cut_images(b, top, bot);
+        return;
+    }
+    if (count > 0)
+        gut_buf_cut_images(b, top, top + count);
+    else
+        gut_buf_cut_images(b, bot + count, bot);
+    for (int i = 0; i < l->n; i++) {
+        struct gut_placement *p = &l->v[i];
+
+        if (p->row >= top && p->row + p->rows <= bot)
+            p->row -= count;
+    }
+}
+
+/* Place a picture with its first skip cell rows hidden, so the band
+ * from row skip of it starts at row. gut_buf_place_image and the VT
+ * layer's sixel scrolling both come here. */
+static int
+gut_buf_place_band(struct gut_buf *b, struct gut_image *img, int row,
+                   int col, int cell_w, int cell_h, int skip)
+{
+    struct gut_image_list *l = &b->images;
+    struct gut_image_ref *ref;
+    struct gut_placement *p;
+    size_t pixels = (size_t)img->w * (size_t)img->h;
+    size_t budget = b->image_budget ? b->image_budget : GUT_BUF_IMAGE_BUDGET;
+
+    if (img->w <= 0 || img->h <= 0 || !img->rgba || cell_w <= 0 ||
+        cell_h <= 0 || row < 0 || row >= b->rows || col < 0 ||
+        col >= b->cols || pixels > budget || skip < 0 ||
+        skip >= (img->h + cell_h - 1) / cell_h)
+        goto drop;
+    gut_images_evict(b, budget - pixels);
+    ref = malloc(sizeof(*ref));
+    if (!ref)
+        goto drop;
+    p = gut_images_append(b);
+    if (!p) {
+        free(ref);
+        goto drop;
+    }
+    if (gut_image_serial == INT_MAX)
+        gut_image_serial = 0;
+    ref->id = ++gut_image_serial;
+    ref->refs = 1;
+    ref->img = *img;
+    img->rgba = NULL;
+    img->w = 0;
+    img->h = 0;
+    l->pixels += pixels;
+    p->ref = ref;
+    p->row = row;
+    p->col = col;
+    p->rows = (ref->img.h + cell_h - 1) / cell_h;
+    p->cols = (ref->img.w + cell_w - 1) / cell_w;
+    p->cell_w = cell_w;
+    p->cell_h = cell_h;
+    p->src_y = 0;
+    p->seq = b->image_seq++;
+    if (skip > 0) {
+        /* the band starts at row, so only the picture side moves */
+        p->rows -= skip;
+        p->src_y = skip * cell_h;
+    }
+    if (p->row + p->rows > b->rows)
+        p->rows = b->rows - p->row;
+    gut_images_dirty(b, p);
+    return ref->id;
+drop:
+    gut_image_free(img);
+    return -1;
+}
+
+int
+gut_buf_place_image(struct gut_buf *b, struct gut_image *img, int row,
+                    int col, int cell_w, int cell_h)
+{
+    int skip = row < 0 ? -row : 0;
+
+    return gut_buf_place_band(b, img, row + skip, col, cell_w, cell_h, skip);
+}
+
+void
+gut_buf_set_image_budget(struct gut_buf *b, size_t pixels)
+{
+    b->image_budget = pixels;
+    gut_images_evict(b, pixels ? pixels : GUT_BUF_IMAGE_BUDGET);
+}
+
+const struct gut_placement *
+gut_buf_images(const struct gut_buf *b, int *n)
+{
+    *n = b->images.n;
+    return b->images.v;
+}
+
+void
+gut_image_list_free(struct gut_image_list *list)
+{
+    /* every hold goes, so no need to count them placement by placement */
+    for (int i = 0; i < list->n; i++) {
+        struct gut_image_ref *ref = list->v[i].ref;
+
+        if (--ref->refs == 0) {
+            gut_image_free(&ref->img);
+            free(ref);
+        }
+    }
+    free(list->v);
+    list->v = NULL;
+    list->n = 0;
+    list->cap = 0;
+    list->pixels = 0;
+}
+
+void
+gut_buf_drop_images(struct gut_buf *b)
+{
+    for (int i = 0; i < b->images.n; i++)
+        gut_images_dirty(b, &b->images.v[i]);
+    gut_image_list_free(&b->images);
+}
+
+void
+gut_buf_swap_images(struct gut_buf *b, struct gut_image_list *other)
+{
+    struct gut_image_list tmp = b->images;
+
+    for (int i = 0; i < b->images.n; i++)
+        gut_images_dirty(b, &b->images.v[i]);
+    b->images = *other;
+    *other = tmp;
+    /* the grid may have changed size while the list was parked */
+    for (int i = b->images.n - 1; i >= 0; i--) {
+        struct gut_placement *p = &b->images.v[i];
+
+        if (p->row >= b->rows)
+            gut_images_remove(b, i);
+        else if (p->row + p->rows > b->rows)
+            p->rows = b->rows - p->row;
+    }
+    gut_images_evict(b, b->image_budget ? b->image_budget
+                                      : GUT_BUF_IMAGE_BUDGET);
+    for (int i = 0; i < b->images.n; i++)
+        gut_images_dirty(b, &b->images.v[i]);
+}
+
+#ifndef GUTERM_NO_VT
+/* Replace dst's placements with src's moved down by offset rows and
+ * clipped to dst's grid, sharing the pictures. For a scrolled back
+ * view; the budget is not applied. */
+static void
+gut_buf_project_images(struct gut_buf *dst, const struct gut_buf *src,
+                       int offset)
+{
+    const struct gut_image_list *l = &src->images;
+
+    gut_buf_drop_images(dst);
+    for (int i = 0; i < l->n; i++) {
+        struct gut_placement *q;
+        int row = l->v[i].row + offset;
+
+        if (row >= dst->rows)
+            continue;
+        q = gut_images_append(dst);
+        if (!q)
+            return;
+        *q = l->v[i];
+        q->row = row;
+        q->ref->refs++;
+        if (gut_images_holding(&dst->images, q->ref) == 1)
+            dst->images.pixels += (size_t)q->ref->img.w *
+                                  (size_t)q->ref->img.h;
+        if (q->row + q->rows > dst->rows)
+            q->rows = dst->rows - q->row;
+        gut_images_dirty(dst, q);
+    }
+}
+#endif /* GUTERM_NO_VT */
+
+#endif /* GUTERM_NO_IMAGES */
+
 int
 gut_buf_init(struct gut_buf *b, int rows, int cols)
 {
@@ -933,6 +1499,9 @@ gut_buf_init(struct gut_buf *b, int rows, int cols)
 void
 gut_buf_free(struct gut_buf *b)
 {
+#ifndef GUTERM_NO_IMAGES
+    gut_image_list_free(&b->images);
+#endif /* GUTERM_NO_IMAGES */
     free(b->cells);
     free(b->dirty);
     b->cells = NULL;
@@ -967,6 +1536,9 @@ gut_buf_resize(struct gut_buf *b, int rows, int cols)
         memcpy(&cells[r * cols], &b->cells[r * b->cols],
                (size_t)keep_cols * sizeof(*cells));
     memset(dirty, 1, (size_t)rows);
+#ifndef GUTERM_NO_IMAGES
+    gut_image_list_free(&b->images);
+#endif /* GUTERM_NO_IMAGES */
     free(b->cells);
     free(b->dirty);
     b->cells = cells;
@@ -1004,6 +1576,9 @@ gut_buf_clear_rows(struct gut_buf *b, int from, int to, struct gut_color bg)
         from = 0;
     if (to > b->rows)
         to = b->rows;
+#ifndef GUTERM_NO_IMAGES
+    gut_buf_cut_images(b, from, to);
+#endif /* GUTERM_NO_IMAGES */
     for (int r = from; r < to; r++) {
         for (int c = 0; c < b->cols; c++)
             gut_cell_erase(&b->cells[r * b->cols + c], bg);
@@ -1133,6 +1708,9 @@ gut_buf_scroll(struct gut_buf *b, int top, int bot, int count,
         gut_buf_clear_rows(b, top, bot, bg);
         return;
     }
+#ifndef GUTERM_NO_IMAGES
+    gut_images_scroll(b, top, bot, count);
+#endif /* GUTERM_NO_IMAGES */
     if (count > 0) {
         memmove(&b->cells[top * b->cols], &b->cells[(top + count) * b->cols],
                 (size_t)(n - count) * (size_t)b->cols * sizeof(*b->cells));
@@ -1519,6 +2097,7 @@ gut_encode_event(const struct gut_event *ev, char *out, size_t n, int flags)
     return len;
 }
 
+#ifndef GUTERM_NO_DEFAULT_FONT
 /****************************************************************
  * Built-in font: unscii-16 subset (Viznut, public domain)
  ****************************************************************/
@@ -2094,6 +2673,8 @@ gut_font_default(void)
     return &f;
 }
 
+#endif /* GUTERM_NO_DEFAULT_FONT */
+
 /****************************************************************
  * Selection
  ****************************************************************/
@@ -2335,6 +2916,7 @@ typedef ptrdiff_t gut_GLsizeiptr;
 #define GUT_GL_ONE_MINUS_SRC_ALPHA  0x0303
 #define GUT_GL_COLOR_BUFFER_BIT     0x4000
 #define GUT_GL_CLAMP_TO_EDGE        0x812F
+#define GUT_GL_MAX_TEXTURE_SIZE     0x0D33
 #define GUT_GL_TEXTURE0             0x84C0
 #define GUT_GL_ARRAY_BUFFER         0x8892
 #define GUT_GL_STREAM_DRAW          0x88E0
@@ -2345,6 +2927,7 @@ typedef ptrdiff_t gut_GLsizeiptr;
 
 #define GUT_GL_FUNCS(X) \
     X(const gut_GLubyte *, glGetString, (gut_GLenum)) \
+    X(void, glGetIntegerv, (gut_GLenum, gut_GLint *)) \
     X(void, glEnable, (gut_GLenum)) \
     X(void, glDisable, (gut_GLenum)) \
     X(void, glBlendFunc, (gut_GLenum, gut_GLenum)) \
@@ -2472,6 +3055,18 @@ struct gut_window {
     struct gut_vertex *verts;
     size_t nverts, cap;
 
+#ifndef GUTERM_NO_IMAGES
+    /* one texture per picture on screen, kept while it stays there */
+    struct gut_texture {
+        int id;
+        int w, h;
+        gut_GLuint tex;
+        int seen;
+    } *textures;
+    int ntextures, cap_textures;
+    int max_texture;            /* GL_MAX_TEXTURE_SIZE */
+#endif /* GUTERM_NO_IMAGES */
+
     char *clip;                 /* last clipboard text handed out */
     char *primary;              /* last primary selection handed out */
     char *event_text;           /* data of the last TEXT or PASTE event */
@@ -2480,15 +3075,24 @@ struct gut_window {
     int paste_keys;
     int overlay;
     int owns_video;             /* gut_open initialised SDL video */
+#ifndef GUTERM_NO_GAMEPAD
     int owns_gamepad;
+#endif /* GUTERM_NO_GAMEPAD */
     uint64_t t0;
     int focused;
 
     struct gut_sel sel;         /* highlighted selection, if sel.active */
 
+#ifndef GUTERM_NO_GAMEPAD
     SDL_Gamepad *pads[GUT_MAX_PADS];
     SDL_JoystickID pad_ids[GUT_MAX_PADS];
     struct gut_pad pad_state[GUT_MAX_PADS];
+#endif /* GUTERM_NO_GAMEPAD */
+
+    int held[64];               /* keys down, by gut_key code */
+    int nheld;
+    int mouse_held;             /* bit (1 << gut_button) per button */
+    uint32_t wake_type;         /* SDL user event pushed by gut_wake */
 };
 
 static const uint32_t gut_default_palette[16] = {
@@ -2754,7 +3358,16 @@ gut_open(const struct gut_desc *desc)
         gut_set_error("out of memory", NULL);
         return NULL;
     }
-    w->font = d.font ? d.font : gut_font_default();
+    w->font = d.font;
+#ifndef GUTERM_NO_DEFAULT_FONT
+    if (!w->font)
+        w->font = gut_font_default();
+#endif
+    if (!w->font) {
+        gut_set_error("no font", NULL);
+        free(w);
+        return NULL;
+    }
     cols = d.cols > 0 ? d.cols : 80;
     rows = d.rows > 0 ? d.rows : 25;
     gut_set_palette(w, d.palette);
@@ -2772,9 +3385,11 @@ gut_open(const struct gut_desc *desc)
         }
         w->owns_video = 1;
     }
+#ifndef GUTERM_NO_GAMEPAD
     if (!d.no_gamepad && !SDL_WasInit(SDL_INIT_GAMEPAD) &&
         SDL_InitSubSystem(SDL_INIT_GAMEPAD))
         w->owns_gamepad = 1;    /* failure just means no pads */
+#endif /* GUTERM_NO_GAMEPAD */
     /* Zoom: as asked, else 1 on an ordinary display and the rounded
      * content scale on a high density one, so text is about the same
      * physical size everywhere. */
@@ -2795,6 +3410,9 @@ gut_open(const struct gut_desc *desc)
         return NULL;
     }
     GUT_GL(glGenBuffers)(1, &w->vbo);
+#ifndef GUTERM_NO_IMAGES
+    GUT_GL(glGetIntegerv)(GUT_GL_MAX_TEXTURE_SIZE, &w->max_texture);
+#endif /* GUTERM_NO_IMAGES */
     GUT_GL(glDisable)(GUT_GL_DEPTH_TEST);
     GUT_GL(glDisable)(GUT_GL_CULL_FACE);
     GUT_GL(glDisable)(GUT_GL_SCISSOR_TEST);
@@ -2819,6 +3437,7 @@ gut_open(const struct gut_desc *desc)
     SDL_GL_SetSwapInterval(1);
     SDL_StartTextInput(w->win);
     w->t0 = SDL_GetTicks();
+    w->wake_type = SDL_RegisterEvents(1);
     return w;
 }
 
@@ -2835,6 +3454,10 @@ gut_close(gut_window *w)
             GUT_GL(glDeleteTextures)(1, &w->tex);
         if (w->prog)
             GUT_GL(glDeleteProgram)(w->prog);
+#ifndef GUTERM_NO_IMAGES
+        for (int i = 0; i < w->ntextures; i++)
+            GUT_GL(glDeleteTextures)(1, &w->textures[i].tex);
+#endif /* GUTERM_NO_IMAGES */
         SDL_GL_DestroyContext(w->ctx);
     }
     if (w->win)
@@ -2846,11 +3469,16 @@ gut_close(gut_window *w)
     free(w->event_text);
     free(w->preedit);
     free(w->verts);
+#ifndef GUTERM_NO_IMAGES
+    free(w->textures);
+#endif /* GUTERM_NO_IMAGES */
+#ifndef GUTERM_NO_GAMEPAD
     for (int i = 0; i < GUT_MAX_PADS; i++)
         if (w->pads[i])
             SDL_CloseGamepad(w->pads[i]);
     if (w->owns_gamepad)
         SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+#endif /* GUTERM_NO_GAMEPAD */
     if (w->owns_video)
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
     free(w);
@@ -2865,6 +3493,7 @@ gut_set_selection(gut_window *w, const struct gut_sel *sel)
         gut_sel_clear(&w->sel);
 }
 
+#ifndef GUTERM_NO_GAMEPAD
 int
 gut_pad_get(const gut_window *w, int slot, struct gut_pad *out)
 {
@@ -3093,6 +3722,8 @@ gut_ticks(const gut_window *w)
 {
     return SDL_GetTicks() - w->t0;
 }
+
+#endif /* GUTERM_NO_GAMEPAD */
 
 /****************************************************************
  * Rendering
@@ -3336,6 +3967,117 @@ gut_text_input_area(gut_window *w, const struct gut_buf *b)
     SDL_SetTextInputArea(w->win, &r, 0);
 }
 
+/* Draw the quads gathered so far with one texture, then start over. */
+static void
+gut_flush(gut_window *w, gut_GLuint tex)
+{
+    if (w->nverts == 0)
+        return;
+    GUT_GL(glBindTexture)(GUT_GL_TEXTURE_2D, tex);
+    GUT_GL(glBufferData)(GUT_GL_ARRAY_BUFFER,
+                         (gut_GLsizeiptr)(w->nverts * sizeof(*w->verts)),
+                         w->verts, GUT_GL_STREAM_DRAW);
+    GUT_GL(glDrawArrays)(GUT_GL_TRIANGLES, 0, (gut_GLsizei)w->nverts);
+    w->nverts = 0;
+}
+
+#ifndef GUTERM_NO_IMAGES
+/* The texture holding a placement's picture, uploaded on first sight.
+ * Ids are unique for the process, so the id alone names the picture. */
+static struct gut_texture *
+gut_texture_for(gut_window *w, const struct gut_placement *p)
+{
+    const struct gut_image_ref *ref = p->ref;
+    struct gut_texture *t;
+
+    for (int i = 0; i < w->ntextures; i++) {
+        t = &w->textures[i];
+        if (t->id == ref->id) {
+            t->seen = 1;
+            return t;
+        }
+    }
+    if (ref->img.w > w->max_texture || ref->img.h > w->max_texture)
+        return NULL;    /* the upload would fail; draw nothing */
+    if (w->ntextures == w->cap_textures) {
+        int cap = w->cap_textures ? w->cap_textures * 2 : 8;
+        struct gut_texture *v = realloc(w->textures,
+                                        (size_t)cap * sizeof(*v));
+
+        if (!v)
+            return NULL;
+        w->textures = v;
+        w->cap_textures = cap;
+    }
+    t = &w->textures[w->ntextures++];
+    t->id = ref->id;
+    t->w = ref->img.w;
+    t->h = ref->img.h;
+    t->seen = 1;
+    GUT_GL(glGenTextures)(1, &t->tex);
+    GUT_GL(glBindTexture)(GUT_GL_TEXTURE_2D, t->tex);
+    GUT_GL(glTexImage2D)(GUT_GL_TEXTURE_2D, 0, GUT_GL_RGBA, t->w, t->h, 0,
+                         GUT_GL_RGBA, GUT_GL_UNSIGNED_BYTE, ref->img.rgba);
+    GUT_GL(glTexParameteri)(GUT_GL_TEXTURE_2D, GUT_GL_TEXTURE_MIN_FILTER,
+                            GUT_GL_NEAREST);
+    GUT_GL(glTexParameteri)(GUT_GL_TEXTURE_2D, GUT_GL_TEXTURE_MAG_FILTER,
+                            GUT_GL_NEAREST);
+    GUT_GL(glTexParameteri)(GUT_GL_TEXTURE_2D, GUT_GL_TEXTURE_WRAP_S,
+                            GUT_GL_CLAMP_TO_EDGE);
+    GUT_GL(glTexParameteri)(GUT_GL_TEXTURE_2D, GUT_GL_TEXTURE_WRAP_T,
+                            GUT_GL_CLAMP_TO_EDGE);
+    return t;
+}
+
+/* Let go of the textures no placement used this frame. */
+static void
+gut_textures_sweep(gut_window *w)
+{
+    for (int i = w->ntextures - 1; i >= 0; i--) {
+        struct gut_texture *t = &w->textures[i];
+
+        if (t->seen) {
+            t->seen = 0;
+            continue;
+        }
+        GUT_GL(glDeleteTextures)(1, &t->tex);
+        *t = w->textures[w->ntextures - 1];
+        w->ntextures--;
+    }
+}
+
+/* Each placement is one textured quad: the band of its picture from
+ * src_y, scaled from the cell size it was placed at to the window's,
+ * so a zoomed font zooms the picture with it. */
+static void
+gut_draw_images(gut_window *w, const struct gut_buf *b)
+{
+    int n;
+    const struct gut_placement *p = gut_buf_images(b, &n);
+
+    for (int i = 0; i < n; i++, p++) {
+        const struct gut_image *img = &p->ref->img;
+        struct gut_texture *t = gut_texture_for(w, p);
+        float sx = (float)w->cell_w / (float)p->cell_w;
+        float sy = (float)w->cell_h / (float)p->cell_h;
+        int band = p->rows * p->cell_h;
+
+        if (!t)
+            continue;
+        if (band > img->h - p->src_y)
+            band = img->h - p->src_y;
+        gut_quad(w, (float)(p->col * w->cell_w), (float)(p->row * w->cell_h),
+                 (float)img->w * sx, (float)band * sy,
+                 0.0f, (float)p->src_y / (float)img->h,
+                 1.0f, (float)(p->src_y + band) / (float)img->h,
+                 0xFFFFFF);
+        gut_flush(w, t->tex);
+    }
+    gut_textures_sweep(w);
+}
+
+#endif /* GUTERM_NO_IMAGES */
+
 void
 gut_present(gut_window *w, struct gut_buf *b)
 {
@@ -3344,6 +4086,35 @@ gut_present(gut_window *w, struct gut_buf *b)
 
     SDL_GL_MakeCurrent(w->win, w->ctx);
     w->nverts = 0;
+
+    GUT_GL(glViewport)(0, 0, w->px_w, w->px_h);
+    GUT_GL(glClearColor)(((w->def_bg >> 16) & 0xFF) / 255.0f,
+                         ((w->def_bg >> 8) & 0xFF) / 255.0f,
+                         (w->def_bg & 0xFF) / 255.0f, 1.0f);
+    GUT_GL(glClear)(GUT_GL_COLOR_BUFFER_BIT);
+    GUT_GL(glUseProgram)(w->prog);
+    GUT_GL(glUniform2f)(w->u_screen, (float)w->px_w, (float)w->px_h);
+    GUT_GL(glActiveTexture)(GUT_GL_TEXTURE0);
+    GUT_GL(glUniform1i)(w->u_tex, 0);
+    GUT_GL(glBindBuffer)(GUT_GL_ARRAY_BUFFER, w->vbo);
+    GUT_GL(glEnableVertexAttribArray)(0);
+    GUT_GL(glEnableVertexAttribArray)(1);
+    GUT_GL(glEnableVertexAttribArray)(2);
+    GUT_GL(glVertexAttribPointer)(0, 2, GUT_GL_FLOAT, GUT_GL_FALSE,
+                                  sizeof(struct gut_vertex),
+                                  (const void *)0);
+    GUT_GL(glVertexAttribPointer)(1, 2, GUT_GL_FLOAT, GUT_GL_FALSE,
+                                  sizeof(struct gut_vertex),
+                                  (const void *)(2 * sizeof(float)));
+    GUT_GL(glVertexAttribPointer)(2, 4, GUT_GL_UNSIGNED_BYTE, GUT_GL_TRUE,
+                                  sizeof(struct gut_vertex),
+                                  (const void *)(4 * sizeof(float)));
+
+#ifndef GUTERM_NO_IMAGES
+    /* pictures lie under the cells: a cell with the default background
+     * shows the picture through, a colored one covers it */
+    gut_draw_images(w, b);
+#endif /* GUTERM_NO_IMAGES */
 
     /* backgrounds first so glyph overhang (bold shift) stays on top */
     for (int r = 0; r < rows; r++) {
@@ -3376,36 +4147,7 @@ gut_present(gut_window *w, struct gut_buf *b)
     }
     if (w->overlay && w->preedit && w->preedit[0])
         gut_draw_preedit(w, b);
-
-    GUT_GL(glViewport)(0, 0, w->px_w, w->px_h);
-    GUT_GL(glClearColor)(((w->def_bg >> 16) & 0xFF) / 255.0f,
-                         ((w->def_bg >> 8) & 0xFF) / 255.0f,
-                         (w->def_bg & 0xFF) / 255.0f, 1.0f);
-    GUT_GL(glClear)(GUT_GL_COLOR_BUFFER_BIT);
-    if (w->nverts > 0) {
-        GUT_GL(glUseProgram)(w->prog);
-        GUT_GL(glUniform2f)(w->u_screen, (float)w->px_w, (float)w->px_h);
-        GUT_GL(glActiveTexture)(GUT_GL_TEXTURE0);
-        GUT_GL(glBindTexture)(GUT_GL_TEXTURE_2D, w->tex);
-        GUT_GL(glUniform1i)(w->u_tex, 0);
-        GUT_GL(glBindBuffer)(GUT_GL_ARRAY_BUFFER, w->vbo);
-        GUT_GL(glBufferData)(GUT_GL_ARRAY_BUFFER,
-                             (gut_GLsizeiptr)(w->nverts * sizeof(*w->verts)),
-                             w->verts, GUT_GL_STREAM_DRAW);
-        GUT_GL(glEnableVertexAttribArray)(0);
-        GUT_GL(glEnableVertexAttribArray)(1);
-        GUT_GL(glEnableVertexAttribArray)(2);
-        GUT_GL(glVertexAttribPointer)(0, 2, GUT_GL_FLOAT, GUT_GL_FALSE,
-                                      sizeof(struct gut_vertex),
-                                      (const void *)0);
-        GUT_GL(glVertexAttribPointer)(1, 2, GUT_GL_FLOAT, GUT_GL_FALSE,
-                                      sizeof(struct gut_vertex),
-                                      (const void *)(2 * sizeof(float)));
-        GUT_GL(glVertexAttribPointer)(2, 4, GUT_GL_UNSIGNED_BYTE, GUT_GL_TRUE,
-                                      sizeof(struct gut_vertex),
-                                      (const void *)(4 * sizeof(float)));
-        GUT_GL(glDrawArrays)(GUT_GL_TRIANGLES, 0, (gut_GLsizei)w->nverts);
-    }
+    gut_flush(w, w->tex);
     SDL_GL_SwapWindow(w->win);
     memset(b->dirty, 0, (size_t)b->rows);
     gut_text_input_area(w, b);
@@ -3533,6 +4275,57 @@ gut_paste_event(gut_window *w, struct gut_event *ev, const char *text,
     return 1;
 }
 
+/* ---- key state ---- */
+
+static int
+gut_held_find(const gut_window *w, int key)
+{
+    for (int i = 0; i < w->nheld; i++)
+        if (w->held[i] == key)
+            return i;
+    return -1;
+}
+
+static void
+gut_held_set(gut_window *w, int key, int down)
+{
+    int i = gut_held_find(w, key);
+
+    if (down) {
+        if (i < 0 && w->nheld < (int)(sizeof(w->held) / sizeof(w->held[0])))
+            w->held[w->nheld++] = key;
+    } else if (i >= 0) {
+        w->held[i] = w->held[--w->nheld];
+    }
+}
+
+int
+gut_key_held(const gut_window *w, int key)
+{
+    return gut_held_find(w, key) >= 0;
+}
+
+int
+gut_mouse_held(const gut_window *w, int button)
+{
+    return button > 0 && button < 31 && (w->mouse_held & (1 << button)) != 0;
+}
+
+int
+gut_mods_held(const gut_window *w)
+{
+    (void)w;
+    return gut_mods_from_sdl(SDL_GetModState());
+}
+
+int
+gut_keys_held(const gut_window *w, int *keys, int n)
+{
+    for (int i = 0; i < w->nheld && i < n; i++)
+        keys[i] = w->held[i];
+    return w->nheld;
+}
+
 static int
 gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
 {
@@ -3540,6 +4333,13 @@ gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
     ev->cursor = -1;
     ev->mods = gut_mods_from_sdl(SDL_GetModState());
 
+    if (e->type == w->wake_type) {
+        /* One wake is as good as many: the program checks its own
+         * sources once and finds everything that arrived. */
+        SDL_FlushEvent(w->wake_type);
+        ev->type = GUT_EVENT_WAKE;
+        return 1;
+    }
     switch (e->type) {
     case SDL_EVENT_QUIT:
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
@@ -3563,6 +4363,8 @@ gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
         return 1;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
         w->focused = 0;
+        w->nheld = 0;           /* releases are not seen while away */
+        w->mouse_held = 0;
         ev->type = GUT_EVENT_FOCUS_OUT;
         return 1;
     case SDL_EVENT_KEY_DOWN:
@@ -3572,9 +4374,18 @@ gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
         ev->type = GUT_EVENT_KEY;
         ev->mods = gut_mods_from_sdl(e->key.mod);
         ev->repeat = e->key.repeat ? 1 : 0;
+        gut_held_set(w, ev->key, 1);
         if (w->paste_keys && gut_is_paste_chord(ev) &&
             gut_paste_event(w, ev, gut_clipboard_get(w), 0))
             return 1;
+        return 1;
+    case SDL_EVENT_KEY_UP:
+        ev->key = gut_key_from_sdl(e->key.key);
+        if (ev->key == GUT_KEY_NONE)
+            return 0;
+        ev->type = GUT_EVENT_KEY_UP;
+        ev->mods = gut_mods_from_sdl(e->key.mod);
+        gut_held_set(w, ev->key, 0);
         return 1;
     case SDL_EVENT_TEXT_INPUT:
         ev->type = GUT_EVENT_TEXT;
@@ -3612,6 +4423,12 @@ gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
                    : e->button.button == SDL_BUTTON_RIGHT ? GUT_BUTTON_RIGHT
                    : 0;
         ev->clicks = e->button.clicks;
+        if (ev->button) {
+            if (ev->type == GUT_EVENT_MOUSE_DOWN)
+                w->mouse_held |= 1 << ev->button;
+            else
+                w->mouse_held &= ~(1 << ev->button);
+        }
         if (w->paste_keys && ev->type == GUT_EVENT_MOUSE_DOWN &&
             ev->button == GUT_BUTTON_MIDDLE &&
             gut_paste_event(w, ev, gut_primary_get(w), 1))
@@ -3623,12 +4440,14 @@ gut_translate(gut_window *w, const SDL_Event *e, struct gut_event *ev)
         ev->dx = (int)e->wheel.x;
         ev->dy = (int)e->wheel.y;
         return 1;
+#ifndef GUTERM_NO_GAMEPAD
     case SDL_EVENT_GAMEPAD_ADDED:
     case SDL_EVENT_GAMEPAD_REMOVED:
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     case SDL_EVENT_GAMEPAD_BUTTON_UP:
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
         return gut_translate_pad(w, e, ev);
+#endif /* GUTERM_NO_GAMEPAD */
     default:
         return 0;
     }
@@ -3681,6 +4500,16 @@ gut_poll(gut_window *w, struct gut_event *ev, int timeout_ms)
     }
 }
 
+void
+gut_wake(gut_window *w)
+{
+    SDL_Event e;
+
+    SDL_zero(e);
+    e.type = w->wake_type;
+    SDL_PushEvent(&e);
+}
+
 #endif /* GUTERM_NO_WINDOW */
 
 #ifndef GUTERM_NO_VT
@@ -3699,6 +4528,8 @@ enum {
     GUT_ST_CSI_INTERMED,
     GUT_ST_CSI_IGNORE,
     GUT_ST_OSC_STRING,
+    GUT_ST_DCS_PARAM,
+    GUT_ST_DCS_SIXEL,
     GUT_ST_DCS_PASSTHRU,
 };
 
@@ -3709,6 +4540,352 @@ static const uint32_t gut_dec_graphics[] = {
     0x23BA, 0x23BB, 0x2500, 0x23BC, 0x23BD, 0x251C, 0x2524, 0x2534,
     0x252C, 0x2502, 0x2264, 0x2265, 0x03C0, 0x2260, 0x00A3, 0x00B7,
 };
+
+#ifndef GUTERM_NO_SIXEL
+/* ---- sixel decoder ---- */
+
+/* VT340 default colors, in percent. */
+static const uint8_t gut_sixel_default[16][3] = {
+    { 0, 0, 0 },    { 20, 20, 80 }, { 80, 13, 13 }, { 20, 80, 20 },
+    { 80, 20, 80 }, { 20, 80, 80 }, { 80, 80, 20 }, { 53, 53, 53 },
+    { 26, 26, 26 }, { 33, 33, 60 }, { 60, 26, 26 }, { 33, 60, 33 },
+    { 60, 33, 60 }, { 33, 60, 60 }, { 60, 60, 33 }, { 80, 80, 80 },
+};
+
+static double
+gut_fabs(double v)
+{
+    return v < 0 ? -v : v;
+}
+
+static int
+gut_pct(int v)
+{
+    if (v < 0)
+        v = 0;
+    if (v > 100)
+        v = 100;
+    return (v * 255 + 50) / 100;
+}
+
+/* Sixel HLS has blue at 0, red at 120 and green at 240, which is the
+ * usual HSL wheel turned by 240 degrees. */
+static uint32_t
+gut_hls_to_rgb(int h, int l, int s)
+{
+    double hue, chroma, second, m, rgb[3];
+    int sector;
+
+    h = ((h % 360) + 360 + 240) % 360;
+    l = l < 0 ? 0 : l > 100 ? 100 : l;
+    s = s < 0 ? 0 : s > 100 ? 100 : s;
+    hue = h / 60.0;
+    sector = (int)hue;
+    chroma = (1.0 - gut_fabs(2.0 * l / 100.0 - 1.0)) * s / 100.0;
+    second = chroma * (1.0 - gut_fabs(hue - 2.0 * (sector / 2) - 1.0));
+    m = l / 100.0 - chroma / 2.0;
+    switch (sector) {
+    case 0: rgb[0] = chroma; rgb[1] = second; rgb[2] = 0; break;
+    case 1: rgb[0] = second; rgb[1] = chroma; rgb[2] = 0; break;
+    case 2: rgb[0] = 0; rgb[1] = chroma; rgb[2] = second; break;
+    case 3: rgb[0] = 0; rgb[1] = second; rgb[2] = chroma; break;
+    case 4: rgb[0] = second; rgb[1] = 0; rgb[2] = chroma; break;
+    default: rgb[0] = chroma; rgb[1] = 0; rgb[2] = second; break;
+    }
+    return ((uint32_t)(int)((rgb[0] + m) * 255.0 + 0.5) << 16) |
+           ((uint32_t)(int)((rgb[1] + m) * 255.0 + 0.5) << 8) |
+           (uint32_t)(int)((rgb[2] + m) * 255.0 + 0.5);
+}
+
+void
+gut_sixel_abort(struct gut_sixel *s)
+{
+    free(s->rgba);
+    s->rgba = NULL;
+    s->w = 0;
+    s->h = 0;
+    s->active = 0;
+}
+
+void
+gut_sixel_begin(struct gut_sixel *s, int p1, int p2, int p3,
+                size_t max_pixels)
+{
+    (void)p1;
+    (void)p3;
+    gut_sixel_abort(s);
+    s->max_w = 0;
+    s->max_h = 0;
+    s->max_pixels = max_pixels ? max_pixels : GUT_VT_IMAGE_MAX_PIXELS;
+    if (s->max_pixels > (size_t)INT_MAX / 8)
+        s->max_pixels = (size_t)INT_MAX / 8;  /* keeps pen arithmetic in int */
+    memset(s->palette, 0, sizeof(s->palette));
+    for (int i = 0; i < 16; i++)
+        s->palette[i] = ((uint32_t)gut_pct(gut_sixel_default[i][0]) << 16) |
+                        ((uint32_t)gut_pct(gut_sixel_default[i][1]) << 8) |
+                        (uint32_t)gut_pct(gut_sixel_default[i][2]);
+    s->color = 0;
+    s->x = 0;
+    s->y = 0;
+    s->vstretch = 1;
+    s->opaque = p2 != 1;
+    s->cmd = 0;
+    s->nparam = 0;
+    s->cur_param = 0;
+    s->has_digit = 0;
+    s->repeat = 1;
+    s->active = 1;
+    s->failed = 0;
+}
+
+/* Grow the canvas to hold need_w by need_h. Returns 0, or -1 when the
+ * picture would pass the limit, which fails the whole picture. */
+static int
+gut_sixel_ensure(struct gut_sixel *s, int need_w, int need_h)
+{
+    int nw = s->w, nh = s->h;
+    uint8_t *canvas;
+
+    if (need_w <= s->w && need_h <= s->h)
+        return 0;
+    if (need_w > GUT_SIXEL_MAX_DIM || need_h > GUT_SIXEL_MAX_DIM ||
+        (size_t)need_w * (size_t)need_h > s->max_pixels)
+        goto fail;
+    /* grow by doubling so a tall or wide picture is copied a few times,
+     * not once per band; fall back to the exact size near the limit */
+    if (need_w > nw)
+        nw = need_w > 2 * nw ? need_w : 2 * nw;
+    if (need_h > nh)
+        nh = need_h > 2 * nh ? need_h : 2 * nh;
+    if (nw > GUT_SIXEL_MAX_DIM)
+        nw = GUT_SIXEL_MAX_DIM;
+    if (nh > GUT_SIXEL_MAX_DIM)
+        nh = GUT_SIXEL_MAX_DIM;
+    if ((size_t)nw * (size_t)nh > s->max_pixels)
+        nw = need_w > s->w ? need_w : s->w;
+    if ((size_t)nw * (size_t)nh > s->max_pixels)
+        nh = need_h > s->h ? need_h : s->h;
+    canvas = calloc((size_t)nw * (size_t)nh, 4);
+    if (!canvas)
+        goto fail;
+    for (int r = 0; r < s->h; r++)
+        memcpy(canvas + (size_t)r * nw * 4, s->rgba + (size_t)r * s->w * 4,
+               (size_t)s->w * 4);
+    free(s->rgba);
+    s->rgba = canvas;
+    s->w = nw;
+    s->h = nh;
+    return 0;
+fail:
+    gut_sixel_abort(s);
+    s->failed = 1;
+    return -1;
+}
+
+static void
+gut_sixel_paint(struct gut_sixel *s, int bits)
+{
+    int n = s->repeat, vs = s->vstretch;
+    uint32_t rgb = s->palette[s->color];
+    int top = -1, bot = 0;
+
+    s->repeat = 1;
+    if (n <= 0)
+        return;
+    if (s->x > (int)s->max_pixels || s->y > (int)s->max_pixels ||
+        n > (int)s->max_pixels) {
+        gut_sixel_abort(s);
+        s->failed = 1;
+        return;
+    }
+    if (bits == 0) {
+        s->x += n;
+        if (s->x > s->max_w)
+            s->max_w = s->x;
+        return;
+    }
+    for (int b = 0; b < 6; b++) {
+        if (bits & (1 << b)) {
+            if (top < 0)
+                top = b;
+            bot = b;
+        }
+    }
+    if (gut_sixel_ensure(s, s->x + n, s->y + (bot + 1) * vs) != 0)
+        return;
+    for (int b = top; b <= bot; b++) {
+        if (!(bits & (1 << b)))
+            continue;
+        for (int dy = 0; dy < vs; dy++) {
+            uint8_t *p = s->rgba +
+                         ((size_t)(s->y + b * vs + dy) * s->w + s->x) * 4;
+
+            for (int i = 0; i < n; i++, p += 4) {
+                p[0] = (uint8_t)(rgb >> 16);
+                p[1] = (uint8_t)(rgb >> 8);
+                p[2] = (uint8_t)rgb;
+                p[3] = 255;
+            }
+        }
+    }
+    s->x += n;
+    if (s->x > s->max_w)
+        s->max_w = s->x;
+    if (s->y + (bot + 1) * vs > s->max_h)
+        s->max_h = s->y + (bot + 1) * vs;
+}
+
+static void
+gut_sixel_finish_param(struct gut_sixel *s)
+{
+    if (s->nparam < 5)
+        s->params[s->nparam++] = s->has_digit ? s->cur_param : 0;
+    s->cur_param = 0;
+    s->has_digit = 0;
+}
+
+/* The parameters of '"', '#' or '!' are complete: act on them. */
+static void
+gut_sixel_dispatch(struct gut_sixel *s)
+{
+    gut_sixel_finish_param(s);
+    switch (s->cmd) {
+    case '"':
+        /* Pan;Pad;Ph;Pv: the aspect stretches, the size is a floor for
+         * the picture and for the opaque fill */
+        if (s->nparam >= 2 && s->params[1] > 0 && s->params[0] > s->params[1]
+            && s->max_h == 0)
+            s->vstretch = (s->params[0] + s->params[1] / 2) / s->params[1];
+        if (s->nparam >= 4 && s->params[2] > 0 && s->params[3] > 0) {
+            if (s->params[2] > GUT_SIXEL_MAX_DIM ||
+                s->params[3] > GUT_SIXEL_MAX_DIM ||
+                (size_t)s->params[2] * (size_t)s->params[3] > s->max_pixels) {
+                gut_sixel_abort(s);
+                s->failed = 1;
+                break;
+            }
+            if (s->params[2] > s->max_w)
+                s->max_w = s->params[2];
+            if (s->params[3] > s->max_h)
+                s->max_h = s->params[3];
+        }
+        break;
+    case '#':
+        s->color = s->params[0] % GUT_SIXEL_COLORS;
+        if (s->nparam >= 5) {
+            if (s->params[1] == 1)
+                s->palette[s->color] = gut_hls_to_rgb(s->params[2],
+                                                      s->params[3],
+                                                      s->params[4]);
+            else if (s->params[1] == 2)
+                s->palette[s->color] =
+                    ((uint32_t)gut_pct(s->params[2]) << 16) |
+                    ((uint32_t)gut_pct(s->params[3]) << 8) |
+                    (uint32_t)gut_pct(s->params[4]);
+        }
+        break;
+    case '!':
+        s->repeat = s->params[0] > 0 ? s->params[0] : 1;
+        break;
+    }
+    s->cmd = 0;
+    s->nparam = 0;
+}
+
+void
+gut_sixel_put(struct gut_sixel *s, unsigned char c)
+{
+    if (!s->active || s->failed)
+        return;
+    if (s->cmd) {
+        if (c >= '0' && c <= '9') {
+            if (s->cur_param < 65535)
+                s->cur_param = s->cur_param * 10 + (c - '0');
+            s->has_digit = 1;
+            return;
+        }
+        if (c == ';') {
+            gut_sixel_finish_param(s);
+            return;
+        }
+        gut_sixel_dispatch(s);
+        if (s->failed)
+            return;
+    }
+    if (c == '"' || c == '#' || c == '!') {
+        s->cmd = c;
+        s->nparam = 0;
+        s->cur_param = 0;
+        s->has_digit = 0;
+    } else if (c == '$') {
+        s->x = 0;
+        s->repeat = 1;
+    } else if (c == '-') {
+        s->x = 0;
+        s->y += 6 * s->vstretch;
+        s->repeat = 1;
+        if (s->y > (int)s->max_pixels) {
+            gut_sixel_abort(s);
+            s->failed = 1;
+        }
+    } else if (c >= 0x3F && c <= 0x7E) {
+        gut_sixel_paint(s, c - 0x3F);
+    } else {
+        s->repeat = 1;
+    }
+}
+
+int
+gut_sixel_end(struct gut_sixel *s, struct gut_image *out)
+{
+    int w, h;
+
+    out->w = 0;
+    out->h = 0;
+    out->rgba = NULL;
+    if (!s->active || s->failed) {
+        gut_sixel_abort(s);
+        return 0;
+    }
+    if (s->cmd)
+        gut_sixel_dispatch(s);
+    w = s->max_w;
+    h = s->max_h;
+    if (w <= 0 || h <= 0 || s->failed ||
+        gut_sixel_ensure(s, w, h) != 0) {
+        gut_sixel_abort(s);
+        return 0;
+    }
+    /* repack to the final width when the canvas is wider */
+    if (s->w != w) {
+        for (int r = 1; r < h; r++)
+            memmove(s->rgba + (size_t)r * w * 4,
+                    s->rgba + (size_t)r * s->w * 4, (size_t)w * 4);
+    }
+    if (s->opaque) {
+        uint32_t rgb = s->palette[0];
+        uint8_t *p = s->rgba;
+
+        for (size_t i = 0; i < (size_t)w * (size_t)h; i++, p += 4) {
+            if (p[3] == 0) {
+                p[0] = (uint8_t)(rgb >> 16);
+                p[1] = (uint8_t)(rgb >> 8);
+                p[2] = (uint8_t)rgb;
+                p[3] = 255;
+            }
+        }
+    }
+    out->w = w;
+    out->h = h;
+    out->rgba = s->rgba;
+    s->rgba = NULL;
+    s->w = 0;
+    s->h = 0;
+    s->active = 0;
+    return 1;
+}
+
+#endif /* GUTERM_NO_SIXEL */
 
 /* ---- state helpers ---- */
 
@@ -3875,6 +5052,9 @@ gut_vt_compose(struct gut_vt *vt)
             out->dirty[r] = 1;
         }
     }
+#ifndef GUTERM_NO_IMAGES
+    gut_buf_project_images(out, live, vt->view);
+#endif /* GUTERM_NO_IMAGES */
     out->cursor_visible = 0;
     out->cursor_row = 0;
     out->cursor_col = 0;
@@ -3897,11 +5077,17 @@ gut_vt_view_apply(struct gut_vt *vt, int offset)
         /* park the live screen so the emulator keeps writing to it */
         if (gut_buf_init(&vt->live, out->rows, out->cols) != 0)
             return 0;
+#ifndef GUTERM_NO_IMAGES
+        vt->live.image_budget = out->image_budget;
+#endif /* GUTERM_NO_IMAGES */
         memcpy(vt->live.cells, out->cells, bytes);
         vt->live.cursor_row = out->cursor_row;
         vt->live.cursor_col = out->cursor_col;
         vt->live.cursor_visible = out->cursor_visible;
         vt->live.cursor_shape = out->cursor_shape;
+#ifndef GUTERM_NO_IMAGES
+        gut_buf_swap_images(&vt->live, &out->images);
+#endif /* GUTERM_NO_IMAGES */
         vt->buf = &vt->live;
     }
     vt->view = offset;
@@ -3911,6 +5097,9 @@ gut_vt_view_apply(struct gut_vt *vt, int offset)
         out->cursor_col = vt->live.cursor_col;
         out->cursor_visible = vt->live.cursor_visible;
         out->cursor_shape = vt->live.cursor_shape;
+#ifndef GUTERM_NO_IMAGES
+        gut_buf_swap_images(out, &vt->live.images);
+#endif /* GUTERM_NO_IMAGES */
         gut_buf_dirty_all(out);
         gut_buf_free(&vt->live);
         vt->buf = out;
@@ -3999,6 +5188,10 @@ gut_vt_altscreen_enter(struct gut_vt *vt)
     vt->alt_cursor.fg = vt->fg;
     vt->alt_cursor.bg = vt->bg;
     vt->modes |= GUT_VT_MODE_ALTSCREEN;
+#ifndef GUTERM_NO_IMAGES
+    gut_image_list_free(&vt->alt_images);
+    gut_buf_swap_images(b, &vt->alt_images);
+#endif /* GUTERM_NO_IMAGES */
     gut_buf_clear(b, gut_color_default());
 }
 
@@ -4015,6 +5208,10 @@ gut_vt_altscreen_leave(struct gut_vt *vt)
                (size_t)b->rows * (size_t)b->cols * sizeof(*b->cells));
     else
         gut_buf_clear(b, gut_color_default());
+#ifndef GUTERM_NO_IMAGES
+    gut_buf_swap_images(b, &vt->alt_images);
+    gut_image_list_free(&vt->alt_images);
+#endif /* GUTERM_NO_IMAGES */
     gut_buf_dirty_all(b);
     free(vt->alt_saved);
     vt->alt_saved = NULL;
@@ -4216,10 +5413,16 @@ gut_vt_erase_display(struct gut_vt *vt, int mode)
     case 0:
         gut_vt_erase_cols(vt, vt->row, vt->col, b->cols);
         gut_buf_clear_rows(b, vt->row + 1, b->rows, vt->bg);
+#ifndef GUTERM_NO_IMAGES
+        gut_buf_cut_images(b, vt->row, vt->row + 1);
+#endif /* GUTERM_NO_IMAGES */
         break;
     case 1:
         gut_buf_clear_rows(b, 0, vt->row, vt->bg);
         gut_vt_erase_cols(vt, vt->row, 0, vt->col + 1);
+#ifndef GUTERM_NO_IMAGES
+        gut_buf_cut_images(b, vt->row, vt->row + 1);
+#endif /* GUTERM_NO_IMAGES */
         break;
     case 2:
         gut_buf_clear_rows(b, 0, b->rows, vt->bg);
@@ -4239,7 +5442,12 @@ gut_vt_erase_line(struct gut_vt *vt, int mode)
     switch (mode) {
     case 0: gut_vt_erase_cols(vt, vt->row, vt->col, cols); break;
     case 1: gut_vt_erase_cols(vt, vt->row, 0, vt->col + 1); break;
-    case 2: gut_vt_erase_cols(vt, vt->row, 0, cols); break;
+    case 2:
+        gut_vt_erase_cols(vt, vt->row, 0, cols);
+#ifndef GUTERM_NO_IMAGES
+        gut_buf_cut_images(vt->buf, vt->row, vt->row + 1);
+#endif /* GUTERM_NO_IMAGES */
+        break;
     }
 }
 
@@ -4287,6 +5495,7 @@ gut_vt_decset(struct gut_vt *vt, int n, int on)
         vt->wrap_pending = 0;
         break;
     case 7: bit = GUT_VT_MODE_AUTOWRAP; break;
+    case 80: bit = GUT_VT_MODE_SIXEL_DISPLAY; break;
     case 25:
         vt->buf->cursor_visible = on;
         return;
@@ -4323,6 +5532,33 @@ gut_vt_decset(struct gut_vt *vt, int n, int on)
         vt->modes &= ~bit;
 }
 
+#ifndef GUTERM_NO_SIXEL
+/* XTSMGRAPHICS, CSI ? Pi ; Pa ; Pv S: a program asking what pictures
+ * it may draw. Item 1 is color registers and 2 the pixel area; the
+ * actions read, reset, set and read the maximum all answer with the
+ * fixed values, since neither can change. */
+static void
+gut_vt_graphics_query(struct gut_vt *vt)
+{
+    int item = gut_vt_param(vt, 0, 0);
+    int action = gut_vt_param(vt, 1, 0);
+    char rep[48];
+    int n;
+
+    if (action < 1 || action > 4 || (item != 1 && item != 2)) {
+        n = snprintf(rep, sizeof(rep), "\033[?%d;%dS", item,
+                     item == 1 || item == 2 ? 2 : 1);
+    } else if (item == 1) {
+        n = snprintf(rep, sizeof(rep), "\033[?1;0;%dS", GUT_SIXEL_COLORS);
+    } else {
+        n = snprintf(rep, sizeof(rep), "\033[?2;0;%d;%dS",
+                     vt->buf->cols * vt->cell_w, vt->buf->rows * vt->cell_h);
+    }
+    gut_vt_reply_str(vt, rep, (size_t)n);
+}
+
+#endif /* GUTERM_NO_SIXEL */
+
 static void
 gut_vt_csi(struct gut_vt *vt, int final)
 {
@@ -4335,6 +5571,10 @@ gut_vt_csi(struct gut_vt *vt, int final)
         if (final == 'h' || final == 'l')
             for (int i = 0; i < vt->nparam; i++)
                 gut_vt_decset(vt, vt->params[i], final == 'h');
+#ifndef GUTERM_NO_SIXEL
+        else if (final == 'S')
+            gut_vt_graphics_query(vt);
+#endif
         return;
     }
     if (vt->intermed == ' ' && final == 'q') {
@@ -4429,7 +5669,11 @@ gut_vt_csi(struct gut_vt *vt, int final)
         break;
     case 'c':
         if (gut_vt_param(vt, 0, 0) == 0)
+#ifndef GUTERM_NO_SIXEL
+            gut_vt_reply_str(vt, "\033[?1;2;4c", 9);
+#else
             gut_vt_reply_str(vt, "\033[?1;2c", 7);
+#endif
         break;
     case 'n':
         n = gut_vt_param(vt, 0, 0);
@@ -4714,6 +5958,56 @@ gut_vt_osc_put(struct gut_vt *vt, char c)
 
 /* ---- parser ---- */
 
+#ifndef GUTERM_NO_SIXEL
+/* Pin a finished picture to the screen. With sixel scrolling, the
+ * default, it starts at the cursor, the region scrolls to make room
+ * for it and for a cursor line below it, a picture taller than that
+ * loses its top, and the cursor ends on the row after it in the column
+ * it started from. With DECSDM the picture sits at the home position
+ * and the cursor stays put. */
+static void
+gut_vt_place_image(struct gut_vt *vt, struct gut_image *img)
+{
+    struct gut_buf *b = vt->buf;
+    int rows = (img->h + vt->cell_h - 1) / vt->cell_h;
+    int row = vt->row, col = vt->col, last, skip = 0;
+
+    if (vt->modes & GUT_VT_MODE_SIXEL_DISPLAY) {
+        gut_buf_place_image(b, img, 0, 0, vt->cell_w, vt->cell_h);
+        return;
+    }
+    last = row + rows - 1;
+    if (row >= vt->scroll_top && row < vt->scroll_bot) {
+        if (last >= vt->scroll_bot - 1) {
+            int n = last - (vt->scroll_bot - 2);
+
+            gut_vt_scroll_up(vt, n);
+            row -= n;
+            last -= n;
+        }
+        if (row < vt->scroll_top) {
+            /* the region's top, not the grid's, bounds the picture */
+            skip = vt->scroll_top - row;
+            row = vt->scroll_top;
+        }
+    }
+    gut_buf_place_band(b, img, row, col, vt->cell_w, vt->cell_h, skip);
+    vt->row = last + 1 < b->rows ? last + 1 : b->rows - 1;
+    vt->col = col;
+    vt->wrap_pending = 0;
+}
+
+static void
+gut_vt_sixel_finish(struct gut_vt *vt)
+{
+    struct gut_image img;
+
+    if (gut_sixel_end(&vt->sixel, &img))
+        gut_vt_place_image(vt, &img);
+}
+
+#endif /* GUTERM_NO_SIXEL */
+
 static void
 gut_vt_csi_reset(struct gut_vt *vt)
 {
@@ -4783,14 +6077,27 @@ gut_vt_byte(struct gut_vt *vt, unsigned char c)
     if (c == 0x1B) {
         if (vt->state == GUT_ST_OSC_STRING)
             gut_vt_osc(vt);
+#ifndef GUTERM_NO_SIXEL
+        if (vt->state == GUT_ST_DCS_SIXEL)
+            gut_vt_sixel_finish(vt);
+#endif /* GUTERM_NO_SIXEL */
         vt->utf8_need = 0;
         vt->utf8_len = 0;
         vt->state = GUT_ST_ESCAPE;
         vt->intermed = 0;
         return;
     }
+    if (c == 0x18 || c == 0x1A) {
+        /* CAN and SUB abandon any string or sequence in progress */
+#ifndef GUTERM_NO_SIXEL
+        if (vt->state == GUT_ST_DCS_SIXEL)
+            gut_sixel_abort(&vt->sixel);
+#endif /* GUTERM_NO_SIXEL */
+        vt->state = GUT_ST_GROUND;
+        return;
+    }
     if (vt->state != GUT_ST_GROUND && vt->state != GUT_ST_OSC_STRING &&
-        vt->state != GUT_ST_DCS_PASSTHRU) {
+        vt->state != GUT_ST_DCS_PASSTHRU && vt->state != GUT_ST_DCS_SIXEL) {
         if (c == 0x07 || (c >= 0x08 && c <= 0x0D)) {
             gut_vt_execute(vt, c);
             return;
@@ -4809,7 +6116,10 @@ gut_vt_byte(struct gut_vt *vt, unsigned char c)
             vt->osc_len = 0;
             vt->osc_overflow = 0;
             vt->state = GUT_ST_OSC_STRING;
-        } else if (c == 'P' || c == 'X' || c == '^' || c == '_') {
+        } else if (c == 'P') {
+            gut_vt_csi_reset(vt);
+            vt->state = GUT_ST_DCS_PARAM;
+        } else if (c == 'X' || c == '^' || c == '_') {
             vt->state = GUT_ST_DCS_PASSTHRU;
         } else if (c >= 0x20 && c <= 0x2F) {
             vt->intermed = c;
@@ -4888,6 +6198,35 @@ gut_vt_byte(struct gut_vt *vt, unsigned char c)
         if (c >= 0x40 && c <= 0x7E)
             vt->state = GUT_ST_GROUND;
         break;
+    case GUT_ST_DCS_PARAM:
+        if (c >= '0' && c <= '9') {
+            if (vt->cur_param < 65535)
+                vt->cur_param = vt->cur_param * 10 + (c - '0');
+            vt->has_digit = 1;
+        } else if (c == ';') {
+            gut_vt_finish_param(vt);
+        } else if (c >= 0x20 && c <= 0x3F) {
+            vt->intermed = c;
+        } else if (c >= 0x40 && c <= 0x7E) {
+            gut_vt_finish_param(vt);
+            vt->state = GUT_ST_DCS_PASSTHRU;
+#ifndef GUTERM_NO_SIXEL
+            if (c == 'q' && vt->intermed == 0) {
+                gut_sixel_begin(&vt->sixel, gut_vt_param(vt, 0, 0),
+                                gut_vt_param(vt, 1, 0), gut_vt_param(vt, 2, 0),
+                                vt->image_max_pixels);
+                vt->state = GUT_ST_DCS_SIXEL;
+            }
+#endif
+        } else {
+            vt->state = GUT_ST_DCS_PASSTHRU;
+        }
+        break;
+#ifndef GUTERM_NO_SIXEL
+    case GUT_ST_DCS_SIXEL:
+        gut_sixel_put(&vt->sixel, (unsigned char)c);
+        break;
+#endif /* GUTERM_NO_SIXEL */
     case GUT_ST_DCS_PASSTHRU:
         /* absorbed until ESC \ arrives; ESC is handled above */
         break;
@@ -4941,6 +6280,12 @@ gut_vt_reset(struct gut_vt *vt)
     vt->wrap_pending = 0;
     memset(&vt->saved, 0, sizeof(vt->saved));
     gut_vt_tab_reset(vt);
+#ifndef GUTERM_NO_SIXEL
+    gut_sixel_abort(&vt->sixel);
+#endif
+#ifndef GUTERM_NO_IMAGES
+    gut_image_list_free(&vt->alt_images);
+#endif
     vt->state = GUT_ST_GROUND;
     vt->utf8_need = 0;
     vt->utf8_len = 0;
@@ -4958,6 +6303,13 @@ gut_vt_init(struct gut_vt *vt, struct gut_buf *buf)
     memset(vt, 0, sizeof(*vt));
     vt->buf = buf;
     vt->out = buf;
+#ifndef GUTERM_NO_SIXEL
+    vt->image_max_pixels = GUT_VT_IMAGE_MAX_PIXELS;
+#endif
+#ifndef GUTERM_NO_IMAGES
+    vt->cell_w = 8;
+    vt->cell_h = 16;
+#endif
     vt->tabstops = calloc((size_t)buf->cols, 1);
     if (!vt->tabstops)
         return -1;
@@ -4973,6 +6325,12 @@ gut_vt_init(struct gut_vt *vt, struct gut_buf *buf)
 void
 gut_vt_free(struct gut_vt *vt)
 {
+#ifndef GUTERM_NO_SIXEL
+    gut_sixel_abort(&vt->sixel);
+#endif
+#ifndef GUTERM_NO_IMAGES
+    gut_image_list_free(&vt->alt_images);
+#endif
     gut_vt_sb_free_lines(vt);
     free(vt->sb);
     if (vt->view > 0)
@@ -5053,6 +6411,9 @@ gut_vt_resize(struct gut_vt *vt, int rows, int cols)
         free(tabs);
         return -1;
     }
+#ifndef GUTERM_NO_IMAGES
+    gut_image_list_free(&vt->alt_images);   /* a resize drops pictures */
+#endif /* GUTERM_NO_IMAGES */
     for (int c = 0; c < cols; c++)
         tabs[c] = c < old_cols ? vt->tabstops[c] : (c % 8) == 0;
     free(vt->tabstops);
@@ -5100,6 +6461,23 @@ gut_vt_set_scrollback(struct gut_vt *vt, int lines)
         gut_vt_view_apply(vt, keep);
     return 0;
 }
+
+#ifndef GUTERM_NO_SIXEL
+void
+gut_vt_set_image_limit(struct gut_vt *vt, size_t max_pixels)
+{
+    vt->image_max_pixels = max_pixels ? max_pixels : GUT_VT_IMAGE_MAX_PIXELS;
+}
+#endif /* GUTERM_NO_SIXEL */
+
+#ifndef GUTERM_NO_IMAGES
+void
+gut_vt_set_cell_size(struct gut_vt *vt, int w, int h)
+{
+    vt->cell_w = w > 0 ? w : 8;
+    vt->cell_h = h > 0 ? h : 16;
+}
+#endif /* GUTERM_NO_IMAGES */
 
 int
 gut_vt_scrollback_lines(const struct gut_vt *vt)
