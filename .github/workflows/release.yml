@@ -1,0 +1,137 @@
+name: Release
+
+# Pushing a version tag (v1.4.0) builds the release binaries and publishes
+# them on the GitHub release for that tag, created here when it does not
+# exist yet. The tag must match VEDIT_VERSION in vedit.c, so a stale version
+# string fails the run before anything is built.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: check version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Compare the tag with VEDIT_VERSION
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          src=$(sed -n 's/^#define VEDIT_VERSION "vedit \(.*\)"$/\1/p' vedit.c)
+          echo "tag: $tag, source: $src"
+          if [ "$tag" != "$src" ]; then
+            echo "the tag does not match VEDIT_VERSION in vedit.c"
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+  # Static musl binaries for Linux, one per architecture, built natively on
+  # the matching runner with the `make static` target. The man page rides
+  # along in the tarball.
+  linux:
+    name: linux ${{ matrix.arch }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: make static
+      - name: Check the binary
+        run: |
+          file vedit
+          if ldd vedit 2>/dev/null; then echo "vedit is not static"; exit 1; fi
+          test "$(uname -m)" = "${{ matrix.arch }}"
+          ./vedit --version
+      - name: Package
+        run: |
+          name="vedit-${{ needs.check.outputs.version }}-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$name"
+          cp vedit man/vedit.1 README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          retention-days: 7
+
+  # The Windows console build, cross-compiled with mingw-w64.
+  windows:
+    name: windows x86_64
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 zip
+      - name: Build
+        run: make CC=x86_64-w64-mingw32-gcc RELEASE=1
+      - name: Check the binary
+        run: file _out/x86_64-w64-mingw32/bin/vedit.exe | grep -q 'PE32+'
+      - name: Package
+        run: |
+          name="vedit-${{ needs.check.outputs.version }}-windows-x86_64"
+          mkdir -p "dist/$name"
+          cp _out/x86_64-w64-mingw32/bin/vedit.exe README.md "dist/$name/"
+          (cd dist && zip -r "$name.zip" "$name")
+      - uses: actions/upload-artifact@v6
+        with:
+          name: windows-x86_64
+          path: dist/*.zip
+          retention-days: 7
+
+  # Publish: create the release for the tag when it is missing (with
+  # GitHub's generated notes), then attach the archives and their checksums.
+  # --clobber lets a rerun replace the assets of an existing release.
+  publish:
+    name: publish
+    needs: [check, linux, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v6
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          ls -l
+          sha256sum vedit-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "vedit ${{ needs.check.outputs.version }}" \
+              --generate-notes --verify-tag
+          fi
+          gh release upload "$tag" --clobber dist/vedit-* dist/SHA256SUMS

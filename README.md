@@ -28,6 +28,12 @@ make install            # install to ~/.local/bin (override PREFIX)
 The only requirement is a C11 compiler and a POSIX system, or mingw-w64 for
 Windows (below). There are no library dependencies.
 
+Prebuilt binaries are on the [releases page](https://github.com/OrangeTide/vedit/releases):
+static Linux builds for x86_64 and aarch64, each with the man page, and a
+Windows x86_64 console build, with a SHA256SUMS file. They are produced by
+the release workflow when a version tag is pushed; the tag must match
+`VEDIT_VERSION` in vedit.c or the run stops before building.
+
 
 ### Windows
 
