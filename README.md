@@ -66,7 +66,9 @@ make CC=x86_64-w64-mingw32-gcc    # _out/x86_64-w64-mingw32/bin/vedit.exe
 
 It runs in Windows Terminal, the classic console, and under wine. Input comes
 from the console as key records, translated into the same sequences a
-terminal sends, so every key and the mouse work as on Unix. Output has two
+terminal sends, so every key and the mouse work as on Unix. Files are
+opened through the wide Win32 API from UTF-8 names, so any file name the
+console can type works, including on the command line. Output has two
 paths: on a real Windows console the editor sends its usual ANSI stream
 through the console's virtual-terminal processing (full 256 colours); under
 wine, whose VT processing is partial, it draws the cell grid directly through

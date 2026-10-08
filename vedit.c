@@ -22,6 +22,9 @@
 /* mingw: use its own printf family so %zu and friends work on every CRT. */
 #define __USE_MINGW_ANSI_STDIO 1
 #endif
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1		/* copy_file_range */
+#endif
 /* The format attribute must name the C99 family the build actually uses. */
 #if defined(_WIN32) && defined(__GNUC__)
 #define VEDIT_PRINTF gnu_printf
@@ -70,34 +73,9 @@
 #include <io.h>
 #include <process.h>
 
-#define mkdir(p, m)	_mkdir(p)
 #define fsync(fd)	_commit(fd)
 #define setenv(n, v, o)	_putenv_s(n, v)
 #define realpath(p, r)	_fullpath((r), (p), PATH_MAX)
-#ifndef S_IRUSR
-#define S_IRUSR 0400
-#define S_IWUSR 0200
-#endif
-typedef unsigned short mode_t;
-
-/* No file modes to speak of: umask and chmod are accepted and ignored. */
-static mode_t
-win_umask(mode_t m)
-{
-	(void)m;
-	return 0;
-}
-#define umask win_umask
-
-static int
-win_chmod(const char *p, mode_t m)
-{
-	(void)p;
-	(void)m;
-	return 0;
-}
-#define chmod win_chmod
-
 /* rename() on Windows refuses an existing target; the save and swap paths
  * rely on the POSIX replace. */
 static int
@@ -154,8 +132,7 @@ kill(pid_t pid, int sig)
 
 /* Memory streams over temporary files. open_memstream registers the stream;
  * the fclose wrapper below reads the file back into a malloc'd buffer for
- * the registered pointers before closing it. fmemopen copies the bytes into
- * a temporary file positioned at its start (reading only). */
+ * the registered pointers before closing it. */
 #define WIN_MEMSTREAMS 8
 static struct win_memstream {
 	FILE	*fp;
@@ -183,22 +160,6 @@ open_memstream(char **bufp, size_t *lenp)
 	*bufp = NULL;
 	*lenp = 0;
 	return g_memstreams[i].fp;
-}
-
-static FILE *
-fmemopen(void *buf, size_t len, const char *mode)
-{
-	FILE *fp = tmpfile();
-
-	(void)mode;
-	if (!fp)
-		return NULL;
-	if (len > 0 && fwrite(buf, 1, len, fp) != len) {
-		fclose(fp);
-		return NULL;
-	}
-	rewind(fp);
-	return fp;
 }
 
 static int
@@ -231,6 +192,843 @@ win_fclose(FILE *fp)
 }
 #define fclose win_fclose
 #endif /* _WIN32 */
+
+/****************************************************************
+ * File access
+ *
+ * Every file the editor reads or writes goes through this table: raw
+ * descriptors on POSIX, CreateFileW with UTF-8 paths on Windows, so
+ * the Windows build opens any name the console can type and both
+ * sides report the same metadata (size, a nanosecond mtime, the
+ * identity pair, the preferred read size). The memory streams
+ * (fmemopen, open_memstream) are not files and stay with stdio.
+ * It is a table of functions so an embedding host can supply its
+ * own storage later; today only the native one exists. Directory
+ * listing stays on opendir for now.
+ ****************************************************************/
+
+typedef struct vf_stat {
+	long long	size;
+	long long	mtime_ns;	/* modification time, ns since the epoch */
+	unsigned long long dev, ino;	/* the same dev and ino = the same file */
+	unsigned	perm;		/* POSIX permission bits (Windows: 0644/0444) */
+	long		blksize;	/* preferred I/O size, 0 = unknown */
+	int		is_reg, is_dir;
+} Vstat;
+
+typedef struct vfile Vfile;		/* an open file, opaque */
+
+enum vf_flags {
+	VF_READ = 1, VF_WRITE = 2, VF_CREATE = 4, VF_TRUNC = 8, VF_EXCL = 16,
+};
+enum vf_access { VF_R = 1, VF_W = 2, VF_X = 4 };
+
+struct vfs_ops {
+	/* Open path; perm applies to a file this call creates. NULL with
+	 * errno set on failure. */
+	Vfile *(*open)(const char *path, int flags, unsigned perm);
+	long (*read)(Vfile *f, void *buf, size_t n);	/* 0 at end, -1 error */
+	long (*write)(Vfile *f, const void *buf, size_t n);	/* may be short */
+	int (*fstat)(Vfile *f, Vstat *st);
+	int (*sync)(Vfile *f);			/* contents to stable storage */
+	int (*close)(Vfile *f);
+	int (*stat)(const char *path, Vstat *st);
+	int (*access)(const char *path, int mode);	/* VF_R|VF_W|VF_X */
+	int (*replace)(const char *from, const char *to);	/* rename over to */
+	int (*remove)(const char *path);
+	int (*chmod)(const char *path, unsigned perm);
+	int (*mkdir)(const char *path, unsigned perm);
+	/* Create a new file from a template ending in XXXXXX, private to the
+	 * user, and leave the name in tmpl. NULL with errno set on failure. */
+	Vfile *(*mktemp)(char *tmpl);
+	/* Copy src to dst as the OS does best (a reflink where the filesystem
+	 * shares blocks). 1 when done, 0 when this host has no such call (the
+	 * caller copies the bytes), -1 with errno set on failure. */
+	int (*copy)(const char *src, const char *dst);
+	unsigned (*default_perm)(void);		/* for a file created afresh */
+};
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <fcntl.h>
+#if defined(__APPLE__)
+#include <sys/clonefile.h>
+#endif
+
+struct vfile {
+	int	fd;
+};
+
+static void
+vf_stat_from(Vstat *out, const struct stat *st)
+{
+	memset(out, 0, sizeof(*out));
+	out->size = (long long)st->st_size;
+#if defined(__APPLE__)
+	out->mtime_ns = (long long)st->st_mtimespec.tv_sec * 1000000000LL +
+	    st->st_mtimespec.tv_nsec;
+#else
+	out->mtime_ns = (long long)st->st_mtim.tv_sec * 1000000000LL +
+	    st->st_mtim.tv_nsec;
+#endif
+	out->dev = (unsigned long long)st->st_dev;
+	out->ino = (unsigned long long)st->st_ino;
+	out->perm = (unsigned)(st->st_mode & 07777);
+	out->blksize = (long)st->st_blksize;
+	out->is_reg = S_ISREG(st->st_mode);
+	out->is_dir = S_ISDIR(st->st_mode);
+}
+
+static Vfile *
+vfd_open(const char *path, int flags, unsigned perm)
+{
+	int oflags = (flags & VF_WRITE) ?
+	    ((flags & VF_READ) ? O_RDWR : O_WRONLY) : O_RDONLY;
+	Vfile *f;
+	int fd;
+
+	if (flags & VF_CREATE)
+		oflags |= O_CREAT;
+	if (flags & VF_TRUNC)
+		oflags |= O_TRUNC;
+	if (flags & VF_EXCL)
+		oflags |= O_EXCL;
+#ifdef O_CLOEXEC
+	oflags |= O_CLOEXEC;
+#endif
+	fd = open(path, oflags, (mode_t)perm);
+	if (fd < 0)
+		return NULL;
+	f = malloc(sizeof(*f));
+	if (!f) {
+		close(fd);
+		errno = ENOMEM;
+		return NULL;
+	}
+	f->fd = fd;
+	return f;
+}
+
+static long
+vfd_read(Vfile *f, void *buf, size_t n)
+{
+	ssize_t r;
+
+	while ((r = read(f->fd, buf, n)) < 0 && errno == EINTR)
+		;
+	return (long)r;
+}
+
+static long
+vfd_write(Vfile *f, const void *buf, size_t n)
+{
+	ssize_t r;
+
+	while ((r = write(f->fd, buf, n)) < 0 && errno == EINTR)
+		;
+	return (long)r;
+}
+
+static int
+vfd_fstat(Vfile *f, Vstat *out)
+{
+	struct stat st;
+
+	if (fstat(f->fd, &st) != 0)
+		return -1;
+	vf_stat_from(out, &st);
+	return 0;
+}
+
+static int
+vfd_sync(Vfile *f)
+{
+	return fsync(f->fd);
+}
+
+static int
+vfd_close(Vfile *f)
+{
+	int rc = close(f->fd);
+
+	free(f);
+	return rc;
+}
+
+static int
+vfd_stat(const char *path, Vstat *out)
+{
+	struct stat st;
+
+	if (stat(path, &st) != 0)
+		return -1;
+	vf_stat_from(out, &st);
+	return 0;
+}
+
+static int
+vfd_access(const char *path, int mode)
+{
+	int m = ((mode & VF_R) ? R_OK : 0) | ((mode & VF_W) ? W_OK : 0) |
+	    ((mode & VF_X) ? X_OK : 0);
+
+	return access(path, m);
+}
+
+static int
+vfd_replace(const char *from, const char *to)
+{
+	return rename(from, to);
+}
+
+static int
+vfd_remove(const char *path)
+{
+	return unlink(path);
+}
+
+static int
+vfd_chmod(const char *path, unsigned perm)
+{
+	return chmod(path, (mode_t)perm);
+}
+
+static int
+vfd_mkdir(const char *path, unsigned perm)
+{
+	return mkdir(path, (mode_t)perm);
+}
+
+static Vfile *
+vfd_mktemp(char *tmpl)
+{
+	Vfile *f;
+	int fd = mkstemp(tmpl);
+
+	if (fd < 0)
+		return NULL;
+#ifdef FD_CLOEXEC
+	fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
+	f = malloc(sizeof(*f));
+	if (!f) {
+		close(fd);
+		unlink(tmpl);
+		errno = ENOMEM;
+		return NULL;
+	}
+	f->fd = fd;
+	return f;
+}
+
+/* Linux: copy_file_range shares blocks on btrfs, XFS and bcachefs and does
+ * a kernel-side copy elsewhere. macOS: clonefile shares blocks on APFS.
+ * Other systems copy the bytes in the caller. */
+static int
+vfd_copy(const char *src, const char *dst)
+{
+#if defined(__linux__)
+	int in = open(src, O_RDONLY | O_CLOEXEC), out, saved;
+	struct stat st;
+	long long left;
+
+	if (in < 0)
+		return -1;
+	if (fstat(in, &st) != 0 || !S_ISREG(st.st_mode)) {
+		close(in);
+		errno = EINVAL;
+		return -1;
+	}
+	out = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (out < 0) {
+		saved = errno;
+		close(in);
+		errno = saved;
+		return -1;
+	}
+	left = (long long)st.st_size;
+	while (left > 0) {
+		ssize_t n = copy_file_range(in, NULL, out, NULL, (size_t)left, 0);
+
+		if (n < 0) {
+			saved = errno;
+			close(in);
+			close(out);
+			if (saved == EXDEV || saved == EINVAL || saved == ENOSYS ||
+			    saved == EOPNOTSUPP) {
+				unlink(dst);
+				return 0;	/* let the caller copy the bytes */
+			}
+			unlink(dst);
+			errno = saved;
+			return -1;
+		}
+		if (n == 0)
+			break;
+		left -= n;
+	}
+	close(in);
+	if (close(out) != 0) {
+		saved = errno;
+		unlink(dst);
+		errno = saved;
+		return -1;
+	}
+	return 1;
+#elif defined(__APPLE__)
+	unlink(dst);
+	if (clonefile(src, dst, 0) == 0)
+		return 1;
+	if (errno == ENOTSUP || errno == EXDEV || errno == EINVAL)
+		return 0;
+	return -1;
+#else
+	(void)src;
+	(void)dst;
+	return 0;
+#endif
+}
+
+static unsigned
+vfd_default_perm(void)
+{
+	mode_t um = umask(0);
+
+	umask(um);
+	return (unsigned)(0666 & ~um);
+}
+
+static const struct vfs_ops vfs_native = {
+	vfd_open, vfd_read, vfd_write, vfd_fstat, vfd_sync,
+	vfd_close, vfd_stat, vfd_access, vfd_replace, vfd_remove,
+	vfd_chmod, vfd_mkdir, vfd_mktemp, vfd_copy, vfd_default_perm,
+};
+
+#else /* _WIN32 */
+
+struct vfile {
+	HANDLE	h;
+};
+
+/* The editor's paths are UTF-8; the file API wants UTF-16. */
+static int
+win_wpath(const char *path, WCHAR *out, int outn)
+{
+	int n = MultiByteToWideChar(CP_UTF8, 0, path, -1, out, outn);
+
+	if (n <= 0) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	return 0;
+}
+
+static void
+win_errno(DWORD err)
+{
+	switch (err) {
+	case ERROR_FILE_NOT_FOUND:
+	case ERROR_PATH_NOT_FOUND:
+	case ERROR_INVALID_NAME:
+		errno = ENOENT;
+		break;
+	case ERROR_ACCESS_DENIED:
+	case ERROR_WRITE_PROTECT:
+		errno = EACCES;
+		break;
+	case ERROR_FILE_EXISTS:
+	case ERROR_ALREADY_EXISTS:
+		errno = EEXIST;
+		break;
+	case ERROR_SHARING_VIOLATION:
+	case ERROR_LOCK_VIOLATION:
+		errno = EBUSY;
+		break;
+	case ERROR_DISK_FULL:
+	case ERROR_HANDLE_DISK_FULL:
+		errno = ENOSPC;
+		break;
+	case ERROR_NOT_ENOUGH_MEMORY:
+	case ERROR_OUTOFMEMORY:
+		errno = ENOMEM;
+		break;
+	case ERROR_DIR_NOT_EMPTY:
+		errno = ENOTEMPTY;
+		break;
+	default:
+		errno = EIO;
+		break;
+	}
+}
+
+static Vfile *
+win_open_h(HANDLE h)
+{
+	Vfile *f = malloc(sizeof(*f));
+
+	if (!f) {
+		CloseHandle(h);
+		errno = ENOMEM;
+		return NULL;
+	}
+	f->h = h;
+	return f;
+}
+
+static Vfile *
+win_open(const char *path, int flags, unsigned perm)
+{
+	WCHAR w[PATH_MAX];
+	DWORD access = (flags & VF_WRITE) ? GENERIC_WRITE : 0, disp;
+	HANDLE h;
+
+	(void)perm;
+	if (flags & VF_READ)
+		access |= GENERIC_READ;
+	if (flags & VF_CREATE)
+		disp = (flags & VF_EXCL) ? CREATE_NEW :
+		    (flags & VF_TRUNC) ? CREATE_ALWAYS : OPEN_ALWAYS;
+	else
+		disp = (flags & VF_TRUNC) ? TRUNCATE_EXISTING : OPEN_EXISTING;
+	if (win_wpath(path, w, PATH_MAX) != 0)
+		return NULL;
+	h = CreateFileW(w, access,
+	    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, disp,
+	    FILE_ATTRIBUTE_NORMAL, NULL);
+	if (h == INVALID_HANDLE_VALUE) {
+		win_errno(GetLastError());
+		return NULL;
+	}
+	return win_open_h(h);
+}
+
+static long
+win_read(Vfile *f, void *buf, size_t n)
+{
+	DWORD got = 0;
+
+	if (!ReadFile(f->h, buf, (DWORD)(n > 0x40000000 ? 0x40000000 : n),
+	    &got, NULL)) {
+		DWORD err = GetLastError();
+
+		if (err == ERROR_BROKEN_PIPE || err == ERROR_HANDLE_EOF)
+			return 0;
+		win_errno(err);
+		return -1;
+	}
+	return (long)got;
+}
+
+static long
+win_write(Vfile *f, const void *buf, size_t n)
+{
+	DWORD put = 0;
+
+	if (!WriteFile(f->h, buf, (DWORD)(n > 0x40000000 ? 0x40000000 : n),
+	    &put, NULL)) {
+		win_errno(GetLastError());
+		return -1;
+	}
+	return (long)put;
+}
+
+static long long
+win_filetime_ns(FILETIME ft)
+{
+	unsigned long long t = ((unsigned long long)ft.dwHighDateTime << 32) |
+	    ft.dwLowDateTime;
+
+	/* 100 ns units since 1601 to ns since 1970 */
+	return (long long)(t - 116444736000000000ULL) * 100;
+}
+
+static int
+win_fstat(Vfile *f, Vstat *out)
+{
+	BY_HANDLE_FILE_INFORMATION bi;
+
+	if (!GetFileInformationByHandle(f->h, &bi)) {
+		win_errno(GetLastError());
+		return -1;
+	}
+	memset(out, 0, sizeof(*out));
+	out->size = (long long)(((unsigned long long)bi.nFileSizeHigh << 32) |
+	    bi.nFileSizeLow);
+	out->mtime_ns = win_filetime_ns(bi.ftLastWriteTime);
+	out->dev = bi.dwVolumeSerialNumber;
+	out->ino = ((unsigned long long)bi.nFileIndexHigh << 32) |
+	    bi.nFileIndexLow;
+	out->is_dir = (bi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+	out->is_reg = !out->is_dir &&
+	    !(bi.dwFileAttributes & FILE_ATTRIBUTE_DEVICE);
+	out->perm = (bi.dwFileAttributes & FILE_ATTRIBUTE_READONLY) ?
+	    0444 : 0644;
+	out->blksize = 65536;
+	return 0;
+}
+
+static int
+win_sync(Vfile *f)
+{
+	if (!FlushFileBuffers(f->h)) {
+		win_errno(GetLastError());
+		return -1;
+	}
+	return 0;
+}
+
+static int
+win_close(Vfile *f)
+{
+	int rc = CloseHandle(f->h) ? 0 : -1;
+
+	if (rc < 0)
+		win_errno(GetLastError());
+	free(f);
+	return rc;
+}
+
+/* A handle opened for metadata only works for directories too. */
+static int
+win_stat(const char *path, Vstat *out)
+{
+	WCHAR w[PATH_MAX];
+	HANDLE h;
+	Vfile f;
+	int rc;
+
+	if (win_wpath(path, w, PATH_MAX) != 0)
+		return -1;
+	h = CreateFileW(w, FILE_READ_ATTRIBUTES,
+	    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+	    OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+	if (h == INVALID_HANDLE_VALUE) {
+		win_errno(GetLastError());
+		return -1;
+	}
+	f.h = h;
+	rc = win_fstat(&f, out);
+	CloseHandle(h);
+	return rc;
+}
+
+static int
+win_access(const char *path, int mode)
+{
+	WCHAR w[PATH_MAX];
+	DWORD attr;
+
+	if (win_wpath(path, w, PATH_MAX) != 0)
+		return -1;
+	attr = GetFileAttributesW(w);
+	if (attr == INVALID_FILE_ATTRIBUTES) {
+		win_errno(GetLastError());
+		return -1;
+	}
+	if ((mode & VF_W) && (attr & FILE_ATTRIBUTE_READONLY)) {
+		errno = EACCES;
+		return -1;
+	}
+	return 0;
+}
+
+/* ReplaceFileW keeps the target's attributes and ACL; a missing target
+ * takes the plain move. */
+static int
+win_replace(const char *from, const char *to)
+{
+	WCHAR wf[PATH_MAX], wt[PATH_MAX];
+
+	if (win_wpath(from, wf, PATH_MAX) != 0 ||
+	    win_wpath(to, wt, PATH_MAX) != 0)
+		return -1;
+	if (GetFileAttributesW(wt) != INVALID_FILE_ATTRIBUTES) {
+		if (ReplaceFileW(wt, wf, NULL, REPLACEFILE_IGNORE_MERGE_ERRORS,
+		    NULL, NULL))
+			return 0;
+	}
+	if (MoveFileExW(wf, wt, MOVEFILE_REPLACE_EXISTING |
+	    MOVEFILE_WRITE_THROUGH))
+		return 0;
+	win_errno(GetLastError());
+	return -1;
+}
+
+static int
+win_remove(const char *path)
+{
+	WCHAR w[PATH_MAX];
+
+	if (win_wpath(path, w, PATH_MAX) != 0)
+		return -1;
+	if (!DeleteFileW(w)) {
+		win_errno(GetLastError());
+		return -1;
+	}
+	return 0;
+}
+
+/* The only mode Windows has is the read-only attribute. */
+static int
+win_chmod_path(const char *path, unsigned perm)
+{
+	WCHAR w[PATH_MAX];
+	DWORD attr;
+
+	if (win_wpath(path, w, PATH_MAX) != 0)
+		return -1;
+	attr = GetFileAttributesW(w);
+	if (attr == INVALID_FILE_ATTRIBUTES) {
+		win_errno(GetLastError());
+		return -1;
+	}
+	if (perm & 0200)
+		attr &= ~(DWORD)FILE_ATTRIBUTE_READONLY;
+	else
+		attr |= FILE_ATTRIBUTE_READONLY;
+	if (!SetFileAttributesW(w, attr)) {
+		win_errno(GetLastError());
+		return -1;
+	}
+	return 0;
+}
+
+static int
+win_mkdir_path(const char *path, unsigned perm)
+{
+	WCHAR w[PATH_MAX];
+
+	(void)perm;
+	if (win_wpath(path, w, PATH_MAX) != 0)
+		return -1;
+	if (!CreateDirectoryW(w, NULL)) {
+		win_errno(GetLastError());
+		return -1;
+	}
+	return 0;
+}
+
+static Vfile *
+win_mktemp(char *tmpl)
+{
+	static const char alphabet[] =
+	    "abcdefghijklmnopqrstuvwxyz0123456789";
+	size_t len = strlen(tmpl);
+	unsigned long long seed;
+	int tries;
+
+	if (len < 6 || strcmp(tmpl + len - 6, "XXXXXX") != 0) {
+		errno = EINVAL;
+		return NULL;
+	}
+	seed = GetTickCount64() ^ ((unsigned long long)GetCurrentProcessId() << 20)
+	    ^ (unsigned long long)(uintptr_t)tmpl;
+	for (tries = 0; tries < 100; tries++) {
+		WCHAR w[PATH_MAX];
+		HANDLE h;
+		int i;
+
+		for (i = 0; i < 6; i++) {
+			seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+			tmpl[len - 6 + i] = alphabet[(seed >> 33) % 36];
+		}
+		if (win_wpath(tmpl, w, PATH_MAX) != 0)
+			return NULL;
+		h = CreateFileW(w, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+		    CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (h != INVALID_HANDLE_VALUE)
+			return win_open_h(h);
+		if (GetLastError() != ERROR_FILE_EXISTS) {
+			win_errno(GetLastError());
+			return NULL;
+		}
+	}
+	errno = EEXIST;
+	return NULL;
+}
+
+/* CopyFileW shares blocks on ReFS where it can and copies elsewhere. */
+static int
+win_copy(const char *src, const char *dst)
+{
+	WCHAR ws[PATH_MAX], wd[PATH_MAX];
+
+	if (win_wpath(src, ws, PATH_MAX) != 0 ||
+	    win_wpath(dst, wd, PATH_MAX) != 0)
+		return -1;
+	if (!CopyFileW(ws, wd, FALSE)) {
+		win_errno(GetLastError());
+		return -1;
+	}
+	return 1;
+}
+
+static unsigned
+win_default_perm(void)
+{
+	return 0644;
+}
+
+static const struct vfs_ops vfs_native = {
+	win_open, win_read, win_write, win_fstat, win_sync, win_close,
+	win_stat, win_access, win_replace, win_remove, win_chmod_path,
+	win_mkdir_path, win_mktemp, win_copy, win_default_perm,
+};
+#endif /* _WIN32 */
+
+static const struct vfs_ops *g_vfs = &vfs_native;
+
+/* ---- helpers over the table ---- */
+
+/* Read all of path into a malloc'd, NUL-terminated buffer. The size from
+ * fstat sizes the buffer for a regular file; anything else grows. Returns
+ * 0 with *out and *len set (the NUL is not counted), or -1 with errno. */
+static int
+vf_read_file(const char *path, char **out, size_t *len)
+{
+	Vfile *f = g_vfs->open(path, VF_READ, 0);
+	Vstat st;
+	char *buf;
+	size_t cap, n = 0;
+	long chunk = 65536;
+	int saved;
+
+	*out = NULL;
+	*len = 0;
+	if (!f)
+		return -1;
+	cap = 4096;
+	if (g_vfs->fstat(f, &st) == 0) {
+		if (st.is_reg && st.size >= 0 && (unsigned long long)st.size <
+		    SIZE_MAX / 2)
+			cap = (size_t)st.size + 1;
+		if (st.blksize > chunk)
+			chunk = st.blksize;
+	}
+	buf = malloc(cap);
+	if (!buf) {
+		g_vfs->close(f);
+		errno = ENOMEM;
+		return -1;
+	}
+	for (;;) {
+		size_t want;
+		long r;
+
+		if (n + 1 >= cap) {
+			char *p;
+
+			if (cap > SIZE_MAX / 2) {
+				errno = ENOMEM;
+				goto fail;
+			}
+			cap *= 2;
+			p = realloc(buf, cap);
+			if (!p) {
+				errno = ENOMEM;
+				goto fail;
+			}
+			buf = p;
+		}
+		want = cap - 1 - n;
+		if (want > (size_t)chunk)
+			want = (size_t)chunk;
+		r = g_vfs->read(f, buf + n, want);
+		if (r < 0)
+			goto fail;
+		if (r == 0)
+			break;
+		n += (size_t)r;
+	}
+	buf[n] = '\0';
+	g_vfs->close(f);
+	*out = buf;
+	*len = n;
+	return 0;
+fail:
+	saved = errno;
+	free(buf);
+	g_vfs->close(f);
+	errno = saved;
+	return -1;
+}
+
+/* Write all n bytes, looping over short writes. 0, or -1 with errno. */
+static int
+vf_write_all(Vfile *f, const void *buf, size_t n)
+{
+	const char *p = buf;
+
+	while (n > 0) {
+		long w = g_vfs->write(f, p, n);
+
+		if (w < 0)
+			return -1;
+		if (w == 0) {
+			errno = EIO;
+			return -1;
+		}
+		p += w;
+		n -= (size_t)w;
+	}
+	return 0;
+}
+
+/* Copy src to dst, sharing blocks when the host can, else byte by byte,
+ * and give dst the permission bits. 0, or -1 with errno set. */
+static int
+vf_copy(const char *src, const char *dst, unsigned perm)
+{
+	int rc = g_vfs->copy(src, dst);
+
+	if (rc == 0) {
+		Vfile *in = g_vfs->open(src, VF_READ, 0), *out;
+		char buf[65536];
+		int saved;
+
+		if (!in)
+			return -1;
+		out = g_vfs->open(dst, VF_WRITE | VF_CREATE | VF_TRUNC, 0600);
+		if (!out) {
+			saved = errno;
+			g_vfs->close(in);
+			errno = saved;
+			return -1;
+		}
+		for (;;) {
+			long r = g_vfs->read(in, buf, sizeof(buf));
+
+			if (r < 0 || (r > 0 && vf_write_all(out, buf, (size_t)r) != 0)) {
+				saved = errno;
+				g_vfs->close(in);
+				g_vfs->close(out);
+				g_vfs->remove(dst);
+				errno = saved;
+				return -1;
+			}
+			if (r == 0)
+				break;
+		}
+		g_vfs->close(in);
+		if (g_vfs->close(out) != 0) {
+			saved = errno;
+			g_vfs->remove(dst);
+			errno = saved;
+			return -1;
+		}
+	} else if (rc < 0) {
+		return -1;
+	}
+	(void)g_vfs->chmod(dst, perm);
+	return 0;
+}
+
+/* The mtime as the whole seconds the rest of the editor keeps. */
+static time_t
+vf_mtime(const Vstat *st)
+{
+	return (time_t)(st->mtime_ns / 1000000000LL);
+}
 
 /* The embedded VT terminal panel (shell / build output in a buffer) is built by
  * default. A primitive embedding host that wants none of the PTY and emulator
@@ -2376,30 +3174,14 @@ cfg_load_mem(Cfg *c, char *text)
 int
 vedit_cfg_load(Cfg *c, const char *path)
 {
-	FILE *f;
-	long sz;
-	size_t got;
 	char *buf;
+	size_t len;
 	int rc;
 
 	if (!c)
 		return -1;
-	f = fopen(path, "r");
-	if (!f)
+	if (vf_read_file(path, &buf, &len) != 0)
 		return -1;
-	if (fseek(f, 0, SEEK_END) != 0 || (sz = ftell(f)) < 0) {
-		fclose(f);
-		return -1;
-	}
-	rewind(f);
-	buf = malloc((size_t)sz + 1);
-	if (!buf) {
-		fclose(f);
-		return -1;
-	}
-	got = fread(buf, 1, (size_t)sz, f);	/* text mode may read fewer */
-	buf[got] = '\0';
-	fclose(f);
 	rc = cfg_load_mem(c, buf);
 	free(buf);
 	return rc;
@@ -7355,37 +8137,13 @@ text_free(Text *t)
  * start of the bytes to load. Detects the line-ending style from the bytes,
  * so it serves both a real file and a recovered swap body. Returns OK, or ERR
  * with errno set on a read or allocation failure. */
+/* Load the bytes of a file (data, len) into t: detect the line-ending
+ * style, split the lines, reset the history. Returns OK, or ERR with errno
+ * set. The buffer stays the caller's. */
 int
-text_load_fp(Text *t, FILE *fp)
+text_load_mem(Text *t, const char *data, size_t len)
 {
-	char *data = NULL;
-	size_t len = 0, cap = 0;
-	int c;
 	size_t start, i;
-	int saved_errno;
-
-	while ((c = fgetc(fp)) != EOF) {
-		if (len + 1 > cap) {
-			size_t ncap = cap ? cap * 2 : 4096;
-			char *p = realloc(data, ncap);
-
-			if (!p) {
-				saved_errno = errno;
-				free(data);
-				errno = saved_errno;
-				return ERR;
-			}
-			data = p;
-			cap = ncap;
-		}
-		data[len++] = (char)c;
-	}
-	if (ferror(fp)) {
-		saved_errno = errno;
-		free(data);
-		errno = saved_errno;
-		return ERR;
-	}
 
 	text_clear(t);
 	estack_clear(&t->undo);		/* history does not span a reload */
@@ -7428,7 +8186,6 @@ text_load_fp(Text *t, FILE *fp)
 				llen--;		/* drop the DOS line's trailing CR */
 			if (lines_insert_at(t, t->nlines, data + start, llen)
 			    != OK) {
-				free(data);
 				errno = ENOMEM;
 				return ERR;
 			}
@@ -7442,13 +8199,11 @@ text_load_fp(Text *t, FILE *fp)
 				llen--;
 			if (lines_insert_at(t, t->nlines, data + start, llen)
 			    != OK) {
-				free(data);
 				errno = ENOMEM;
 				return ERR;
 			}
 		}
 	}
-	free(data);
 
 	if (t->nlines == 0 &&
 	    lines_insert_at(t, 0, "", 0) != OK) {	/* empty file: one line */
@@ -7459,29 +8214,74 @@ text_load_fp(Text *t, FILE *fp)
 	return OK;
 }
 
-/* Load a file by path into t. Opens it read-only and delegates to
- * text_load_fp. Returns OK, or ERR with errno set (ENOENT for a missing file,
- * which callers treat as a new buffer). */
+/* Load a stream into t (a memory stream, or a test's temporary file). Reads
+ * it whole, then parses. Returns OK, or ERR with errno set. */
 int
-text_load(Text *t, const char *path)
+text_load_fp(Text *t, FILE *fp)
 {
-	FILE *fp = fopen(path, "rb");
+	char *data = NULL;
+	size_t len = 0, cap = 0;
 	int rc, saved_errno;
 
-	if (!fp)
+	for (;;) {
+		size_t got;
+
+		if (len + 1 >= cap) {
+			size_t ncap = cap ? cap * 2 : 65536;
+			char *p = realloc(data, ncap);
+
+			if (!p) {
+				free(data);
+				errno = ENOMEM;
+				return ERR;
+			}
+			data = p;
+			cap = ncap;
+		}
+		got = fread(data + len, 1, cap - len, fp);
+		if (got == 0)
+			break;
+		len += got;
+	}
+	if (ferror(fp)) {
+		saved_errno = errno;
+		free(data);
+		errno = saved_errno;
 		return ERR;
-	rc = text_load_fp(t, fp);
+	}
+	rc = text_load_mem(t, data ? data : "", len);
 	saved_errno = errno;
-	fclose(fp);
+	free(data);
 	errno = saved_errno;
 	return rc;
 }
 
-/* Write every line of t to fp, with the terminator chosen from t->eol. The
- * trailing terminator is emitted only when the source carried one. The caller
- * owns fp. Returns OK, or ERR with errno set on a write failure. */
+/* Load a file by path into t, read whole in the file's preferred chunks.
+ * Returns OK, or ERR with errno set (ENOENT for a missing file, which
+ * callers treat as a new buffer). */
 int
-text_write_fp(const Text *t, FILE *fp)
+text_load(Text *t, const char *path)
+{
+	char *data;
+	size_t len;
+	int rc, saved_errno;
+
+	if (vf_read_file(path, &data, &len) != 0)
+		return ERR;
+	rc = text_load_mem(t, data, len);
+	saved_errno = errno;
+	free(data);
+	errno = saved_errno;
+	return rc;
+}
+
+/* Hand every line of t to emit, with the terminator chosen from t->eol. The
+ * trailing terminator goes out only when the source carried one. Returns OK,
+ * or ERR as soon as emit fails (with errno set by it). */
+typedef int (*text_emit_fn)(void *ctx, const char *buf, size_t n);
+
+static int
+text_write(const Text *t, text_emit_fn emit, void *ctx)
 {
 	size_t i;
 	const char *term = (t->eol == EOL_CRLF) ? "\r\n" :
@@ -7490,17 +8290,73 @@ text_write_fp(const Text *t, FILE *fp)
 
 	for (i = 0; i < t->nlines; i++) {
 		if (t->lines[i].len &&
-		    fwrite(t->lines[i].buf, 1, t->lines[i].len, fp)
-		    != t->lines[i].len)
+		    emit(ctx, t->lines[i].buf, t->lines[i].len) != 0)
 			return ERR;
 		/* a terminator between lines, and after the last only when the
 		 * source carried a trailing terminator */
-		if (i + 1 < t->nlines || t->final_newline) {
-			if (fwrite(term, 1, termlen, fp) != termlen)
-				return ERR;
-		}
+		if ((i + 1 < t->nlines || t->final_newline) &&
+		    emit(ctx, term, termlen) != 0)
+			return ERR;
 	}
 	return OK;
+}
+
+static int
+text_emit_fp(void *ctx, const char *buf, size_t n)
+{
+	return fwrite(buf, 1, n, (FILE *)ctx) == n ? 0 : -1;
+}
+
+/* Write every line of t to fp (a memory stream, the swap, a test). The
+ * caller owns fp. Returns OK, or ERR with errno set on a write failure. */
+int
+text_write_fp(const Text *t, FILE *fp)
+{
+	return text_write(t, text_emit_fp, fp);
+}
+
+/* The file writer gathers the lines into large writes. */
+typedef struct text_vfw {
+	Vfile	*f;
+	size_t	n;
+	char	buf[65536];
+} Textvfw;
+
+static int
+text_vfw_flush(Textvfw *w)
+{
+	int rc = w->n ? vf_write_all(w->f, w->buf, w->n) : 0;
+
+	w->n = 0;
+	return rc;
+}
+
+static int
+text_emit_vf(void *ctx, const char *buf, size_t n)
+{
+	Textvfw *w = ctx;
+
+	if (n > sizeof(w->buf) - w->n) {
+		if (text_vfw_flush(w) != 0)
+			return -1;
+		if (n > sizeof(w->buf))
+			return vf_write_all(w->f, buf, n);
+	}
+	memcpy(w->buf + w->n, buf, n);
+	w->n += n;
+	return 0;
+}
+
+static int
+text_write_vf(const Text *t, Vfile *f)
+{
+	Textvfw w;
+
+	w.f = f;
+	w.n = 0;
+	if (text_write(t, text_emit_vf, &w) != OK)
+		return ERR;
+	return text_vfw_flush(&w) == 0 ? OK : ERR;
 }
 
 /* Save t to path atomically: write the bytes to a temporary file in the same
@@ -7512,13 +8368,13 @@ text_save(Text *t, const char *path)
 {
 	char tmp[PATH_MAX];
 	const char *slash = strrchr(path, '/');
-	int fd, saved_errno;
-	FILE *fp;
-	struct stat st;
-	mode_t mode;
+	int saved_errno;
+	Vfile *f;
+	Vstat st;
+	unsigned perm;
 
-	/* The temp file must share the target's directory so the rename stays
-	 * on one filesystem (an atomic replace, never an EXDEV copy). */
+	/* The temp file must share the target's directory so the replace stays
+	 * on one filesystem (an atomic rename, never an EXDEV copy). */
 	if (slash) {
 		int dlen = (int)(slash - path);
 
@@ -7532,57 +8388,40 @@ text_save(Text *t, const char *path)
 		errno = ENAMETOOLONG;
 		return ERR;
 	}
-	fd = mkstemp(tmp);
-	if (fd < 0) {
+	f = g_vfs->mktemp(tmp);
+	if (!f) {
 		/* The directory is not writable (so no sibling temp is possible),
 		 * but the file itself might be. Fall back to a direct, in-place
 		 * write: not atomic, but it still saves the common case of a
 		 * writable file in a read-only directory. */
-		fp = fopen(path, "wb");
-		if (!fp)
+		f = g_vfs->open(path, VF_WRITE | VF_CREATE | VF_TRUNC,
+		    g_vfs->default_perm());
+		if (!f)
 			return ERR;
-		if (text_write_fp(t, fp) != OK) {
+		if (text_write_vf(t, f) != OK) {
 			saved_errno = errno;
-			fclose(fp);
+			g_vfs->close(f);
 			errno = saved_errno;
 			return ERR;
 		}
-		if (fclose(fp) != 0)
+		if (g_vfs->close(f) != 0)
 			return ERR;
 		t->dirty = 0;
 		return OK;
 	}
-	fp = fdopen(fd, "wb");
-	if (!fp) {
+	if (text_write_vf(t, f) != OK || g_vfs->sync(f) != 0) {
 		saved_errno = errno;
-		close(fd);
+		g_vfs->close(f);
 		goto fail;
 	}
-	if (text_write_fp(t, fp) != OK) {
-		saved_errno = errno;
-		fclose(fp);
-		goto fail;
-	}
-	if (fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
-		saved_errno = errno;
-		fclose(fp);
-		goto fail;
-	}
-	if (fclose(fp) != 0) {
+	if (g_vfs->close(f) != 0) {
 		saved_errno = errno;
 		goto fail;
 	}
-	/* Keep the existing file's permission bits; mkstemp made tmp 0600. */
-	if (stat(path, &st) == 0)
-		mode = st.st_mode & 07777;
-	else {
-		mode_t um = umask(0);
-
-		umask(um);
-		mode = 0666 & ~um;
-	}
-	(void)chmod(tmp, mode);
-	if (rename(tmp, path) != 0) {
+	/* Keep the existing file's permission bits; the temp was made private. */
+	perm = (g_vfs->stat(path, &st) == 0) ? st.perm : g_vfs->default_perm();
+	(void)g_vfs->chmod(tmp, perm);
+	if (g_vfs->replace(tmp, path) != 0) {
 		saved_errno = errno;
 		goto fail;
 	}
@@ -7590,7 +8429,7 @@ text_save(Text *t, const char *path)
 	return OK;
 
 fail:
-	unlink(tmp);
+	g_vfs->remove(tmp);
 	errno = saved_errno;
 	return ERR;
 }
@@ -15199,7 +16038,7 @@ resolve_dir_opt(const char *key, char *out, size_t sz)
 	} else if ((size_t)snprintf(out, sz, "%s", v) >= sz) {
 		return 0;
 	}
-	if (access(out, W_OK | X_OK) != 0)
+	if (g_vfs->access(out, VF_W | VF_X) != 0)
 		return 0;
 	return 1;
 }
@@ -15241,44 +16080,6 @@ static int
 backup_path_for(const char *file_path, char *out, size_t sz)
 {
 	return aux_path_for(file_path, "edit.backupdir", 0, "~", out, sz);
-}
-
-/* Copy src's bytes to dst, giving dst the mode bits. Returns 0, or -1 with
- * errno set. Used to keep the previous version as a backup before a save. */
-static int
-file_copy(const char *src, const char *dst, mode_t mode)
-{
-	FILE *in = fopen(src, "rb"), *out;
-	char buf[8192];
-	size_t n;
-	int saved;
-
-	if (!in)
-		return -1;
-	out = fopen(dst, "wb");
-	if (!out) {
-		saved = errno;
-		fclose(in);
-		errno = saved;
-		return -1;
-	}
-	while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
-		if (fwrite(buf, 1, n, out) != n) {
-			saved = errno;
-			fclose(in);
-			fclose(out);
-			errno = saved;
-			return -1;
-		}
-	}
-	saved = ferror(in);
-	fclose(in);
-	if (fclose(out) != 0 || saved) {
-		errno = saved ? EIO : errno;
-		return -1;
-	}
-	(void)chmod(dst, mode);
-	return 0;
 }
 
 /* Set e->swap_path from the active buffer's name when swap is enabled and the
@@ -15512,12 +16313,12 @@ ed_save_file(Editor *e)
 		ed_format(e);		/* best effort; a failure leaves the buffer */
 #endif
 	if (e->backup_enabled && e->has_name) {
-		struct stat st;
+		Vstat st;
 		char backup[PATH_MAX];
 
-		if (stat(e->path, &st) == 0 && S_ISREG(st.st_mode) &&
+		if (g_vfs->stat(e->path, &st) == 0 && st.is_reg &&
 		    backup_path_for(e->path, backup, sizeof(backup)))
-			(void)file_copy(e->path, backup, st.st_mode & 07777);
+			(void)vf_copy(e->path, backup, st.perm);
 	}
 #ifdef VEDIT_ART
 	if (e->art && art_export(e) < 0)	/* the grid is the truth */
@@ -15539,7 +16340,7 @@ mkdir_p(const char *dir)
 {
 	char buf[PATH_MAX];
 	char *p;
-	struct stat st;
+	Vstat st;
 
 	if (snprintf(buf, sizeof(buf), "%s", dir) >= (int)sizeof(buf)) {
 		errno = ENAMETOOLONG;
@@ -15549,15 +16350,15 @@ mkdir_p(const char *dir)
 		if (*p != '/')
 			continue;
 		*p = '\0';
-		if (mkdir(buf, 0777) != 0 && errno != EEXIST)
+		if (g_vfs->mkdir(buf, 0777) != 0 && errno != EEXIST)
 			return -1;
 		*p = '/';
 	}
-	if (mkdir(buf, 0777) != 0 && errno != EEXIST)
+	if (g_vfs->mkdir(buf, 0777) != 0 && errno != EEXIST)
 		return -1;
-	if (stat(buf, &st) != 0)
+	if (g_vfs->stat(buf, &st) != 0)
 		return -1;
-	if (!S_ISDIR(st.st_mode)) {
+	if (!st.is_dir) {
 		errno = ENOTDIR;
 		return -1;
 	}
@@ -15572,13 +16373,13 @@ save_ensure_dir(Editor *e)
 {
 	char dir[PATH_MAX], msg[PATH_MAX + 32];
 	const char *slash = strrchr(e->path, '/');
-	struct stat st;
+	Vstat st;
 	int room, dlen;
 
 	if (!slash || slash == e->path)
 		return 1;			/* the cwd or the root: exists */
 	snprintf(dir, sizeof(dir), "%.*s", (int)(slash - e->path), e->path);
-	if (stat(dir, &st) == 0 || errno != ENOENT)
+	if (g_vfs->stat(dir, &st) == 0 || errno != ENOENT)
 		return 1;
 	/* keep the tail of a long path: its last components are what matter */
 	room = e->cols > 30 ? e->cols - 30 : 30;
@@ -16833,12 +17634,12 @@ buf_cycle(Editor *e, int dir)
 static int
 buf_same_file(const char *a, const char *b)
 {
-	struct stat sa, sb;
+	Vstat sa, sb;
 
 	if (strcmp(a, b) == 0)
 		return 1;
-	if (stat(a, &sa) == 0 && stat(b, &sb) == 0)
-		return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+	if (g_vfs->stat(a, &sa) == 0 && g_vfs->stat(b, &sb) == 0)
+		return sa.dev == sb.dev && sa.ino == sb.ino;
 	return 0;
 }
 
@@ -16874,8 +17675,8 @@ buf_open(Editor *e, const char *path)
 		return -1;
 	}
 	if (path && path[0]) {			/* offer swap recovery */
-		struct stat st;
-		time_t mt = (stat(path, &st) == 0) ? st.st_mtime : 0;
+		Vstat st;
+		time_t mt = (g_vfs->stat(path, &st) == 0) ? vf_mtime(&st) : 0;
 
 		swap_action = swap_recover(e, path, nt, mt);
 		swap_mtime = mt;
@@ -17386,46 +18187,29 @@ tags_locate(Editor *e, char *out, size_t outsz)
 
 	if (cfg && cfg[0]) {
 		snprintf(out, outsz, "%s", cfg);
-		return access(out, R_OK) == 0 ? 0 : -1;
+		return g_vfs->access(out, VF_R) == 0 ? 0 : -1;
 	}
 	if (!e->has_name)
 		return -1;
 	path_dir(e->path, dir, sizeof(dir));
 	if (snprintf(out, outsz, "%s/tags", dir) >= (int)outsz)
 		return -1;
-	return access(out, R_OK) == 0 ? 0 : -1;
+	return g_vfs->access(out, VF_R) == 0 ? 0 : -1;
 }
 
 /* Read and parse the tags file at path into db. Returns 0, or -1 on error. */
 static int
 tags_load(Tagdb *db, const char *path)
 {
-	FILE *fp = fopen(path, "rb");
-	char *data = NULL;
-	size_t len = 0, cap = 0, start, i;
-	int c;
+	char *data;
+	size_t len, start, i;
 
-	if (!fp)
+	if (vf_read_file(path, &data, &len) != 0)
 		return -1;
-	while ((c = fgetc(fp)) != EOF) {
-		if (len + 2 > cap) {
-			size_t nc = cap ? cap * 2 : 8192;
-			char *p = realloc(data, nc);
-
-			if (!p) {
-				free(data);
-				fclose(fp);
-				return -1;
-			}
-			data = p;
-			cap = nc;
-		}
-		data[len++] = (char)c;
-	}
-	fclose(fp);
-	if (!data)				/* empty file */
+	if (len == 0) {				/* empty file */
+		free(data);
 		return 0;
-	data[len] = '\0';
+	}
 	path_dir(path, db->dir, sizeof(db->dir));
 
 	for (start = 0, i = 0; i < len; i++) {
@@ -17828,49 +18612,29 @@ cc_resolve(Editor *e, CcIncludes *out)
 	static int cache_valid;
 
 	const char *cfg = cfg_proj_get("cc.file");
-	struct stat st;
+	Vstat st;
 	char *json = NULL, *p;
-	size_t len = 0, cap = 0;
-	FILE *fp;
-	int c;
+	size_t len = 0;
 
 	out->found = 0;
 	out->ninc = out->nquote = 0;
 	out->dir[0] = '\0';
 	if (!cfg || !cfg[0] || !e->has_name)
 		return -1;
-	if (stat(cfg, &st) != 0)
+	if (g_vfs->stat(cfg, &st) != 0)
 		return -1;
 
-	if (cache_valid && cache_mtime == st.st_mtime &&
-	    cache_size == st.st_size && strcmp(cache_key, e->path) == 0 &&
+	if (cache_valid && cache_mtime == vf_mtime(&st) &&
+	    cache_size == (off_t)st.size && strcmp(cache_key, e->path) == 0 &&
 	    strcmp(cache_db, cfg) == 0) {
 		*out = cache;
 		return out->found ? 0 : -1;
 	}
 
-	fp = fopen(cfg, "rb");
-	if (!fp)
-		return -1;
-	while ((c = fgetc(fp)) != EOF) {
-		if (len + 2 > cap) {
-			size_t nc = cap ? cap * 2 : 8192;
-			char *np = realloc(json, nc);
+	if (vf_read_file(cfg, &json, &len) != 0)
+		return -1;			/* unreadable: do not cache */
 
-			if (!np) {
-				free(json);
-				fclose(fp);
-				return -1;	/* allocation failure: do not cache */
-			}
-			json = np;
-			cap = nc;
-		}
-		json[len++] = (char)c;
-	}
-	fclose(fp);
-
-	if (json) {
-		json[len] = '\0';
+	if (len > 0) {
 		p = cc_skip_ws(json);
 		if (*p == '[') {
 			p++;
@@ -17890,8 +18654,8 @@ cc_resolve(Editor *e, CcIncludes *out)
 	cache = *out;				/* remember this outcome */
 	snprintf(cache_key, sizeof(cache_key), "%s", e->path);
 	snprintf(cache_db, sizeof(cache_db), "%s", cfg);
-	cache_mtime = st.st_mtime;
-	cache_size = st.st_size;
+	cache_mtime = vf_mtime(&st);
+	cache_size = (off_t)st.size;
 	cache_valid = 1;
 	return out->found ? 0 : -1;
 }
@@ -17979,7 +18743,7 @@ cc_try_open(Editor *e, const char *path)
 
 	if (path_normalize(path, norm, sizeof(norm)) != 0)
 		snprintf(norm, sizeof(norm), "%.4094s", path);	/* fall back */
-	if (access(norm, R_OK) != 0)
+	if (g_vfs->access(norm, VF_R) != 0)
 		return -1;
 	if (ed_goto_target(e, norm, 0, NULL) != 0)
 		return -1;
@@ -19319,14 +20083,8 @@ mail_new_buffer(Editor *e, const char *data, size_t len, const Mailref *ref,
 		free(m);
 		return -1;
 	}
-	if (len > 0) {
-		FILE *in = fmemopen((void *)data, len, "rb");
-
-		if (in) {
-			text_load_fp(e->t, in);
-			fclose(in);
-		}
-	}
+	if (len > 0)
+		text_load_mem(e->t, data, len);
 	e->t->dirty = dirty;
 	e->mref = m;
 	e->cy = e->cx = e->top = e->left = 0;
@@ -20005,7 +20763,7 @@ filepick_load(Filepick *fp)
 		return;
 	while ((de = readdir(dp)) != NULL) {
 		char path[PATH_MAX];
-		struct stat st;
+		Vstat st;
 		int isdir, len;
 		char *nm;
 
@@ -20014,9 +20772,9 @@ filepick_load(Filepick *fp)
 		if (snprintf(path, sizeof(path), "%s/%s", fp->dir,
 		    de->d_name) >= (int)sizeof(path))
 			continue;
-		if (stat(path, &st) != 0)
+		if (g_vfs->stat(path, &st) != 0)
 			continue;
-		isdir = S_ISDIR(st.st_mode) ? 1 : 0;
+		isdir = st.is_dir ? 1 : 0;
 		if (fp->n == fp->cap) {
 			int nc = fp->cap ? fp->cap * 2 : 32;
 			Fpent *ne = realloc(fp->ent, (size_t)nc * sizeof(*ne));
@@ -20100,7 +20858,7 @@ filepick_submit(void *ctx, const char *text)
 {
 	Filepick *fp = ctx;
 	char cand[PATH_MAX];
-	struct stat st;
+	Vstat st;
 
 	if (!text[0])
 		return PICK_STAY;
@@ -20112,7 +20870,7 @@ filepick_submit(void *ctx, const char *text)
 	    >= (int)sizeof(cand)) {
 		return PICK_STAY;
 	}
-	if (stat(cand, &st) == 0 && S_ISDIR(st.st_mode)) {
+	if (g_vfs->stat(cand, &st) == 0 && st.is_dir) {
 		filepick_chdir(fp, cand);
 		return PICK_STAY;
 	}
@@ -20132,10 +20890,10 @@ static void
 filepick_start_dir(const char *start, char *out, size_t outsz)
 {
 	char dirpart[PATH_MAX];
-	struct stat st;
+	Vstat st;
 	const char *d = NULL;
 
-	if (start && start[0] && stat(start, &st) == 0 && S_ISDIR(st.st_mode)) {
+	if (start && start[0] && g_vfs->stat(start, &st) == 0 && st.is_dir) {
 		d = start;			/* start is itself a directory */
 	} else if (start && start[0]) {
 		const char *slash = strrchr(start, '/');
@@ -20227,8 +20985,8 @@ ed_open(Editor *e)
 		return;
 	}
 	{
-		struct stat st;
-		time_t mt = (stat(path, &st) == 0) ? st.st_mtime : 0;
+		Vstat st;
+		time_t mt = (g_vfs->stat(path, &st) == 0) ? vf_mtime(&st) : 0;
 		int action = swap_recover(e, path, nt, mt);
 
 		if (action == SWAP_ABORT) {	/* keep the current buffer */
@@ -22108,14 +22866,8 @@ vcs_open_text(Editor *e, const char *text, size_t len, const char *label,
 
 	if (i < 0)
 		return -1;
-	if (len > 0) {
-		FILE *in = fmemopen((void *)text, len, "rb");
-
-		if (in) {
-			text_load_fp(e->t, in);
-			fclose(in);
-		}
-	}
+	if (len > 0)
+		text_load_mem(e->t, text, len);
 	e->t->dirty = 0;
 	e->t->readonly = 1;
 	snprintf(e->label, sizeof(e->label), "%s", label);
@@ -22344,8 +23096,8 @@ vcs_commit_send(Editor *e)
 	char name[32], msgpath[PATH_MAX], path[PATH_MAX];
 	struct fmtbuf b;
 	size_t i, n, last = 0;
-	FILE *fp;
-	int fd, rc, src;
+	Vfile *f;
+	int rc, src;
 
 	if (!colon || (size_t)(colon - e->vcs_src) >= sizeof(name))
 		return -1;
@@ -22378,10 +23130,8 @@ vcs_commit_send(Editor *e)
 		set_status(e, "commit: TMPDIR too long");
 		return -1;
 	}
-	fd = mkstemp(msgpath);
-	if (fd < 0 || !(fp = fdopen(fd, "w"))) {
-		if (fd >= 0)
-			close(fd);
+	f = g_vfs->mktemp(msgpath);
+	if (!f) {
 		set_status(e, "commit: %s", strerror(errno));
 		return -1;
 	}
@@ -22391,11 +23141,11 @@ vcs_commit_send(Editor *e)
 
 		if (!ln || (len > 0 && ln[0] == '#'))
 			continue;
-		fwrite(ln, 1, len, fp);
-		fputc('\n', fp);
+		if (vf_write_all(f, ln, len) != 0 || vf_write_all(f, "\n", 1) != 0)
+			break;
 	}
-	if (fclose(fp) != 0) {
-		unlink(msgpath);
+	if (g_vfs->close(f) != 0 || i < last) {
+		g_vfs->remove(msgpath);
 		set_status(e, "commit: %s", strerror(errno));
 		return -1;
 	}
@@ -24364,13 +25114,13 @@ vedit_new(const struct vedit_io *io)
 int
 vedit_open(struct vedit *v, const char *path)
 {
-	struct stat st;
+	Vstat st;
 
 	snprintf(v->e.path, sizeof(v->e.path), "%s", path);
 	v->e.has_name = 1;
 	if (text_load(v->e.t, v->e.path) < 0 && errno != ENOENT)
 		return -1;
-	v->e.load_mtime = (stat(v->e.path, &st) == 0) ? st.st_mtime : 0;
+	v->e.load_mtime = (g_vfs->stat(v->e.path, &st) == 0) ? vf_mtime(&st) : 0;
 	v->e.syn = syn_for_path(v->e.path);
 	v->e.expand_tabs = indent_expand_default(v->e.syn ? v->e.syn->name : NULL);
 	tabs_config(&v->e);
@@ -24645,25 +25395,20 @@ static const char g_config_template[] =
 static void
 ed_edit_config(Editor *e)
 {
-	struct stat st;
+	Vstat st;
 	int existed;
 
 	if (e->cfg_path[0] == '\0') {
 		set_status(e, "no config file for this session (see --config)");
 		return;
 	}
-	existed = stat(e->cfg_path, &st) == 0;
+	existed = g_vfs->stat(e->cfg_path, &st) == 0;
 	if (buf_open(e, e->cfg_path) < 0)
 		return;				/* buf_open set the status */
 	if (!existed && text_lines(e->t) == 1 && e->t->lines[0].len == 0) {
-		FILE *in = fmemopen((void *)g_config_template,
-		    sizeof(g_config_template) - 1, "rb");
-
-		if (in) {
-			if (text_load_fp(e->t, in) == OK)
-				e->t->dirty = 1;
-			fclose(in);
-		}
+		if (text_load_mem(e->t, g_config_template,
+		    sizeof(g_config_template) - 1) == OK)
+			e->t->dirty = 1;
 		e->hl_valid = 0;
 	}
 	if (!e->syn) {
@@ -30955,11 +31700,8 @@ art_export(Editor *e)
 		return -1;
 	}
 	if (len > 0) {
-		FILE *in = fmemopen(buf, len, "rb");
-		int rc = in ? text_load_fp(nt, in) : ERR;
+		int rc = text_load_mem(nt, buf, len);
 
-		if (in)
-			fclose(in);
 		if (rc != OK) {
 			text_free(nt);
 			free(buf);
@@ -31087,14 +31829,8 @@ term_repost_text(Editor *e)
 		free(buf);
 		return -1;
 	}
-	if (len > 0) {
-		FILE *in = fmemopen(buf, len, "rb");
-
-		if (in) {
-			text_load_fp(e->t, in);
-			fclose(in);
-		}
-	}
+	if (len > 0)
+		text_load_mem(e->t, buf, len);
 	free(buf);
 	e->t->dirty = 1;
 	set_status(e, "reposted %d lines as text [%d/%d]", nlines, e->cur + 1,
@@ -32208,25 +32944,25 @@ cli_run_filter(void *ctx, const char *cmd, const char *dir,
 {
 	char line[8192], tail[PATH_MAX + 32], tmp[PATH_MAX];
 	const char *tmpdir = getenv("TEMP");
-	int fd, rc;
+	Vfile *f;
+	int rc;
 
 	(void)ctx;
 	if (!tmpdir || !tmpdir[0])
 		tmpdir = ".";
 	snprintf(tmp, sizeof(tmp), "%s\\vedit-in.XXXXXX", tmpdir);
-	fd = mkstemp(tmp);
-	if (fd < 0)
+	f = g_vfs->mktemp(tmp);
+	if (!f)
 		return -1;
-	if (inlen > 0 && (size_t)_write(fd, input, (unsigned)inlen) != inlen) {
-		_close(fd);
-		_unlink(tmp);
+	if ((inlen > 0 && vf_write_all(f, input, inlen) != 0) ||
+	    g_vfs->close(f) != 0) {
+		g_vfs->remove(tmp);
 		return -1;
 	}
-	_close(fd);
 	snprintf(tail, sizeof(tail), "< \"%s\" 2>NUL", tmp);
 	win_cmdline(line, sizeof(line), cmd, dir, tail);
 	rc = win_popen_run(line, emit, sink);
-	_unlink(tmp);
+	g_vfs->remove(tmp);
 	return rc;
 }
 #else /* POSIX: fork and exec through /bin/sh */
@@ -32555,7 +33291,7 @@ maildir_folders(void *ctx, int (*emit)(void *sink, const char *name),
 		return -1;
 	while ((de = readdir(d)) != NULL) {
 		char probe[PATH_MAX], *name;
-		struct stat st;
+		Vstat st;
 		size_t k;
 
 		if (de->d_name[0] != '.' || de->d_name[1] == '\0' ||
@@ -32563,7 +33299,7 @@ maildir_folders(void *ctx, int (*emit)(void *sink, const char *name),
 			continue;
 		if (snprintf(probe, sizeof(probe), "%s/%s/cur", m->root,
 		    de->d_name) >= (int)sizeof(probe) ||
-		    stat(probe, &st) != 0 || !S_ISDIR(st.st_mode))
+		    g_vfs->stat(probe, &st) != 0 || !st.is_dir)
 			continue;
 		if (n == cap) {
 			int ncap = cap ? cap * 2 : 16;
@@ -32696,7 +33432,7 @@ maildir_list(void *ctx, const char *folder,
 			char path[PATH_MAX], uid[256];
 			char from[256], subject[256], date[128];
 			struct vedit_mail_summary sum;
-			struct stat st;
+			Vstat st;
 			size_t hlen;
 			const char *colon;
 
@@ -32705,7 +33441,7 @@ maildir_list(void *ctx, const char *folder,
 			if (snprintf(path, sizeof(path), "%s/%s", sub, de->d_name) >=
 			    (int)sizeof(path))
 				continue;
-			if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+			if (g_vfs->stat(path, &st) != 0 || !st.is_reg)
 				continue;
 			colon = strchr(de->d_name, ':');
 			snprintf(uid, sizeof(uid), "%.*s", colon ?
@@ -32721,7 +33457,7 @@ maildir_list(void *ctx, const char *folder,
 			sum.from = from;
 			sum.subject = subject;
 			sum.date = date;
-			sum.size = (long)st.st_size;
+			sum.size = (long)st.size;
 			if (emit(sink, &sum) != 0) {
 				closedir(d);
 				free(head);
@@ -33051,6 +33787,35 @@ main(int argc, char **argv)
 	int scale = 0;		/* 0: from the display */
 #endif
 
+#ifdef _WIN32
+	/* The C runtime hands argv in the ANSI code page; take the wide command
+	 * line instead so any file name reaches the editor as UTF-8. */
+	{
+		int wargc = 0;
+		LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+
+		if (wargv && wargc > 0) {
+			char **uargv = calloc((size_t)wargc + 1, sizeof(*uargv));
+			int k, ok = uargv != NULL;
+
+			for (k = 0; ok && k < wargc; k++) {
+				int n = WideCharToMultiByte(CP_UTF8, 0, wargv[k], -1,
+				    NULL, 0, NULL, NULL);
+
+				uargv[k] = n > 0 ? malloc((size_t)n) : NULL;
+				if (!uargv[k] || WideCharToMultiByte(CP_UTF8, 0,
+				    wargv[k], -1, uargv[k], n, NULL, NULL) <= 0)
+					ok = 0;
+			}
+			if (ok) {
+				argc = wargc;
+				argv = uargv;	/* leaked at exit, like argv itself */
+			}
+		}
+		if (wargv)
+			LocalFree(wargv);
+	}
+#endif
 	if (argv[0])
 		progname = argv[0];
 	for (i = 1; i < argc; i++) {
