@@ -281,6 +281,7 @@ XDG layout (`-DVEDIT_NO_XDG`) uses `~/.veditrc` instead.
     tabstops =           # a ruler of stops, e.g. "5 9 17"; empty = none
     swap = on            # keep a crash-recovery swap beside the file (on by default)
     swapdir =            # where swap files go; empty = beside the file
+    mmap = on            # map files read-only; lines are copied as edited
     backup = off         # keep the previous version as a "~" file on save
     backupdir =          # where backups go; empty = beside the file
     formatonsave = off   # run command.<lang>.format before each save
@@ -674,6 +675,36 @@ edits made since the last quiet moment. Once the journal grows past a few
 megabytes vedit compacts it: the base is rewritten from the current text and
 the journal starts over. A new buffer that has never been saved has no name
 yet, so it gets no swap until its first save.
+
+### Large files
+
+A file is not read into memory when it is opened. vedit maps it read-only
+and keeps each line as a pointer into the map, so an unedited file costs no
+heap beyond a small record per line, the operating system pages the bytes in
+and out as the view needs them, and opening is a scan for line breaks. A
+line is copied to the heap the first time it is changed, and only that line.
+Saving walks the lines, so the mapped bytes are never written back in place.
+
+| 200 MB, 4 million lines | mapped | read into memory |
+|---|---|---|
+| open | 0.13 s | 0.63 s |
+| peak resident memory | 302 MB, of which 200 MB is page cache the kernel may drop | 607 MB |
+
+The first edit of a mapped file takes the crash-recovery base (see above),
+which on a filesystem with reflinks costs nothing, and moves the map onto
+that base. From then on nothing another program does to the original can
+disturb the buffer. Before that first edit the map still points at the file
+itself, so a program that truncates the file while you are looking at it
+would pull pages out from under the editor. vedit catches that fault, shows
+the lost part as blank, and tells you, so `:e!` can reload; nothing is
+written anywhere by that event. Windows does not let another program
+truncate a mapped file in the first place.
+
+`edit.mmap = off` reads every file into memory as before, for a filesystem
+that does not map well (some network or FUSE mounts) or a host that must not
+hold files open. On Windows the mapping pins the file, so the swap base is
+copied into memory when the swap is removed after a save, and the original
+is copied before an in-place save over it.
 
 ### File browser
 

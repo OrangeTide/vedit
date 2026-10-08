@@ -3508,16 +3508,16 @@ t_tbl_edit(Test *t)
 	/* set: quoting only when needed, a short row padded, one undo step */
 	TAP_CHECK(t, tbl_set_cell(&v->e, 1, 1, "Ann, PhD", 8) == 0);
 	line = text_line(v->e.t, 1, &len);
-	TAP_CHECKF(t, strcmp(line, "1,\"Ann, PhD\",x") == 0, "row 2 [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "1,\"Ann, PhD\",x"), "row 2 [%.*s]", (int)len, line);
 	TAP_CHECK(t, tbl_set_cell(&v->e, 1, 1, "Ann", 3) == 0);
 	line = text_line(v->e.t, 1, &len);
-	TAP_CHECKF(t, strcmp(line, "1,Ann,x") == 0, "row 2 [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "1,Ann,x"), "row 2 [%.*s]", (int)len, line);
 	TAP_CHECK(t, tbl_set_cell(&v->e, 2, 2, "say \"hi\"\nthere", 14) == 0);
 	line = text_line(v->e.t, 2, &len);
-	TAP_CHECKF(t, strcmp(line, "2,Bob,\"say \"\"hi\"\"\nthere\"") == 0, "row 3 [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "2,Bob,\"say \"\"hi\"\"\nthere\""), "row 3 [%.*s]", (int)len, line);
 	TAP_CHECK(t, text_undo(v->e.t, &v->e.cy, &v->e.cx) == 0);
 	line = text_line(v->e.t, 2, &len);
-	TAP_CHECKF(t, strcmp(line, "2,Bob") == 0, "after undo [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "2,Bob"), "after undo [%.*s]", (int)len, line);
 	TAP_CHECK(t, text_dirty(v->e.t));
 
 	/* keys: Delete clears; typing replaces through the prompt; Ctrl+C/V */
@@ -3529,7 +3529,7 @@ t_tbl_edit(Test *t)
 	seq.key = TKBD_KEY_DEL;
 	run_req(&v->e, tbl_key(&v->e, &seq));
 	line = text_line(v->e.t, 1, &len);
-	TAP_CHECKF(t, strcmp(line, "1,Ann,") == 0, "cleared [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "1,Ann,"), "cleared [%.*s]", (int)len, line);
 	v->e.tbl->cx = 1;
 	seq.key = TKBD_KEY_C;
 	seq.mod = TKBD_MOD_CTRL;
@@ -3539,7 +3539,7 @@ t_tbl_edit(Test *t)
 	seq.key = TKBD_KEY_V;
 	run_req(&v->e, tbl_key(&v->e, &seq));
 	line = text_line(v->e.t, 1, &len);
-	TAP_CHECKF(t, strcmp(line, "1,Ann,Ann") == 0, "pasted [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "1,Ann,Ann"), "pasted [%.*s]", (int)len, line);
 	seq.mod = 0;
 	vedit_free(v);
 	memio_free(&m);
@@ -3556,7 +3556,7 @@ t_tbl_edit(Test *t)
 	seq.ch = 'Q';
 	run_req(&v->e, tbl_key(&v->e, &seq));
 	line = text_line(v->e.t, 1, &len);
-	TAP_CHECKF(t, strcmp(line, "1,Qx,x") == 0, "replaced [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "1,Qx,x"), "replaced [%.*s]", (int)len, line);
 	vedit_free(v);
 	memio_free(&m);
 
@@ -3573,12 +3573,12 @@ t_tbl_edit(Test *t)
 	seq.ch = 'a';
 	run_req(&v->e, tbl_key(&v->e, &seq));
 	line = text_line(v->e.t, 1, &len);
-	TAP_CHECKF(t, strcmp(line, "1,Ann!,x") == 0, "appended [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "1,Ann!,x"), "appended [%.*s]", (int)len, line);
 	seq.key = TKBD_KEY_X;
 	seq.ch = 'x';
 	run_req(&v->e, tbl_key(&v->e, &seq));
 	line = text_line(v->e.t, 1, &len);
-	TAP_CHECKF(t, strcmp(line, "1,,x") == 0, "x cleared [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "1,,x"), "x cleared [%.*s]", (int)len, line);
 	snprintf(v->e.last_find, sizeof(v->e.last_find), "needle");
 	v->e.vi_search_dir = 1;
 	seq.key = TKBD_KEY_N;
@@ -3641,7 +3641,7 @@ t_tbl_loop(Test *t)
 	TAP_CHECKF(t, v->e.cy == 2 && v->e.tbl->cx == 2, "ended on row %zu col %d",
 	    v->e.cy, v->e.tbl->cx);
 	line = text_line(v->e.t, 2, &len);
-	TAP_CHECKF(t, strcmp(line, "2,Bob,y!") == 0, "row 3 [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "2,Bob,y!"), "row 3 [%.*s]", (int)len, line);
 	TAP_CHECK(t, !text_dirty(v->e.t));
 	vedit_free(v);
 	memio_free(&m);
@@ -3685,7 +3685,7 @@ t_tbl_rows(Test *t)
 	TAP_CHECKF(t, text_lines(v->e.t) == 6 && v->e.cy == 1, "%zu lines, row %zu",
 	    text_lines(v->e.t), v->e.cy);
 	line = text_line(v->e.t, 3, &len);
-	TAP_CHECK(t, strcmp(line, "1,Ann,x") == 0 && text_line_len(v->e.t, 1) == 0);
+	TAP_CHECK(t, lineq(line, len, "1,Ann,x") && text_line_len(v->e.t, 1) == 0);
 	TAP_CHECK(t, text_undo(v->e.t, &v->e.cy, &v->e.cx) == 0 && text_lines(v->e.t) == 4);
 	v->e.cy = 3;
 	tbl_row_add(&v->e, 1, 1);
@@ -3695,14 +3695,14 @@ t_tbl_rows(Test *t)
 	TAP_CHECKF(t, text_lines(v->e.t) == 3 && v->e.cy == 1, "%zu lines after rowdel",
 	    text_lines(v->e.t));
 	line = text_line(v->e.t, 1, &len);
-	TAP_CHECK(t, strcmp(line, "3,Cy,z") == 0);
+	TAP_CHECK(t, lineq(line, len, "3,Cy,z"));
 	TAP_CHECK(t, v->e.clip_len == 10 && memcmp(v->e.clip, "1,Ann,x\n2\n", 10) == 0);
 	tbl_row_paste(&v->e, 0);		/* above: back where they were */
 	TAP_CHECK(t, text_lines(v->e.t) == 5 && v->e.cy == 1);
 	line = text_line(v->e.t, 2, &len);
-	TAP_CHECKF(t, strcmp(line, "2") == 0, "pasted row 3 [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "2"), "pasted row 3 [%.*s]", (int)len, line);
 	line = text_line(v->e.t, 3, &len);
-	TAP_CHECK(t, strcmp(line, "3,Cy,z") == 0);
+	TAP_CHECK(t, lineq(line, len, "3,Cy,z"));
 	v->e.cy = 4;
 	tbl_row_paste(&v->e, 1);		/* below the last row */
 	TAP_CHECK(t, text_lines(v->e.t) == 7 && v->e.cy == 5);
@@ -3714,36 +3714,36 @@ t_tbl_rows(Test *t)
 	tbl_col_add(&v->e, 1, 0);
 	TAP_CHECK(t, v->e.tbl->ncols == 4 && v->e.tbl->cx == 1);
 	line = text_line(v->e.t, 0, &len);
-	TAP_CHECKF(t, strcmp(line, "\xef\xbb\xbfid,,name,note") == 0, "header [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "\xef\xbb\xbfid,,name,note"), "header [%.*s]", (int)len, line);
 	line = text_line(v->e.t, 2, &len);
-	TAP_CHECK(t, strcmp(line, "2") == 0);
+	TAP_CHECK(t, lineq(line, len, "2"));
 	/* insert right of A on row 0 keeps the BOM ahead of A */
 	v->e.tbl->cx = 0;
 	tbl_set_width(v->e.tbl, 0, 5);
 	tbl_set_width(v->e.tbl, 1, 7);
 	tbl_col_add(&v->e, 1, 1);
 	line = text_line(v->e.t, 0, &len);
-	TAP_CHECKF(t, strcmp(line, "\xef\xbb\xbfid,,,name,note") == 0, "header [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "\xef\xbb\xbfid,,,name,note"), "header [%.*s]", (int)len, line);
 	TAP_CHECK(t, v->e.tbl->cx == 1 && v->e.tbl->ncols == 5);
 	TAP_CHECK(t, tbl_width(v->e.tbl, 0) == 5 && tbl_width(v->e.tbl, 1) == 10 &&
 	    tbl_width(v->e.tbl, 2) == 7);
 	/* delete the two empty columns; then the last column; then the only one */
 	tbl_col_del(&v->e, 2);
 	line = text_line(v->e.t, 0, &len);
-	TAP_CHECKF(t, strcmp(line, "\xef\xbb\xbfid,name,note") == 0, "header [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "\xef\xbb\xbfid,name,note"), "header [%.*s]", (int)len, line);
 	TAP_CHECK(t, v->e.tbl->ncols == 3 && tbl_width(v->e.tbl, 1) == 10 && tbl_width(v->e.tbl, 0) == 5);
 	v->e.tbl->cx = 2;
 	tbl_col_del(&v->e, 1);
 	line = text_line(v->e.t, 1, &len);
-	TAP_CHECKF(t, strcmp(line, "1,Ann") == 0, "row 2 [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "1,Ann"), "row 2 [%.*s]", (int)len, line);
 	TAP_CHECK(t, v->e.tbl->ncols == 2 && v->e.tbl->cx == 1);
 	tbl_col_del(&v->e, 5);
 	line = text_line(v->e.t, 0, &len);
-	TAP_CHECKF(t, strcmp(line, "\xef\xbb\xbfid") == 0, "header [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "\xef\xbb\xbfid"), "header [%.*s]", (int)len, line);
 	v->e.tbl->cx = 0;
 	tbl_col_del(&v->e, 1);			/* the only column: cleared */
 	line = text_line(v->e.t, 0, &len);
-	TAP_CHECKF(t, strcmp(line, "\xef\xbb\xbf") == 0 && v->e.tbl->ncols == 1, "header [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "\xef\xbb\xbf") && v->e.tbl->ncols == 1, "header [%.*s]", (int)len, line);
 
 	/* undo from the keys keeps the cell cursor sane */
 	memset(&seq, 0, sizeof(seq));
@@ -3753,7 +3753,7 @@ t_tbl_rows(Test *t)
 	seq.mod = TKBD_MOD_CTRL;
 	run_req(&v->e, tbl_key(&v->e, &seq));
 	line = text_line(v->e.t, 0, &len);
-	TAP_CHECKF(t, strcmp(line, "\xef\xbb\xbfid") == 0, "after undo [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "\xef\xbb\xbfid"), "after undo [%.*s]", (int)len, line);
 	run_req(&v->e, tbl_key(&v->e, &seq));
 	run_req(&v->e, tbl_key(&v->e, &seq));
 	TAP_CHECKF(t, v->e.tbl->ncols == 3, "ncols %d after undos", v->e.tbl->ncols);
@@ -3790,7 +3790,7 @@ t_tbl_rows(Test *t)
 	run_req(&v->e, tbl_key(&v->e, &seq));
 	TAP_CHECK(t, text_lines(v->e.t) == 6 && v->e.cy == 3);
 	line = text_line(v->e.t, 3, &len);
-	TAP_CHECK(t, strcmp(line, "2") == 0);
+	TAP_CHECK(t, lineq(line, len, "2"));
 
 	/* the Edit menu knows the table */
 	TAP_CHECK(t, menu_item_enabled(&v->e, MA_TBL_ROWADD) == 1);
@@ -3835,20 +3835,20 @@ t_sort(Test *t)
 	/* plain: bytewise, so capitals first; then ignore case; then reverse */
 	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "sort")) == REQ_CONTINUE);
 	s = text_line(v->e.t, 0, &len);
-	TAP_CHECKF(t, strcmp(s, "Apple 2") == 0, "line 0 [%s]", s);
+	TAP_CHECKF(t, lineq(s, len, "Apple 2"), "line 0 [%.*s]", (int)len, s);
 	s = text_line(v->e.t, 1, &len);
-	TAP_CHECK(t, strcmp(s, "apple 1") == 0);
+	TAP_CHECK(t, lineq(s, len, "apple 1"));
 	s = text_line(v->e.t, 5, &len);
-	TAP_CHECK(t, strcmp(s, "zoo x") == 0);
+	TAP_CHECK(t, lineq(s, len, "zoo x"));
 	TAP_CHECK(t, text_dirty(v->e.t));
 	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "sort i")) == REQ_CONTINUE);
 	s = text_line(v->e.t, 0, &len);
-	TAP_CHECKF(t, strcmp(s, "apple 1") == 0, "icase line 0 [%s]", s);
+	TAP_CHECKF(t, lineq(s, len, "apple 1"), "icase line 0 [%.*s]", (int)len, s);
 	s = text_line(v->e.t, 1, &len);
-	TAP_CHECK(t, strcmp(s, "Apple 2") == 0);
+	TAP_CHECK(t, lineq(s, len, "Apple 2"));
 	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "sort!")) == REQ_CONTINUE);
 	s = text_line(v->e.t, 0, &len);
-	TAP_CHECKF(t, strcmp(s, "zoo x") == 0, "reverse line 0 [%s]", s);
+	TAP_CHECKF(t, lineq(s, len, "zoo x"), "reverse line 0 [%.*s]", (int)len, s);
 	TAP_CHECK(t, strncmp(v->e.status, "sorted 6 lines", 14) == 0);
 	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "sort!")) == REQ_CONTINUE);
 	TAP_CHECK(t, strcmp(v->e.status, "already in order") == 0);
@@ -3868,22 +3868,22 @@ t_sort(Test *t)
 	}
 	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "sort n 4")) == REQ_CONTINUE);
 	s = text_line(v->e.t, 0, &len);
-	TAP_CHECKF(t, strcmp(s, "ee 1") == 0, "numeric line 0 [%s]", s);
+	TAP_CHECKF(t, lineq(s, len, "ee 1"), "numeric line 0 [%.*s]", (int)len, s);
 	s = text_line(v->e.t, 2, &len);
-	TAP_CHECKF(t, strcmp(s, "aa 10") == 0, "numeric line 2 [%s]", s);
+	TAP_CHECKF(t, lineq(s, len, "aa 10"), "numeric line 2 [%.*s]", (int)len, s);
 	s = text_line(v->e.t, 3, &len);
-	TAP_CHECK(t, strcmp(s, "cc 100") == 0);
+	TAP_CHECK(t, lineq(s, len, "cc 100"));
 	s = text_line(v->e.t, 4, &len);
-	TAP_CHECK(t, strcmp(s, "dd x") == 0);
+	TAP_CHECK(t, lineq(s, len, "dd x"));
 	/* a range sorts only those lines; undo restores one step */
 	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "1,3sort! n 4")) == REQ_CONTINUE);
 	s = text_line(v->e.t, 4, &len);
-	TAP_CHECK(t, strcmp(s, "dd x") == 0);
+	TAP_CHECK(t, lineq(s, len, "dd x"));
 	s = text_line(v->e.t, 0, &len);
-	TAP_CHECKF(t, strcmp(s, "aa 10") == 0, "range line 0 [%s]", s);
+	TAP_CHECKF(t, lineq(s, len, "aa 10"), "range line 0 [%.*s]", (int)len, s);
 	TAP_CHECK(t, text_undo(v->e.t, &v->e.cy, &v->e.cx) == 0);
 	s = text_line(v->e.t, 0, &len);
-	TAP_CHECK(t, strcmp(s, "ee 1") == 0);
+	TAP_CHECK(t, lineq(s, len, "ee 1"));
 	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "sort q")) == REQ_CONTINUE &&
 	    strncmp(v->e.status, "E474", 4) == 0);
 	vedit_free(v);
@@ -3905,16 +3905,16 @@ t_sort(Test *t)
 	v->e.tbl->cx = 1;
 	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "sort n")) == REQ_CONTINUE);
 	s = text_line(v->e.t, 0, &len);
-	TAP_CHECK(t, strcmp(s, "name,qty") == 0);
+	TAP_CHECK(t, lineq(s, len, "name,qty"));
 	s = text_line(v->e.t, 1, &len);
-	TAP_CHECKF(t, strcmp(s, "adams,9") == 0, "table row 2 [%s]", s);
+	TAP_CHECKF(t, lineq(s, len, "adams,9"), "table row 2 [%.*s]", (int)len, s);
 	s = text_line(v->e.t, 3, &len);
-	TAP_CHECK(t, strcmp(s, "Brown,100") == 0);
+	TAP_CHECK(t, lineq(s, len, "Brown,100"));
 	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "sort i A")) == REQ_CONTINUE);
 	s = text_line(v->e.t, 1, &len);
-	TAP_CHECKF(t, strcmp(s, "adams,9") == 0, "by name [%s]", s);
+	TAP_CHECKF(t, lineq(s, len, "adams,9"), "by name [%.*s]", (int)len, s);
 	s = text_line(v->e.t, 3, &len);
-	TAP_CHECKF(t, strcmp(s, "\"Smith, J\",10") == 0, "by name last [%s]", s);
+	TAP_CHECKF(t, lineq(s, len, "\"Smith, J\",10"), "by name last [%.*s]", (int)len, s);
 
 	/* the dialog's keys: Tab to the kind, Right picks decimal, r reverses,
 	 * then Enter; a letter in the column field is a label */

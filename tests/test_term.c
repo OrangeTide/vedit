@@ -1500,11 +1500,11 @@ t_art_edit(Test *t)
 	TAP_ASSERT(t, art_export(&v->e) == 0);
 	TAP_CHECKF(t, text_lines(v->e.t) == 4, "%zu lines", text_lines(v->e.t));
 	line = text_line(v->e.t, 0, &len);
-	TAP_CHECKF(t, strcmp(line, "\033[0;1;30;40mh\033[0m   \xe2\x94\x8c\xe2\x94\x80\xe2\x94\x90") == 0,
-	    "line 0 [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "\033[0;1;30;40mh\033[0m   \xe2\x94\x8c\xe2\x94\x80\xe2\x94\x90"),
+	    "line 0 [%.*s]", (int)len, line);
 	line = text_line(v->e.t, 2, &len);
-	TAP_CHECKF(t, strcmp(line, "\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x90") == 0,
-	    "line 2 [%s]", line);
+	TAP_CHECKF(t, lineq(line, len, "\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x90"),
+	    "line 2 [%.*s]", (int)len, line);
 
 	vedit_free(v);
 	memio_free(&m);

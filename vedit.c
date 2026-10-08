@@ -247,6 +247,12 @@ struct vfs_ops {
 	 * caller copies the bytes), -1 with errno set on failure. */
 	int (*copy)(const char *src, const char *dst);
 	unsigned (*default_perm)(void);		/* for a file created afresh */
+	/* Map a regular file read-only, private to this process, and fill st
+	 * from it. NULL with errno set when the host cannot (an empty file,
+	 * a non-regular file, no mapping support). The pages stay valid until
+	 * unmap even if the file is later removed or replaced by name. */
+	void *(*map)(const char *path, Vstat *st);
+	void (*unmap)(void *p, size_t len);
 };
 
 #ifndef _WIN32
@@ -501,10 +507,46 @@ vfd_default_perm(void)
 	return (unsigned)(0666 & ~um);
 }
 
+#include <sys/mman.h>
+
+static void *
+vfd_map(const char *path, Vstat *st)
+{
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	struct stat sb;
+	void *p;
+
+	if (fd < 0)
+		return NULL;
+	if (fstat(fd, &sb) != 0) {
+		close(fd);
+		return NULL;
+	}
+	if (!S_ISREG(sb.st_mode) || sb.st_size <= 0 ||
+	    (unsigned long long)sb.st_size > (unsigned long long)SIZE_MAX / 2) {
+		close(fd);
+		errno = EINVAL;
+		return NULL;
+	}
+	p = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);				/* the mapping holds the inode */
+	if (p == MAP_FAILED)
+		return NULL;
+	vf_stat_from(st, &sb);
+	return p;
+}
+
+static void
+vfd_unmap(void *p, size_t len)
+{
+	munmap(p, len);
+}
+
 static const struct vfs_ops vfs_native = {
 	vfd_open, vfd_read, vfd_write, vfd_fstat, vfd_sync,
 	vfd_close, vfd_stat, vfd_access, vfd_replace, vfd_remove,
 	vfd_chmod, vfd_mkdir, vfd_mktemp, vfd_copy, vfd_default_perm,
+	vfd_map, vfd_unmap,
 };
 
 #else /* _WIN32 */
@@ -874,10 +916,54 @@ win_default_perm(void)
 	return 0644;
 }
 
+static void *
+win_map(const char *path, Vstat *st)
+{
+	WCHAR w[PATH_MAX];
+	HANDLE h, m;
+	struct vfile vf;
+	void *p;
+
+	if (win_wpath(path, w, PATH_MAX) != 0)
+		return NULL;
+	h = CreateFileW(w, GENERIC_READ,
+	    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+	    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (h == INVALID_HANDLE_VALUE) {
+		errno = ENOENT;
+		return NULL;
+	}
+	vf.h = h;
+	if (win_fstat(&vf, st) != 0 || !st->is_reg || st->size <= 0) {
+		CloseHandle(h);
+		errno = EINVAL;
+		return NULL;
+	}
+	m = CreateFileMappingW(h, NULL, PAGE_READONLY, 0, 0, NULL);
+	CloseHandle(h);			/* the section keeps the file */
+	if (!m) {
+		errno = EIO;
+		return NULL;
+	}
+	p = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+	CloseHandle(m);			/* the view keeps the section */
+	if (!p)
+		errno = ENOMEM;
+	return p;
+}
+
+static void
+win_unmap(void *p, size_t len)
+{
+	(void)len;
+	UnmapViewOfFile(p);
+}
+
 static const struct vfs_ops vfs_native = {
 	win_open, win_read, win_write, win_fstat, win_sync, win_close,
 	win_stat, win_access, win_replace, win_remove, win_chmod_path,
 	win_mkdir_path, win_mktemp, win_copy, win_default_perm,
+	win_map, win_unmap,
 };
 #endif /* _WIN32 */
 
@@ -7943,9 +8029,11 @@ static void estack_clear(Estack *s);
 static void estack_free(Estack *s);
 
 typedef struct line {
-	char	*buf;		/* NUL-terminated line bytes, no newline */
+	char	*buf;		/* line bytes, no newline; NUL-terminated when owned */
 	size_t	len;		/* bytes excluding the NUL */
-	size_t	cap;		/* allocated bytes including room for NUL */
+	size_t	cap;		/* allocated bytes including room for the NUL; 0 =
+				 * borrowed from the text's map (read-only, not
+				 * NUL-terminated: use len), copied on first write */
 } Line;
 
 /* A reversible primitive. Applying one mutates the buffer and yields the
@@ -8006,16 +8094,52 @@ struct text {
 	 * text is still as it was. NULL when nothing listens. */
 	void		(*edit_cb)(void *ctx, const struct text *t, const Erec *op);
 	void		*edit_ctx;
+
+	/* The loaded file mapped read-only (NULL when read into the heap).
+	 * Borrowed lines (cap == 0) point into it; map_st identifies the file
+	 * so a save or a swap can tell when it is about to replace it. torn is
+	 * set by the fault guard when a mapped page vanished underneath. */
+	char		*map;
+	size_t		map_len;
+	Vstat		map_st;
+	int		map_torn;
 };
 
 /****************************************************************
  * Growable storage
  ****************************************************************/
 
+/* Give a borrowed line its own heap copy with room for need bytes (at
+ * least its current length). A no-op for an owned line. */
+static int
+line_own(Line *l, size_t need)
+{
+	size_t cap = 16;
+	char *p;
+
+	if (l->cap)
+		return OK;
+	if (need < l->len)
+		need = l->len;
+	while (cap < need + 1)
+		cap *= 2;
+	p = malloc(cap);
+	if (!p)
+		return ERR;
+	if (l->len)
+		memcpy(p, l->buf, l->len);
+	p[l->len] = '\0';
+	l->buf = p;
+	l->cap = cap;
+	return OK;
+}
+
 static int
 line_reserve(Line *l, size_t need)
 {
 	/* need is bytes excluding the NUL */
+	if (l->cap == 0)
+		return line_own(l, need);
 	if (need + 1 > l->cap) {
 		size_t cap = l->cap ? l->cap : 16;
 		char *p;
@@ -8086,12 +8210,31 @@ lines_insert_at(Text *t, size_t idx, const char *s, size_t n)
 	return OK;
 }
 
+/* Append a line: a copy of s[0..n), or with borrow a line that points at
+ * s itself (cap 0). */
+static int
+lines_push(Text *t, const char *s, size_t n, int borrow)
+{
+	Line *l;
+
+	if (!borrow)
+		return lines_insert_at(t, t->nlines, s, n);
+	if (lines_reserve(t, t->nlines + 1) != OK)
+		return ERR;
+	l = &t->lines[t->nlines++];
+	l->buf = (char *)s;
+	l->len = n;
+	l->cap = 0;
+	return OK;
+}
+
 static void
 lines_remove_at(Text *t, size_t idx)
 {
 	if (idx >= t->nlines)
 		return;
-	free(t->lines[idx].buf);
+	if (t->lines[idx].cap)
+		free(t->lines[idx].buf);
 	memmove(&t->lines[idx], &t->lines[idx + 1],
 	    (t->nlines - idx - 1) * sizeof(Line));
 	t->nlines--;
@@ -8103,8 +8246,214 @@ text_clear(Text *t)
 	size_t i;
 
 	for (i = 0; i < t->nlines; i++)
-		free(t->lines[i].buf);
+		if (t->lines[i].cap)
+			free(t->lines[i].buf);
 	t->nlines = 0;
+}
+
+/****************************************************************
+ * The file map
+ *
+ * text_load maps the file read-only when the host can and hands out
+ * lines that borrow their bytes from the map (cap == 0), so an unedited
+ * gigabyte costs no heap and loading is a scan for separators. A line
+ * is copied to the heap the first time it is written. The map lives
+ * until the text is freed, materialized (every line copied), or remapped
+ * onto the swap base, which holds the same bytes under a name of ours
+ * that no other program rewrites.
+ *
+ * On POSIX a program truncating the mapped file would make a later read
+ * of a vanished page a SIGBUS. The guard below catches that: it drops an
+ * anonymous zero page over the hole, marks the text torn, and returns,
+ * so the editor reports the loss instead of dying. Windows refuses to
+ * truncate a mapped file, so no guard is needed there.
+ ****************************************************************/
+
+static int g_map_enabled = 1;		/* edit.mmap */
+
+#define MAP_MAX	256			/* guarded maps; beyond this, unguarded */
+
+static struct {
+	Text *t;
+} g_maps[MAP_MAX];
+
+#ifndef _WIN32
+static void (*g_bus_fallback)(int);
+
+/* The SIGBUS handler: a fault inside a registered map gets a zero page
+ * and the text is marked torn; anything else goes to the fallback (the
+ * terminal's fatal handler) or the default action. Everything here is
+ * async-signal-safe. */
+static void
+map_on_bus(int sig, siginfo_t *si, void *uc)
+{
+	char *a = si ? (char *)si->si_addr : NULL;
+	long pg = sysconf(_SC_PAGESIZE);
+	int i;
+
+	(void)uc;
+	if (pg <= 0)
+		pg = 4096;
+	for (i = 0; a && i < MAP_MAX; i++) {
+		Text *t = g_maps[i].t;
+		char *page;
+
+		if (!t || !t->map || a < t->map || a >= t->map + t->map_len)
+			continue;
+		page = (char *)((uintptr_t)a & ~(uintptr_t)(pg - 1));
+		if (mmap(page, (size_t)pg, PROT_READ,
+		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED) {
+			t->map_torn = 1;
+			return;
+		}
+		break;
+	}
+	if (g_bus_fallback) {
+		g_bus_fallback(sig);
+		return;
+	}
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
+/* Install the guard (once); fallback handles a SIGBUS that is not ours. */
+static void
+map_guard_install(void (*fallback)(int))
+{
+	static int installed;
+	struct sigaction sa;
+
+	if (fallback)
+		g_bus_fallback = fallback;
+	if (installed)
+		return;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = map_on_bus;
+	sa.sa_flags = SA_SIGINFO;
+	sigaction(SIGBUS, &sa, NULL);
+	installed = 1;
+}
+#else
+static void
+map_guard_install(void (*fallback)(int))
+{
+	(void)fallback;
+}
+#endif
+
+static void
+map_register(Text *t)
+{
+	int i;
+
+	map_guard_install(NULL);
+	for (i = 0; i < MAP_MAX; i++)
+		if (!g_maps[i].t) {
+			g_maps[i].t = t;
+			return;
+		}
+}
+
+static void
+map_unregister(Text *t)
+{
+	int i;
+
+	for (i = 0; i < MAP_MAX; i++)
+		if (g_maps[i].t == t)
+			g_maps[i].t = NULL;
+}
+
+/* Drop the map. The caller has made sure no line borrows from it. */
+static void
+text_unmap(Text *t)
+{
+	if (!t->map)
+		return;
+	map_unregister(t);
+	g_vfs->unmap(t->map, t->map_len);
+	t->map = NULL;
+	t->map_len = 0;
+	t->map_torn = 0;
+}
+
+/* Copy every borrowed line to the heap and drop the map. OK, or ERR
+ * (ENOMEM) with the map still in place and some lines now owned. The
+ * text's contents do not change, hence the const. */
+static int
+text_materialize(const Text *ct)
+{
+	Text *t = (Text *)ct;		/* storage only */
+	size_t i;
+
+	if (!t->map)
+		return OK;
+	for (i = 0; i < t->nlines; i++)
+		if (line_own(&t->lines[i], t->lines[i].len) != OK)
+			return ERR;
+	text_unmap(t);
+	return OK;
+}
+
+/* Move the borrowed lines onto a map of path, which must hold exactly the
+ * bytes of the current map (the swap base cloned from the mapped file).
+ * OK, or ERR with the old map untouched. */
+static int
+text_remap(const Text *ct, const char *path)
+{
+	Text *t = (Text *)ct;		/* storage only */
+	Vstat st;
+	char *np;
+	size_t i;
+
+	if (!t->map || !g_vfs->map)
+		return ERR;
+	np = g_vfs->map(path, &st);
+	if (!np)
+		return ERR;
+	if ((size_t)st.size != t->map_len ||
+	    memcmp(np, t->map, t->map_len > 4096 ? 4096 : t->map_len) != 0) {
+		g_vfs->unmap(np, (size_t)st.size);
+		errno = EINVAL;
+		return ERR;
+	}
+	for (i = 0; i < t->nlines; i++) {
+		Line *l = &t->lines[i];
+
+		if (l->cap == 0 && l->buf >= t->map &&
+		    l->buf <= t->map + t->map_len)
+			l->buf = np + (l->buf - t->map);
+	}
+	map_unregister(t);
+	g_vfs->unmap(t->map, t->map_len);
+	t->map = np;
+	t->map_st = st;
+	map_register(t);
+	return OK;
+}
+
+/* Whether path names the file t has mapped. */
+static int
+text_maps_file(const Text *t, const char *path)
+{
+	Vstat st;
+
+	return t->map && g_vfs->stat(path, &st) == 0 &&
+	    st.dev == t->map_st.dev && st.ino == t->map_st.ino;
+}
+
+/* Before path is truncated in place, or (on Windows, where a mapping
+ * pins the file) replaced or removed: give up the map if it is that
+ * file. Returns OK, or ERR when the lines could not be copied. */
+static int
+text_release_file(const Text *t, const char *path, int in_place)
+{
+#ifdef _WIN32
+	in_place = 1;
+#endif
+	if (!in_place || !text_maps_file(t, path))
+		return OK;
+	return text_materialize(t);
 }
 
 /****************************************************************
@@ -8135,6 +8484,7 @@ text_free(Text *t)
 	if (!t)
 		return;
 	text_clear(t);
+	text_unmap(t);
 	estack_free(&t->undo);
 	estack_free(&t->redo);
 	free(t->lines);
@@ -8152,9 +8502,10 @@ text_free(Text *t)
  * with errno set on a read or allocation failure. */
 /* Load the bytes of a file (data, len) into t: detect the line-ending
  * style, split the lines, reset the history. Returns OK, or ERR with errno
- * set. The buffer stays the caller's. */
-int
-text_load_mem(Text *t, const char *data, size_t len)
+ * set. With borrow the lines point into data, which must then outlive
+ * them (the text's map); otherwise each line is copied. */
+static int
+text_load_bytes(Text *t, const char *data, size_t len, int borrow)
 {
 	size_t start, i;
 
@@ -8188,33 +8539,20 @@ text_load_mem(Text *t, const char *data, size_t len)
 		t->final_newline = (len > 0 && data[len - 1] == sep);
 
 		start = 0;
-		for (i = 0; i < len; i++) {
+		while (start < len) {
+			const char *nl = memchr(data + start, sep, len - start);
 			size_t llen;
 
-			if (data[i] != sep)
-				continue;
+			i = nl ? (size_t)(nl - data) : len;
 			llen = i - start;
 			if (t->eol == EOL_CRLF && llen > 0 &&
 			    data[start + llen - 1] == '\r')
 				llen--;		/* drop the DOS line's trailing CR */
-			if (lines_insert_at(t, t->nlines, data + start, llen)
-			    != OK) {
+			if (lines_push(t, data + start, llen, borrow) != OK) {
 				errno = ENOMEM;
 				return ERR;
 			}
-			start = i + 1;
-		}
-		/* trailing bytes with no terminator form a final line */
-		if (start < len) {
-			size_t llen = len - start;
-
-			if (t->eol == EOL_CRLF && data[start + llen - 1] == '\r')
-				llen--;
-			if (lines_insert_at(t, t->nlines, data + start, llen)
-			    != OK) {
-				errno = ENOMEM;
-				return ERR;
-			}
+			start = i + 1;	/* past the end when the last line had none */
 		}
 	}
 
@@ -8225,6 +8563,12 @@ text_load_mem(Text *t, const char *data, size_t len)
 	}
 	t->dirty = 0;
 	return OK;
+}
+
+int
+text_load_mem(Text *t, const char *data, size_t len)
+{
+	return text_load_bytes(t, data, len, 0);
 }
 
 /* Load a stream into t (a memory stream, or a test's temporary file). Reads
@@ -8269,7 +8613,8 @@ text_load_fp(Text *t, FILE *fp)
 	return rc;
 }
 
-/* Load a file by path into t, read whole in the file's preferred chunks.
+/* Load a file by path into t: mapped and borrowed when the host can (see
+ * the file map above), else read whole in the file's preferred chunks.
  * Returns OK, or ERR with errno set (ENOENT for a missing file, which
  * callers treat as a new buffer). */
 int
@@ -8279,6 +8624,30 @@ text_load(Text *t, const char *path)
 	size_t len;
 	int rc, saved_errno;
 
+	if (g_map_enabled && g_vfs->map) {
+		Vstat st;
+		char *old = t->map;
+		size_t old_len = t->map_len;
+		char *p = g_vfs->map(path, &st);
+
+		if (p) {
+			rc = text_load_bytes(t, p, (size_t)st.size, 1);
+			saved_errno = errno;
+			/* the lines now borrow from p; the old map can go */
+			if (old) {
+				map_unregister(t);
+				g_vfs->unmap(old, old_len);
+			}
+			t->map = p;
+			t->map_len = (size_t)st.size;
+			t->map_st = st;
+			t->map_torn = 0;
+			map_register(t);
+			errno = saved_errno;
+			return rc;
+		}
+		/* empty, special, or a filesystem that will not map: read it */
+	}
 	if (vf_read_file(path, &data, &len) != 0)
 		return ERR;
 	rc = text_load_mem(t, data, len);
@@ -8407,6 +8776,8 @@ text_save(Text *t, const char *path)
 		 * but the file itself might be. Fall back to a direct, in-place
 		 * write: not atomic, but it still saves the common case of a
 		 * writable file in a read-only directory. */
+		if (text_release_file(t, path, 1) != OK)
+			return ERR;
 		f = g_vfs->open(path, VF_WRITE | VF_CREATE | VF_TRUNC,
 		    g_vfs->default_perm());
 		if (!f)
@@ -8434,6 +8805,10 @@ text_save(Text *t, const char *path)
 	/* Keep the existing file's permission bits; the temp was made private. */
 	perm = (g_vfs->stat(path, &st) == 0) ? st.perm : g_vfs->default_perm();
 	(void)g_vfs->chmod(tmp, perm);
+	if (text_release_file(t, path, 0) != OK) {
+		saved_errno = errno;
+		goto fail;
+	}
 	if (g_vfs->replace(tmp, path) != 0) {
 		saved_errno = errno;
 		goto fail;
@@ -8635,6 +9010,8 @@ apply_op(Text *t, const Erec *in, Erec *inv)
 		l = &t->lines[in->line];
 		if (in->col > l->len)
 			return ERR;
+		if (line_own(l, l->len) != OK)
+			return ERR;
 		nn = in->n;
 		if (nn > l->len - in->col)
 			nn = l->len - in->col;
@@ -8660,6 +9037,8 @@ apply_op(Text *t, const Erec *in, Erec *inv)
 			return ERR;
 		l = &t->lines[in->line];
 		if (in->col > l->len)
+			return ERR;
+		if (line_own(l, l->len) != OK)
 			return ERR;
 		if (lines_insert_at(t, in->line + 1, l->buf + in->col,
 		    l->len - in->col) != OK)
@@ -16051,6 +16430,7 @@ enum {
  * two editors, this one or Emacs, see each other. */
 typedef struct swapj {
 	Editor		*e;		/* for swap_enabled */
+	Text		*t;		/* the text it journals */
 	Vfile		*f;		/* the open journal, or NULL */
 	char		path[PATH_MAX];		/* the journal, .swpm */
 	char		base[PATH_MAX];		/* the base, .swpf */
@@ -16381,22 +16761,31 @@ swap_write_header(Swapj *j, time_t load_mtime)
 static int
 swap_write_base(Swapj *j, const Text *t)
 {
+	char tmp[PATH_MAX];
 	Vstat st;
 	Vfile *f;
 
+	/* The base may be mapped by the text (after a remap), so it is never
+	 * rewritten in place: a sibling temp is renamed over it, and the old
+	 * inode lives on under the map. Windows pins a mapped file instead,
+	 * so there the lines are copied out first. */
+	if (text_release_file(t, j->base, 0) != OK)
+		return -1;
 	if (!text_dirty(t) && g_vfs->stat(j->file, &st) == 0 && st.is_reg &&
 	    st.size == j->disk_size && st.mtime_ns == j->disk_mtime_ns &&
 	    vf_copy(j->file, j->base, 0600) == 0)
-		return 0;
-	f = g_vfs->open(j->base, VF_WRITE | VF_CREATE | VF_TRUNC, 0600);
+		return 1;
+	if (snprintf(tmp, sizeof(tmp), "%s~", j->base) >= (int)sizeof(tmp))
+		return -1;
+	f = g_vfs->open(tmp, VF_WRITE | VF_CREATE | VF_TRUNC, 0600);
 	if (!f)
 		return -1;
-	if (text_write_vf(t, f) != OK) {
-		g_vfs->close(f);
-		g_vfs->remove(j->base);
+	if (text_write_vf(t, f) != OK || g_vfs->close(f) != 0 ||
+	    g_vfs->replace(tmp, j->base) != 0) {
+		g_vfs->remove(tmp);
 		return -1;
 	}
-	return g_vfs->close(f);
+	return 0;
 }
 
 /* Start the journal for t: the base, then an empty journal with its header,
@@ -16404,8 +16793,14 @@ swap_write_base(Swapj *j, const Text *t)
 static int
 swap_journal_start(Swapj *j, const Text *t, time_t load_mtime)
 {
-	if (swap_write_base(j, t) != 0)
+	int cloned = swap_write_base(j, t);
+
+	if (cloned < 0)
 		return -1;
+	/* A clone of the mapped file holds the same bytes under our own name:
+	 * move the map there, out of reach of whoever rewrites the original. */
+	if (cloned == 1 && t->map && text_maps_file(t, j->file))
+		(void)text_remap(t, j->base);
 	j->f = g_vfs->open(j->path, VF_WRITE | VF_CREATE | VF_TRUNC, 0600);
 	if (!j->f) {
 		g_vfs->remove(j->base);
@@ -16539,6 +16934,7 @@ swap_attach(Editor *e)
 		j->disk_mtime_ns = -1;
 	}
 	e->t->edit_cb = swap_on_edit;
+	j->t = e->t;
 	e->t->edit_ctx = j;
 }
 
@@ -16553,6 +16949,7 @@ swap_rebind(Editor *e)
 	if (!j)
 		return;
 	e->t->edit_cb = swap_on_edit;
+	j->t = e->t;
 	e->t->edit_ctx = j;
 	if (j->f)
 		swap_compact(j, e->t);
@@ -16572,8 +16969,11 @@ swap_drop(Swapj *j)
 	}
 	if (j->path[0])
 		g_vfs->remove(j->path);
-	if (j->base[0])
+	if (j->base[0]) {
+		if (j->t)
+			(void)text_release_file(j->t, j->base, 0);
 		g_vfs->remove(j->base);
+	}
 	lock_release(j);
 	j->bytes = 0;
 	j->pending = 0;
@@ -16589,6 +16989,8 @@ swap_detach(Text *t, Swapj *j)
 		t->edit_cb = NULL;
 		t->edit_ctx = NULL;
 	}
+	if (j)
+		j->t = NULL;
 	if (j && j->f)
 		g_vfs->close(j->f);
 	free(j);
@@ -19949,8 +20351,9 @@ markpick_label(void *ctx, int i)
 	y = e->vi_mark_y[slot];
 	if (y < text_lines(e->t))
 		s = text_line(e->t, y, &llen);
-	snprintf(mp->line, sizeof(mp->line), " %c  %6zu %4zu  %.80s",
-	    mark_char(slot), y + 1, e->vi_mark_x[slot], s ? s : "");
+	snprintf(mp->line, sizeof(mp->line), " %c  %6zu %4zu  %.*s",
+	    mark_char(slot), y + 1, e->vi_mark_x[slot],
+	    (int)(llen > 80 ? 80 : llen), s ? s : "");
 	return mp->line;
 }
 
@@ -23055,7 +23458,7 @@ tool_term_start(Editor *e, const char *cmd, const char *dir, const char *label)
 {
 	char *argv[5];
 	Term *old = tool_term_find(e, NULL);
-	int i;
+	int i, n;
 
 	if (old && !old->dead) {
 		set_status(e, "%s is still running (Ctrl-W c in its buffer stops it)",
@@ -23723,7 +24126,11 @@ vcs_commit_send(Editor *e)
 		size_t len = 0;
 		const char *ln = text_line(e->t, i, &len);
 
-		if (ln && len > 0 && ln[0] != '#' && strspn(ln, " \t") < len)
+		size_t k = 0;
+
+		while (k < len && (ln[k] == ' ' || ln[k] == '\t'))
+			k++;
+		if (ln && len > 0 && ln[0] != '#' && k < len)
 			last = i + 1;
 	}
 	if (last == 0) {
@@ -25376,6 +25783,12 @@ editor_loop(Editor *e)
 			break;
 		case EVENT_IDLE:
 			swap_maybe_write(e);	/* snapshot a dirty buffer */
+			if (e->t->map_torn) {
+				e->t->map_torn = 0;
+				set_status(e, "another program truncated this file; "
+				    "the lost part reads as blank (:e! reloads)");
+				ed_render(e, e->d);
+			}
 #ifdef VEDIT_TERM
 			if (e->term_dirty) {	/* the pane's program wrote */
 				ed_render(e, e->d);
@@ -25804,6 +26217,7 @@ ed_apply_config(Editor *e)
 		scr_mouse(e->d, e->mouse);
 	e->auto_indent = cfg_bool(g_cfg, "edit.autoindent", e->auto_indent);
 	e->swap_enabled = cfg_bool(g_cfg, "edit.swap", e->swap_enabled);
+	g_map_enabled = cfg_bool(g_cfg, "edit.mmap", 1);
 	e->backup_enabled = cfg_bool(g_cfg, "edit.backup", e->backup_enabled);
 	e->format_on_save = cfg_bool(g_cfg, "edit.formatonsave", e->format_on_save);
 #ifndef VEDIT_NO_TOOLS
@@ -25955,6 +26369,7 @@ static const char g_config_template[] =
 	"#	tabstop = 8          # the interval between tab stops\n"
 	"#	tabstops =           # a ruler of stops, e.g. \"5 9 17\"\n"
 	"#	swap = on            # keep a crash-recovery swap (.swpf base, .swpm journal)\n"
+	"#	mmap = on            # map files read-only; lines are copied as edited\n"
 	"#	swapdir =            # where swap files go; empty = beside the file\n"
 	"#	backup = off         # keep the previous version as a \"~\" file\n"
 	"#	backupdir =          # where backups go; empty = beside the file\n"
@@ -26410,7 +26825,7 @@ tty_begin(void *ctx)
 	 * retire), so they keep the in-handler best-effort flush and restore. */
 	sa.sa_handler = tty_on_fatal;
 	sigaction(SIGSEGV, &sa, NULL);
-	sigaction(SIGBUS, &sa, NULL);
+	map_guard_install(tty_on_fatal);	/* SIGBUS: the map guard first */
 	sigaction(SIGILL, &sa, NULL);
 	sigaction(SIGFPE, &sa, NULL);
 	sigaction(SIGABRT, &sa, NULL);
@@ -26428,7 +26843,7 @@ tty_end(void *ctx)
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGHUP, &sa, NULL);
 	sigaction(SIGSEGV, &sa, NULL);
-	sigaction(SIGBUS, &sa, NULL);
+	g_bus_fallback = NULL;		/* the map guard stays */
 	sigaction(SIGILL, &sa, NULL);
 	sigaction(SIGFPE, &sa, NULL);
 	sigaction(SIGABRT, &sa, NULL);

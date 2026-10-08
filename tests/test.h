@@ -64,3 +64,21 @@ void tap_bail(Test *t);
     } while (0)
 
 #endif /* TAP_TEST_H */
+
+#include <stddef.h>
+
+/* A text line (which need not be NUL-terminated: it may borrow from the
+ * file map) equals the C string want. No string.h here: this header is
+ * included before vedit.c sets the feature macros. */
+static inline int
+lineq(const char *s, size_t len, const char *want)
+{
+	size_t i;
+
+	if (!s)
+		return 0;
+	for (i = 0; i < len; i++)
+		if (want[i] == 0 || s[i] != want[i])
+			return 0;
+	return want[len] == 0;
+}

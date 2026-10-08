@@ -1342,6 +1342,202 @@ t_backup_save(Test *t)
 	rmdir(dir);
 }
 
+/* text_load maps a file: the lines borrow from the map (cap 0), an edit
+ * copies just its line to the heap, a DOS file loses its CRs, and
+ * materializing copies every line and drops the map. */
+static void
+t_map_load(Test *t)
+{
+	char dir[] = "/tmp/vedit_mapXXXXXX";
+	char path[PATH_MAX];
+	Text *tx;
+	FILE *f;
+	size_t i;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/m.txt", dir);
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("one\ntwo\nthree", f);
+	fclose(f);
+
+	tx = text_new();
+	TAP_ASSERT(t, tx != NULL);
+	TAP_ASSERT(t, text_load(tx, path) == OK);
+	TAP_CHECK(t, tx->map != NULL && tx->map_len == 13);
+	TAP_CHECK(t, text_lines(tx) == 3 && !tx->final_newline);
+	for (i = 0; i < 3; i++)
+		TAP_CHECK(t, tx->lines[i].cap == 0 &&
+		    tx->lines[i].buf >= tx->map &&
+		    tx->lines[i].buf < tx->map + tx->map_len);
+	TAP_CHECK(t, dump_is(tx, "one\ntwo\nthree"));
+
+	/* an edit owns its line only */
+	TAP_CHECK(t, text_insert(tx, 1, 3, "!", 1) == OK);
+	TAP_CHECK(t, tx->lines[1].cap > 0 && tx->lines[0].cap == 0 &&
+	    tx->lines[2].cap == 0);
+	TAP_CHECK(t, dump_is(tx, "one\ntwo!\nthree"));
+	TAP_CHECK(t, text_delete(tx, 0, 0, 1) == OK);	/* a delete copies too */
+	TAP_CHECK(t, tx->lines[0].cap > 0);
+	TAP_CHECK(t, text_split(tx, 2, 2) == OK);	/* and a split */
+	TAP_CHECK(t, dump_is(tx, "ne\ntwo!\nth\nree"));
+	{
+		size_t ul = 0, uc = 0;
+
+		TAP_CHECK(t, text_undo(tx, &ul, &uc) == 0 &&
+		    text_undo(tx, &ul, &uc) == 0 && text_undo(tx, &ul, &uc) == 0);
+	}
+	TAP_CHECK(t, dump_is(tx, "one\ntwo\nthree"));
+
+	/* materialize: everything owned, no map */
+	TAP_CHECK(t, text_materialize(tx) == OK);
+	TAP_CHECK(t, tx->map == NULL);
+	for (i = 0; i < text_lines(tx); i++)
+		TAP_CHECK(t, tx->lines[i].cap > 0);
+	TAP_CHECK(t, dump_is(tx, "one\ntwo\nthree"));
+	text_free(tx);
+
+	/* DOS line endings: the CR sits in the map, outside the line */
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("a\r\nbb\r\n", f);
+	fclose(f);
+	tx = text_new();
+	TAP_ASSERT(t, tx != NULL);
+	TAP_ASSERT(t, text_load(tx, path) == OK);
+	TAP_CHECK(t, tx->map != NULL && text_eol(tx) == EOL_CRLF &&
+	    tx->final_newline);
+	TAP_CHECK(t, text_lines(tx) == 2 && text_line_len(tx, 0) == 1 &&
+	    text_line_len(tx, 1) == 2);
+	TAP_CHECK(t, dump_is(tx, "a\nbb"));
+
+	/* a reload into the same text swaps maps */
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("new\n", f);
+	fclose(f);
+	TAP_ASSERT(t, text_load(tx, path) == OK);
+	TAP_CHECK(t, tx->map != NULL && tx->map_len == 4);
+	TAP_CHECK(t, dump_is(tx, "new"));
+	text_free(tx);
+
+	/* an empty file is not mapped */
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	fclose(f);
+	tx = text_new();
+	TAP_ASSERT(t, tx != NULL);
+	TAP_ASSERT(t, text_load(tx, path) == OK);
+	TAP_CHECK(t, tx->map == NULL && text_lines(tx) == 1);
+	text_free(tx);
+
+	unlink(path);
+	rmdir(dir);
+}
+
+/* The first edit of a mapped, clean file clones it to the swap base and
+ * moves the map onto the clone, so the original can be rewritten freely
+ * afterward; the borrowed lines still read right and the swap recovers. */
+static void
+t_map_remap(Test *t)
+{
+	char dir[] = "/tmp/vedit_mrXXXXXX";
+	char path[PATH_MAX], base[PATH_MAX];
+	Editor e;
+	Text *rd;
+	Vstat st;
+	FILE *f;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/r.txt", dir);
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("keep\nme\n", f);
+	fclose(f);
+	TAP_ASSERT(t, swap_base_for(path, base, sizeof(base)));
+
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	TAP_ASSERT(t, text_load(e.t, path) == OK);
+	TAP_ASSERT(t, e.t->map != NULL);
+	snprintf(e.path, sizeof(e.path), "%s", path);
+	e.has_name = 1;
+	swap_attach(&e);
+	TAP_CHECK(t, text_maps_file(e.t, path));
+	TAP_CHECK(t, text_insert(e.t, 1, 2, "!", 1) == OK);	/* starts the swap */
+	TAP_CHECK(t, g_vfs->stat(base, &st) == 0);
+	TAP_CHECK(t, text_maps_file(e.t, base));	/* the map moved to the base */
+	TAP_CHECK(t, !text_maps_file(e.t, path));
+	TAP_CHECK(t, e.t->lines[0].cap == 0);		/* still borrowed */
+
+	/* the original can now be truncated without touching the buffer */
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	fclose(f);
+	TAP_CHECK(t, dump_is(e.t, "keep\nme!"));
+
+	/* recovery from the base and journal sees the same text */
+	swap_maybe_write(&e);
+	rd = text_new();
+	TAP_ASSERT(t, rd != NULL);
+	TAP_CHECK(t, swap_recover_text(rd, base, e.swap_path) == 0);
+	TAP_CHECK(t, dump_is(rd, "keep\nme!"));
+	text_free(rd);
+
+	/* compaction rewrites the base by rename; the map stays valid */
+	swap_compact(e.swapj, e.t);
+	TAP_CHECK(t, !e.swapj->failed);
+	TAP_CHECK(t, dump_is(e.t, "keep\nme!"));
+
+	TAP_CHECK(t, ed_save_file(&e) == OK);
+	TAP_CHECK(t, access(base, F_OK) != 0);
+	TAP_CHECK(t, dump_is(e.t, "keep\nme!"));	/* unlinked base still mapped */
+	swap_detach(e.t, e.swapj);
+	text_free(e.t);
+	unlink(path);
+	rmdir(dir);
+}
+
+#ifndef _WIN32
+/* Another program truncating a mapped file: the guard turns the fault
+ * into a torn map and a blank page instead of a crash. */
+static void
+t_map_torn(Test *t)
+{
+	char dir[] = "/tmp/vedit_mtXXXXXX";
+	char path[PATH_MAX];
+	Text *tx;
+	FILE *f;
+	size_t i, len = 0;
+	const char *s;
+	long pg = sysconf(_SC_PAGESIZE);
+	volatile char sink = 0;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/t.txt", dir);
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	for (i = 0; i < (size_t)pg * 3; i++)
+		fputc(i % 64 == 63 ? '\n' : 'x', f);
+	fclose(f);
+	tx = text_new();
+	TAP_ASSERT(t, tx != NULL);
+	TAP_ASSERT(t, text_load(tx, path) == OK);
+	TAP_ASSERT(t, tx->map != NULL);
+	TAP_CHECK(t, text_lines(tx) == (size_t)pg * 3 / 64);
+	TAP_ASSERT(t, truncate(path, 10) == 0);	/* the last two pages vanish */
+	s = text_line(tx, text_lines(tx) - 2, &len);
+	TAP_ASSERT(t, s != NULL && len == 63);
+	sink = s[0];				/* faults; the guard patches it */
+	TAP_CHECK(t, tx->map_torn);
+	TAP_CHECK(t, s[0] == '\0' && sink == '\0');	/* reads as zeros now */
+	text_free(tx);
+	unlink(path);
+	rmdir(dir);
+}
+#endif
+
 /* swap_write lays down a base and a journal that recover to the text; an
  * edit appends to the journal; a save then clears both and the lock. */
 static void
@@ -3588,6 +3784,11 @@ const Case tap_cases[] = {
 	{ "atomic_save", t_atomic_save },
 	{ "save_rodir_fallback", t_save_rodir_fallback },
 	{ "backup_save", t_backup_save },
+	{ "map_load", t_map_load },
+	{ "map_remap", t_map_remap },
+#ifndef _WIN32
+	{ "map_torn", t_map_torn },
+#endif
 	{ "swap_write_clear", t_swap_write_clear },
 	{ "swap_flush_all", t_swap_flush_all },
 	{ "text_edit_undo", t_text_edit_undo },
