@@ -1366,19 +1366,22 @@ t_map_load(Test *t)
 	TAP_ASSERT(t, text_load(tx, path) == OK);
 	TAP_CHECK(t, tx->map != NULL && tx->map_len == 13);
 	TAP_CHECK(t, text_lines(tx) == 3 && !tx->final_newline);
-	for (i = 0; i < 3; i++)
-		TAP_CHECK(t, tx->lines[i].cap == 0 &&
-		    tx->lines[i].buf >= tx->map &&
-		    tx->lines[i].buf < tx->map + tx->map_len);
+	for (i = 0; i < 3; i++) {
+		size_t ll = 0;
+		const char *lp = text_line(tx, i, &ll);
+
+		TAP_CHECK(t, !line_is_owned(tx, i) && lp >= tx->map &&
+		    lp < tx->map + tx->map_len);
+	}
 	TAP_CHECK(t, dump_is(tx, "one\ntwo\nthree"));
 
 	/* an edit owns its line only */
 	TAP_CHECK(t, text_insert(tx, 1, 3, "!", 1) == OK);
-	TAP_CHECK(t, tx->lines[1].cap > 0 && tx->lines[0].cap == 0 &&
-	    tx->lines[2].cap == 0);
+	TAP_CHECK(t, line_is_owned(tx, 1) && !line_is_owned(tx, 0) &&
+	    !line_is_owned(tx, 2));
 	TAP_CHECK(t, dump_is(tx, "one\ntwo!\nthree"));
 	TAP_CHECK(t, text_delete(tx, 0, 0, 1) == OK);	/* a delete copies too */
-	TAP_CHECK(t, tx->lines[0].cap > 0);
+	TAP_CHECK(t, line_is_owned(tx, 0));
 	TAP_CHECK(t, text_split(tx, 2, 2) == OK);	/* and a split */
 	TAP_CHECK(t, dump_is(tx, "ne\ntwo!\nth\nree"));
 	{
@@ -1393,7 +1396,7 @@ t_map_load(Test *t)
 	TAP_CHECK(t, text_materialize(tx) == OK);
 	TAP_CHECK(t, tx->map == NULL);
 	for (i = 0; i < text_lines(tx); i++)
-		TAP_CHECK(t, tx->lines[i].cap > 0);
+		TAP_CHECK(t, line_is_owned(tx, i));
 	TAP_CHECK(t, dump_is(tx, "one\ntwo\nthree"));
 	text_free(tx);
 
@@ -1435,6 +1438,88 @@ t_map_load(Test *t)
 	rmdir(dir);
 }
 
+/* The line records are a gap buffer: inserting and removing lines at the
+ * front, the back and in the middle, across growth of the record array,
+ * keeps every line in order. A line too long for a borrowed record is
+ * copied at load; its neighbours still borrow. */
+static void
+t_lines_gap(Test *t)
+{
+	char dir[] = "/tmp/vedit_gapXXXXXX";
+	char path[PATH_MAX], want[4096], num[16];
+	Text *tx;
+	FILE *f;
+	size_t i, n;
+	const char *s;
+	int ok = 1;
+
+	tx = text_new();
+	TAP_ASSERT(t, tx != NULL);
+	/* build 0..199 by inserting at the front, back and middle in turn */
+	TAP_CHECK(t, text_insert(tx, 0, 0, "100", 3) == OK);
+	for (i = 1; i <= 100; i++) {
+		snprintf(num, sizeof(num), "%zu", 100 - i);
+		TAP_ASSERT(t, text_split(tx, 0, 0) == OK);	/* a new empty line 0 */
+		TAP_ASSERT(t, text_insert(tx, 0, 0, num, strlen(num)) == OK);
+		snprintf(num, sizeof(num), "%zu", 100 + i);
+		n = text_lines(tx);
+		TAP_ASSERT(t, text_split(tx, n - 1, text_line_len(tx, n - 1)) == OK);
+		TAP_ASSERT(t, text_insert(tx, n, 0, num, strlen(num)) == OK);
+	}
+	TAP_CHECK(t, text_lines(tx) == 201);
+	for (i = 0; i < 201 && ok; i++) {
+		snprintf(num, sizeof(num), "%zu", i);
+		s = text_line(tx, i, &n);	/* fetch first: argument order is unspecified */
+		ok = lineq(s, n, num);
+	}
+	TAP_CHECKF(t, ok, "line %zu out of order: [%.*s] of %zu lines", i - 1,
+	    (int)text_line_len(tx, i - 1), text_line(tx, i - 1, NULL),
+	    text_lines(tx));
+	/* remove every odd line from the middle outward, then join the rest */
+	for (i = 1; i < text_lines(tx); i++) {
+		size_t ll = text_line_len(tx, i - 1);
+
+		TAP_ASSERT(t, text_delete(tx, i, 0, text_line_len(tx, i)) == OK);
+		TAP_ASSERT(t, text_join(tx, i - 1) == OK);	/* drops line i */
+		TAP_CHECK(t, text_line_len(tx, i - 1) == ll);
+	}
+	TAP_CHECK(t, text_lines(tx) == 101);
+	for (i = 0, ok = 1; i < 101 && ok; i++) {
+		snprintf(num, sizeof(num), "%zu", i * 2);
+		s = text_line(tx, i, &n);	/* fetch first: argument order is unspecified */
+		ok = lineq(s, n, num);
+	}
+	TAP_CHECKF(t, ok, "after removal line %zu: [%.*s] of %zu", i - 1,
+	    (int)text_line_len(tx, i - 1), text_line(tx, i - 1, NULL),
+	    text_lines(tx));
+	TAP_CHECK(t, dump_is(tx, "0\n2\n4\n6\n8\n10\n12\n14\n16\n18\n20\n22\n24\n26\n28\n30\n32\n34\n36\n38\n40\n42\n44\n46\n48\n50\n52\n54\n56\n58\n60\n62\n64\n66\n68\n70\n72\n74\n76\n78\n80\n82\n84\n86\n88\n90\n92\n94\n96\n98\n100\n102\n104\n106\n108\n110\n112\n114\n116\n118\n120\n122\n124\n126\n128\n130\n132\n134\n136\n138\n140\n142\n144\n146\n148\n150\n152\n154\n156\n158\n160\n162\n164\n166\n168\n170\n172\n174\n176\n178\n180\n182\n184\n186\n188\n190\n192\n194\n196\n198\n200"));
+	text_free(tx);
+
+	/* a mapped file with a line past the record's length limit */
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/long.txt", dir);
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("short\n", f);
+	memset(want, 'y', sizeof(want));
+	for (i = 0; i < (LREC_LEN_MAX + 4096) / sizeof(want); i++)
+		fwrite(want, 1, sizeof(want), f);
+	fputs("\nlast\n", f);
+	fclose(f);
+	tx = text_new();
+	TAP_ASSERT(t, tx != NULL);
+	TAP_ASSERT(t, text_load(tx, path) == OK);
+	TAP_CHECK(t, tx->map != NULL && text_lines(tx) == 3);
+	TAP_CHECK(t, !line_is_owned(tx, 0) && line_is_owned(tx, 1) &&
+	    !line_is_owned(tx, 2));
+	TAP_CHECK(t, text_line_len(tx, 1) > LREC_LEN_MAX);
+	s = text_line(tx, 2, &n);
+	TAP_CHECK(t, lineq(s, n, "last"));
+	text_free(tx);
+	unlink(path);
+	rmdir(dir);
+}
+
 /* The first edit of a mapped, clean file clones it to the swap base and
  * moves the map onto the clone, so the original can be rewritten freely
  * afterward; the borrowed lines still read right and the swap recovers. */
@@ -1469,7 +1554,7 @@ t_map_remap(Test *t)
 	TAP_CHECK(t, g_vfs->stat(base, &st) == 0);
 	TAP_CHECK(t, text_maps_file(e.t, base));	/* the map moved to the base */
 	TAP_CHECK(t, !text_maps_file(e.t, path));
-	TAP_CHECK(t, e.t->lines[0].cap == 0);		/* still borrowed */
+	TAP_CHECK(t, !line_is_owned(e.t, 0));		/* still borrowed */
 
 	/* the original can now be truncated without touching the buffer */
 	f = fopen(path, "w");
@@ -3787,6 +3872,7 @@ const Case tap_cases[] = {
 	{ "backup_save", t_backup_save },
 	{ "map_load", t_map_load },
 	{ "map_remap", t_map_remap },
+	{ "lines_gap", t_lines_gap },
 #ifdef __linux__
 	{ "map_torn", t_map_torn },
 #endif

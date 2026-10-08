@@ -16,6 +16,10 @@
  *           fuzzer so the build and the invariant battery still run.
  *   seed    PRNG seed (default 1).
  */
+/* vedit.c wants the feature macro before the first system header. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

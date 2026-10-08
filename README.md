@@ -694,16 +694,19 @@ yet, so it gets no swap until its first save.
 ### Large files
 
 A file is not read into memory when it is opened. vedit maps it read-only
-and keeps each line as a pointer into the map, so an unedited file costs no
-heap beyond a small record per line, the operating system pages the bytes in
-and out as the view needs them, and opening is a scan for line breaks. A
-line is copied to the heap the first time it is changed, and only that line.
-Saving walks the lines, so the mapped bytes are never written back in place.
+and keeps each line as an 8-byte record, an offset and a length into the
+map, so an unedited file costs 8 bytes of heap per line, the operating system
+pages the bytes in and out as the view needs them, and opening is a scan for
+line breaks. A line is copied to the heap the first time it is changed, and
+only that line. The records live in a gap buffer, so adding or removing lines
+near the last edit costs nothing however long the file is. Saving walks the
+lines, so the mapped bytes are never written back in place.
 
 | 200 MB, 4 million lines | mapped | read into memory |
 |---|---|---|
-| open | 0.13 s | 0.63 s |
-| peak resident memory | 302 MB, of which 200 MB is page cache the kernel may drop | 607 MB |
+| open | 0.10 s | 0.66 s |
+| heap | 32 MB | 607 MB |
+| resident, including page cache the kernel may drop | 241 MB | 607 MB |
 
 The first edit of a mapped file takes the crash-recovery base (see above),
 which on a filesystem with reflinks costs nothing, and moves the map onto

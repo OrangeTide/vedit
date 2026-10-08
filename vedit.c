@@ -8040,13 +8040,25 @@ typedef struct estack Estack;
 static void estack_clear(Estack *s);
 static void estack_free(Estack *s);
 
-typedef struct line {
-	char	*buf;		/* line bytes, no newline; NUL-terminated when owned */
-	size_t	len;		/* bytes excluding the NUL */
-	size_t	cap;		/* allocated bytes including room for the NUL; 0 =
-				 * borrowed from the text's map (read-only, not
-				 * NUL-terminated: use len), copied on first write */
-} Line;
+/* One line is an 8-byte record. A borrowed line is a slice of the text's
+ * map, held as an offset (40 bits, 1 TB) and a length (23 bits, 8 MB; a
+ * longer line is copied). An owned line is the index of a pool entry that
+ * holds its heap buffer, NUL-terminated, with room to grow. Lines are
+ * copied into the pool on their first write. */
+typedef uint64_t Lrec;
+#define LREC_OWNED	(1ULL << 63)
+#define LREC_LEN_BITS	23
+#define LREC_LEN_MAX	((1ULL << LREC_LEN_BITS) - 1)
+#define LREC_OFF_MAX	((1ULL << 40) - 1)
+#define lrec_slice(off, len)	(((uint64_t)(off) << LREC_LEN_BITS) | (uint64_t)(len))
+#define lrec_pool(i)	(LREC_OWNED | (uint64_t)(i))
+
+typedef struct lown {
+	char		*buf;		/* NULL: a free slot, len links the next one */
+	uint32_t	len;		/* bytes excluding the NUL */
+	uint32_t	cap;		/* allocated bytes including the NUL */
+} Lown;
+#define LOWN_NONE	UINT32_MAX
 
 /* A reversible primitive. Applying one mutates the buffer and yields the
  * primitive that reverses it, which is how undo and redo stay symmetric. */
@@ -8081,9 +8093,15 @@ enum eol {
 };
 
 struct text {
-	Line	*lines;
+	/* The line records, a gap buffer: lines 0..gap-1 sit at recs[0..],
+	 * the rest at recs[gap + gaplen ..], so inserting and removing lines
+	 * near the last edit costs nothing and elsewhere moves 8 bytes a line. */
+	Lrec		*recs;
 	size_t		nlines;
-	size_t		cap;
+	size_t		cap;		/* records allocated; gaplen == cap - nlines */
+	size_t		gap, gaplen;
+	Lown		*pool;		/* the owned lines */
+	uint32_t	npool, poolcap, pfree;
 	int		final_newline;	/* source ended with a line terminator */
 	int		eol;		/* enum eol: the line-ending style */
 	int		dirty;
@@ -8118,149 +8136,246 @@ struct text {
 };
 
 /****************************************************************
- * Growable storage
+ * Growable storage: the record gap buffer and the pool of owned lines
  ****************************************************************/
 
-/* Give a borrowed line its own heap copy with room for need bytes (at
- * least its current length). A no-op for an owned line. */
-static int
-line_own(Line *l, size_t need)
+static inline Lrec *
+rec_at(const Text *t, size_t i)
 {
-	size_t cap = 16;
-	char *p;
-
-	if (l->cap)
-		return OK;
-	if (need < l->len)
-		need = l->len;
-	while (cap < need + 1)
-		cap *= 2;
-	p = malloc(cap);
-	if (!p)
-		return ERR;
-	if (l->len)
-		memcpy(p, l->buf, l->len);
-	p[l->len] = '\0';
-	l->buf = p;
-	l->cap = cap;
-	return OK;
+	return &t->recs[i < t->gap ? i : i + t->gaplen];
 }
 
-static int
-line_reserve(Line *l, size_t need)
+static inline int
+line_is_owned(const Text *t, size_t i)
 {
-	/* need is bytes excluding the NUL */
-	if (l->cap == 0)
-		return line_own(l, need);
-	if (need + 1 > l->cap) {
-		size_t cap = l->cap ? l->cap : 16;
+	return (*rec_at(t, i) & LREC_OWNED) != 0;
+}
+
+static inline const char *
+line_buf(const Text *t, size_t i)
+{
+	Lrec r = *rec_at(t, i);
+
+	if (r & LREC_OWNED)
+		return t->pool[r & ~LREC_OWNED].buf;
+	return t->map + (r >> LREC_LEN_BITS);
+}
+
+static inline size_t
+line_len(const Text *t, size_t i)
+{
+	Lrec r = *rec_at(t, i);
+
+	if (r & LREC_OWNED)
+		return t->pool[r & ~LREC_OWNED].len;
+	return (size_t)(r & LREC_LEN_MAX);
+}
+
+/* A free pool slot (its buf is NULL), or LOWN_NONE. */
+static uint32_t
+pool_alloc(Text *t)
+{
+	uint32_t i;
+
+	if (t->pfree != LOWN_NONE) {
+		i = t->pfree;
+		t->pfree = t->pool[i].len;
+		t->pool[i].len = 0;
+		return i;
+	}
+	if (t->npool == t->poolcap) {
+		uint32_t cap = t->poolcap ? t->poolcap * 2 : 32;
+		Lown *p;
+
+		if (cap <= t->poolcap || cap == LOWN_NONE)
+			return LOWN_NONE;
+		p = realloc(t->pool, (size_t)cap * sizeof(*p));
+		if (!p)
+			return LOWN_NONE;
+		t->pool = p;
+		t->poolcap = cap;
+	}
+	i = t->npool++;
+	t->pool[i].buf = NULL;
+	t->pool[i].len = 0;
+	t->pool[i].cap = 0;
+	return i;
+}
+
+static void
+pool_free(Text *t, uint32_t i)
+{
+	free(t->pool[i].buf);
+	t->pool[i].buf = NULL;
+	t->pool[i].cap = 0;
+	t->pool[i].len = t->pfree;
+	t->pfree = i;
+}
+
+/* Room for need bytes (plus the NUL) in an owned line. */
+static int
+lown_reserve(Lown *o, size_t need)
+{
+	if (need + 1 > o->cap) {
+		size_t cap = o->cap ? o->cap : 16;
 		char *p;
 
 		while (cap < need + 1)
 			cap *= 2;
-		p = realloc(l->buf, cap);
+		if (cap > UINT32_MAX)
+			return ERR;
+		p = realloc(o->buf, cap);
 		if (!p)
 			return ERR;
-		l->buf = p;
-		l->cap = cap;
+		o->buf = p;
+		o->cap = (uint32_t)cap;
 	}
 	return OK;
 }
 
-static int
-line_init(Line *l, const char *s, size_t n)
+/* The owned, writable form of line i with room for need bytes (at least
+ * its length): a borrowed line is copied into the pool first. NULL on
+ * ENOMEM. The pointer is good until the next line is created. */
+static Lown *
+line_owned(Text *t, size_t i, size_t need)
 {
-	l->buf = NULL;
-	l->len = 0;
-	l->cap = 0;
-	if (line_reserve(l, n) != OK)
+	Lrec *r = rec_at(t, i);
+	Lown *o;
+	uint32_t pi;
+	size_t len;
+
+	if (*r & LREC_OWNED) {
+		o = &t->pool[*r & ~LREC_OWNED];
+		return lown_reserve(o, need) == OK ? o : NULL;
+	}
+	len = (size_t)(*r & LREC_LEN_MAX);
+	pi = pool_alloc(t);
+	if (pi == LOWN_NONE)
+		return NULL;
+	r = rec_at(t, i);			/* the pool moved, not the records */
+	o = &t->pool[pi];
+	if (lown_reserve(o, need > len ? need : len) != OK) {
+		pool_free(t, pi);
+		return NULL;
+	}
+	if (len)
+		memcpy(o->buf, t->map + (*r >> LREC_LEN_BITS), len);
+	o->buf[len] = '\0';
+	o->len = (uint32_t)len;
+	*r = lrec_pool(pi);
+	return o;
+}
+
+/* Put the gap at idx. */
+static void
+gap_move(Text *t, size_t idx)
+{
+	if (idx < t->gap)
+		memmove(&t->recs[idx + t->gaplen], &t->recs[idx],
+		    (t->gap - idx) * sizeof(Lrec));
+	else if (idx > t->gap)
+		memmove(&t->recs[t->gap], &t->recs[t->gap + t->gaplen],
+		    (idx - t->gap) * sizeof(Lrec));
+	t->gap = idx;
+}
+
+/* Make sure the gap can take one more record. */
+static int
+recs_reserve(Text *t)
+{
+	size_t cap, tail;
+	Lrec *p;
+
+	if (t->gaplen > 0)
+		return OK;
+	cap = t->cap ? t->cap * 2 : 32;
+	p = realloc(t->recs, cap * sizeof(*p));
+	if (!p)
 		return ERR;
-	if (n)
-		memcpy(l->buf, s, n);
-	l->buf[n] = '\0';
-	l->len = n;
+	tail = t->cap - t->gap;			/* records after the (empty) gap */
+	memmove(&p[cap - tail], &p[t->gap], tail * sizeof(Lrec));
+	t->recs = p;
+	t->gaplen = cap - t->cap;
+	t->cap = cap;
 	return OK;
 }
 
+/* Insert the record r as line idx. */
 static int
-lines_reserve(Text *t, size_t need)
+recs_insert(Text *t, size_t idx, Lrec r)
 {
-	if (need > t->cap) {
-		size_t cap = t->cap ? t->cap : 32;
-		Line *p;
-
-		while (cap < need)
-			cap *= 2;
-		p = realloc(t->lines, cap * sizeof(*p));
-		if (!p)
-			return ERR;
-		t->lines = p;
-		t->cap = cap;
-	}
-	return OK;
-}
-
-/* Insert a fresh line initialized from s[0..n) at index idx. */
-static int
-lines_insert_at(Text *t, size_t idx, const char *s, size_t n)
-{
-	if (idx > t->nlines)
+	if (idx > t->nlines || recs_reserve(t) != OK)
 		return ERR;
-	if (lines_reserve(t, t->nlines + 1) != OK)
-		return ERR;
-	if (line_init(&t->lines[t->nlines], s, n) != OK)
-		return ERR;
-	/* the new line was built at the end; rotate it into place */
-	if (idx < t->nlines) {
-		Line tmp = t->lines[t->nlines];
-
-		memmove(&t->lines[idx + 1], &t->lines[idx],
-		    (t->nlines - idx) * sizeof(Line));
-		t->lines[idx] = tmp;
-	}
+	gap_move(t, idx);
+	t->recs[t->gap++] = r;
+	t->gaplen--;
 	t->nlines++;
 	return OK;
 }
 
-/* Append a line: a copy of s[0..n), or with borrow a line that points at
- * s itself (cap 0). */
+/* Insert a fresh owned line holding a copy of s[0..n) at index idx. */
+static int
+lines_insert_at(Text *t, size_t idx, const char *s, size_t n)
+{
+	uint32_t pi;
+	Lown *o;
+
+	if (idx > t->nlines || n > UINT32_MAX - 1)
+		return ERR;
+	pi = pool_alloc(t);
+	if (pi == LOWN_NONE)
+		return ERR;
+	o = &t->pool[pi];
+	if (lown_reserve(o, n) != OK || recs_insert(t, idx, lrec_pool(pi)) != OK) {
+		pool_free(t, pi);
+		return ERR;
+	}
+	if (n)
+		memcpy(o->buf, s, n);
+	o->buf[n] = '\0';
+	o->len = (uint32_t)n;
+	return OK;
+}
+
+/* Append a line: a copy of s[0..n), or with borrow a slice of the map
+ * (s points into t->map) when the record can hold it. */
 static int
 lines_push(Text *t, const char *s, size_t n, int borrow)
 {
-	Line *l;
-
-	if (!borrow)
+	if (!borrow || n > LREC_LEN_MAX)
 		return lines_insert_at(t, t->nlines, s, n);
-	if (lines_reserve(t, t->nlines + 1) != OK)
-		return ERR;
-	l = &t->lines[t->nlines++];
-	l->buf = (char *)s;
-	l->len = n;
-	l->cap = 0;
-	return OK;
+	return recs_insert(t, t->nlines, lrec_slice(s - t->map, n));
 }
 
 static void
 lines_remove_at(Text *t, size_t idx)
 {
+	Lrec r;
+
 	if (idx >= t->nlines)
 		return;
-	if (t->lines[idx].cap)
-		free(t->lines[idx].buf);
-	memmove(&t->lines[idx], &t->lines[idx + 1],
-	    (t->nlines - idx - 1) * sizeof(Line));
+	r = *rec_at(t, idx);
+	if (r & LREC_OWNED)
+		pool_free(t, (uint32_t)(r & ~LREC_OWNED));
+	gap_move(t, idx);			/* the line now sits just past the gap */
+	t->gaplen++;
 	t->nlines--;
 }
 
 static void
 text_clear(Text *t)
 {
-	size_t i;
+	uint32_t i;
 
-	for (i = 0; i < t->nlines; i++)
-		if (t->lines[i].cap)
-			free(t->lines[i].buf);
+	for (i = 0; i < t->npool; i++)
+		free(t->pool[i].buf);
+	free(t->pool);
+	t->pool = NULL;
+	t->npool = t->poolcap = 0;
+	t->pfree = LOWN_NONE;
 	t->nlines = 0;
+	t->gap = 0;
+	t->gaplen = t->cap;
 }
 
 /****************************************************************
@@ -8401,7 +8516,7 @@ text_materialize(const Text *ct)
 	if (!t->map)
 		return OK;
 	for (i = 0; i < t->nlines; i++)
-		if (line_own(&t->lines[i], t->lines[i].len) != OK)
+		if (!line_is_owned(t, i) && !line_owned(t, i, 0))
 			return ERR;
 	text_unmap(t);
 	return OK;
@@ -8409,14 +8524,14 @@ text_materialize(const Text *ct)
 
 /* Move the borrowed lines onto a map of path, which must hold exactly the
  * bytes of the current map (the swap base cloned from the mapped file).
- * OK, or ERR with the old map untouched. */
+ * The records hold offsets, so only the base pointer changes. OK, or ERR
+ * with the old map untouched. */
 static int
 text_remap(const Text *ct, const char *path)
 {
 	Text *t = (Text *)ct;		/* storage only */
 	Vstat st;
 	char *np;
-	size_t i;
 
 	if (!t->map || !g_vfs->map)
 		return ERR;
@@ -8428,13 +8543,6 @@ text_remap(const Text *ct, const char *path)
 		g_vfs->unmap(np, (size_t)st.size);
 		errno = EINVAL;
 		return ERR;
-	}
-	for (i = 0; i < t->nlines; i++) {
-		Line *l = &t->lines[i];
-
-		if (l->cap == 0 && l->buf >= t->map &&
-		    l->buf <= t->map + t->map_len)
-			l->buf = np + (l->buf - t->map);
 	}
 	map_unregister(t);
 	g_vfs->unmap(t->map, t->map_len);
@@ -8479,8 +8587,9 @@ text_new(void)
 
 	if (!t)
 		return NULL;
+	t->pfree = LOWN_NONE;
 	if (lines_insert_at(t, 0, "", 0) != OK) {
-		free(t->lines);
+		free(t->recs);
 		free(t);
 		return NULL;
 	}
@@ -8499,7 +8608,7 @@ text_free(Text *t)
 	text_unmap(t);
 	estack_free(&t->undo);
 	estack_free(&t->redo);
-	free(t->lines);
+	free(t->recs);
 	free(t);
 }
 
@@ -8642,18 +8751,23 @@ text_load(Text *t, const char *path)
 		size_t old_len = t->map_len;
 		char *p = g_vfs->map(path, &st);
 
+		if (p && (unsigned long long)st.size > LREC_OFF_MAX) {
+			g_vfs->unmap(p, (size_t)st.size);	/* too big for a record */
+			p = NULL;
+		}
 		if (p) {
-			rc = text_load_bytes(t, p, (size_t)st.size, 1);
-			saved_errno = errno;
-			/* the lines now borrow from p; the old map can go */
-			if (old) {
+			/* the records are offsets into t->map, so swap the map in
+			 * first; the old one goes once its lines are cleared */
+			if (old)
 				map_unregister(t);
-				g_vfs->unmap(old, old_len);
-			}
 			t->map = p;
 			t->map_len = (size_t)st.size;
 			t->map_st = st;
 			t->map_torn = 0;
+			rc = text_load_bytes(t, p, (size_t)st.size, 1);
+			saved_errno = errno;
+			if (old)
+				g_vfs->unmap(old, old_len);
 			map_register(t);
 			errno = saved_errno;
 			return rc;
@@ -8683,8 +8797,8 @@ text_write(const Text *t, text_emit_fn emit, void *ctx)
 	size_t termlen = (t->eol == EOL_CRLF) ? 2 : 1;
 
 	for (i = 0; i < t->nlines; i++) {
-		if (t->lines[i].len &&
-		    emit(ctx, t->lines[i].buf, t->lines[i].len) != 0)
+		if (line_len(t, i) &&
+		    emit(ctx, line_buf(t, i), line_len(t, i)) != 0)
 			return ERR;
 		/* a terminator between lines, and after the last only when the
 		 * source carried a trailing terminator */
@@ -8850,8 +8964,8 @@ text_line(const Text *t, size_t line, size_t *len)
 	if (line >= t->nlines)
 		return NULL;
 	if (len)
-		*len = t->lines[line].len;
-	return t->lines[line].buf;
+		*len = line_len(t, line);
+	return line_buf(t, line);
 }
 
 size_t
@@ -8859,7 +8973,7 @@ text_line_len(const Text *t, size_t line)
 {
 	if (line >= t->nlines)
 		return 0;
-	return t->lines[line].len;
+	return line_len(t, line);
 }
 
 int
@@ -8973,7 +9087,7 @@ op_valid(const Text *t, const Erec *in)
 		return 0;
 	if (in->op == OP_JOIN)
 		return in->line + 1 < t->nlines;
-	return in->col <= t->lines[in->line].len;
+	return in->col <= line_len(t, in->line);
 }
 
 /* Apply one primitive to the buffer and fill inv with the primitive that
@@ -8992,19 +9106,18 @@ apply_op(Text *t, const Erec *in, Erec *inv)
 
 	switch (in->op) {
 	case OP_INSERT: {
-		Line *l;
+		Lown *l;
 
-		if (in->line >= t->nlines)
+		if (in->line >= t->nlines || in->col > line_len(t, in->line) ||
+		    line_len(t, in->line) + in->n > UINT32_MAX - 1)
 			return ERR;
-		l = &t->lines[in->line];
-		if (in->col > l->len)
-			return ERR;
-		if (line_reserve(l, l->len + in->n) != OK)
+		l = line_owned(t, in->line, line_len(t, in->line) + in->n);
+		if (!l)
 			return ERR;
 		memmove(l->buf + in->col + in->n, l->buf + in->col,
 		    l->len - in->col);
 		memcpy(l->buf + in->col, in->bytes, in->n);
-		l->len += in->n;
+		l->len += (uint32_t)in->n;
 		l->buf[l->len] = '\0';
 		inv->op = OP_DELETE;
 		inv->line = in->line;
@@ -9013,16 +9126,14 @@ apply_op(Text *t, const Erec *in, Erec *inv)
 		break;
 	}
 	case OP_DELETE: {
-		Line *l;
+		Lown *l;
 		size_t nn;
 		char *cap;
 
-		if (in->line >= t->nlines)
+		if (in->line >= t->nlines || in->col > line_len(t, in->line))
 			return ERR;
-		l = &t->lines[in->line];
-		if (in->col > l->len)
-			return ERR;
-		if (line_own(l, l->len) != OK)
+		l = line_owned(t, in->line, 0);
+		if (!l)
 			return ERR;
 		nn = in->n;
 		if (nn > l->len - in->col)
@@ -9033,7 +9144,7 @@ apply_op(Text *t, const Erec *in, Erec *inv)
 		memcpy(cap, l->buf + in->col, nn);
 		memmove(l->buf + in->col, l->buf + in->col + nn,
 		    l->len - in->col - nn);
-		l->len -= nn;
+		l->len -= (uint32_t)nn;
 		l->buf[l->len] = '\0';
 		inv->op = OP_INSERT;
 		inv->line = in->line;
@@ -9043,39 +9154,40 @@ apply_op(Text *t, const Erec *in, Erec *inv)
 		break;
 	}
 	case OP_SPLIT: {
-		Line *l;
+		Lown *l;
 
-		if (in->line >= t->nlines)
+		if (in->line >= t->nlines || in->col > line_len(t, in->line))
 			return ERR;
-		l = &t->lines[in->line];
-		if (in->col > l->len)
-			return ERR;
-		if (line_own(l, l->len) != OK)
+		l = line_owned(t, in->line, 0);
+		if (!l)
 			return ERR;
 		if (lines_insert_at(t, in->line + 1, l->buf + in->col,
 		    l->len - in->col) != OK)
 			return ERR;
-		l = &t->lines[in->line];	/* array may have moved */
-		l->len = in->col;
+		l = line_owned(t, in->line, 0);	/* the pool may have moved */
+		l->len = (uint32_t)in->col;
 		l->buf[in->col] = '\0';
 		inv->op = OP_JOIN;
 		inv->line = in->line;
 		break;
 	}
 	case OP_JOIN: {
-		Line *l, *next;
-		size_t boundary;
+		size_t boundary, nlen;
 
 		if (in->line + 1 >= t->nlines)
 			return ERR;
-		l = &t->lines[in->line];
-		next = &t->lines[in->line + 1];
-		boundary = l->len;
-		if (next->len) {
-			if (line_reserve(l, l->len + next->len) != OK)
+		boundary = line_len(t, in->line);
+		nlen = line_len(t, in->line + 1);
+		if (nlen) {
+			Lown *l;
+
+			if (boundary + nlen > UINT32_MAX - 1)
 				return ERR;
-			memcpy(l->buf + l->len, next->buf, next->len);
-			l->len += next->len;
+			l = line_owned(t, in->line, boundary + nlen);
+			if (!l)
+				return ERR;
+			memcpy(l->buf + boundary, line_buf(t, in->line + 1), nlen);
+			l->len = (uint32_t)(boundary + nlen);
 			l->buf[l->len] = '\0';
 		}
 		lines_remove_at(t, in->line + 1);
@@ -9152,7 +9264,7 @@ text_insert(Text *t, size_t line, size_t col,
 {
 	Erec in, inv;
 
-	if (t->readonly || line >= t->nlines || col > t->lines[line].len)
+	if (t->readonly || line >= t->nlines || col > line_len(t, line))
 		return ERR;
 	if (n == 0)
 		return OK;
@@ -9174,9 +9286,9 @@ text_delete(Text *t, size_t line, size_t col, size_t n)
 {
 	Erec in, inv;
 
-	if (t->readonly || line >= t->nlines || col > t->lines[line].len)
+	if (t->readonly || line >= t->nlines || col > line_len(t, line))
 		return ERR;
-	if (n == 0 || col == t->lines[line].len)
+	if (n == 0 || col == line_len(t, line))
 		return OK;
 
 	in.op = OP_DELETE;
@@ -9196,7 +9308,7 @@ text_split(Text *t, size_t line, size_t col)
 {
 	Erec in, inv;
 
-	if (t->readonly || line >= t->nlines || col > t->lines[line].len)
+	if (t->readonly || line >= t->nlines || col > line_len(t, line))
 		return ERR;
 
 	in.op = OP_SPLIT;
@@ -12463,29 +12575,29 @@ tbl_join_records(Text *t, char delim)
 	int capped = 0;
 
 	while (i + 1 < t->nlines) {
-		Line *l = &t->lines[i];
 		int span = 1;
 
-		if (!tbl_open_quote(delim, l->buf, l->len)) {
+		if (!tbl_open_quote(delim, line_buf(t, i), line_len(t, i))) {
 			i++;
 			continue;
 		}
 		/* the quote must open a field for this to be a record */
-		while (tbl_open_quote(delim, l->buf, l->len) &&
+		while (tbl_open_quote(delim, line_buf(t, i), line_len(t, i)) &&
 		    i + 1 < t->nlines && span < TBL_JOIN_MAX) {
-			Line *next = &t->lines[i + 1];
+			size_t ll = line_len(t, i), nl = line_len(t, i + 1);
+			Lown *l;
 
-			if (line_reserve(l, l->len + seplen + next->len) != OK)
+			if (ll + seplen + nl > UINT32_MAX - 1 ||
+			    !(l = line_owned(t, i, ll + seplen + nl)))
 				return capped;
-			memcpy(l->buf + l->len, sep, seplen);
-			l->len += seplen;
-			memcpy(l->buf + l->len, next->buf, next->len);
-			l->len += next->len;
+			memcpy(l->buf + ll, sep, seplen);
+			memcpy(l->buf + ll + seplen, line_buf(t, i + 1), nl);
+			l->len = (uint32_t)(ll + seplen + nl);
 			l->buf[l->len] = '\0';
 			lines_remove_at(t, i + 1);
 			span++;
 		}
-		if (tbl_open_quote(delim, l->buf, l->len))
+		if (tbl_open_quote(delim, line_buf(t, i), line_len(t, i)))
 			capped++;
 		i++;
 	}
@@ -12500,7 +12612,7 @@ tbl_count_cols(const Text *t, char delim)
 	int max = 1;
 
 	for (i = 0; i < nl; i++) {
-		size_t len;
+		size_t len = 0;
 		const char *s = text_line(t, i, &len);
 		Tblfield f[1];
 		int n = tbl_fields(delim, s, len, f, 1);
@@ -26444,7 +26556,7 @@ ed_edit_config(Editor *e)
 	existed = g_vfs->stat(e->cfg_path, &st) == 0;
 	if (buf_open(e, e->cfg_path) < 0)
 		return;				/* buf_open set the status */
-	if (!existed && text_lines(e->t) == 1 && e->t->lines[0].len == 0) {
+	if (!existed && text_lines(e->t) == 1 && text_line_len(e->t, 0) == 0) {
 		if (text_load_mem(e->t, g_config_template,
 		    sizeof(g_config_template) - 1) == OK)
 			e->t->dirty = 1;
