@@ -1,5 +1,5 @@
 /* guterm.h : graphical micro terminal, a single-header cell grid window */
-/* vendored from guterm v0.1.1-10-g03ea4dc */
+/* vendored from guterm v0.2.0 */
 
 /*
  * guterm gives a text-based program a window: a grid of character cells
@@ -59,7 +59,7 @@ extern "C" {
 #define GUTERM_NO_SIXEL
 #endif
 
-#define GUT_VERSION "0.1.1"
+#define GUT_VERSION "0.2.0"
 
 /****************************************************************
  * Cells
