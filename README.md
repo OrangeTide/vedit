@@ -7,7 +7,10 @@ terminfo database and no differential compositor, so it runs over a telnet or
 ssh link to a simple terminal emulator such as a MUD client.
 
 vedit is one source file (`vedit.c`) plus a public header for embedding
-(`vedit.h`).
+(`vedit.h`). The same source also builds gvedit, the GUI version: the editor in
+its own SDL3 window, drawn through the vendored `guterm.h`, for a desktop
+without a usable terminal emulator and for Windows and macOS (see
+"Graphical build (gvedit)" below).
 
 ![Editing a C file, with syntax highlighting and the MS-EDIT chrome](docs/shot-edit.png)
 
@@ -36,11 +39,12 @@ the release workflow when a version tag is pushed; the tag must match
 
 ### Graphical build (gvedit)
 
-The same source also builds as its own window, for a desktop without a
-terminal emulator worth using, or for Windows and macOS. It draws the
-editor's screen with a bitmap font through the vendored `guterm.h`
-(from the guterm project) and needs SDL3 at build and run time; nothing
-else in the editor changes, and the plain build never needs SDL.
+gvedit is the GUI version of the editor. The same source builds as its
+own window, for a desktop without a terminal emulator worth using, or
+for Windows and macOS. It draws the editor's screen with a bitmap font
+through the vendored `guterm.h` (from the guterm project) and needs SDL3
+at build and run time; nothing else in the editor changes, and the plain
+build never needs SDL.
 
 ```sh
 make gvedit                       # _out/<triple>/bin/gvedit, linked as ./gvedit
@@ -1736,24 +1740,27 @@ entirely.
 ## What it includes and what it leaves out
 
 vedit has a text buffer with undo and redo, the modeless and vi personalities,
-the MS-EDIT chrome (menu bar, frame, scrollbars, dialogs), regex find and
-replace, selection and an internal clipboard, goto-line, multiple buffers, a hex
-view, a 2D/block draw mode with glyph and colour palettes, an art view for
-coloured .ans files, a table view for CSV and TSV with sorting, per-language
-build commands with a quickfix error list, a pane under the text for a shell,
-a build or a second buffer, selectable line endings (LF, CRLF, NUL), tab
-display with a per-buffer ruler of tab stops, auto-indent and tab/space
-conversion, a symbol picker that merges a buffer scan with a ctags
-tags file, terminal buffers running a shell or a build through a built-in VT
-emulator, and lightweight syntax highlighting. It draws through a
-self-contained ANSI renderer over the io vtable, and decodes the keyboard with
-a compact decoder that covers UTF-8 text, control keys, arrows, navigation
-keys, function keys, CSI modifiers, Alt+letter, and bracketed paste.
+the MS-EDIT chrome (menu bar, frame, scrollbars, dialogs), mouse clicks and
+wheel, regex find and replace, selection and an internal clipboard, goto-line,
+multiple buffers, a hex view, a 2D/block draw mode with glyph and colour
+palettes, an art view for coloured .ans files, a table view for CSV and
+TSV with sorting, per-language build commands with a quickfix error list,
+a pane under the text for a shell, a build or a second buffer, selectable
+line endings (LF, CRLF, NUL), tab display with a per-buffer ruler of tab
+stops, auto-indent and tab/space conversion, a symbol picker that merges
+a buffer scan with a ctags tags file, terminal buffers running a shell
+or a build through a built-in VT emulator, a date picker and file insert,
+git status, history, blame and commit from the editor, an alpine-style mail
+reader and composer over Maildir, and lightweight syntax highlighting. Files
+are mapped rather than read, edits go to a crash-recovery journal beside
+a cloned base, and the same source builds for Windows and as its own SDL3
+window. It draws through a self-contained ANSI renderer over the io vtable,
+and decodes the keyboard with a compact decoder that covers UTF-8 text,
+control keys, arrows, navigation keys, function keys, CSI modifiers,
+Alt+letter, and bracketed paste.
 
-It deliberately leaves out, as overworked for a primitive-terminal editor:
-
-- mouse input,
-- a differential compositor and terminfo capability lookup.
+It deliberately leaves out, as overworked for a primitive-terminal editor, a
+differential compositor and terminfo capability lookup.
 
 Syntax highlighting is a data-driven FSM highlighter (see below) rather than a
 general language engine.
