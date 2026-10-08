@@ -53,6 +53,12 @@ endif
 ifdef VEDIT_NO_TERM
 CFLAGS += -DVEDIT_NO_TERM
 endif
+# The art view (.ans files as a cell grid) is likewise built by default;
+# `make VEDIT_NO_ART=1` drops it. The VT emulator stays as long as either
+# feature is in.
+ifdef VEDIT_NO_ART
+CFLAGS += -DVEDIT_NO_ART
+endif
 
 TESTDIR  = tests
 TESTBINS = $(TESTDIR)/test_unit $(TESTDIR)/test_render
@@ -173,8 +179,8 @@ cov:
 # Line coverage of the terminal-buffer code: the union of the terminal tests
 # and the allocation-failure tests, both built with the feature on. The gate
 # for making VEDIT_TERM the default is >90% of the terminal block covered. The
-# block runs from `struct term {` to its closing VEDIT_TERM #endif, found in
-# the source so the bounds track edits. Informational.
+# block runs from the "Terminal buffers" banner to its closing VEDIT_TERM
+# #endif, found in the source so the bounds track edits. Informational.
 cov-term:
 	@cd $(TESTDIR) && \
 	$(CC) $(TERMTESTCFLAGS) -O0 --coverage test_term.c testmain.c \
@@ -186,7 +192,7 @@ cov-term:
 	    ./test_termfault-cov >/dev/null && \
 	    gcov test_termfault-cov-test_termfault.gcda >/dev/null 2>&1 && \
 	    mv vedit.c.gcov vedit.c.gcov.fault && \
-	lo=`grep -n '^struct term {' ../vedit.c | head -1 | cut -d: -f1` && \
+	lo=`grep -n '^ \* Terminal buffers$' ../vedit.c | head -1 | cut -d: -f1` && \
 	hi=`awk -v lo=$$lo 'NR>lo && /#endif \/\* VEDIT_TERM/{print NR; exit}' \
 	    ../vedit.c` && \
 	awk -v lo=$$lo -v hi=$$hi 'function load(f){ \

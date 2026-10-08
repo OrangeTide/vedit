@@ -1206,8 +1206,9 @@ When the child exits, the buffer shows `[process exited N]` and waits for
 `Ctrl-W q` to close.
 
 The terminal is compiled in by default. Build with `-DVEDIT_NO_TERM`
-(`make VEDIT_NO_TERM=1`) to drop it, along with all the pseudo-terminal and
-emulator code, for a primitive embedding host that does not want it. The feature
+(`make VEDIT_NO_TERM=1`) to drop it, along with all the pseudo-terminal code,
+for a primitive embedding host that does not want it. The VT emulator stays
+while the art view is in, and goes with `-DVEDIT_NO_ART` as well. The feature
 needs a host that can wait on more than one file descriptor at once: the
 command-line binary does this, but an embedding host must supply the `poll_fds`
 callback in `struct vedit_io`, or `:terminal` reports that it needs a
@@ -1260,8 +1261,10 @@ edit the cells. Each cell holds one Unicode glyph with a foreground, a
 background and attributes, so coloured art renders the way a terminal would
 show it. Saving writes the grid back as UTF-8 with the SGR colour sequences
 that reproduce it, one line per row, so `cat file.ans` still shows the picture.
-The art view needs the terminal emulator (it is not in a `VEDIT_NO_TERM` build)
-and the status line shows `-- ART --` while it is active. A file that ends its
+The art view renders through the VT emulator but not through the terminal
+buffers, so it is in a `VEDIT_NO_TERM` build too; `-DVEDIT_NO_ART`
+(`make VEDIT_NO_ART=1`) drops it. The status line shows `-- ART --` while it
+is active. A file that ends its
 lines with a bare LF, as the editor's own files do, replays the same as one with
 CR LF.
 
@@ -1651,8 +1654,9 @@ slow link.
 ### Ways to make it smaller or larger
 
 If you want an even leaner build, `-DVEDIT_NO_TERM` drops the terminal buffers
-and all the pseudo-terminal and emulator code, and `-DVEDIT_NO_TOOLS` drops the
-build commands and the output pane. Beyond those, the hex view and
+and the pseudo-terminal code, `-DVEDIT_NO_ART` drops the art view (the VT
+emulator goes once both are out), and `-DVEDIT_NO_TOOLS` drops the build
+commands and the output pane. Beyond those, the hex view and
 multiple-buffer support are the next candidates to remove; each is
 self-contained. For a smaller input surface, drop the vi personality.
 

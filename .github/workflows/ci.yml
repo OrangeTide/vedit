@@ -103,17 +103,22 @@ jobs:
           if ldd vedit 2>/dev/null; then echo "vedit is not static"; exit 1; fi
           ./vedit --version
 
-  # The embedding-host configuration without the terminal panel.
+  # The slimmer configurations: without the terminal panel, without the art
+  # view, and without both (which also drops the VT emulator).
   no-term:
-    name: no-term
+    name: slim (${{ matrix.flags }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        flags: ["VEDIT_NO_TERM=1", "VEDIT_NO_ART=1", "VEDIT_NO_TERM=1 VEDIT_NO_ART=1"]
     steps:
       - uses: actions/checkout@v6
-      - name: Build without the terminal panel
-        run: make VEDIT_NO_TERM=1
+      - name: Build
+        run: make ${{ matrix.flags }}
       - name: Test
-        run: make test VEDIT_NO_TERM=1
+        run: make test ${{ matrix.flags }}
 
   # macOS: the pty code takes the <util.h> path there. The allocation-failure
   # test needs the GNU linker's --wrap, which Apple's ld lacks, so it is left

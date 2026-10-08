@@ -241,6 +241,18 @@ win_fclose(FILE *fp)
 #define VEDIT_TERM 1
 #endif
 
+/* The art view (.ans files edited as a grid of cells) is built by default;
+ * -DVEDIT_NO_ART drops it. Its code is guarded by VEDIT_ART. */
+#if !defined(VEDIT_NO_ART) && !defined(VEDIT_ART)
+#define VEDIT_ART 1
+#endif
+
+/* The VT emulator (the grid and the escape-sequence parser) serves both the
+ * terminal buffers and the art view, so it is built when either is. */
+#if (defined(VEDIT_TERM) || defined(VEDIT_ART)) && !defined(VEDIT_VT)
+#define VEDIT_VT 1
+#endif
+
 /* The mail reader and composer is built by default; -DVEDIT_NO_MAIL drops it.
  * Its code is guarded by VEDIT_MAIL. */
 #if !defined(VEDIT_NO_MAIL) && !defined(VEDIT_MAIL)
@@ -2679,9 +2691,9 @@ vt_cell_clear(Cell *c)
 	c->width = 1;
 }
 
-#ifdef VEDIT_TERM
+#ifdef VEDIT_VT
 /* Like vt_cell_clear but keeps bg, for background-color erase. Used by the
- * embedded VT emulator in the VEDIT_TERM block near the end of this file. */
+ * embedded VT emulator in the VEDIT_VT block near the end of this file. */
 static void
 vt_cell_erase(Cell *c, Color bg)
 {
@@ -2706,7 +2718,22 @@ vt_cell_erase(Cell *c, Color bg)
 #define VT_ATTR_HIDDEN		ATTR_HIDDEN
 #define VT_ATTR_STRIKE		ATTR_STRIKE
 #define VT_ATTR_PREDICTED	ATTR_PREDICTED
-#endif /* VEDIT_TERM */
+
+/* A cell that contributes nothing to a file: a plain blank. Shared by the
+ * art view and the terminal repost, which trims trailing blank rows. */
+static int
+art_cell_plain(const Cell *c)
+{
+	return c->attrs == 0 && c->fg.type == COLOR_DEFAULT &&
+	    c->bg.type == COLOR_DEFAULT;
+}
+
+static int
+art_cell_blank(const Cell *c)
+{
+	return (c->codepoint == ' ' || c->codepoint == 0) && art_cell_plain(c);
+}
+#endif /* VEDIT_VT */
 
 /* Parse a color: "default", a 0-255 palette index, "#rrggbb", or one of the 16
  * ANSI names (with a "bright-" prefix for 8-15). Returns 1 on success. Used by
@@ -6975,16 +7002,6 @@ static void pane_close(Editor *e);		/* close the pane's terminal */
 static void pane_key(Editor *e);		/* Ctrl-W from a text buffer */
 static int pane_shown(const Editor *e);		/* the pane is on screen */
 static int pane_possible(const Editor *e);	/* a pane could open now */
-static void art_sync_file(Editor *e);		/* .ans files get the art view */
-static void art_detach(Editor *e);		/* drop the active buffer's grid */
-static void art_free(Art *a);
-static int art_export(Editor *e);		/* grid -> text buffer, for saving */
-static void art_render(Editor *e, Screen *d);
-static Req art_key(Editor *e, const struct tkbd_seq *seq);
-static int art_put(Editor *e, int y, int x, uint32_t cp);
-static void art_mark(Editor *e);
-static void art_move(Art *a, int dy, int dx);
-static void dlg_colors(Editor *e);		/* the colour palette dialog */
 static Term *term_repost_src(const Editor *e);	/* terminal a repost reads */
 static int term_repost_text(Editor *e);	/* terminal history -> text buffer */
 static int term_repost_art(Editor *e);		/* terminal history -> art buffer */
@@ -7008,6 +7025,19 @@ static int term_open(Editor *e, const char *cmd); /* :term; -1 on failure */
 static int term_collect(void *ctx, int *fds, int max);	/* aux_collect hook */
 static void term_drain(void *ctx, int fd);		/* aux_ready hook */
 #endif /* VEDIT_TERM */
+#ifdef VEDIT_ART
+/* Art view interface, defined with the emulator near end of file. */
+static void art_sync_file(Editor *e);		/* .ans files get the art view */
+static void art_detach(Editor *e);		/* drop the active buffer's grid */
+static void art_free(Art *a);
+static int art_export(Editor *e);		/* grid -> text buffer, for saving */
+static void art_render(Editor *e, Screen *d);
+static Req art_key(Editor *e, const struct tkbd_seq *seq);
+static int art_put(Editor *e, int y, int x, uint32_t cp);
+static void art_mark(Editor *e);
+static void art_move(Art *a, int dy, int dx);
+static void dlg_colors(Editor *e);		/* the colour palette dialog */
+#endif /* VEDIT_ART */
 
 /* Set the one-line status message (printf-style). The single choke point for
  * e->status, so every message is bounded by its size the same way. */
@@ -9665,13 +9695,13 @@ menu_item_enabled(const Editor *e, Menuact act)
 	case MA_CUT:
 		return e->sel_active;
 	case MA_GLYPHS:
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 		if (e->art)
 			return 1;
 #endif
 		return e->draw_mode;
 	case MA_COLORS:
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 		return e->art != NULL;
 #else
 		return 0;
@@ -9686,7 +9716,7 @@ menu_item_enabled(const Editor *e, Menuact act)
 	case MA_INS_FILE:
 		if (e->kind != BUF_TEXT || e->tbl || e->draw_mode)
 			return 0;
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 		if (e->art)
 			return 0;
 #endif
@@ -9979,7 +10009,7 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 	int rlen;
 	size_t ly = e->cy;	/* the line shown; the art view has its own */
 
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 	if (e->art)
 		ly = (size_t)e->art->cy;
 #endif
@@ -10002,7 +10032,7 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 	} else {
 		const char *mode = "";
 
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 		if (e->art)
 			mode = "-- ART --  ";
 		else
@@ -10032,7 +10062,7 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 			scr_text(e->d, row, 1 + (int)strlen(mode) + 9, e->vcs,
 			    p->bar_fg, p->bar_bg, at);
 		}
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 		if (e->art)		/* a swatch of the pen */
 			scr_text(e->d, row, 1 + (int)strlen(mode) + 9, " Ab ",
 			    e->art->fg, e->art->bg, e->art->attrs);
@@ -12805,7 +12835,7 @@ render_body(Editor *e, Screen *d)
 	}
 #endif
 
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 	if (e->art) {
 		e->prev_text_view = 0;	/* a cell grid, not the text view */
 		art_render(e, d);
@@ -15483,7 +15513,7 @@ ed_save_file(Editor *e)
 		    backup_path_for(e->path, backup, sizeof(backup)))
 			(void)file_copy(e->path, backup, st.st_mode & 07777);
 	}
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 	if (e->art && art_export(e) < 0)	/* the grid is the truth */
 		return ERR;
 #endif
@@ -16134,7 +16164,7 @@ static const char *const tut_draw[] = {
 	"trim trailing whitespace when it saves.",
 };
 
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 static const char *const tut_art[] = {
 	"The art view edits coloured text art. A file named *.ans opens",
 	"as a grid of cells, each a glyph with its own colours, and is",
@@ -16171,7 +16201,8 @@ static const char *const tut_art[] = {
 	"",
 	"Set art.view = off in the config to open .ans files as text.",
 };
-
+#endif
+#ifdef VEDIT_TERM
 static const char *const tut_term[] = {
 	"A terminal buffer runs a shell, or any command, inside vedit as",
 	"one more buffer alongside your files. It needs a host that can",
@@ -16333,6 +16364,8 @@ static const Tutorial g_tutorials[] = {
 	{ "Line Draw Mode",	TUT(tut_draw) },
 #ifdef VEDIT_TERM
 	{ "Terminal Buffers",	TUT(tut_term) },
+#endif
+#ifdef VEDIT_ART
 	{ "Art View (.ans)",	TUT(tut_art) },
 #endif
 	{ "Table View (CSV)",	TUT(tut_table) },
@@ -16857,6 +16890,8 @@ buf_open(Editor *e, const char *path)
 #ifdef VEDIT_TERM
 	e->kind = BUF_TEXT;		/* parked a terminal: this slot is text */
 	e->vterm = NULL;
+#endif
+#ifdef VEDIT_ART
 	e->art = NULL;
 #endif
 	e->tbl = NULL;
@@ -16879,7 +16914,7 @@ buf_open(Editor *e, const char *path)
 	e->expand_tabs = indent_expand_default(e->syn ? e->syn->name : NULL);
 	tabs_config(e);
 	e->cy = e->cx = e->top = e->left = 0;
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 	art_sync_file(e);
 #endif
 	tbl_sync_file(e);
@@ -16924,6 +16959,8 @@ buf_close(Editor *e, int i)
 			e->kind = BUF_TEXT;
 			e->vterm = NULL;
 		}
+#endif
+#ifdef VEDIT_ART
 		art_detach(e);
 #endif
 		tbl_detach(e);
@@ -16941,6 +16978,8 @@ buf_close(Editor *e, int i)
 			unlink(e->bufs[i].swap_path);
 #ifdef VEDIT_TERM
 		term_buf_free(&e->bufs[i]);	/* no-op unless it is a terminal */
+#endif
+#ifdef VEDIT_ART
 		art_free(e->bufs[i].art);
 #endif
 		tbl_free(e->bufs[i].tbl);
@@ -18827,7 +18866,7 @@ ed_new(Editor *e)
 	e->path[0] = '\0';
 	e->syn = NULL;
 	buffer_reset(e);
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 	art_detach(e);
 #endif
 	tbl_detach(e);
@@ -20197,7 +20236,7 @@ ed_open(Editor *e)
 		e->has_name = 1;
 		e->syn = syn_for_path(e->path);
 		buffer_reset(e);
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 		art_sync_file(e);
 #endif
 		tbl_sync_file(e);
@@ -22641,7 +22680,7 @@ run_menu_act(Editor *e, Menuact act)
 		break;
 	}
 	case MA_COLORS:
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 		dlg_colors(e);
 #endif
 		break;
@@ -23603,7 +23642,7 @@ glyph_insert(Editor *e, uint32_t cp)
 	unsigned char buf[8];
 	int n;
 
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 	if (e->art) {
 		int w;
 
@@ -23900,7 +23939,11 @@ ed_mouse_event(Editor *e, const struct tkbd_seq *m)
 	if (e->hex_view || e->tbl)
 		return MA_NONE;
 #ifdef VEDIT_TERM
-	if (e->kind == BUF_TERM || e->art || e->pane_focus)
+	if (e->kind == BUF_TERM || e->pane_focus)
+		return MA_NONE;
+#endif
+#ifdef VEDIT_ART
+	if (e->art)
 		return MA_NONE;
 #endif
 	if (m->y < CHROME_TOP || m->y >= CHROME_TOP + text_h)
@@ -24045,7 +24088,7 @@ editor_loop(Editor *e)
 			continue;
 		}
 
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 		/* The art view takes every key while a .ans file is current. */
 		if (e->art) {
 			if (run_req(e, art_key(e, &seq)))
@@ -24200,6 +24243,8 @@ editor_teardown(Editor *e)
 				unlink(e->bufs[i].swap_path);
 #ifdef VEDIT_TERM
 			term_buf_free(&e->bufs[i]);	/* reap any child */
+#endif
+#ifdef VEDIT_ART
 			art_free(e->bufs[i].art);
 #endif
 			tbl_free(e->bufs[i].tbl);
@@ -24208,7 +24253,7 @@ editor_teardown(Editor *e)
 			buf_free_fields(e->bufs[i].t, e->bufs[i].line_state);
 		}
 	} else {
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 		art_detach(e);
 #endif
 		tbl_detach(e);
@@ -24310,7 +24355,7 @@ vedit_open(struct vedit *v, const char *path)
 	v->e.syn = syn_for_path(v->e.path);
 	v->e.expand_tabs = indent_expand_default(v->e.syn ? v->e.syn->name : NULL);
 	tabs_config(&v->e);
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 	art_sync_file(&v->e);
 #endif
 	tbl_sync_file(&v->e);
@@ -25633,8 +25678,10 @@ tty_getsize(void *ctx, int *rows, int *cols)
 }
 #endif /* _WIN32 */
 
+#ifdef VEDIT_VT
 #ifdef VEDIT_TERM
 static long pty_write(int fd, const void *buf, size_t n);	/* the PTY layer, below */
+#endif
 
 /* ============================================================
  * Embedded VT terminal emulator.
@@ -27125,6 +27172,7 @@ param_or(const int *params, int nparam, int idx, int def)
 static void
 vt_reply(struct vt_state *st, const char *data, size_t len)
 {
+#ifdef VEDIT_TERM
 	if (st->reply_fd < 0)
 		return;
 	while (len > 0) {
@@ -27137,6 +27185,11 @@ vt_reply(struct vt_state *st, const char *data, size_t len)
 		data += n;
 		len -= (size_t)n;
 	}
+#else
+	(void)st;
+	(void)data;
+	(void)len;
+#endif
 }
 
 /* line drawing character map (DEC special graphics, 0x5F-0x7E) */
@@ -28511,7 +28564,9 @@ vt_parse_feed(struct vt_parse *p, const char *data, size_t len)
 	for (i = 0; i < len; i++)
 		process_byte(p, (unsigned char)data[i]);
 }
+#endif /* VEDIT_VT */
 
+#ifdef VEDIT_TERM
 /****************************************************************
  * Terminal buffers
  *
@@ -30111,6 +30166,9 @@ term_loop_step(Editor *e)
 	return TERM_CONT;
 }
 
+#endif /* VEDIT_TERM */
+
+#ifdef VEDIT_ART
 /****************************************************************
  * Art view: colour text art edited as a grid of cells
  *
@@ -30164,19 +30222,6 @@ art_blank(Cell *c)
 	vt_cell_clear(c);
 }
 
-/* A cell that contributes nothing to the file: a plain blank. */
-static int
-art_cell_plain(const Cell *c)
-{
-	return c->attrs == 0 && c->fg.type == COLOR_DEFAULT &&
-	    c->bg.type == COLOR_DEFAULT;
-}
-
-static int
-art_cell_blank(const Cell *c)
-{
-	return (c->codepoint == ' ' || c->codepoint == 0) && art_cell_plain(c);
-}
 
 static int
 art_style_same(const Cell *a, const Cell *b)
@@ -30484,6 +30529,9 @@ art_export(Editor *e)
 	return 0;
 }
 
+#endif /* VEDIT_ART */
+
+#ifdef VEDIT_TERM
 /* ---- repost: copy a terminal's scrollback and screen into a new buffer ---- */
 
 /* The terminal a repost reads: the active one, else the pane's. */
@@ -30607,6 +30655,7 @@ term_repost_text(Editor *e)
 	return 0;
 }
 
+#ifdef VEDIT_ART
 /* Repost the terminal as art: the cells with their colours, in a new unnamed
  * buffer in the art view. Save it as a .ans file to keep it. */
 static int
@@ -30645,7 +30694,17 @@ term_repost_art(Editor *e)
 	    rows, e->cur + 1, e->nbuf);
 	return 0;
 }
+#else /* no art view: the command stays, and says so */
+static int
+term_repost_art(Editor *e)
+{
+	set_status(e, "the art view is not in this build");
+	return -1;
+}
+#endif /* VEDIT_ART */
+#endif /* VEDIT_TERM */
 
+#ifdef VEDIT_ART
 /* ---- undo: whole-grid snapshots ---- */
 
 static int
@@ -31632,7 +31691,7 @@ art_key(Editor *e, const struct tkbd_seq *seq)
 	return REQ_CONTINUE;
 }
 
-#endif /* VEDIT_TERM */
+#endif /* VEDIT_ART */
 #ifndef VEDIT_NO_TOOLS
 /* The standalone binary's default tool runner: it spawns "sh -c <cmd>" in the
  * file's directory. An embedding host installs its own vedit_tool_api instead
@@ -37040,7 +37099,7 @@ vi_ex_exec(Editor *e, char *buf)
 			e->cy = e->cx = e->top = e->left = 0;
 			e->sel_active = 0;
 			e->hl_valid = 0;
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 			art_sync_file(e);
 #endif
 			tbl_sync_file(e);
