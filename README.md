@@ -871,56 +871,79 @@ remaining menus stay put, so their letters do not move.
 
 ### vi keys
 
-Press F2 to switch to the vi personality. NORMAL mode supports `h j k l`, `0 ^
-$`, `w b e`, `gg G`, `f F t T`, `; ,`, `{ } ( )`, `% H M L |`, counts such as
-`3j`, the operators `d c y` with motions (`dw`, `d$`, `dt`), `cc dd yy`, `x`,
-`p`, `u`, and `i a A I o O` to insert. Visual mode selects text: `v` charwise,
-`V` linewise, and `Ctrl-V` blockwise, after which an operator acts on the
-selection; `gv` reselects the previous range. A blockwise selection (a column
-rectangle) supports `d`/`x` to delete
-the columns, `y` to yank them, and `I` / `A` to insert at the left edge or append
-past the right edge, replicating the typed text down every row when you press
-Esc; a block yanked or deleted this way pastes back as a rectangle with `p`.
-`qa` records the keys you type into register a until you press `q` again, and an
-uppercase name (`qA`) appends to it instead of replacing it. `@a` plays a
-register back as keystrokes, `@@` repeats the last one, and a count repeats the
-macro (`3@a`). A register can also be filled by yanking into it (`"ayy`), since
-both are just stored bytes. `m` followed by a letter sets a mark; `` ` `` and `'`
-jump to it (to the exact spot and to the line's first non-blank). The marks
-`` ` `` / `'`, `` `. ``, `` `^ ``, `` `< `` / `` `> ``, and `` `[ `` / `` `] `` are kept
-automatically for the previous position, the last change, where insert mode
-stopped, the last visual selection, and the bounds of the last change or yank. A long-range move (`G`, `gg`, a search, a mark jump) is a jump:
-`Ctrl-O` steps back through the jump list and `Ctrl-I` (Tab) forward, `` ` `` /
-`''` toggle between a jump's ends, and `g`` / `g'` jump without recording.
-`:marks` lists the marks (choose one to jump to it), `:delmarks` clears some (or
-`:delmarks!` all a-z), and `:jumps` lists the jump list. `Ctrl-Home` and
-`Ctrl-End` jump to the first and last line, the same as `gg` and `G`, and work
-in insert mode too. `ZZ`
-writes and quits, `ZQ` quits without writing. The `:` line runs `write`, `quit`,
-`wq`, `xit`, `qall`, `wqall`, `cquit`, `edit`, `enew`, `read`, `buffer`,
-`bnext`, `bprevious`, `bdelete`, `buffers`, `tag`, `pop`, `retab`, `marks`,
-`delmarks`, `jumps`, `sort`, `:N`,
-`:set number` / `:set nonumber`, and `:set wrap` / `:set nowrap`. `:!cmd` runs a
-shell command the way the build commands run: in a terminal buffer labelled
-with the command, or in the output pane when a terminal buffer is not possible
-(through the host's command runner, so it is unavailable when none is
-installed). `:terminal [cmd]` opens a
-terminal buffer, described under
-[Terminal buffers](#terminal-buffers). Command names
-follow the usual vi abbreviation rule: any leading prefix of the full name down
-to its standard short form works, so `:s` is `:substitute`, `:e` is `:edit`,
-`:w` is `:write`, `:bn` is `:bnext`, while `:se` stays `:set` and `:sy` is
-`:syntax`. `/` and `?` search incrementally (forward and backward, the
-cursor following the first match as you type, Esc restoring the start) and `n` /
-`N` repeat. Searches and substitutions take regular expressions. Substitution
-follows the usual vi forms: `:s/old/new/`, `:s/old/new/g` for every match on the
-line, a leading range such as `:%s/old/new/g` for the whole file, and
-`:g/pat/...` / `:v/pat/...` to run a command on matching (or non-matching) lines.
-The global command runs `d` (delete), `s///` (substitute), `y` (yank the lines
-to the clipboard), or `>` / `<` (shift them). The replacement supports `&` and
-`\1`..`\9` and the `\U \L \u \l \E` case
-escapes. In the modeless personality, Ctrl-R walks the matches one at a time and
-asks before each.
+Press F2 to switch to the vi personality. The keys below follow vi; counts
+such as `3j` apply to motions, operators, and macros.
+
+| NORMAL mode | Action |
+| --- | --- |
+| `h j k l` | move by a character or a line |
+| `0 ^ $` | start of line, first non-blank, end of line |
+| `w b e` | word forward, back, end |
+| `gg G` | first and last line (also Ctrl-Home and Ctrl-End, which work in insert mode too) |
+| `f F t T` then `; ,` | find a character on the line, repeat forward or back |
+| `{ } ( )` | paragraph and sentence motions |
+| `% H M L \|` | matching bracket, screen top, middle, bottom, column |
+| `d c y` with a motion | delete, change, yank (`dw`, `d$`, `dt,`) |
+| `cc dd yy` | the whole line |
+| `x p u` | delete a character, paste, undo (Ctrl-R redoes) |
+| `i a A I o O` | enter insert mode before, after, at the ends, on a new line |
+| `ZZ` / `ZQ` | write and quit / quit without writing |
+| `/` `?` then `n` `N` | search forward or back incrementally, repeat (Esc restores the start) |
+
+| Visual mode | Action |
+| --- | --- |
+| `v` `V` Ctrl-V | select by character, by line, as a block (a column rectangle) |
+| `gv` | reselect the previous range |
+| operator on a selection | `d` `c` `y` act on it; a block `d`/`x` deletes the columns, `y` yanks them |
+| block `I` / `A` | insert at the left edge or append past the right edge; Esc repeats the text down every row |
+| `p` | a block yanked or deleted this way pastes back as a rectangle |
+
+| Registers and macros | Action |
+| --- | --- |
+| `qa` ... `q` | record the keys you type into register a; `qA` appends instead of replacing |
+| `@a` `@@` `3@a` | play a register back as keystrokes, repeat the last one, with a count |
+| `"ayy` | a register can also be filled by yanking, since both are just stored bytes |
+
+| Marks and jumps | Action |
+| --- | --- |
+| `ma` | set mark a |
+| `` `a `` / `'a` | jump to the exact spot / to the line's first non-blank |
+| ``` `` ``` / `''` | the previous position (toggle between a jump's ends) |
+| `` `. `` `` `^ `` | the last change, where insert mode stopped |
+| `` `< `` `` `> `` | the bounds of the last visual selection |
+| `` `[ `` `` `] `` | the bounds of the last change or yank |
+| Ctrl-O / Ctrl-I (Tab) | step back / forward through the jump list |
+| ``g` `` `g'` | jump to a mark without recording a jump |
+| `:marks` `:jumps` | list the marks or the jump list and pick one |
+| `:delmarks a b` / `:delmarks!` | clear some marks / all of a-z |
+
+A long-range move (`G`, `gg`, a search, a mark jump) records a jump; the
+automatic marks above are kept as you edit.
+
+**The `:` line.** It runs `write`, `quit`, `wq`, `xit`, `qall`, `wqall`,
+`cquit`, `edit`, `enew`, `read`, `buffer`, `bnext`, `bprevious`, `bdelete`,
+`buffers`, `tag`, `pop`, `retab`, `marks`, `delmarks`, `jumps`, `sort`, `:N`
+(go to line N), `:set number` / `:set nonumber`, and `:set wrap` /
+`:set nowrap`. Command names follow the usual vi abbreviation rule: any
+leading prefix of the full name down to its standard short form works, so
+`:s` is `:substitute`, `:e` is `:edit`, `:w` is `:write`, `:bn` is `:bnext`,
+while `:se` stays `:set` and `:sy` is `:syntax`.
+
+`:!cmd` runs a shell command the way the build commands run: in a terminal
+buffer labelled with the command, or in the output pane when a terminal
+buffer is not possible (through the host's command runner, so it is
+unavailable when none is installed). `:terminal [cmd]` opens a terminal
+buffer, described under [Terminal buffers](#terminal-buffers).
+
+**Substitution.** Searches and substitutions take regular expressions.
+`:s/old/new/` replaces the first match on the line and `:s/old/new/g` every
+match; a leading range such as `:%s/old/new/g` covers the whole file.
+`:g/pat/cmd` and `:v/pat/cmd` run a command on the matching (or
+non-matching) lines, where the command is `d` (delete), `s///`
+(substitute), `y` (yank the lines to the clipboard), or `>` / `<` (shift
+them). The replacement supports `&`, `\1`..`\9`, and the `\U \L \u \l \E`
+case escapes. In the modeless personality, Ctrl-R walks the matches one at
+a time and asks before each.
 
 ### Regular expressions
 
