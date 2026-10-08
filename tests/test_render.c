@@ -3824,6 +3824,8 @@ t_sort(Test *t)
 	size_t len;
 	const char *s;
 
+	memset(&md, 0, sizeof(md));
+
 	memio_init(&m, "", 0, 24, 80);
 	memio_bind(&io, &m);
 	v = vedit_new(&io);

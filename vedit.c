@@ -23070,13 +23070,14 @@ tool_term_start(Editor *e, const char *cmd, const char *dir, const char *label)
 	argv[0] = "cmd.exe";
 	argv[1] = "/d";
 	argv[2] = "/c";
+	n = 3;
 #else
 	argv[0] = "/bin/sh";
 	argv[1] = "-c";
-	argv[2] = NULL;
+	n = 2;
 #endif
-	argv[argv[2] ? 3 : 2] = (char *)cmd;
-	argv[argv[2] ? 4 : 3] = NULL;
+	argv[n] = (char *)cmd;
+	argv[n + 1] = NULL;
 	if ((e->tool_in_pane ? pane_open(e, argv, dir, label)
 	    : term_open_argv(e, argv, dir, label, 0)) < 0)
 		return -1;

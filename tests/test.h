@@ -13,6 +13,12 @@
 #ifndef TAP_TEST_H
 #define TAP_TEST_H
 
+/* The tests include vedit.c after this header, so the feature macro it
+ * wants must already be set when the first system header comes in. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
+
 
 /* Per-case context, opaque to the case. */
 typedef struct Test Test;

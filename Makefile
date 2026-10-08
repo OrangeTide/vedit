@@ -152,10 +152,13 @@ $(TERMFAULTBIN): $(TESTDIR)/test_termfault.c $(TESTDIR)/testmain.c \
 
 # The tests never read a config file, but point the lookup at an empty
 # directory anyway so a developer's own settings can never leak in.
+# TAPFLAGS passes options to the driver: -v lists every check, so a failing
+# one is named in a CI log.
+TAPFLAGS ?=
 test: $(TESTDIR)/taptest $(TESTBINS) $(TERMTESTBIN) $(TERMFAULTBIN)
 	XDG_CONFIG_HOME=$(abspath $(TESTDIR))/no-config VEDIT_CONFIG= \
-	    $(TESTDIR)/taptest --self-test --exe $(TESTBINS) $(TERMTESTBIN) \
-	    $(TERMFAULTBIN)
+	    $(TESTDIR)/taptest $(TAPFLAGS) --self-test --exe $(TESTBINS) \
+	    $(TERMTESTBIN) $(TERMFAULTBIN)
 
 # Build and run the torture/fuzz suite.
 $(TESTDIR)/torturet: $(TESTDIR)/torture.c $(SRC) $(HDR)

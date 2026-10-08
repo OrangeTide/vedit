@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+# -v makes the test driver list every check, so a failing one is named here.
+env:
+  TAPFLAGS: -v
+
 permissions:
   contents: read
 
@@ -134,7 +138,7 @@ jobs:
       - name: Test
         run: |
           make tests/taptest tests/test_unit tests/test_render tests/test_term
-          tests/taptest --self-test --exe tests/test_unit tests/test_render tests/test_term
+          tests/taptest -v --self-test --exe tests/test_unit tests/test_render tests/test_term
 
   # The graphical build. The ubuntu-24.04 runners have no SDL3 package, so
   # it runs in a newer container that does; a link failure here means the
