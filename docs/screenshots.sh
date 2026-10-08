@@ -119,28 +119,10 @@ LD-0021,LED,100,0.08,Lumen Co,green
 PB-0007,Power brick,4,22.00,Northwind,"12 V, 2 A"
 EOF
 
-# A small piece of coloured text art for the art view, written as the SGR
-# sequences a .ans file carries (UTF-8 glyphs, since the view edits Unicode).
-# The letters are three cells wide and three rows tall with one cell between
-# them (19 cells), so the double-line box is 23 cells across with its borders.
-{
-	Y='\033[1;33m' C='\033[1;36m' c='\033[36m' R='\033[0m'
-	TL='\342\225\224' TR='\342\225\227' BL='\342\225\232' BR='\342\225\235'
-	H='\342\225\220' V='\342\225\221'
-	F='\342\226\210' U='\342\226\200' L='\342\226\204'	# full, upper, lower block
-	HH="$H$H$H$H$H$H$H$H$H$H$H$H$H$H$H$H$H$H$H$H$H"		# 21 of them
-	#        V         E         D         I         T
-	r1="$F $F $F$U$U $F$U$L $U$F$U $U$F$U"
-	r2="$F $F $F$U$U $F $F  $F   $F "
-	r3=" $U  $U$U$U $U$U  $U$U$U  $U "
-	printf "$Y$TL$HH$TR$R\n"
-	printf "$Y$V$R $C$r1$R $Y$V$R\n"
-	printf "$Y$V$R $C$r2$R $Y$V$R\n"
-	printf "$Y$V$R $c$r3$R $Y$V$R\n"
-	printf "$Y$BL$HH$BR$R\n"
-	printf '\033[41m  \033[43m  \033[42m  \033[46m  \033[44m  \033[45m  \033[47m  \033[0m \033[1;31mr\033[1;33me\033[1;32md\033[1;36m \033[1;34mb\033[1;35mo\033[1;37mx\033[0m\n'
-	printf '\033[2m\342\226\221\342\226\221\033[0m\342\226\222\342\226\222\033[1m\342\226\223\342\226\223\342\226\210\342\226\210\033[0m shades\n'
-} > "$work/logo.ans"
+# The art view shows docs/space.ans, one of the three sample scenes kept with
+# the documentation (space, mountain, beach: 256-colour block and box art
+# with a VEDIT logo at the bottom right).
+cp "$here/space.ans" "$work/space.ans"
 
 # A build command for C, so the context-sensitive Compile and Run menus are
 # present in the shots (they hide when no command is configured for the file).
@@ -269,8 +251,10 @@ render "$here/shot-table.png" parts.csv \
     "Down Down Down Right Right Right Right"
 
 # The art view: a .ans opens as a cell grid; the status line shows the pen.
-render "$here/shot-art.png" logo.ans \
-    "Down Down Down Down Down Right Right"
+# The scene is 40 rows: walk the cursor to its last row so the logo scrolls
+# into the frame, then over two cells for a coloured pen on the status line.
+render "$here/shot-art.png" space.ans \
+    "$(printf 'Down %.0s' $(seq 39)) Right Right"
 
 
 # Version control: a copy of ring.c committed twice in its own repository, so

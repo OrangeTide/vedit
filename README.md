@@ -1266,9 +1266,11 @@ buffers, so it is in a `VEDIT_NO_TERM` build too; `-DVEDIT_NO_ART`
 (`make VEDIT_NO_ART=1`) drops it. The status line shows `-- ART --` while it
 is active. A file that ends its
 lines with a bare LF, as the editor's own files do, replays the same as one with
-CR LF.
+CR LF. Three sample scenes to try it on are in `docs/`: `space.ans`,
+`mountain.ans` and `beach.ans`, 256-colour block and box art generated from
+the splash screens of lumi, the terminal multiplexer this editor grew out of.
 
-![Coloured text art in the art view, with the pen's colours on the status line](docs/shot-art.png)
+![The space scene from docs/space.ans in the art view, with the pen's colours on the status line](docs/shot-art.png)
 
 The editing model is draw mode's, applied to cells:
 
