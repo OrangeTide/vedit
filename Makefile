@@ -24,6 +24,16 @@ OUTBIN  = $(OUT)/$(TARGET)/bin
 EXE     = $(if $(findstring mingw,$(TARGET)),.exe,)
 BIN     = $(OUTBIN)/$(PROG)$(EXE)
 
+# The graphical editor: the same source with the guterm window binding
+# (VEDIT_GUI) in place of the tty one. Needs SDL3; built only on request
+# with `make gvedit`, so a plain build never needs it.
+GPROG   = gvedit
+GBIN    = $(OUTBIN)/$(GPROG)$(EXE)
+SDL_CFLAGS := $(shell pkg-config --cflags sdl3 2>/dev/null)
+SDL_LIBS   := $(shell pkg-config --libs sdl3 2>/dev/null)
+# Where the vendored guterm.h is refreshed from with `make guterm-sync`.
+GUTERM_DIR ?= ../guterm
+
 # Static build against musl, handy for dropping the binary onto a server:
 #   make static            (or: make STATIC=1)
 #   make static install    installs that binary
@@ -86,7 +96,7 @@ TORTURE_ROUNDS ?= 20000
 SANCFLAGS = -std=gnu11 -Wall -Wextra -g -O1 -fno-omit-frame-pointer
 
 .PHONY: all link clean install uninstall test torture asan ubsan cov cov-term \
-    screenshots static
+    screenshots static gvedit guterm-sync
 
 all: $(BIN) link
 
@@ -102,6 +112,18 @@ link: $(BIN)
 	$(if $(EXE),,ln -sfn $(BIN) $(PROG))
 
 static: all
+
+gvedit: $(GBIN)
+	$(if $(EXE),,ln -sfn $(GBIN) $(GPROG))
+
+$(GBIN): $(SRC) $(HDR) guterm.h | $(OUTBIN)
+	$(CC) $(CFLAGS) -DVEDIT_GUI $(SDL_CFLAGS) -o $@ $(SRC) $(SDL_LIBS) -lm \
+	    $(LDFLAGS)
+
+# Refresh the vendored header from a guterm checkout and stamp its commit.
+guterm-sync:
+	cp $(GUTERM_DIR)/guterm.h guterm.h
+	sed -i "1a\\/* vendored from guterm $$(git -C $(GUTERM_DIR) describe --always --dirty) */" guterm.h
 
 # Unit and integration tests, run through the vendored taptest driver.
 $(TESTDIR)/taptest: $(TESTDIR)/taptest.c $(TESTDIR)/taptest_selftest.c \

@@ -34,6 +34,25 @@ Windows x86_64 console build, with a SHA256SUMS file. They are produced by
 the release workflow when a version tag is pushed; the tag must match
 `VEDIT_VERSION` in vedit.c or the run stops before building.
 
+### Graphical build (gvedit)
+
+The same source also builds as its own window, for a desktop without a
+terminal emulator worth using, or for Windows and macOS. It draws the
+editor's screen with a bitmap font through the vendored `guterm.h`
+(from the guterm project) and needs SDL3 at build and run time; nothing
+else in the editor changes, and the plain build never needs SDL.
+
+```sh
+make gvedit                       # _out/<triple>/bin/gvedit, linked as ./gvedit
+./gvedit --scale 2 file.txt       # zoom the font; default 1, or the
+                                  # display scale on a high density display
+make guterm-sync GUTERM_DIR=../guterm   # refresh the vendored header
+```
+
+Resizing the window resizes the editor, never the font. Mouse, paste,
+the terminal panel, and the clipboard through OSC 52 all work as in a
+terminal, because to the editor it is one.
+
 
 ### Windows
 

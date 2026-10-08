@@ -23044,6 +23044,10 @@ usage(void)
 	    "  --scroll      use the VT100 scroll region when scrolling (faster\n"
 	    "                on a slow link; needs a client that supports it)\n"
 	    "  --no-scroll   repaint instead (the default; also VEDIT_SCROLL=0|1)\n"
+#ifdef VEDIT_GUI
+	    "  --scale N     zoom the font N times (default: 1, or the display\n"
+	    "                scale on a high density display)\n"
+#endif
 	    "  --config FILE read settings from FILE (gitconfig style)\n"
 	    "  --no-config   skip the config file\n"
 	    "                Default: $VEDIT_CONFIG, else $XDG_CONFIG_HOME/vedit/\n"
@@ -24771,6 +24775,7 @@ vedit_free(struct vedit *v)
  * and SIGWINCH. This is the only part that touches termios and
  * signals; an embedded host supplies its own io instead.
  ****************************************************************/
+#ifndef VEDIT_GUI
 #ifndef _WIN32
 
 typedef struct tty_io {
@@ -25677,6 +25682,325 @@ tty_getsize(void *ctx, int *rows, int *cols)
 	return (*rows > 0 && *cols > 0) ? 0 : -1;
 }
 #endif /* _WIN32 */
+#endif /* VEDIT_GUI: the tty binding */
+
+#ifdef VEDIT_GUI
+/****************************************************************
+ * The graphical binding (gvedit): the same io vtable over a guterm
+ * window. The editor's escape stream goes through guterm's VT layer
+ * into a cell grid the window draws; window events come back as the
+ * bytes an xterm would send. Nothing else in the editor changes.
+ ****************************************************************/
+#define GUTERM_IMPLEMENTATION
+#include "guterm.h"
+#ifndef _WIN32
+#include <poll.h>
+#endif
+
+typedef struct gui_io {
+	gut_window	*w;
+	struct gut_buf	 buf;
+	struct gut_vt	 vt;
+	char		*in;		/* bytes queued for the editor */
+	size_t		 in_len, in_cap;
+	int		 dirty;		/* changed since the last present */
+	int		 quit;		/* the window was closed */
+} Guiio;
+
+static Guiio g_gui;
+
+static void
+gui_queue(Guiio *g, const char *data, size_t n)
+{
+	if (n == 0)
+		return;
+	if (g->in_len + n > g->in_cap) {
+		size_t cap = g->in_cap ? g->in_cap * 2 : 1024;
+		char *p;
+
+		while (cap < g->in_len + n)
+			cap *= 2;
+		p = realloc(g->in, cap);
+		if (!p)
+			return;
+		g->in = p;
+		g->in_cap = cap;
+	}
+	memcpy(g->in + g->in_len, data, n);
+	g->in_len += n;
+}
+
+/* The emulator's answers (DA, DSR) go back to the editor as input. */
+static void
+gui_reply(void *ctx, const char *data, size_t len)
+{
+	gui_queue(ctx, data, len);
+}
+
+static void
+gui_title(void *ctx, const char *title)
+{
+	Guiio *g = ctx;
+
+	gut_set_title(g->w, title);
+}
+
+/* OSC 52 from the editor's own copy and yank lands in the system
+ * clipboard. Queries stay unanswered; the editor never sends one. */
+static void
+gui_clipboard(void *ctx, int which, const char *text, size_t len)
+{
+	Guiio *g = ctx;
+
+	(void)len;
+	if (which == GUT_CLIP_CLIPBOARD)
+		gut_clipboard_set(g->w, text);
+	else
+		gut_primary_set(g->w, text);
+}
+
+/* Turn one window event into input bytes. */
+static void
+gui_event(Guiio *g, const struct gut_event *ev)
+{
+	char small[64];
+	char *buf = small;
+	size_t cap = sizeof(small), n;
+
+	switch (ev->type) {
+	case GUT_EVENT_QUIT:
+		g->quit = 1;
+		return;
+	case GUT_EVENT_RESIZE:
+		g_winch = 1;	/* scr_wait asks getsize, as after SIGWINCH */
+		g->dirty = 1;
+		return;
+	case GUT_EVENT_MOUSE_DOWN:
+	case GUT_EVENT_MOUSE_UP:
+	case GUT_EVENT_MOUSE_MOVE:
+	case GUT_EVENT_MOUSE_WHEEL:
+	case GUT_EVENT_FOCUS_IN:
+	case GUT_EVENT_FOCUS_OUT:
+		n = gut_vt_mouse(&g->vt, ev, small, sizeof(small));
+		if (n > 0 && n < sizeof(small))
+			gui_queue(g, small, n);
+		return;
+	case GUT_EVENT_KEY:
+	case GUT_EVENT_TEXT:
+	case GUT_EVENT_PASTE:
+		break;
+	default:
+		return;
+	}
+	if (ev->len + 16 > cap) {
+		cap = ev->len + 16;
+		buf = malloc(cap);
+		if (!buf)
+			return;
+	}
+	n = gut_encode_event(ev, buf, cap, gut_vt_encode_flags(&g->vt));
+	if (n > 0 && n < cap)
+		gui_queue(g, buf, n);
+	if (buf != small)
+		free(buf);
+}
+
+/* Present what the editor drew, then wait up to timeout_ms for window
+ * events and queue them. Returns 1 when input is queued (or the window
+ * closed, which reads as end of input), 0 on timeout. */
+static int
+gui_pump(Guiio *g, int timeout_ms)
+{
+	struct gut_event ev;
+	int got;
+
+	if (g->dirty) {
+		gut_present(g->w, &g->buf);
+		g->dirty = 0;
+	}
+	if (g->in_len > 0 || g->quit)
+		timeout_ms = 0;
+	got = gut_poll(g->w, &ev, timeout_ms);
+	while (got) {
+		gui_event(g, &ev);
+		got = gut_poll(g->w, &ev, 0);
+	}
+	if (g->dirty) {	/* a resize or focus change redraws the overlay */
+		gut_present(g->w, &g->buf);
+		g->dirty = 0;
+	}
+	return g->in_len > 0 || g->quit;
+}
+
+static long
+gui_read(void *ctx, void *buf, long n)
+{
+	Guiio *g = ctx;
+	size_t take;
+
+	if (g->in_len == 0) {
+		gui_pump(g, 0);
+		if (g->in_len == 0)
+			return g->quit ? -1 : 0;
+	}
+	take = (size_t)n < g->in_len ? (size_t)n : g->in_len;
+	memcpy(buf, g->in, take);
+	memmove(g->in, g->in + take, g->in_len - take);
+	g->in_len -= take;
+	return (long)take;
+}
+
+static long
+gui_write(void *ctx, const void *buf, long n)
+{
+	Guiio *g = ctx;
+
+	gut_vt_feed(&g->vt, buf, (size_t)n);
+	g->dirty = 1;
+	return n;
+}
+
+static int
+gui_poll(void *ctx, int timeout_ms)
+{
+	return gui_pump(ctx, timeout_ms);
+}
+
+#ifndef _WIN32
+/* The window cannot be waited on together with file descriptors, so the
+ * wait alternates: a short poll() on the terminal panels' ptys, then the
+ * window's queue, until something is ready or the timeout passes. */
+static int
+gui_poll_fds(void *ctx, int timeout_ms, const int *extra, int nextra,
+    int *ready, int *nready)
+{
+	Guiio *g = ctx;
+	struct pollfd pfd[VEDIT_TERM_MAX * 2 + 1];
+	uint64_t deadline = gut_ticks(g->w) + (uint64_t)(timeout_ms > 0 ?
+	    timeout_ms : 0);
+	int i, n;
+
+	*nready = 0;
+	if (nextra > (int)(sizeof(pfd) / sizeof(pfd[0])))
+		nextra = (int)(sizeof(pfd) / sizeof(pfd[0]));
+	for (;;) {
+		int wait, r;
+
+		if (gui_pump(g, 0))
+			wait = 0;
+		else if (timeout_ms < 0)
+			wait = 16;
+		else {
+			uint64_t now = gut_ticks(g->w);
+
+			wait = now >= deadline ? 0 : (int)(deadline - now);
+			if (wait > 16)
+				wait = 16;
+		}
+		for (i = 0, n = 0; i < nextra; i++) {
+			if (extra[i] < 0)
+				continue;
+			pfd[n].fd = extra[i];
+			pfd[n].events = POLLIN;
+			pfd[n].revents = 0;
+			n++;
+		}
+		r = n > 0 ? poll(pfd, (nfds_t)n, wait) : 0;
+		if (r < 0 && errno != EINTR)
+			return -1;
+		if (r > 0) {
+			for (i = 0; i < n; i++)
+				if (pfd[i].revents)
+					ready[(*nready)++] = pfd[i].fd;
+		}
+		if (n == 0 && wait > 0)
+			gui_pump(g, wait);
+		if (*nready > 0 || g->in_len > 0 || g->quit)
+			return g->in_len > 0 || g->quit;
+		if (timeout_ms >= 0 && gut_ticks(g->w) >= deadline)
+			return 0;
+	}
+}
+#endif /* _WIN32 */
+
+static void
+gui_begin(void *ctx)
+{
+	(void)ctx;
+}
+
+static void
+gui_end(void *ctx)
+{
+	(void)ctx;
+}
+
+/* The grid follows the window; the emulator follows the grid, before the
+ * editor repaints at the new size. */
+static int
+gui_getsize(void *ctx, int *rows, int *cols)
+{
+	Guiio *g = ctx;
+
+	gut_grid_size(g->w, cols, rows);
+	if (*rows != g->buf.rows || *cols != g->buf.cols)
+		gut_vt_resize(&g->vt, *rows, *cols);
+	return 0;
+}
+
+/* Open the window and bind the vtable. Returns 0, or -1 with a message
+ * on stderr. */
+static int
+gui_open(Guiio *g, struct vedit_io *io, int scale)
+{
+	struct gut_desc desc = {0};
+	int rows, cols;
+
+	desc.title = "gvedit";
+	desc.scale = scale;
+	g->w = gut_open(&desc);
+	if (!g->w) {
+		fprintf(stderr, "%s: cannot open a window: %s\n", progname,
+		    gut_error());
+		return -1;
+	}
+	gut_grid_size(g->w, &cols, &rows);
+	if (gut_buf_init(&g->buf, rows, cols) != 0 ||
+	    gut_vt_init(&g->vt, &g->buf) != 0) {
+		fprintf(stderr, "%s: out of memory\n", progname);
+		return -1;
+	}
+	gut_vt_set_scrollback(&g->vt, 0);	/* the editor keeps history */
+	gut_vt_set_reply(&g->vt, gui_reply, g);
+	gut_vt_set_title_cb(&g->vt, gui_title, g);
+	gut_vt_set_clipboard_cb(&g->vt, gui_clipboard, NULL, g);
+	g->dirty = 1;
+
+	memset(io, 0, sizeof(*io));
+	io->ctx = g;
+	io->read = gui_read;
+	io->write = gui_write;
+	io->poll = gui_poll;
+	io->begin = gui_begin;
+	io->end = gui_end;
+	io->getsize = gui_getsize;
+#if defined(VEDIT_TERM) && !defined(_WIN32)
+	io->poll_fds = gui_poll_fds;
+#endif
+	return 0;
+}
+
+static void
+gui_close(Guiio *g)
+{
+	gut_vt_free(&g->vt);
+	gut_buf_free(&g->buf);
+	if (g->w)
+		gut_close(g->w);
+	free(g->in);
+	memset(g, 0, sizeof(*g));
+}
+#endif /* VEDIT_GUI */
 
 #ifdef VEDIT_VT
 #ifdef VEDIT_TERM
@@ -32507,6 +32831,7 @@ cli_config_path(const char *opt, char *buf, size_t bufsz)
  * so this exercises only the parse -> grid -> local-screen path. The child's
  * bytes never reach the real terminal: they land in the vt_buf and are
  * re-emitted by scr_present at coordinates vedit chooses. Run: vedit --term-demo */
+#ifndef VEDIT_GUI
 static int
 term_demo(const struct vedit_io *io)
 {
@@ -32586,6 +32911,7 @@ term_demo(const struct vedit_io *io)
 	scr_free(d);
 	return 0;
 }
+#endif /* VEDIT_GUI */
 #endif /* VEDIT_TERM */
 
 int
@@ -32598,6 +32924,9 @@ main(int argc, char **argv)
 	const char *cfg_opt = NULL;
 	char cfg_path[PATH_MAX];
 	int rc, i, no_config = 0;
+#ifdef VEDIT_GUI
+	int scale = 0;		/* 0: from the display */
+#endif
 
 	if (argv[0])
 		progname = argv[0];
@@ -32654,6 +32983,18 @@ main(int argc, char **argv)
 			cfg_opt = argv[++i];
 			continue;
 		}
+#ifdef VEDIT_GUI
+		if (strcmp(argv[i], "--scale") == 0) {
+			if (i + 1 >= argc || atoi(argv[i + 1]) < 1 ||
+			    atoi(argv[i + 1]) > 8) {
+				fprintf(stderr, "%s: --scale needs 1 to 8\n",
+				    progname);
+				return 1;
+			}
+			scale = atoi(argv[++i]);
+			continue;
+		}
+#endif
 		if (!file) {
 			file = argv[i];
 			continue;
@@ -32661,6 +33002,18 @@ main(int argc, char **argv)
 		fprintf(stderr, "%s: too many arguments\n", progname);
 		return 1;
 	}
+#ifdef VEDIT_GUI
+	/* The window stands in for the terminal: a UTF-8, 256 color client
+	 * with a scroll region, unless the command line says otherwise. */
+	if (g_box_force < 0)
+		g_box_force = VEDIT_BOX_UTF8;
+	if (g_colors_force < 0)
+		g_colors_force = 256;
+	if (g_scroll_force < 0)
+		g_scroll_force = 1;
+	if (gui_open(&g_gui, &io, scale) != 0)
+		return 1;
+#else
 	if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
 		fprintf(stderr, "%s: not a terminal\n", progname);
 		return 1;
@@ -32704,12 +33057,16 @@ main(int argc, char **argv)
 	if (file && strcmp(file, "--term-demo") == 0)
 		return term_demo(&io);
 #endif
+#endif /* VEDIT_GUI */
 
 	v = vedit_new(&io);
 	if (!v) {
 		fprintf(stderr, "%s: out of memory\n", progname);
 		return 1;
 	}
+#ifdef VEDIT_GUI
+	v->e.clip_osc52 = 1;	/* copies reach the system clipboard */
+#endif
 #ifndef VEDIT_NO_TOOLS
 	vedit_set_tools(v, &cli_tools);		/* the default shell spawner */
 #endif
@@ -32763,6 +33120,9 @@ main(int argc, char **argv)
 	}
 	vedit_free(v);
 	vedit_cfg_free(cfg);
+#ifdef VEDIT_GUI
+	gui_close(&g_gui);
+#endif
 	return rc;
 }
 

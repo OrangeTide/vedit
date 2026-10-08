@@ -14,3 +14,4 @@
 /tests/*.gcda
 /tests/*.gcov
 /tests/vedit.c.gcov.*
+/gvedit
