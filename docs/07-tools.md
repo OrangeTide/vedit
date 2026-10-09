@@ -156,6 +156,7 @@ From a text buffer, Ctrl-W followed by one of these:
 | c, q | Terminal > Close Pane | close the pane. A terminal is closed, a text buffer kept |
 | r, R | Terminal > Repost as Text, as Art | copy the pane terminal's output into a new buffer |
 | +, - | Terminal > Taller Pane, Shorter Pane | change the height a row at a time |
+| : | | an ex command line, in the vi keys |
 
 In the vi keys, `:split` opens a shell in the pane and `:split cmd` runs
 a command there, `:sbuffer [N]` shows this buffer or buffer N there, and
@@ -172,10 +173,12 @@ pane.
 
 ## Symbols and tags
 
-**Ctrl-T** (Search > Go to Symbol) lists the definitions in the current
-buffer and jumps to the one you choose: top-level functions, `struct`,
-`union`, `enum`, and `class` tags, `} Name;` typedefs, and `#define`
-lines. Each row shows the name, its kind, and the line. The patterns cover
+**Ctrl-T** (Search > Go to Symbol, or `:symbol` in the vi keys) lists the
+definitions in the current buffer and jumps to the one you choose. `:symbol
+text` lists only the names containing `text`. The scan finds top-level
+functions, `struct`, `union`, `enum`, and `class` tags, `} Name;`
+typedefs, and `#define` lines. Each row shows the name, its kind, and the
+line. The patterns cover
 C, C++, LPC, and shell functions, with no tags file needed.
 
 With a **tags file** the list also covers the rest of the project. vedit

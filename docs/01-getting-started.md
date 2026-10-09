@@ -55,10 +55,10 @@ allowed, the file is written in place.
 
 ## Quitting
 
-Ctrl-Q, or File > Exit. With unsaved changes it asks:
+Ctrl-Q, or File > Exit. For each file with unsaved changes it asks:
 
 ```
-Save changes before exiting?
+Save changes to notes.txt before exiting?
 [ Yes ]  [ No ]  [ Cancel ]
 ```
 

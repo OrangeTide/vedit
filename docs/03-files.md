@@ -24,9 +24,10 @@ into it. Any other name opens that file, which may be a new one.
 **File > Save As**, and the first save of an unnamed buffer, use the same
 browser with the `File:` line focused. For a named file it is filled with
 the current name, in the file's directory; for an unnamed buffer it is
-empty. Edit the name and press Enter to write there,
-or pick an existing file from the list to overwrite it. A save into a
-directory that does not exist asks `Create directory ...?` first.
+empty. Edit the name and press Enter to write there, or pick an existing
+file from the list. Writing over a file that exists asks `Overwrite
+name?` first, and a save into a directory that does not exist asks
+`Create directory ...?`.
 
 **File > New** starts an empty, unnamed buffer.
 
@@ -79,7 +80,7 @@ unsaved work. Two hidden files appear next to `name` at the first edit:
 A clean save or quit removes both. Only a crash leaves them behind. On a
 filesystem with reflinks (Btrfs, XFS, bcachefs, APFS) the base is a clone
 that shares the file's blocks and takes no extra time or space; elsewhere
-it is a copy. Once the journal passes 4 MB, the base is rewritten from the
+it is a copy. Once the journal grows large, the base is rewritten from the
 current text and the journal starts over.
 
 When you open a file that has a journal, vedit asks:
@@ -136,8 +137,7 @@ host always asks. With `edit.swap = off` there is no lock.
 Opening a file maps it. A line is copied to memory only when it is first
 changed, so a large log or data file opens in the time it takes to find
 the line breaks, and the operating system pages the bytes in as you
-scroll. A 200 MB file of four million
-lines opens in a tenth of a second.
+scroll.
 
 Before the first edit the view follows the file on disk, so a program that
 truncates the file while you are looking at it pulls the pages away. vedit

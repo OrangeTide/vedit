@@ -99,12 +99,6 @@ Select a block five lines tall, then `I`, type `//`, and Esc comments all
 six lines. `:g/TODO/d` deletes every line containing `TODO`, and
 `:%s/\<foo\>/bar/g` renames a word throughout the file. Chapter 6.
 
-## A 200 MB log file
-
-Opening a file maps it rather than reading it, so a 200 MB file of four
-million lines opens in a tenth of a second and costs 32 MB of memory.
-Chapter 3.
-
 ## Over a slow link
 
 `vedit --scroll --16color --dec` suits a telnet session to a terminal
