@@ -7893,7 +7893,7 @@ static int pane_open(Editor *e, char *const argv[], const char *dir,
     const char *label);			/* spawn argv in the bottom pane */
 static void pane_run(Editor *e, const char *cmd);	/* :split [cmd] */
 static void pane_close(Editor *e);		/* close the pane's terminal */
-static void pane_key(Editor *e);		/* Ctrl-W from a text buffer */
+static Req pane_key(Editor *e);		/* Ctrl-W from a text buffer */
 static int pane_shown(const Editor *e);		/* the pane is on screen */
 static int pane_possible(const Editor *e);	/* a pane could open now */
 static Term *term_repost_src(const Editor *e);	/* terminal a repost reads */
@@ -10685,13 +10685,13 @@ static const Menuitem mi_search[] = {
 	{ "&Find...",		"Ctrl+F",	"/",	MA_FIND },
 	{ "&Repeat Find",	"",		"n",	MA_FIND_NEXT },
 	{ "&Replace...",	"Ctrl+R",	":s",	MA_REPLACE },
-	{ "Go to S&ymbol...",	"Ctrl+T",	"",	MA_SYMBOL },
+	{ "Go to S&ymbol...",	"Ctrl+T",	":symbol",	MA_SYMBOL },
 	{ "&Pop Tag",		"",		":pop",	MA_TAG_POP },
 	{ "Open &Header",	"",		"gf",	MA_OPEN_HEADER },
 	{ "&Go to Line...",	"Ctrl+L",	"G",	MA_GOTO },
 };
 static const Menuitem mi_view[] = {
-	{ "&Syntax Highlight",	"",	"",	MA_SYNTAX },
+	{ "&Syntax Highlight",	"",	":syntax",	MA_SYNTAX },
 	{ "&Color Scheme",	"",	"",	MA_SCHEME },
 	{ "&Line Numbers",	"",	":set nu",	MA_LINENO },
 	{ "&Word Wrap",		"",	":set wrap",	MA_WRAP },
@@ -10706,7 +10706,7 @@ static const Menuitem mi_view[] = {
 	{ "Ta&ble View",	"",	":table",	MA_TABLE },
 };
 static const Menuitem mi_options[] = {
-	{ "&Draw Mode",		"Ins",	"",		MA_DRAW },
+	{ "&Draw Mode",		"Ins",	":draw",	MA_DRAW },
 	{ "&Glyph Palette...",	"Alt+G",	"",	MA_GLYPHS },
 #ifdef VEDIT_TERM
 	{ "&Color Palette...",	"Alt+C",	"",	MA_COLORS },
@@ -17539,6 +17539,32 @@ save_named(Editor *e)
 	return 0;
 }
 
+/* Browse for a name to save under and confirm before an existing file that
+ * is not this buffer's own is overwritten. Returns 1 with out filled, 0 when
+ * the browser or the question was cancelled (the status says so). */
+static int
+dlg_save_file_confirm(Editor *e, char *out, size_t outsz)
+{
+	Vstat st;
+	char msg[96];
+	const char *slash;
+
+	if (!dlg_save_file(e, out, outsz)) {
+		set_status(e, "save cancelled");
+		return 0;
+	}
+	if (g_vfs->stat(out, &st) != 0 ||
+	    (e->has_name && buf_same_file(out, e->path)))
+		return 1;
+	slash = strrchr(out, '/');
+	snprintf(msg, sizeof(msg), "Overwrite %.60s?", slash ? slash + 1 : out);
+	if (!dlg_confirm_yesno(e, msg)) {
+		set_status(e, "save cancelled");
+		return 0;
+	}
+	return 1;
+}
+
 /* Save the buffer, prompting for a name if it has none. Returns 0 on a
  * successful save, -1 on failure or when the save was cancelled. */
 static int
@@ -17548,10 +17574,8 @@ save_editor(Editor *e)
 		char name[PATH_MAX];
 
 		name[0] = '\0';
-		if (!dlg_save_file(e, name, sizeof(name))) {
-			set_status(e, "save cancelled");
+		if (!dlg_save_file_confirm(e, name, sizeof(name)))
 			return -1;
-		}
 		snprintf(e->path, sizeof(e->path), "%s", name);
 		e->has_name = 1;
 		e->syn = syn_for_path(e->path);
@@ -17933,6 +17957,7 @@ static const struct {
 	{ ":N  :cq",		"Go to a line, quit with an error code" },
 	{ "Ctrl-]  :tag",	"Jump to a tag (under cursor / by name)" },
 	{ "Ctrl-T  :pop",	"Pop the tag stack back to the last jump" },
+	{ ":symbol [text]",	"Pick a definition from the buffer and tags" },
 	{ ":marks  :jumps",	"List marks / the jump list (:delmarks clears)" },
 	{ "gf",			"Open the header or file named under the cursor" },
 	{ ":bn :bp :bd :ls",	"Next / prev / delete / list buffers (also F8)" },
@@ -18457,7 +18482,8 @@ dlg_help(Editor *e)
 		case TKBD_KEY_PGDN:	top += body; break;
 		case TKBD_KEY_HOME:	top = 0; break;
 		case TKBD_KEY_END:	top = maxtop; break;
-		case TKBD_KEY_ESC:	return;
+		case TKBD_KEY_ESC:
+		case TKBD_KEY_ENTER:	return;
 		default:
 			if (ev.key.ch == 't' || ev.key.ch == 'T')
 				dlg_tutorial(e);
@@ -18631,6 +18657,62 @@ static int
 dlg_confirm_discard(Editor *e)
 {
 	return dlg_confirm_save(e, "Save changes to the current file?");
+}
+
+/* The text of buffer i, wherever it currently lives (see buf_kind_at). */
+static const Text *
+buf_text_at(const Editor *e, int i)
+{
+	return (i == e->cur && !e->view_swap) ? e->t : e->bufs[i].t;
+}
+
+/* The index of the first modified text buffer, or -1 when every buffer is
+ * clean. Terminal buffers never count. */
+static int
+buf_first_dirty(const Editor *e)
+{
+	int i;
+
+	for (i = 0; i < e->nbuf; i++) {
+		const Text *t;
+
+		if (buf_kind_at(e, i) != BUF_TEXT)
+			continue;
+		t = buf_text_at(e, i);
+		if (t && text_dirty(t))
+			return i;
+	}
+	return -1;
+}
+
+/* Ask about every modified buffer before the editor exits: each one in turn
+ * becomes current and gets the Yes/No/Cancel question, so the user sees what
+ * they are answering about. Returns 1 to go ahead (everything saved or
+ * discarded), 0 when a question was cancelled or a save failed. */
+static int
+quit_confirm_all(Editor *e)
+{
+	int i;
+
+	for (i = 0; i < e->nbuf; i++) {
+		const Text *t;
+		const char *name, *slash;
+		char msg[96];
+
+		if (buf_kind_at(e, i) != BUF_TEXT)
+			continue;
+		t = buf_text_at(e, i);
+		if (!t || !text_dirty(t))
+			continue;
+		buf_switch(e, i);
+		name = buf_name_at(e, i);
+		slash = strrchr(name, '/');
+		snprintf(msg, sizeof(msg), "Save changes to %.40s before exiting?",
+		    slash ? slash + 1 : name);
+		if (!dlg_confirm_save(e, msg))
+			return 0;
+	}
+	return 1;
 }
 
 /* Reset syntax and cursor state after the buffer is swapped. */
@@ -22154,7 +22236,7 @@ ed_save_as(Editor *e)
 	char path[PATH_MAX];
 
 	path[0] = '\0';
-	if (!dlg_save_file(e, path, sizeof(path)))
+	if (!dlg_save_file_confirm(e, path, sizeof(path)))
 		return;
 	swap_remove(e);			/* the old name's swap no longer applies */
 	snprintf(e->path, sizeof(e->path), "%s", path);
@@ -24398,7 +24480,7 @@ run_menu_act(Editor *e, Menuact act)
 		dlg_buffer_pick(e);
 		break;
 	case MA_EXIT:
-		if (dlg_confirm_save(e, "Save changes before exiting?"))
+		if (quit_confirm_all(e))
 			return 1;
 		break;
 	case MA_UNDO:
@@ -25013,7 +25095,7 @@ run_req(Editor *e, Req req)
 		(void)save_editor(e);
 		break;
 	case REQ_QUIT:
-		if (dlg_confirm_save(e, "Save changes before exiting?"))
+		if (quit_confirm_all(e))
 			return 1;
 		break;
 	default:
@@ -26064,7 +26146,14 @@ editor_loop(Editor *e)
 		 * shell below, w moves the focus there, c closes it. */
 		if (seq.type == TKBD_KEY && seq.key == TKBD_KEY_W &&
 		    (seq.mod & TKBD_MOD_CTRL) && e->mode != MODE_INSERT) {
-			pane_key(e);
+			switch (pane_key(e)) {
+			case REQ_FORCE_QUIT:
+				return 0;
+			case REQ_QUIT_ERR:
+				return 1;
+			default:
+				break;
+			}
 			ed_render(e, e->d);
 			continue;
 		}
@@ -32327,19 +32416,22 @@ pane_close(Editor *e)
 		set_status(e, "pane closed");
 }
 
-/* Ctrl-W from a text buffer: one more key picks the pane action. */
-static void
+/* Ctrl-W from a text buffer: one more key picks the pane action. In the vi
+ * personality ':' opens the ex line, and its result is returned so a quit
+ * typed there ends the run. */
+static Req
 pane_key(Editor *e)
 {
 	Event ev;
 	uint32_t ch;
 
-	set_status(e, "Ctrl-W: (s)hell below, (b)uffer below, (w) focus the pane, (c)lose it, (r)epost it, (+/-) resize it, (:) ex");
+	set_status(e, "Ctrl-W: (s)hell below, (b)uffer below, (w) focus the pane, (c)lose it, (r)epost it, (+/-) resize it%s",
+	    e->mode != MODE_MODELESS ? ", (:) ex" : "");
 	ed_render(e, e->d);
 	for (;;) {
 		switch (scr_wait(e->d, &ev)) {
 		case EVENT_EOF:
-			return;
+			return REQ_CONTINUE;
 		case EVENT_RESIZE:
 		case EVENT_RESUME:
 			scr_size(e->d, &e->rows, &e->cols);
@@ -32353,7 +32445,7 @@ pane_key(Editor *e)
 	}
 	e->status[0] = '\0';
 	if (ev.key.type != TKBD_KEY || ev.key.ch == TKBD_CH_NONE)
-		return;
+		return REQ_CONTINUE;
 	ch = ev.key.ch;
 	if (ch == 'w' || ch == 'W' || ch == 'p' || ch == 'j') {
 		if (!pane_shown(e)) {
@@ -32378,7 +32470,10 @@ pane_key(Editor *e)
 		pane_resize(e, 1);
 	} else if (ch == '-' || ch == '_') {
 		pane_resize(e, -1);
+	} else if (ch == ':' && e->mode != MODE_MODELESS) {
+		return vi_colon(e);	/* the ex line, as in a terminal buffer */
 	}
+	return REQ_CONTINUE;
 }
 
 /* Match every live terminal's PTY and grid to the current text-area size. */
@@ -37905,6 +38000,12 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 					return REQ_CONTINUE;
 				}
 			}
+			if (buf_first_dirty(e) >= 0) {
+				set_status(e,
+				    "E37: no write since last change in buffer %d (:q! overrides)",
+				    buf_first_dirty(e) + 1);
+				return REQ_CONTINUE;
+			}
 			return REQ_FORCE_QUIT;
 		}
 		if (c == 'Q')			/* quit, discarding changes */
@@ -39527,7 +39628,8 @@ enum excmd {
 	EX_NONE, EX_SUBST, EX_GLOBAL, EX_VGLOBAL, EX_DELETE, EX_YANK, EX_READ,
 	EX_EDIT, EX_ENEW, EX_WRITE, EX_WQ, EX_XIT, EX_QUIT, EX_QALL, EX_WQALL,
 	EX_CQUIT, EX_SET, EX_SYNTAX, EX_LS, EX_BUFFER, EX_BNEXT, EX_BPREV,
-	EX_BDELETE, EX_TAG, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD, EX_CONFIG,
+	EX_BDELETE, EX_TAG, EX_SYMBOL, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD,
+	EX_CONFIG,
 	EX_MAIL, EX_COMPOSE, EX_REPLY, EX_SEND,
 	EX_DATE, EX_LOG, EX_BLAME, EX_COMMIT,
 	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH, EX_CELL, EX_SORT, EX_TABSTOPS,
@@ -39568,6 +39670,7 @@ static const struct excmd_name {
 	{ "bNext",	2, EX_BPREV },
 	{ "bdelete",	2, EX_BDELETE },
 	{ "tag",	2, EX_TAG },
+	{ "symbol",	3, EX_SYMBOL },
 	{ "pop",	2, EX_POP },
 	{ "retab",	3, EX_RETAB },
 	{ "draw",	2, EX_DRAW },
@@ -39821,22 +39924,27 @@ vi_ex_exec(Editor *e, char *buf)
 			return REQ_CONTINUE;
 		return REQ_FORCE_QUIT;
 	case EX_QUIT:
-		if (!bang && text_dirty(e->t)) {
-			set_status(e,
-			    "E37: no write since last change (:q! overrides)");
-			return REQ_CONTINUE;
-		}
-		return REQ_FORCE_QUIT;
 	case EX_QALL:
-		if (!bang && text_dirty(e->t)) {
+		if (!bang && (rr = buf_first_dirty(e)) >= 0) {
 			set_status(e,
-			    "E37: no write since last change (add ! to override)");
+			    "E37: no write since last change in buffer %d (add ! to override)",
+			    rr + 1);
 			return REQ_CONTINUE;
 		}
 		return REQ_FORCE_QUIT;
 	case EX_WQALL:
-		if (ex_write_current(e) != 0)
-			return REQ_CONTINUE;
+		/* Write every modified buffer, each made current in turn so
+		 * the save path sees it; stop at the first failure. */
+		while ((rr = buf_first_dirty(e)) >= 0) {
+			buf_switch(e, rr);
+			if (!e->has_name) {
+				set_status(e,
+				    "E32: buffer %d has no file name", rr + 1);
+				return REQ_CONTINUE;
+			}
+			if (save_named(e) != 0)
+				return REQ_CONTINUE;
+		}
 		return REQ_FORCE_QUIT;
 	case EX_CQUIT:
 		return REQ_QUIT_ERR;		/* exit with a nonzero code */
@@ -39925,6 +40033,9 @@ vi_ex_exec(Editor *e, char *buf)
 		else
 			set_status(e,
 			    "E471: argument required");
+		return REQ_CONTINUE;
+	case EX_SYMBOL:
+		symbol_pick_filtered(e, NULL, *rest ? rest : NULL, 0);
 		return REQ_CONTINUE;
 	case EX_POP:
 		ed_tag_pop(e);
