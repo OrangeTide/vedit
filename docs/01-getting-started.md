@@ -1,0 +1,117 @@
+# Getting started
+
+Starting the editor, reading the screen, opening and saving a file, and
+quitting. Everything here uses the default keys, the EDIT personality.
+
+## Starting
+
+```sh
+vedit                   # an empty, unnamed buffer
+vedit notes.txt         # open a file
+```
+
+A file that does not exist yet opens as an empty buffer with that name, and
+is created on the first save. vedit needs a terminal on both standard input
+and standard output.
+
+## The screen
+
+![The editor with a C file open](shot-edit.png)
+
+From top to bottom:
+
+- **The menu bar.** File, Edit, View, Search, Insert, Options, Help, and
+  some menus that appear only when they apply (Compile, Run, Terminal, VCS,
+  Mail).
+- **The frame.** The file name sits in the top border. The right border is
+  a scrollbar.
+- **The text.**
+- **The status line.** On the left, `F1=Help` and, in a git working copy,
+  the branch. On the right, the line-ending style (`LF`, `CRLF`, or
+  `NUL`), the cursor's line and column, and a `*` when the buffer has
+  unsaved changes. Flags such as `WRAP` and `NUM` appear here when those
+  view settings are on. A message from the editor, such as `wrote
+  notes.txt`, replaces the left part until the next key.
+
+## Typing and moving
+
+Type to insert text at the cursor. Enter splits the line, Backspace deletes
+to the left, Delete to the right. The arrow keys move one character or
+line. Home and End go to the start and end of the line, PgUp and PgDn move
+a screen, Ctrl-Home and Ctrl-End go to the start and end of the file.
+Hold Shift while moving to select text.
+
+Chapter 2 covers editing in full.
+
+## Saving
+
+Ctrl-S, or File > Save, writes the buffer. A buffer that has no name yet
+asks for one in the file browser (chapter 3). File > Save As writes under a
+new name.
+
+Saving is atomic: the new contents are written to a temporary file in the
+same directory, then renamed over the original, so a crash or a full disk
+cannot leave a half-written file.
+
+## Quitting
+
+Ctrl-Q, or File > Exit. With unsaved changes it asks:
+
+```
+Save changes before exiting?
+[ Yes ]  [ No ]  [ Cancel ]
+```
+
+Yes saves and quits, No quits and discards, Cancel returns to the editor.
+Choose a button with the arrow keys and Enter, or press its letter: `y`,
+`n`, or `c`. Esc is Cancel.
+
+## The menu bar
+
+Everything the editor can do is in the menus, with the key beside the item
+when it has one, so the menus are the place to look when you forget a key.
+
+- **F10** activates the bar. Then the arrow keys move between menus and
+  items, Enter runs the item, and Esc backs out.
+- **Alt+letter** opens a menu directly: the underlined letter of its name,
+  so Alt+F for File and Alt+V for View. Many desktop terminals take
+  Alt+letter for their own menus. F10 followed by the letter always works.
+- Inside a menu, an item's underlined letter runs it.
+- A mouse click on the bar opens that menu (chapter 2 covers the mouse).
+
+An item that cannot act right now is grayed and skipped: Paste with an
+empty clipboard, Undo with nothing to undo. A whole menu is hidden when
+none of its items apply, which is why Compile and Run appear only once a
+build command is configured for the file's language.
+
+## Help
+
+- **F1** shows the key bindings of the active personality. Up and Down
+  scroll it, and Esc or `q` returns.
+- **Help > Tutorial**, or `t` on the F1 screen, opens the built-in
+  walkthroughs: draw mode, terminal buffers, the art view, the table view,
+  and crash recovery.
+- **Help > About** shows the version.
+
+## Two sets of keys
+
+vedit has two personalities. The default is the modeless EDIT personality
+described in this chapter and the next: keys always insert text, and
+commands are control keys and menus. The other is a vi: keys are commands
+until you enter insert mode. **F2** switches between them, and the status
+line shows `-- NORMAL --` or `-- INSERT --` while the vi keys are active.
+The vi personality is described in chapter 6, which assumes no previous
+knowledge of vi. The config file can make it the default (chapter 5).
+
+## If the editor dies
+
+If vedit or the connection drops while a file has unsaved changes, start it
+again on the same file. It finds the recovery journal it kept beside the
+file and asks:
+
+```
+Unsaved changes found. (r)ecover (o)pen (d)elete (q)uit?
+```
+
+Press `r` to get the unsaved work back, then save. Chapter 3 explains what
+the journal is and the other answers.
