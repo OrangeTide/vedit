@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>$title$ - vedit manual</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@400;600&display=swap">
+</head>
+<body>
+  <nav class="top-bar">
+    <a href="index.html" class="back-link">&larr; vedit manual</a>
+    <div class="chapter-links">
+$if(prev-file)$
+      <a href="$prev-file$" class="prev-link" title="$prev-title$">&larr; $prev-title$</a>
+$endif$
+$if(next-file)$
+      <a href="$next-file$" class="next-link" title="$next-title$">$next-title$ &rarr;</a>
+$endif$
+    </div>
+  </nav>
+  <div class="page">
+$if(toc)$
+    <aside class="toc">
+      <div class="toc-header">Contents</div>
+$toc$
+    </aside>
+$endif$
+    <article class="doc">
+      <header>
+        <h1>$title$</h1>
+      </header>
+$body$
+      <footer class="chapter-nav">
+$if(prev-file)$
+        <a href="$prev-file$" class="prev-link">&larr; $prev-title$</a>
+$else$
+        <span></span>
+$endif$
+$if(next-file)$
+        <a href="$next-file$" class="next-link">$next-title$ &rarr;</a>
+$endif$
+      </footer>
+    </article>
+  </div>
+  <footer class="bottom-bar">
+    <a href="index.html">vedit manual</a> &middot;
+    <a href="https://github.com/OrangeTide/vedit">GitHub</a>
+  </footer>
+</body>
+</html>

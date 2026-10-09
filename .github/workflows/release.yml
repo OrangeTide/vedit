@@ -70,6 +70,7 @@ jobs:
           name="vedit-${{ needs.check.outputs.version }}-linux-${{ matrix.arch }}"
           mkdir -p "dist/$name"
           cp vedit man/vedit.1 README.md "dist/$name/"
+          mkdir -p "dist/$name/docs" && cp docs/*.md docs/shot-*.png "dist/$name/docs/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
       - uses: actions/upload-artifact@v6
         with:
@@ -96,6 +97,7 @@ jobs:
           name="vedit-${{ needs.check.outputs.version }}-windows-x86_64"
           mkdir -p "dist/$name"
           cp _out/x86_64-w64-mingw32/bin/vedit.exe README.md "dist/$name/"
+          mkdir -p "dist/$name/docs" && cp docs/*.md docs/shot-*.png "dist/$name/docs/"
           (cd dist && zip -r "$name.zip" "$name")
       - uses: actions/upload-artifact@v6
         with:
