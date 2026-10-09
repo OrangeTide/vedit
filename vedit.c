@@ -7903,7 +7903,6 @@ static Term *pane_term(const Editor *e, int *idx);	/* the pane's terminal */
 static int pane_text_idx(const Editor *e);	/* the pane's text buffer, or -1 */
 static int pane_top_idx(const Editor *e);	/* the buffer shown above it */
 static int pane_height(const Editor *e);	/* rows the pane takes */
-static const char *buf_name_at(const Editor *e, int i);	/* a buffer's frame name */
 static void pane_frame(Editor *e, Screen *d, const char *name, int focused);
 static void pane_buffer(Editor *e);		/* the current text buffer into the pane */
 static void pane_focus_text(Editor *e, int into);	/* focus into or out of a text pane */
@@ -10269,6 +10268,24 @@ text_height_full(const Editor *e)
 	return h < 1 ? 1 : h;
 }
 
+/* Per-buffer facts read across the whole buffer list. The current buffer's
+ * live in the flat editor, except while a parked buffer is loaded there for
+ * painting (view_swap), when its own slot is current. */
+static int
+buf_kind_at(const Editor *e, int i)
+{
+	return (i == e->cur && !e->view_swap) ? e->kind : e->bufs[i].kind;
+}
+
+/* The name a buffer shows on a frame. */
+static const char *
+buf_name_at(const Editor *e, int i)
+{
+	if (i == e->cur && !e->view_swap)
+		return e->has_name ? e->path : "Untitled";
+	return e->bufs[i].has_name ? e->bufs[i].path : "Untitled";
+}
+
 #ifdef VEDIT_TERM
 /* ---- the bottom pane ---------------------------------------------------- *
  * One terminal buffer can be shown in a pane under the current text buffer:
@@ -10281,15 +10298,6 @@ text_height_full(const Editor *e)
 #define PANE_MIN_TOTAL	8	/* full text rows needed before a pane is shown */
 #define PANE_MIN_ROWS	3	/* smallest pane */
 
-
-/* Per-buffer facts read across the whole buffer list. The current buffer's
- * live in the flat editor, except while a parked buffer is loaded there for
- * painting (view_swap), when its own slot is current. */
-static int
-buf_kind_at(const Editor *e, int i)
-{
-	return (i == e->cur && !e->view_swap) ? e->kind : e->bufs[i].kind;
-}
 
 static Term *
 buf_vterm_at(const Editor *e, int i)
@@ -10307,15 +10315,6 @@ static int
 buf_top_last_at(const Editor *e, int i)
 {
 	return (i == e->cur && !e->view_swap) ? e->top_last : e->bufs[i].top_last;
-}
-
-/* The name a buffer shows on a frame. */
-static const char *
-buf_name_at(const Editor *e, int i)
-{
-	if (i == e->cur && !e->view_swap)
-		return e->has_name ? e->path : "Untitled";
-	return e->bufs[i].has_name ? e->bufs[i].path : "Untitled";
 }
 
 /* The terminal flagged for the pane, or NULL; its buffer index to *idx. */
