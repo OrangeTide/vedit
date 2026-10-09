@@ -10695,7 +10695,7 @@ static const Menuitem mi_view[] = {
 	{ "&Color Scheme",	"",	"",	MA_SCHEME },
 	{ "&Line Numbers",	"",	":set nu",	MA_LINENO },
 	{ "&Word Wrap",		"",	":set wrap",	MA_WRAP },
-	{ "Line &Endings",	"",	":set ff",	MA_EOL },
+	{ "Line &Endings",	"",	":set ff=",	MA_EOL },
 	{ "Show &Tabs",		"",	":set list",	MA_SHOW_TABS },
 #ifndef VEDIT_NO_MOUSE
 	{ "&Mouse",		"",	":set mouse",	MA_MOUSE },
@@ -26461,7 +26461,7 @@ ed_reload_config(Editor *e)
 /* The starting content of a config file that does not exist yet: every common
  * key, commented out with its default, so the file documents itself. Options >
  * Edit Config loads it into the buffer; nothing is written until the user
- * saves. Keep it in step with the CONFIGURATION section of the README. */
+ * saves. Keep it in step with docs/05-configuration.md. */
 static const char g_config_template[] =
 	"# vedit configuration (gitconfig style). Remove the leading '#' from a\n"
 	"# line to set it. ':reload' or Options > Reload Config applies changes.\n"
@@ -26472,7 +26472,7 @@ static const char g_config_template[] =
 	"#	wrap = off           # word wrap\n"
 	"#	box = utf8           # utf8 | dec | ascii\n"
 	"#	colors = 256         # 256 | 16\n"
-	"#	scroll = on          # VT100 scroll-region fast path\n"
+	"#	scroll = off         # VT100 scroll-region fast path\n"
 	"#	clipboard = off      # mirror every copy/yank to the terminal (OSC 52)\n"
 	"#	tabs = on            # mark hard tabs with a guide glyph\n"
 	"#	paneheight = 0       # rows for the pane under the text; 0 = a third\n"
@@ -26528,7 +26528,7 @@ static const char g_config_template[] =
 	"#	commit = git commit --only -F $(msg) -- $(file)\n"
 	"\n"
 	"[insert]\n"
-	"#	dateformat = %Y-%m-%d # strftime pattern Insert > Date starts on\n"
+	"#	dateformat =         # strftime pattern Insert > Date starts on, e.g. %Y-%m-%d\n"
 	"\n"
 	"[gitcommit]\n"
 	"#	subject = 50         # mark a commit subject past this column\n"
