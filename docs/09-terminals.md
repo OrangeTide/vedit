@@ -38,9 +38,9 @@ The default is UTF-8 under a UTF-8 locale and ASCII otherwise. Config:
 | `--256color` | `VEDIT_COLORS=256` | the xterm 256-color palette |
 | `--16color` | `VEDIT_COLORS=16` | the 16 ANSI colors, sent as the classic SGR codes |
 
-The default is 256 when `TERM` or `COLORTERM` says the terminal supports
-it, and 16 otherwise. At 16 colors every color maps to the nearest ANSI
-color, and syntax highlighting uses a separate, stronger palette. Config:
+The default is 256 when `COLORTERM` contains `truecolor` or `24bit`, or
+`TERM` contains `256color`, and 16 otherwise. At 16 colors every color,
+including the syntax colors, maps to the nearest ANSI color. Config:
 `ui.colors`.
 
 ## Slow links
@@ -72,8 +72,8 @@ make gvedit
 ./gvedit --scale 2 file.txt
 ```
 
-`--scale` zooms the font; the default is 1, or the display scale on a
-high density display. Resizing the window resizes the editor, never the
+`--scale` zooms the font, 1 to 8; by default it follows the display
+scale. Resizing the window resizes the editor, never the
 font. The mouse, paste, terminal buffers, and the clipboard through OSC 52
 all work as in a terminal. Closing the window asks about unsaved changes
 as File > Exit does; closing it again while that question is pending ends
@@ -88,8 +88,9 @@ The same source builds a native Windows console program with mingw-w64
 console, and under wine. Every key and the mouse work as on Unix, and
 file names are UTF-8.
 
-On a real Windows console the editor sends its usual ANSI stream through
-the console's virtual-terminal processing, with 256 colors. Under wine it
+On a real Windows console the editor sends its ANSI stream through the
+console's virtual-terminal processing; pass `--256color` or set
+`VEDIT_COLORS=256` for 256 colors. Under wine it
 draws through the console API instead, with the console's sixteen colors,
 each color mapped to the nearest entry of the console's own color table.
 `VEDIT_WIN_RENDER=console` or `=vt` forces one or the other.
@@ -109,9 +110,8 @@ with `SDL3.dll` beside it.
 
 For debugging a console problem, `VEDIT_WIN_LOG=file` records the console
 calls that fail and the translated input bytes, and `VEDIT_WIN_TRACE=file`
-saves the raw output stream of the VT path. Under wine from a Unix
-terminal, a lone Escape never reaches the program; real consoles deliver
-it.
+saves the raw output stream of the VT path. Under wine started from a
+Unix terminal, a lone Escape does not reach the program.
 
 ## Environment variables
 
@@ -121,6 +121,6 @@ it.
 | `VEDIT_BOX`, `VEDIT_ASCII` | the frame style |
 | `VEDIT_COLORS` | the color depth |
 | `VEDIT_SCROLL` | the scroll-region fast path |
-| `VEDIT_MOUSE=0` or `1` | mouse reporting, overriding the config |
+| `VEDIT_MOUSE=1` or `0` (also `on`, `off`, `yes`, `no`) | mouse reporting, overriding the config |
 | `VEDIT_TAGS_FILE`, `VEDIT_CC_FILE`, and the other per-project keys | chapter 5 |
 | `VEDIT_GUI_TRACE`, `VEDIT_WIN_LOG`, `VEDIT_WIN_TRACE`, `VEDIT_WIN_RENDER` | gvedit and Windows, above |

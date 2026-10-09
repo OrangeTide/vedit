@@ -12,7 +12,9 @@ options, and the per-project commands.
 | a build with `-DVEDIT_NO_XDG` | `~/.veditrc` |
 
 `$VEDIT_CONFIG` names a different file. On the command line, `--config
-FILE` names one and `--no-config` skips it. A missing file is ignored.
+FILE` names one and `--no-config` skips it. A missing file is ignored. A
+file with a syntax error (a line without `=`, or an unclosed `[`) is
+dropped as a whole; only an explicit `--config` path reports it.
 
 The easiest way to start is **Options > Edit Config** (`:config` in the vi
 keys). It opens the file in a buffer and, when the file does not exist
@@ -28,16 +30,12 @@ The file is in gitconfig style: `[section]` headers, `key = value` lines,
 and `#` or `;` comments.
 
 ```ini
-[ui]
-    scheme = black
-    number = on
-
-[edit]
-    mode = vi
+[table]
+    width = 12           # a comment
 ```
 
 - Keys are dotted, so `ui.scheme = black` with no section header also
-  works, and this manual names keys that way.
+  works.
 - Booleans accept `on`/`off`, `yes`/`no`, `true`/`false`, or `1`/`0`.
 - A value containing `#` or `;`, or ending in a space, must be in double
   quotes, or the reader takes the rest as a comment.
@@ -69,8 +67,7 @@ embedding host's own settings. So `--dec` on the command line beats
 
 A few per-project keys can be set from the environment, which suits a
 per-project shell or an `.envrc`. The variable is `VEDIT_` followed by the
-key in upper case with each `.` turned into `_`, and a non-empty variable
-wins over the file:
+key in upper case with each `.` turned into `_`:
 
 | Key | Variable |
 |---|---|
@@ -80,12 +77,14 @@ wins over the file:
 | `command.<lang>.<name>` | `VEDIT_COMMAND_<LANG>_<NAME>` |
 | `vcs.<name>.<cmd>` | `VEDIT_VCS_<NAME>_<CMD>` |
 
-Only those keys read the environment. The rendering flags have their own
-variables, listed in chapter 9.
+Those keys and the rendering flags, which have their own variables
+listed in chapter 9, are the only ones that read the environment.
 
 ## Every key
 
-The values shown are the defaults.
+The values shown are the defaults in a terminal. gvedit starts with
+`ui.box = utf8`, `ui.colors = 256`, `ui.scroll = on`, and
+`ui.clipboard = on`.
 
 ### `[ui]`: the look
 
@@ -94,8 +93,8 @@ The values shown are the defaults.
 | `scheme` | `dos` | `dos`, `black`, `plain`, or a `[theme]` name (chapter 10) |
 | `number` | `off` | line-number gutter |
 | `wrap` | `off` | word wrap |
-| `box` | `utf8` | frame style: `utf8`, `dec`, or `ascii` (chapter 9) |
-| `colors` | `256` | `256` or `16` (chapter 9) |
+| `box` | `utf8` under a UTF-8 locale, else `ascii` | frame style: `utf8`, `dec`, or `ascii` (chapter 9) |
+| `colors` | `256` when the terminal advertises it, else `16` | `256` or `16` (chapter 9) |
 | `scroll` | `off` | use the terminal scroll region when scrolling (chapter 9) |
 | `clipboard` | `off` | also send every copy and cut to the terminal clipboard (chapter 2) |
 | `tabs` | `on` | mark hard tabs with a guide glyph |
@@ -127,6 +126,8 @@ The values shown are the defaults.
 | `indent.<lang>.expand` | | the same for one language, such as `[indent "python"]` |
 
 ### `[art]` and `[table]`: the views (chapter 8)
+
+The `[art]` keys apply to a build with terminals.
 
 | Key | Default | Meaning |
 |---|---|---|

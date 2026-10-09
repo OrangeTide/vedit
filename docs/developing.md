@@ -16,8 +16,7 @@ chapter.
 | `tests/` | the test suite and the vendored `taptest` driver |
 | `_out/<triple>/bin/` | build output, one directory per target |
 
-Every build lands in `_out/` under the compiler's target triple, so a native
-build, a static musl build, and a cross build never overwrite each other.
+Every build lands in `_out/` under the compiler's target triple.
 A `vedit` symlink at the top level points at the most recent build.
 
 ## Build targets
@@ -63,7 +62,9 @@ make cov-term           # line coverage of the terminal-buffer code
 ```
 
 The tests have no external dependencies. The driver is a vendored copy of
-the `taptest` TAP framework (`tests/taptest`, `test.h`, `testmain.c`).
+the `taptest` TAP framework (`tests/taptest.c`, `taptest.h`, and
+`taptest_selftest.c`, built to `tests/taptest`); `test.h` and
+`testmain.c` are the harness.
 
 Each test file includes `vedit.c` as a single unit with `main` renamed, so
 it can call the internal helpers directly. `test_unit.c` covers the pure
@@ -82,7 +83,8 @@ iteration count. To reproduce a run, pass its seed as the second argument to
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on every push and pull request:
+`.github/workflows/ci.yml` runs on every push to `main` and on every pull
+request against it:
 
 - build and test on gcc and clang
 - the asan and ubsan suites

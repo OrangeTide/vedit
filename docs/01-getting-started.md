@@ -1,7 +1,7 @@
 # Getting started
 
 Starting the editor, reading the screen, opening and saving a file, and
-quitting. Everything here uses the default keys, the EDIT personality.
+quitting. Everything here uses the default keys.
 
 ## Starting
 
@@ -20,9 +20,9 @@ and standard output.
 
 From top to bottom:
 
-- **The menu bar.** File, Edit, View, Search, Insert, Options, Help, and
-  some menus that appear only when they apply (Compile, Run, Terminal, VCS,
-  Mail).
+- **The menu bar.** File, Edit, Insert, Search, View, Options, Help, and
+  menus that appear only when they apply: Compile, Run, VCS%, Terminal,
+  and Mail.
 - **The frame.** The file name sits in the top border. The right border is
   a scrollbar.
 - **The text.**
@@ -49,9 +49,9 @@ Ctrl-S, or File > Save, writes the buffer. A buffer that has no name yet
 asks for one in the file browser (chapter 3). File > Save As writes under a
 new name.
 
-Saving is atomic: the new contents are written to a temporary file in the
-same directory, then renamed over the original, so a crash or a full disk
-cannot leave a half-written file.
+The new contents are written to a temporary file in the same directory
+and then renamed over the original. In a directory where that is not
+allowed, the file is written in place.
 
 ## Quitting
 
@@ -63,6 +63,8 @@ Save changes before exiting?
 ```
 
 Yes saves and quits, No quits and discards, Cancel returns to the editor.
+For a buffer with no name, Yes opens the file browser first, and
+cancelling there cancels the quit.
 Choose a button with the arrow keys and Enter, or press its letter: `y`,
 `n`, or `c`. Esc is Cancel.
 
@@ -74,15 +76,15 @@ when it has one, so the menus are the place to look when you forget a key.
 - **F10** activates the bar. Then the arrow keys move between menus and
   items, Enter runs the item, and Esc backs out.
 - **Alt+letter** opens a menu directly: the underlined letter of its name,
-  so Alt+F for File and Alt+V for View. Many desktop terminals take
-  Alt+letter for their own menus. F10 followed by the letter always works.
+  so Alt+F for File and Alt+V for View. If the terminal takes Alt+letter
+  for itself, use F10 and then the letter.
 - Inside a menu, an item's underlined letter runs it.
 - A mouse click on the bar opens that menu (chapter 2 covers the mouse).
 
 An item that cannot act right now is grayed and skipped: Paste with an
 empty clipboard, Undo with nothing to undo. A whole menu is hidden when
-none of its items apply, which is why Compile and Run appear only once a
-build command is configured for the file's language.
+none of its items apply: Compile and Run appear once a build command is
+configured for the file's language.
 
 ## Help
 
@@ -113,5 +115,6 @@ file and asks:
 Unsaved changes found. (r)ecover (o)pen (d)elete (q)uit?
 ```
 
-Press `r` to get the unsaved work back, then save. Chapter 3 explains what
+Press `r` to get the unsaved work back, then save. `q` at this prompt
+quits vedit. Chapter 3 explains what
 the journal is and the other answers.

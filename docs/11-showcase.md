@@ -1,7 +1,6 @@
 # Showcase
 
-Things to try, with the pictures. Each one points at the chapter that
-describes it.
+Things to try, with the pictures.
 
 ## Color text art
 
@@ -38,7 +37,7 @@ Chapter 8.
 
 ![A build log in the pane under the file being edited](shot-pane.png)
 
-F9 runs make in a terminal under the file, the cursor lands on the first
+F9 runs make in the pane under the file, the cursor lands on the first
 error, and F4 steps through the rest. Chapter 7.
 
 ## A shell inside the editor

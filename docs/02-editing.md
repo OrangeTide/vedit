@@ -15,8 +15,6 @@ covers the vi keys.
 | Ctrl-Home, Ctrl-End | the start and end of the file |
 | Ctrl-L | a line number, asked for on the status line |
 
-There is no word-by-word movement with Ctrl and an arrow.
-
 ## Typing
 
 Characters are inserted at the cursor. Enter splits the line and, with
@@ -32,19 +30,19 @@ View > Indent with Spaces is on. Shift-Tab does the same as Tab.
 
 Hold Shift with any movement key except Ctrl-Home and Ctrl-End to select
 from the cursor. The selection is shown in reverse video. A movement
-without Shift drops it. Typing, Tab, Enter, or a paste replaces the
-selection with what was typed. Backspace and Delete delete it. Esc does
-not clear a selection; press an arrow key instead.
+without Shift drops it; Ctrl-Home, Ctrl-End, and Esc leave it in place.
+Typing, Tab, Enter, or a paste replaces the selection with what was
+typed. Backspace and Delete delete it.
 
 ## Cut, copy, and paste
 
 | Key | Action |
 |---|---|
 | Ctrl-C | copy the selection. With no selection, copy the whole line |
-| Ctrl-X | cut the selection. With no selection it does nothing |
+| Ctrl-X | cut the selection. With no selection it shows a hint and cuts nothing |
 | Ctrl-V | paste at the cursor, replacing the selection if there is one |
 
-The clipboard is inside the editor, so it works over any connection. A
+The clipboard is inside the editor and works over any connection. A
 line copied with Ctrl-C and no selection is pasted at the cursor position,
 including its line break, so paste it at the start of a line to insert it
 as a line.
@@ -53,12 +51,11 @@ as a line.
 the terminal's own clipboard, and **Edit > Copy File to Terminal** sends
 the whole buffer. This is how to get text out of a vedit running over ssh
 or telnet into a local application. The terminal must support the OSC 52
-clipboard escape; one that does not ignores it. With `ui.clipboard = on`
-in the config, every Ctrl-C and Ctrl-X also goes to the terminal
-clipboard.
+clipboard escape; one that does not ignores it. The limit is 100000
+bytes. With `ui.clipboard = on` in the config, every Ctrl-C and Ctrl-X
+also goes to the terminal clipboard.
 
-Text pasted by the terminal (bracketed paste) is inserted as typed, and
-replaces the selection.
+Text pasted by the terminal (bracketed paste) is inserted as typed.
 
 ## Undo and redo
 
@@ -80,7 +77,7 @@ started, and the view follows. The prompt reads `ISearch:`, with
 
 **Search > Repeat Find** finds the next match of the last pattern,
 forward. The search wraps around the end of the file. The pattern is a
-regular expression (described at the end of chapter 6), and matches do not
+regular expression (the Regular expressions section of chapter 6), and matches do not
 cross lines. Searches are case sensitive unless `edit.ignorecase = on` is
 set in the config.
 
@@ -112,8 +109,8 @@ end goes to the last line.
 A left click in the text puts the cursor there. The wheel scrolls three
 lines, and the cursor is pulled along when it would leave the window. A
 click on the menu bar opens that menu, and clicks work in the menus and in
-the Yes/No/Cancel dialogs. There is no selection by dragging, and the
-right and middle buttons do nothing.
+the Yes/No/Cancel dialogs. Dragging and the right and middle buttons are
+ignored.
 
 With the mouse on, the terminal's own text selection usually needs Shift
 held. View > Mouse turns reporting off for the session. `ui.mouse` in the
@@ -143,7 +140,7 @@ number sort after the rest.
 | Enter | insert the date as shown under the grid |
 | Esc | close |
 
-The formats cycle from the ISO `2026-10-07` through `07 Oct 2026`,
+The formats cycle from the ISO `2026-10-07` through `2026-10-07 14:30`, `07 Oct 2026`,
 `October 07, 2026`, the weekday form, and the slashed forms. The chosen
 format is kept for the rest of the session. `insert.dateformat` in the
 config adds a `strftime` pattern of your own at the front of the cycle.

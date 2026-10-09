@@ -58,8 +58,9 @@ Each `rule` is `charset  target-state  [options]`:
   mark is per line and starts at the beginning of the line.
 - **`col N`** in place of a charset fires when the line has reached
   display column N (tabs count to the next multiple of 8), so `rule = col
-  72 over noeat` marks overlong lines. `col gitcommit.body:72` takes the
-  column from that config key, with 72 when it is unset.
+  72 long noeat` sends the rest of an overlong line to a state named
+  `long` that you define. `col gitcommit.body:72` takes the column from
+  that config key, with 72 when it is unset.
 
 A state may set `include = <other-state>`: when none of its own rules
 match, the included state's rules are tried, keeping the including
@@ -157,8 +158,8 @@ commands.
 
 ## Embedding in a program
 
-The editor owns no file descriptors and installs no signal handlers. All
-terminal I/O goes through a vtable, `struct vedit_io`, that the host fills
+The host owns the file descriptors and the signal handlers. All terminal
+I/O goes through a vtable, `struct vedit_io`, that the host fills
 over its own transport. The host drives the editor with `vedit_run()` and
 delivers window sizes with `vedit_set_size()`.
 
@@ -181,17 +182,16 @@ int rc = vedit_run(v);                 /* blocks until the player quits */
 vedit_free(v);
 ```
 
-`vedit.h` documents the full interface and the callback contracts. The
-box mode and colors are per instance, so two players on one server can
+`vedit.h` documents the full interface and the callback contracts. Box
+mode and colors are set per instance, and two players on one server can
 use different clients.
 
 - `vedit_run()` drives its own loop by calling `io.poll` and `io.read`.
   In a single-threaded event-loop host, run the editor on its own thread
   or coroutine, or supply a `poll` callback that yields to the host loop.
 - The config is handed in with `vedit_set_config()`, built from
-  `vedit_cfg_new()` and `vedit_cfg_load()`. The core never opens the
-  config file itself. `vedit_set_config_path()` names the file so that
-  `:reload` works.
+  `vedit_cfg_new()` and `vedit_cfg_load()`. `vedit_set_config_path()`
+  names the file, which `:reload` re-reads.
 - Terminal buffers need the host to wait on the input and the child
   pseudo-terminals together, through the optional `io.poll_fds` callback.
   Without it the editor runs normally and `:terminal` reports that it
@@ -199,8 +199,8 @@ use different clients.
 - The build commands, `:!`, and the formatter run through a tool runner
   installed with `vedit_set_tools()`; with none, those features are
   unavailable.
-- Mail goes through `struct vedit_mail_api`, a vtable shaped like IMAP
-  (folders, message lists, flags, fetch, store, move, append, send). The
+- Mail goes through `struct vedit_mail_api`, a vtable of folder, message
+  list, flag, fetch, store, move, append, and send operations. The
   standalone binary installs the Maildir implementation when `mail.dir` is
   set; a host installs its own with `vedit_set_mail()`.
 - Over raw telnet, the host handles the IAC negotiation and reads the
@@ -216,7 +216,7 @@ others go in `CFLAGS`.
 |---|---|
 | `VEDIT_NO_TERM` | terminal buffers, the pane's shell, `:terminal`, `:split`, `:sbuffer`, `:repost`, and the Terminal menu |
 | `VEDIT_NO_ART` | the art view. The VT emulator goes once both this and `NO_TERM` are set |
-| `VEDIT_NO_TOOLS` | the build commands, the Compile, Run, and VCS menus, the output pane, `:format`, `:!`, `:log`, `:blame`, `:commit` |
+| `VEDIT_NO_TOOLS` | the build commands, the Compile, Run, and VCS menus, the output pane, and `:format`. `:!`, `:log`, `:blame`, and `:commit` remain and report that the feature is unavailable |
 | `VEDIT_NO_MAIL` | the Mail menu and commands |
 | `VEDIT_NO_MOUSE` | mouse reporting and View > Mouse |
 | `VEDIT_NO_XDG` | the XDG config path; `~/.veditrc` is used instead |

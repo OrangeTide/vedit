@@ -49,9 +49,7 @@ Hold Shift while moving to select.
 
 ## Manual
 
-The manual is in `docs/`, in reading order. The first chapters cover what
-everyone uses; the vi keys and the tools come later; the last chapters cover
-the unusual features.
+The manual is in `docs/`, in reading order:
 
 1. [Getting started](docs/01-getting-started.md): the screen, opening,
    saving, quitting, the menu bar, help

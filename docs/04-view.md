@@ -17,8 +17,9 @@ Config: `ui.number`.
 **View > Word Wrap** folds long lines at the window width instead of
 scrolling sideways. Lines break at word boundaries, a word wider than the
 window is broken mid-word, and the continuation rows have a blank gutter.
-The file is unchanged. Up and Down move by whole lines; Home, End, Left,
-and Right move within the folded line. `WRAP` shows on the status line.
+The file is unchanged. Up and Down move by buffer line, Home and End go to
+the start and end of the buffer line, and Left and Right move by
+character. `WRAP` shows on the status line.
 Config: `ui.wrap`.
 
 ## Tabs
@@ -30,15 +31,15 @@ buffer has a ruler (below).
 with a faint guide glyph: an arrow in UTF-8 mode, `>` in DEC or ASCII mode.
 Config: `ui.tabs`.
 
-**View > Indent with Spaces** makes the Tab key and auto indent insert
-spaces up to the next stop instead of a tab character. It is per buffer.
+**View > Indent with Spaces** makes the Tab key insert spaces up to the
+next stop instead of a tab character. It is per buffer.
 A new buffer takes its default from the config, per language or globally:
 
 ```ini
 [indent]
     expand = off         # off = tabs, on = spaces
 
-[indent "python"]
+[indent "c"]
     expand = on          # buffers of this language indent with spaces
 ```
 
@@ -56,7 +57,8 @@ key `edit.shiftwidth = N` shifts by N columns instead.
 ## Auto indent
 
 **View > Auto Indent** (on by default) starts each new line with the same
-leading blanks as the line you pressed Enter on. Config:
+leading blanks as the line you pressed Enter on, copied as they are, tabs
+or spaces. Config:
 `edit.autoindent`.
 
 ## Line endings
@@ -99,7 +101,7 @@ files such as `config` and `COMMIT_EDITMSG`:
 | HTML | `.html .htm .xhtml` |
 | INI | `.ini .cfg .conf .gitconfig .editorconfig .veditrc .desktop .service`, and a file named `config` |
 | git commit message | `COMMIT_EDITMSG`, `MERGE_MSG`, `SQUASH_MSG`, `TAG_EDITMSG`, `.gitmessage` |
-| diff | `.diff .patch .rej` |
+| diff | `.diff .patch .rej`, and the buffers that History and Blame open (chapter 7) |
 
 The C grammar colors keywords, types, strings, character and number
 literals, comments, and preprocessor lines. The shell grammar also colors
@@ -112,6 +114,6 @@ message has its subject marked past column 50 and body lines past 72
 (`gitcommit.subject` and `gitcommit.body` change the widths), and `#`
 lines are comments.
 
-In the vi keys, `:syntax off` and `:syntax on` toggle it and `:syntax c`
-forces a language. The config file can map more extensions and define
+In the vi keys, `:syntax off` and `:syntax on` turn it off and on, and
+`:syntax c` forces a language. The config file can map more extensions and define
 new languages (chapter 10). Config: `syntax.enable`.

@@ -22,8 +22,9 @@ The `File:` line takes a typed name or path. A directory there changes
 into it. Any other name opens that file, which may be a new one.
 
 **File > Save As**, and the first save of an unnamed buffer, use the same
-browser with the `File:` line focused and filled with the current name, in
-the current file's directory. Edit the name and press Enter to write there,
+browser with the `File:` line focused. For a named file it is filled with
+the current name, in the file's directory; for an unnamed buffer it is
+empty. Edit the name and press Enter to write there,
 or pick an existing file from the list to overwrite it. A save into a
 directory that does not exist asks `Create directory ...?` first.
 
@@ -31,18 +32,20 @@ directory that does not exist asks `Create directory ...?` first.
 
 ## Several files at once
 
-Opening a file does not close the one you were editing. Each open file is a
-buffer, and one buffer is shown at a time.
+File > Open and File > New replace the file in view, after the save
+prompt if it has unsaved changes. To keep the current file open as well,
+use `:e name` or `:enew` in the vi keys (chapter 6). Each open file is
+then a buffer, and one buffer is shown at a time.
 
 - **F8** switches to the next buffer and **Shift-F8** to the previous one.
 - **File > Buffer List** lists them: the buffer number, a `*` on the
   current one, the name, `[+]` when it has unsaved changes, and the line
-  count. Move with the arrows or type the first letter of a name, then
-  Enter switches to it.
-- There is no menu item to close a buffer. In the vi keys, `:bd` closes the
-  current one (chapter 6). Quitting closes them all.
+  count. Move with the arrows, or type a digit to jump to that buffer
+  number, then Enter switches to it.
+- `:bd` in the vi keys closes the current buffer. Quitting closes them
+  all.
 
-Opening a file that is already open, even under another spelling (a
+`:e` of a file that is already open, even under another spelling (a
 symlink, a `./` or `../` detour, or a hard link), switches to the existing
 buffer instead of loading a second copy.
 
@@ -54,8 +57,8 @@ message or a file's history (chapter 7), the parts of a mail message
 
 **View > Line Endings** cycles the style a save writes: `LF` (Unix),
 `CRLF` (DOS and Windows), or `NUL` (NUL-separated records). The style is
-detected when a file is loaded: a NUL byte means NUL, a `\r\n` means CRLF,
-anything else LF. A new buffer uses LF. The current style is always on the
+detected from the first line break when a file is loaded: a NUL before it
+means NUL, a `\r\n` pair means CRLF, otherwise LF. A new buffer uses LF. The current style is always on the
 status line.
 
 The text in memory never holds the terminator, so changing the style only
@@ -65,8 +68,8 @@ since the bytes on disk will differ.
 ## Crash recovery
 
 While you edit a named file, vedit keeps a journal of your edits beside
-it, so that a crash, a dropped connection, or a killed terminal does not
-lose unsaved work. Two hidden files appear next to `name`:
+it. A crash, a dropped connection, or a killed terminal does not lose
+unsaved work. Two hidden files appear next to `name` at the first edit:
 
 | File | What it is |
 |---|---|
@@ -74,9 +77,10 @@ lose unsaved work. Two hidden files appear next to `name`:
 | `.name.swpm` | the journal: every edit, appended as it happens |
 
 A clean save or quit removes both. Only a crash leaves them behind. On a
-filesystem with reflinks (Btrfs, XFS, APFS, ReFS) the base is a clone that
-shares the file's blocks, so it costs no time and no space whatever the
-file's size.
+filesystem with reflinks (Btrfs, XFS, bcachefs, APFS) the base is a clone
+that shares the file's blocks and takes no extra time or space; elsewhere
+it is a copy. Once the journal passes 4 MB, the base is rewritten from the
+current text and the journal starts over.
 
 When you open a file that has a journal, vedit asks:
 
@@ -84,14 +88,18 @@ When you open a file that has a journal, vedit asks:
 Unsaved changes found. (r)ecover (o)pen (d)elete (q)uit?
 ```
 
+The message adds `maybe open elsewhere` when another running process
+holds the file, and `file changed since` when the file on disk is newer
+than the journal.
+
 - `r` loads the base, replays the journal on top, and leaves the result in
   the buffer for you to check and save.
 - `o` opens the file on disk and ignores the journal.
 - `d` deletes the journal and opens the file.
-- `q` leaves the file unopened.
+- `q` quits vedit at startup, or keeps the current buffer in File > Open.
 
-Replay stops at the first damaged record, so a crash in the middle of a
-write costs at most one edit. The journal is flushed to disk whenever input
+Replay stops at the first damaged record. A crash during a write loses at
+most one edit. The journal is flushed to disk whenever input
 goes quiet, and when the editor is killed by `SIGTERM` or `SIGHUP`. Only a
 power loss can lose edits made since the last quiet moment.
 
@@ -106,37 +114,37 @@ Options in the config file (chapter 5):
 
 ## The lock file
 
-Beside the journal, vedit marks the file as being edited with an
-Emacs-style lock, `.#name`, so that two editors warn about each other.
-Emacs honors the same lock. The owner is named as user, process id, and
-boot id. Opening a file whose lock belongs to a running
+At the first edit, vedit also takes an Emacs-style lock beside the file,
+`.#name`, which Emacs honors too. The owner is recorded as
+`user.pid:boot`. Opening a file whose lock belongs to a running
 process asks:
 
 ```
-jon.1234:5f0c... is editing this file. (s)teal (r)ead-only (q)uit?
+jon.1234:1728300000 is editing this file. (s)teal (r)ead-only (q)uit?
 ```
 
 - `s` takes the file over.
 - `r` opens it read-only. The status line shows `RO` and edits are refused.
 - `q` leaves it unopened.
 
-A lock left by a process that has exited, or from an earlier boot, is stale
-and is replaced without asking.
+A lock left by a process on this machine that has exited, or from an
+earlier boot, is stale and is replaced without asking. A lock from another
+host always asks. With `edit.swap = off` there is no lock.
 
 ## Large files
 
-Opening a file does not read it into memory. The file is mapped, and a line
-is copied to memory only when it is first changed, so a large log or data
-file opens in the time it takes to find the line breaks, and the operating
-system pages the bytes in as you scroll. A 200 MB file of four million
+Opening a file maps it. A line is copied to memory only when it is first
+changed, so a large log or data file opens in the time it takes to find
+the line breaks, and the operating system pages the bytes in as you
+scroll. A 200 MB file of four million
 lines opens in a tenth of a second.
 
 Before the first edit the view follows the file on disk, so a program that
 truncates the file while you are looking at it pulls the pages away. vedit
 catches that, shows the lost part as blank, and tells you. Reload with
-File > Open, or `:e!` in the vi keys. After the first edit the buffer is
-backed by the recovery base instead, and nothing another program does to
-the original affects it.
+File > Open, or `:e` in the vi keys. After the first edit, with the
+journal on, the buffer is backed by the recovery base instead, and nothing
+another program does to the original affects it.
 
 `edit.mmap = off` in the config reads files into memory instead, for a
 filesystem that does not map well, such as some network or FUSE mounts.

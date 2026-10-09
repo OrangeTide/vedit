@@ -22,7 +22,7 @@ a walkthrough.
 | Shift+arrows | mark a rectangle |
 | Ctrl-C, Ctrl-X | copy the rectangle, or cut it and blank it |
 | Ctrl-V | overlay the copied block at the cursor |
-| Ctrl-B | draw an ASCII border around the rectangle: `+` corners, `-` and `\|` edges. A one-cell-wide or one-cell-tall rectangle becomes a line |
+| Ctrl-B | draw an ASCII border around the rectangle: `+` corners, `-` and `\|` edges. A rectangle one cell wide or tall becomes a line with `+` at its ends, and a single cell becomes `+` |
 | Esc | drop the rectangle |
 | Alt+1 to Alt+9, Alt+0 | insert a glyph from the active set of the glyph palette |
 | Alt+G | the glyph palette |
@@ -53,7 +53,7 @@ The keys are draw mode's, applied to cells:
 
 | Key | Action |
 |---|---|
-| arrows | move one cell. Moving below the grid adds rows |
+| arrows | move one cell. The cursor may go below the last row, and typing there adds rows |
 | Home, End | the start of the row, and past its last glyph |
 | PgUp, PgDn | a page |
 | Enter | down one row, column 0 |
@@ -78,7 +78,7 @@ status line.
 | Alt+1 to Alt+0, Alt+G | the glyph palette; glyphs take the pen |
 
 The grid is as wide as the widest line but at least 80 columns, and as
-tall as the file. `art.width` forces a width from 80 to 1024, and
+tall as the file. `art.width` forces a width from 80 to 1024 (0 takes it from the file), and
 `art.view = off` opens `.ans` files as plain text, showing the raw escape
 sequences. Colors beyond the first 16 load, render, and save unchanged,
 but the pen cycles only the base 16; Alt+P picks the rest up from a cell.
@@ -90,9 +90,9 @@ A terminal buffer's output can be turned into an art buffer with Ctrl-W R
 ## Table view
 
 A file whose name ends in `.csv`, `.tsv`, or `.tab` opens in the table
-view. The text buffer stays the truth: a record is a line and a cell is a
-range of bytes inside it, so undo, search, and the recovery journal work
-as on text, and saving writes the lines back unchanged. A quoted field may
+view. A record is a line of the text buffer and a cell is a range of bytes
+inside it, so undo, search, and the recovery journal work as on text, and
+saving writes the lines back unchanged. A quoted field may
 hold the delimiter, doubled quotes, and newlines; a record whose quoted
 field spans several lines of the file is one row. A UTF-8 byte order mark
 at the start of the file is kept and is not part of cell A1.
@@ -123,8 +123,8 @@ again.
 | copy, paste a cell | Ctrl-C, Ctrl-V | Ctrl-C, Ctrl-V |
 | cut the cell | Ctrl-X | Ctrl-X |
 | search, next, previous | Ctrl-F, F3, Shift-F3 | `/`, `n`, `N` |
-| go to a cell | `:cell C7` | `:cell C7` |
-| insert a row above, below | Edit menu, `:rowadd`, `:rowadd!` | `O`, `o` |
+| go to a cell | | `:cell C7` |
+| insert a row above, below | Edit menu inserts above; `:rowadd`, `:rowadd!` | `O`, `o` |
 | delete the row | Edit menu, `:rowdel` | `dd` |
 | copy, paste rows | `:rowdel` copies; `p`, `P` paste | `yy`, `p` (below), `P` (above) |
 | insert a column left, right | Edit menu, `:coladd`, `:coladd!` | the same |
@@ -133,7 +133,9 @@ again.
 | sort the rows by this column | Edit > Sort Lines, `:sort` | `:sort`, `:sort! n` |
 | save, quit | Ctrl-S, Ctrl-Q | `:w`, `:q` |
 
-The `:` command line works in the table view in both personalities.
+The `:` command line works in the table view with the vi keys. With the
+EDIT keys a typed `:` starts editing the cell, so the Edit menu is the way
+to the row and column commands.
 
 Editing a cell happens on the prompt line: the value is loaded into it,
 Left, Right, Home, End, Backspace, and Delete edit it, Alt+Enter inserts a
@@ -148,8 +150,7 @@ you type. `:cell C7` moves to column C, row 7; `:cell C` or `:cell 7`
 moves one way only.
 
 `:rowadd [N]` inserts N blank rows above the cursor row and `:rowadd! [N]`
-below it. `:rowdel [N]` deletes N rows from the cursor, copying them
-first, so `p` pastes them back. `:coladd [N]` inserts N empty columns
+below it. `:rowdel [N]` deletes N rows from the cursor. `:coladd [N]` inserts N empty columns
 left of the cursor column, `:coladd! [N]` right of it, and `:coldel [N]`
 deletes N columns. A column operation edits every row in one undo step. A
 row's only cell is cleared rather than removed.
@@ -171,7 +172,8 @@ quote cannot swallow the rest of the file.
 ## Hex view
 
 **View > Hex Dump** shows the buffer as a hex dump and lets you edit the
-bytes. Choose it again, or press Esc or `q`, to return to the text view.
+bytes. Choose it again, or press `q`, or Esc with no selection, to return to
+the text view.
 It works from either personality and has no key of its own.
 
 Each row shows an offset, the bytes in hex with a gap after every eight,
@@ -210,9 +212,9 @@ bar.
 ## Mail
 
 vedit reads and writes a Maildir, the one-file-per-message mailbox
-format. It does not fetch mail or deliver it: a fetcher fills the Maildir,
-vedit reads it and drops outgoing messages in an `Outbox` folder, and a
-script submits those.
+format. A separate program fills the Maildir with incoming mail, vedit
+reads it and puts outgoing messages in an `Outbox` folder, and another
+program submits those.
 
 ![The INBOX message list over an open message](shot-mail.png)
 
@@ -235,9 +237,9 @@ script submits those.
        from = Jon Mayo <jon@example.org>
    ```
 
-   `mail.dir` enables the Mail menu and the `:mail`, `:compose`, `:reply`,
-   and `:send` commands. `mail.from` is the From line of every message you
-   write.
+   `mail.dir` enables the Mail menu. Without it, the `:mail`, `:compose`,
+   `:reply`, and `:send` commands report that there is no mail backend.
+   `mail.from` is the From line of every message you write.
 
 3. **Arrange delivery** for the `Outbox` folder (below).
 
@@ -303,4 +305,4 @@ A message that fails to submit stays in the Outbox.
 
 Not supported: reply-all, attachments on outgoing mail, decoding of
 encoded-word (`=?utf-8?...?=`) header values, deleting or moving messages
-from the editor, and submitting from the editor itself.
+from the editor.

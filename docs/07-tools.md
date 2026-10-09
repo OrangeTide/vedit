@@ -43,7 +43,7 @@ Once a command is configured for the file's language, the **Compile** and
 A modified file asks `Save before building? (y)es (n)o` first.
 
 The command runs in a terminal buffer (below) shown in the pane under the
-file, labelled with the command name, so the output appears live and in
+file, labelled Compile, Make, or Run, so the output appears live and in
 color, and a program that prompts can be answered. The buffer stays after
 the command exits, with the exit status on its status line, and the next
 build replaces it. `command.split = off` makes the terminal fill the frame
@@ -56,7 +56,7 @@ whole screen. The editor hides until it exits.
 
 ## Diagnostics
 
-Output lines in the gcc, clang, or MSVC form (`file:line:col: message` or
+Output lines in the gcc and clang form (`file:line:col: message` or
 `file:line: message`, including a Windows path with a drive letter) become
 jump targets. F4 and Shift-F4 step through them from the editor, wrapping
 at the ends, and Enter on a line in the output pane goes to it. A
@@ -70,10 +70,10 @@ through errors only, or through warnings when there are no errors. A line
 in the location form with no recognized severity word, such as a linker
 error, counts as an error.
 
-For another format, add `error.pattern` keys. Each is a regular expression
-with group 1 the file, group 2 the line, and an optional group 3 the
-column. They are tried before the built-in forms, in order, and may be
-repeated:
+For another format, such as MSVC's, add `error.pattern` keys. Each is a
+regular expression with group 1 the file, group 2 the line, and an
+optional group 3 the column. They are tried before the built-in forms, in
+order, up to sixteen of them:
 
 ```ini
 [error]
@@ -104,8 +104,8 @@ A buffer can be a live terminal running a shell or any other program,
 drawn inside the editor frame. **Terminal > New Terminal**, or
 `:terminal` in the vi keys, opens one running your login shell.
 `:terminal make` or `:terminal htop` runs that command instead. The
-command is split on spaces and run directly, with no shell between, so for
-pipes or quoting wrap it as `sh -c '...'`.
+command is split on spaces and run directly, without a shell. For pipes
+or quoting, write `sh -c '...'`.
 
 ![A terminal buffer running a build inside the editor frame](shot-term.png)
 
@@ -114,33 +114,35 @@ understands 16, 256, and 24-bit colors, cursor movement, and the window
 title the program sets, which becomes the buffer's frame label.
 Scrollback holds twice the visible height.
 
-While a terminal buffer has focus, every key goes to the program,
-including F1, F8, F10, and Alt+letter. **Ctrl-W** is the prefix for
+While a terminal buffer, or a terminal in the pane, has focus, every key
+goes to the program, including F1, F8, F10, and Alt+letter. **Ctrl-W** is the prefix for
 talking to the editor instead:
 
 | Key | Action |
 |---|---|
 | Ctrl-W m | open the menu bar |
 | Ctrl-W : | an ex command line |
-| Ctrl-W w, Ctrl-W W | next and previous buffer |
+| Ctrl-W w | the next buffer |
+| Ctrl-W W, Ctrl-W p | the previous buffer |
 | Ctrl-W 1 to Ctrl-W 9 | switch to that buffer |
 | Ctrl-W n | open another terminal |
 | Ctrl-W r | copy the terminal's output into a new text buffer |
 | Ctrl-W R | copy it into a new art-view buffer, keeping the colors (chapter 8) |
 | Ctrl-W c, Ctrl-W q | close the terminal. Closing the last buffer quits |
+| Ctrl-W +, Ctrl-W - | a row taller or shorter, for a terminal in the pane |
 | Ctrl-W Ctrl-W | send a literal Ctrl-W to the program |
 
 When the program exits the status line shows `[process exited N]` and the
 buffer waits for Ctrl-W q.
 
-`:!cmd` runs a shell command in a terminal buffer of its own, labelled
-with the command.
+`:!cmd` runs a shell command the same way, in a terminal labelled with
+the command, or in the output pane when `command.terminal` is off.
 
 ## The pane
 
 One buffer can be shown in a pane under the text, a third of the text
 area high, so a build, a shell, a log, or a second file stays in view
-while you edit. Build commands put their output there.
+while you edit.
 
 ![A build log in the pane under the file being edited](shot-pane.png)
 
@@ -150,7 +152,7 @@ From a text buffer, Ctrl-W followed by one of these:
 |---|---|---|
 | s | Terminal > Split Terminal | open a shell in the pane, or focus the one there |
 | b | Terminal > Buffer in Pane | show this buffer in the pane with the previous one above; again to undo |
-| w, p, j | | move the focus into the pane, or back out |
+| w, W, p, j | | move the focus into the pane, or back out |
 | c, q | Terminal > Close Pane | close the pane. A terminal is closed, a text buffer kept |
 | r, R | Terminal > Repost as Text, as Art | copy the pane terminal's output into a new buffer |
 | +, - | Terminal > Taller Pane, Shorter Pane | change the height a row at a time |
@@ -161,9 +163,7 @@ a command there, `:sbuffer [N]` shows this buffer or buffer N there, and
 the default.
 
 A new pane leaves the focus in the file. The pane's title is drawn
-reversed while the focus is there. With a terminal in the pane, keys then
-go to its program with Ctrl-W as the prefix, as in a full terminal buffer.
-With a text buffer there, Ctrl-W w switches between the two buffers and
+reversed while the focus is there. With a text buffer there, Ctrl-W w switches between the two buffers and
 editing follows the focused one. The pane holds one thing: opening another
 there hands a terminal back as a plain terminal buffer, or closes it when
 its program has exited. F8 still reaches the pane's buffer, which fills
@@ -186,13 +186,13 @@ the file they point into; choosing one opens that file at the definition.
 
 | Key | Action |
 |---|---|
-| Ctrl-] | jump to the definition of the identifier under the cursor (needs a tags file) |
+| Ctrl-] | jump to the definition of the identifier under the cursor. A definition in the current buffer needs no tags file; others do |
 | `:tag NAME` | jump to a named tag. Several matches open the picker on them |
 | `:tag /pat` | the picker, filtered to names containing `pat` |
 | Search > Pop Tag, `:pop`, Ctrl-T in the vi keys | return to where you jumped from |
 
-Each jump pushes the previous position on a stack, so Pop Tag retraces
-them.
+Each jump into another file pushes the previous position on a stack, so
+Pop Tag retraces them.
 
 ## Opening a header
 
@@ -203,9 +203,9 @@ in the include directories of the current file.
 
 Those directories come from a clang compilation database: point `cc.file`
 at a `compile_commands.json` and vedit reads the `-I`, `-isystem`, and
-`-iquote` flags of the entry whose `file` matches the buffer. Only the
-flags are read; the command is never run. Without `cc.file`, the current
-and buffer directories are searched.
+`-iquote` flags of the entry whose `file` matches the buffer. The compile
+command itself is not run. Without `cc.file`, only the path as written and
+the current file's directory are searched.
 
 ## Version control
 
