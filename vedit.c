@@ -5774,7 +5774,7 @@ syn_line(const Syntax *sy, uint32_t state_in, const char *bytes,
 	}
 }
 
-#define VEDIT_VERSION "vedit 1.4.1"
+#define VEDIT_VERSION "vedit 1.5.0"
 
 /****************************************************************
  * Keyboard input decoding -- It fills the same struct tkbd_seq the editor
