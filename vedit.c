@@ -7641,6 +7641,10 @@ struct tkbd_seq;
 
 /* Editing personality. The default is a modeless (nano-style) editor;
  * MODE_NORMAL/MODE_INSERT are the vi personality, toggled with F2. */
+/* Status bar styles (ui.statusline). */
+enum { STATUS_PLAIN, STATUS_POWERLINE };
+#define SEP_DEFAULT	0xffffffffu	/* e->sep: pick the glyph from the box style */
+
 typedef enum edit_mode {
 	MODE_MODELESS,		/* value 0, so a zeroed editor starts modeless */
 	MODE_NORMAL,		/* vi command mode */
@@ -7761,6 +7765,9 @@ typedef struct editor {
 	int		expand_tabs;	/* Tab and auto-indent use spaces (per buffer) */
 	int		shiftwidth;	/* >> / << shift size in columns; 0 = a tab stop */
 	int		textwidth;	/* gq and the insert wrap pack to this; 0 = the window */
+	int		statusline;	/* STATUS_PLAIN or STATUS_POWERLINE (ui.statusline) */
+	uint32_t	sep[2];		/* powerline separators, left and right side; 0 = none,
+					 * SEP_DEFAULT = chosen by the box style */
 	int		vi_gq_width;	/* a count typed before gq: the width for this one */
 	int		swap_enabled;	/* keep a crash-recovery swap (base + journal) */
 	int		save_force;	/* :w! in progress: save despite readonly */
@@ -10108,6 +10115,11 @@ typedef struct chrome_pal {
 	Color	guide_fg;		/* tab arrows and joined-line marks; default
 					 * = the text color dimmed */
 	int		reverse_bars;		/* draw the bars in reverse video */
+	/* the powerline status bar (ui.statusline): the mode segment takes one
+	 * of the st_* backgrounds with st_mode_fg text, the rest cycle a, b, c */
+	Color	st_mode_fg;
+	Color	st_normal, st_insert, st_visual, st_draw, st_edit;
+	Color	st_a_fg, st_a_bg, st_b_fg, st_b_bg, st_c_fg, st_c_bg;
 } Pal;
 
 #define CIDX(n) { .type = COLOR_INDEXED, { .index = (n) } }
@@ -10120,6 +10132,12 @@ static Pal chrome_dos = {
 	.bar_fg = CIDX(0), .bar_bg = CIDX(7),
 	.guide_fg = CIDX(27),	/* a blue a shade off the area; 12 at 16 colors */
 	.reverse_bars = 0,
+	.st_mode_fg = CIDX(0),
+	.st_normal = CIDX(33), .st_insert = CIDX(34), .st_visual = CIDX(127),
+	.st_draw = CIDX(178), .st_edit = CIDX(245),
+	.st_a_fg = CIDX(0), .st_a_bg = CIDX(7),
+	.st_b_fg = CIDX(15), .st_b_bg = CIDX(240),
+	.st_c_fg = CIDX(7), .st_c_bg = CIDX(236),
 };
 /* Black look: the text area stays on the terminal default background, so
  * scr_present can clear trailing blanks with erase-to-EOL on any client. The
@@ -10131,6 +10149,12 @@ static const Pal chrome_black = {
 	.bar_fg = CIDX(0), .bar_bg = CIDX(7),
 	.guide_fg = CIDX(240),	/* dark gray; 8 at 16 colors */
 	.reverse_bars = 0,
+	.st_mode_fg = CIDX(0),
+	.st_normal = CIDX(33), .st_insert = CIDX(34), .st_visual = CIDX(127),
+	.st_draw = CIDX(178), .st_edit = CIDX(245),
+	.st_a_fg = CIDX(0), .st_a_bg = CIDX(7),
+	.st_b_fg = CIDX(15), .st_b_bg = CIDX(240),
+	.st_c_fg = CIDX(7), .st_c_bg = CIDX(236),
 };
 static const Pal chrome_plain = {
 	.content_fg = CDEF, .content_bg = CDEF,
@@ -10139,6 +10163,12 @@ static const Pal chrome_plain = {
 	.bar_fg = CDEF, .bar_bg = CDEF,
 	.guide_fg = CDEF,
 	.reverse_bars = 1,
+	.st_mode_fg = CDEF,
+	.st_normal = CDEF, .st_insert = CDEF, .st_visual = CDEF,
+	.st_draw = CDEF, .st_edit = CDEF,
+	.st_a_fg = CDEF, .st_a_bg = CDEF,
+	.st_b_fg = CDEF, .st_b_bg = CDEF,
+	.st_c_fg = CDEF, .st_c_bg = CDEF,
 };
 #undef CIDX
 #undef CDEF
@@ -10263,6 +10293,30 @@ themes_load_cfg(const Cfg *c)
 				cfg_color(val, &p->guide_fg);
 			else if (strcmp(field, "reverse-bars") == 0)
 				p->reverse_bars = str_bool(val, p->reverse_bars);
+			else if (strcmp(field, "status.mode.fg") == 0)
+				cfg_color(val, &p->st_mode_fg);
+			else if (strcmp(field, "status.normal") == 0)
+				cfg_color(val, &p->st_normal);
+			else if (strcmp(field, "status.insert") == 0)
+				cfg_color(val, &p->st_insert);
+			else if (strcmp(field, "status.visual") == 0)
+				cfg_color(val, &p->st_visual);
+			else if (strcmp(field, "status.draw") == 0)
+				cfg_color(val, &p->st_draw);
+			else if (strcmp(field, "status.edit") == 0)
+				cfg_color(val, &p->st_edit);
+			else if (strcmp(field, "status.a.fg") == 0)
+				cfg_color(val, &p->st_a_fg);
+			else if (strcmp(field, "status.a.bg") == 0)
+				cfg_color(val, &p->st_a_bg);
+			else if (strcmp(field, "status.b.fg") == 0)
+				cfg_color(val, &p->st_b_fg);
+			else if (strcmp(field, "status.b.bg") == 0)
+				cfg_color(val, &p->st_b_bg);
+			else if (strcmp(field, "status.c.fg") == 0)
+				cfg_color(val, &p->st_c_fg);
+			else if (strcmp(field, "status.c.bg") == 0)
+				cfg_color(val, &p->st_c_bg);
 			else if (strcmp(field, "borderless") == 0)
 				g_user_themes[slot].borderless =
 				    str_bool(val, g_user_themes[slot].borderless);
@@ -10709,7 +10763,7 @@ typedef enum menu_act {
 	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_HEX, MA_TABLE, MA_DRAW,
 	MA_TBL_ROWADD, MA_TBL_ROWDEL, MA_TBL_COLADD, MA_TBL_COLDEL, MA_TBL_FIT,
 	MA_SORT, MA_INS_DATE, MA_INS_FILE,
-	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS, MA_MOUSE,
+	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS, MA_MOUSE, MA_STATUSLINE,
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS, MA_REFLOW, MA_TEXTWIDTH,
 	MA_VI_MODE, MA_EDIT_CONFIG, MA_RELOAD_CONFIG, MA_GLYPHS, MA_COLORS,
 	MA_TABSTOPS,
@@ -10837,6 +10891,7 @@ static const Menuitem mi_search[] = {
 static const Menuitem mi_view[] = {
 	{ "&Syntax Highlight",	"",	":syntax",	MA_SYNTAX },
 	{ "&Color Scheme",	"",	"",	MA_SCHEME },
+	{ "Status Li&ne",	"",	":set sl=",	MA_STATUSLINE },
 	{ "&Line Numbers",	"",	":set nu",	MA_LINENO },
 	{ "&Word Wrap",		"",	":set wrap",	MA_WRAP },
 	{ "Line &Endings",	"",	":set ff=",	MA_EOL },
@@ -11168,6 +11223,8 @@ menu_checked(const Editor *e, Menuact act)
 		return e->hl_on ? 1 : 0;
 	case MA_SCHEME:
 		return -1;		/* a three-way cycle, not a checkbox */
+	case MA_STATUSLINE:
+		return e->statusline == STATUS_POWERLINE ? 1 : 0;
 	case MA_LINENO:
 		return e->show_lineno ? 1 : 0;
 	case MA_WRAP:
@@ -11541,6 +11598,208 @@ ui_frame(Editor *e, const Pal *p)
 	}
 }
 
+/* One segment of the powerline status bar. */
+typedef struct status_seg {
+	const char	*text;
+	Color		fg, bg;
+	uint16_t	at;
+} Stseg;
+
+/* Display columns of a UTF-8 string, as scr_text would advance. */
+static int
+status_cols(const char *s)
+{
+	const unsigned char *p = (const unsigned char *)s;
+	size_t len = strlen(s), i = 0;
+	int cols = 0;
+
+	while (i < len) {
+		uint32_t cp;
+		int n = utf8_decode(&cp, p + i, len - i);
+		int w = rune_width(cp);
+
+		cols += w < 1 ? 1 : w;
+		i += n <= 0 ? 1 : (size_t)n;
+	}
+	return cols;
+}
+
+/* The separator glyph for side (0 left, 1 right): the configured one, or the
+ * powerline arrow under UTF-8 box drawing and a space otherwise. 0 = none. */
+static uint32_t
+status_sep(const Editor *e, int side)
+{
+	if (e->sep[side] != SEP_DEFAULT)
+		return e->sep[side];
+	if (e->d->t->box_mode == VEDIT_BOX_UTF8)
+		return side == 0 ? 0xe0b0 : 0xe0b2;
+	return ' ';
+}
+
+/* Width of a segment on the bar: a space, the text, a space, and the glyph. */
+static int
+status_seg_cols(const Stseg *s, uint32_t sep)
+{
+	int w = status_cols(s->text) + 2;
+
+	if (sep)
+		w += rune_width(sep) < 1 ? 1 : rune_width(sep);
+	return w;
+}
+
+/* Paint " text " in the segment's colours and return the column after it. */
+static int
+status_seg_text(Editor *e, int row, int col, const Stseg *s)
+{
+	scr_cell(e->d, row, col, ' ', s->fg, s->bg, s->at);
+	col = scr_text(e->d, row, col + 1, s->text, s->fg, s->bg, s->at);
+	scr_cell(e->d, row, col, ' ', s->fg, s->bg, s->at);
+	return col + 1;
+}
+
+/* The status bar as coloured segments with glyphs between them (View > Status
+ * Line, ui.statusline = powerline). Left: the mode (or the message, or the
+ * table cell) in the mode colour, F1=Help, the VCS branch. Right: the view
+ * flags, the line endings, the position, and the dirty mark. The plain scheme
+ * has no colours, so its segments alternate reverse video instead. */
+static void
+ui_statusbar_pl(Editor *e, const Pal *p, int cur_col, size_t ly)
+{
+	int row = e->rows - 1;
+	uint16_t at = p->reverse_bars ? ATTR_REVERSE : 0;
+	Stseg left[3], right[4];
+	int nl = 0, nr = 0, i, col, wl, wr;
+	uint32_t sepl = status_sep(e, 0), sepr = status_sep(e, 1);
+	Color mode_bg = p->st_edit;
+	const char *mode = "EDIT";
+	char cell[160], pos[48], flags[24], msg[sizeof(e->status)];
+	int rev = p->reverse_bars &&
+	    p->st_a_bg.type == COLOR_DEFAULT && p->st_b_bg.type == COLOR_DEFAULT;
+
+	scr_fill(e->d, row, 0, e->cols, ' ', p->bar_fg, p->bar_bg, at);
+
+#ifdef VEDIT_ART
+	if (e->art) {
+		mode = "ART";
+		mode_bg = p->st_draw;
+	} else
+#endif
+	if (e->draw_mode) {
+		mode = "DRAW";
+		mode_bg = p->st_draw;
+	} else if (e->vi_visual == 'v') {
+		mode = "VISUAL";
+		mode_bg = p->st_visual;
+	} else if (e->vi_visual == 'V') {
+		mode = "V-LINE";
+		mode_bg = p->st_visual;
+	} else if (e->vi_visual == VI_VBLOCK) {
+		mode = "V-BLOCK";
+		mode_bg = p->st_visual;
+	} else if (e->mode == MODE_NORMAL) {
+		mode = "NORMAL";
+		mode_bg = p->st_normal;
+	} else if (e->mode == MODE_INSERT) {
+		mode = "INSERT";
+		mode_bg = p->st_insert;
+	}
+	if (e->status[0]) {
+		snprintf(msg, sizeof(msg), "%s", e->status);
+		mode = msg;
+	} else if (e->tbl) {
+		tbl_cell_status(e, cell, sizeof(cell));
+		mode = cell;
+	}
+	left[nl].text = mode;
+	left[nl].fg = p->st_mode_fg;
+	left[nl].bg = mode_bg;
+	left[nl].at = ATTR_BOLD | (rev ? ATTR_REVERSE : 0);
+	nl++;
+	if (!e->status[0] && !e->tbl) {
+		left[nl].text = "F1=Help";
+		left[nl].fg = p->st_a_fg;
+		left[nl].bg = p->st_a_bg;
+		left[nl].at = 0;
+		nl++;
+		if (e->vcs[0]) {
+			left[nl].text = e->vcs;
+			left[nl].fg = p->st_b_fg;
+			left[nl].bg = p->st_b_bg;
+			left[nl].at = rev ? ATTR_REVERSE : 0;
+			nl++;
+		}
+	}
+
+	flags[0] = '\0';
+	if (e->wrap)
+		strcat(flags, "WRAP ");
+	if (e->show_lineno)
+		strcat(flags, "NUM ");
+	if (e->t->readonly)
+		strcat(flags, "RO ");
+	if (flags[0]) {
+		flags[strlen(flags) - 1] = '\0';
+		right[nr].text = flags;
+		right[nr].fg = p->st_c_fg;
+		right[nr].bg = p->st_c_bg;
+		right[nr].at = 0;
+		nr++;
+	}
+	right[nr].text = eol_name(text_eol(e->t));
+	right[nr].fg = p->st_b_fg;
+	right[nr].bg = p->st_b_bg;
+	right[nr].at = rev ? ATTR_REVERSE : 0;
+	nr++;
+	snprintf(pos, sizeof(pos), "Line:%zu  Col:%zu", ly + 1,
+	    (size_t)cur_col + 1);
+	right[nr].text = pos;
+	right[nr].fg = p->st_a_fg;
+	right[nr].bg = p->st_a_bg;
+	right[nr].at = 0;
+	nr++;
+	if (text_dirty(e->t)) {
+		right[nr].text = "*";
+		right[nr].fg = p->st_mode_fg;
+		right[nr].bg = mode_bg;
+		right[nr].at = ATTR_BOLD | (rev ? ATTR_REVERSE : 0);
+		nr++;
+	}
+
+	/* the left side, then as much of the right side as fits after it */
+	col = 0;
+	for (i = 0; i < nl; i++) {
+		col = status_seg_text(e, row, col, &left[i]);
+		if (sepl) {
+			Color nbg = i + 1 < nl ? left[i + 1].bg : p->bar_bg;
+
+			scr_cell(e->d, row, col, sepl, left[i].bg, nbg,
+			    i + 1 < nl ? left[i + 1].at & ATTR_REVERSE : at);
+			col += rune_width(sepl) < 1 ? 1 : rune_width(sepl);
+		}
+	}
+	wl = col;
+	wr = 0;
+	for (i = 0; i < nr; i++)
+		wr += status_seg_cols(&right[i], sepr);
+	for (i = 0; i < nr && wl + wr > e->cols; i++)
+		wr -= status_seg_cols(&right[i], sepr);	/* drop from the left */
+	col = e->cols - wr;
+	for (; i < nr; i++) {
+		if (sepr) {
+			scr_cell(e->d, row, col, sepr, right[i].bg,
+			    col == e->cols - wr ? p->bar_bg : right[i - 1].bg,
+			    right[i].at & ATTR_REVERSE);
+			col += rune_width(sepr) < 1 ? 1 : rune_width(sepr);
+		}
+		col = status_seg_text(e, row, col, &right[i]);
+	}
+#ifdef VEDIT_ART
+	if (e->art && !e->status[0])	/* a swatch of the pen after the segments */
+		scr_text(e->d, row, wl + 1, " Ab ", e->art->fg, e->art->bg,
+		    e->art->attrs);
+#endif
+}
+
 static void
 ui_statusbar(Editor *e, const Pal *p, int cur_col)
 {
@@ -11555,6 +11814,10 @@ ui_statusbar(Editor *e, const Pal *p, int cur_col)
 	if (e->art)
 		ly = (size_t)e->art->cy;
 #endif
+	if (e->statusline == STATUS_POWERLINE) {
+		ui_statusbar_pl(e, p, cur_col, ly);
+		return;
+	}
 	scr_fill(e->d, row, 0, e->cols, ' ', p->bar_fg, p->bar_bg, at);
 
 	/* compact indicators for the sticky display toggles, then the line-ending
@@ -25415,6 +25678,12 @@ run_menu_act(Editor *e, Menuact act)
 		    names[e->scheme]);
 		break;
 	}
+	case MA_STATUSLINE:
+		e->statusline = e->statusline == STATUS_POWERLINE ?
+		    STATUS_PLAIN : STATUS_POWERLINE;
+		set_status(e, "statusline %s",
+		    e->statusline == STATUS_POWERLINE ? "powerline" : "plain");
+		break;
 	case MA_LINENO:
 		e->show_lineno = !e->show_lineno;
 		set_status(e, "line numbers %s",
@@ -26672,6 +26941,7 @@ editor_init(Editor *e)
 	e->auto_indent = 1;	/* copy the previous line's indent by default */
 	e->swap_enabled = 1;	/* write crash-recovery swap files by default */
 	e->textwidth = 79;	/* gq and the insert wrap pack to this width */
+	e->sep[0] = e->sep[1] = SEP_DEFAULT;
 	e->backup_enabled = 0;	/* keep no previous-version backup by default */
 	e->format_on_save = 0;	/* do not reformat on save unless asked */
 #ifndef VEDIT_NO_TOOLS
@@ -27659,6 +27929,22 @@ ed_apply_config(Editor *e)
 	e->wrap = cfg_bool(g_cfg, "ui.wrap", e->wrap);
 	e->show_lineno = cfg_bool(g_cfg, "ui.number", e->show_lineno);
 	e->show_tabs = cfg_bool(g_cfg, "ui.tabs", e->show_tabs);
+	s = cfg_get(g_cfg, "ui.statusline");
+	if (s)
+		e->statusline = strcmp(s, "powerline") == 0 ?
+		    STATUS_POWERLINE : STATUS_PLAIN;
+	for (int i = 0; i < 2; i++) {
+		s = cfg_get(g_cfg, i == 0 ? "ui.separator-left" :
+		    "ui.separator-right");
+		if (s) {
+			uint32_t cp = 0;
+
+			if (s[0] && utf8_decode(&cp, (const unsigned char *)s,
+			    strlen(s)) <= 0)
+				cp = (unsigned char)s[0];
+			e->sep[i] = cp;		/* empty = none */
+		}
+	}
 	e->mouse = mouse_default();
 	if (e->d)
 		scr_mouse(e->d, e->mouse);
@@ -27797,6 +28083,9 @@ static const char g_config_template[] =
 	"\n"
 	"[ui]\n"
 	"#	scheme = dos         # dos | black | plain\n"
+	"#	statusline = plain   # plain | powerline (coloured segments)\n"
+	"#	separator-left = \"\"  # powerline glyph after a left segment; default U+E0B0\n"
+	"#	separator-right = \"\" # and before a right one; default U+E0B2\n"
 	"#	number = off         # line-number gutter\n"
 	"#	wrap = off           # word wrap\n"
 	"#	box = utf8           # utf8 | dec | ascii\n"
@@ -40811,6 +41100,20 @@ ex_set(Editor *e, const char *arg)
 		pane_set_rows(e, v);
 		return REQ_CONTINUE;
 #endif
+	} else if (strncmp(arg, "statusline=", 11) == 0 ||
+	    strncmp(arg, "sl=", 3) == 0) {
+		const char *v = strchr(arg, '=') + 1;
+
+		if (strcmp(v, "powerline") == 0)
+			e->statusline = STATUS_POWERLINE;
+		else if (strcmp(v, "plain") == 0)
+			e->statusline = STATUS_PLAIN;
+		else {
+			set_status(e, "statusline is plain or powerline");
+			return REQ_CONTINUE;
+		}
+		set_status(e, "statusline %s", v);
+		return REQ_CONTINUE;
 	} else if (strncmp(arg, "dateformat=", 11) == 0 ||
 	    strncmp(arg, "df=", 3) == 0) {
 		char text[64];

@@ -41,6 +41,8 @@ From top to bottom:
   `RO` appear here when those view settings are on or the buffer is
   read-only. A message from the editor, such as `wrote
   notes.txt`, replaces the left part until the next key.
+  View > Status Line shows the same items as coloured segments
+  (chapter 4).
 
 ## Typing and moving
 

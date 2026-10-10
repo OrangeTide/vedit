@@ -118,6 +118,18 @@ selects:
     bar.bg       = 54
     guide.fg     = 60         # the hard-tab guide glyphs
     reverse-bars = off        # draw the bars in reverse video
+    status.normal = 33        # powerline mode segment: NORMAL
+    status.insert = 34        # INSERT
+    status.visual = 127       # the visual modes
+    status.draw   = 178       # DRAW and ART
+    status.edit   = 245       # the modeless keys
+    status.mode.fg = 0        # text on the mode segment
+    status.a.fg   = 0         # the other segments: F1=Help and the position
+    status.a.bg   = 7
+    status.b.fg   = 15        # the branch and the line endings
+    status.b.bg   = 240
+    status.c.fg   = 7         # the view flags
+    status.c.bg   = 236
     borderless   = on         # drop the right border so text reaches the edge
 ```
 

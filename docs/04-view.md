@@ -96,6 +96,21 @@ The scheme covers the whole interface: menus, dialogs, prompts, and the
 help screen. Config: `ui.scheme`. A config file can also define schemes of
 its own (chapter 10).
 
+## Status line
+
+**View > Status Line** switches the status line between the plain style
+and a powerline style. In the powerline style the items sit in coloured
+segments with a glyph between them. On the left, the mode (`NORMAL`,
+`INSERT`, `VISUAL`, `V-LINE`, `V-BLOCK`, `DRAW`, `ART`, or `EDIT` for the
+modeless keys) in a colour of its own, then `F1=Help` and the version
+control branch. On the right, the view flags, the line endings, the
+position, and the `*` for unsaved changes in the mode colour. A message
+from the editor takes the mode segment. The glyphs are the powerline
+arrows, which need a font that has them; under ASCII box drawing they
+are spaces. Config: `ui.statusline`, `ui.separator-left`, and
+`ui.separator-right`, or `:set statusline=powerline` for the session.
+A theme can recolour the segments (chapter 10).
+
 ## Syntax highlighting
 
 **View > Syntax Highlight** colors the buffer according to its file type.

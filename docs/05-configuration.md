@@ -96,6 +96,9 @@ environment variables say; it starts with `ui.clipboard = on`.
 | Key | Default | Meaning |
 |---|---|---|
 | `scheme` | `dos` | `dos`, `black`, `plain`, or a `[theme]` name (chapter 10) |
+| `statusline` | `plain` | `plain` or `powerline`, the status line style (chapter 4) |
+| `separator-left` | U+E0B0 | the glyph after each left-hand powerline segment; empty for none. Under ASCII box drawing the default is a space |
+| `separator-right` | U+E0B2 | the glyph before each right-hand segment |
 | `number` | `off` | line-number gutter |
 | `wrap` | `off` | word wrap |
 | `box` | `utf8` under a UTF-8 locale, else `ascii` | frame style: `utf8`, `dec`, or `ascii` (chapter 9) |

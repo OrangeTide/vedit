@@ -3307,6 +3307,107 @@ t_split_ex(Test *t)
 }
 #undef CELL
 
+/* The powerline status bar: coloured segments with a glyph between them, the
+ * mode colour on the first, the right side flush with the last column. A
+ * message takes the mode segment's place. :set statusline and the menu switch
+ * it; the config chooses the glyphs and a theme colours the segments. */
+static void
+t_statusline_pl(Test *t)
+{
+	const char keys[] = "\033OQ";	/* F2: the vi keys, NORMAL mode */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Scrbuf *sb;
+	Cell *row;
+	char bar[81], ex[64];
+	int i, x;
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_run(v);
+	TAP_ASSERT(t, v->e.mode == MODE_NORMAL);
+	v->e.statusline = STATUS_POWERLINE;
+	v->e.d->t->box_mode = VEDIT_BOX_UTF8;
+	v->e.status[0] = '\0';
+	ed_render(&v->e, v->e.d);
+	sb = v->e.d->t;
+	row = &sb->cur[(size_t)(sb->rows - 1) * sb->cols];
+#define BAR() do { \
+	for (i = 0; i < 80; i++) \
+		bar[i] = (char)(row[i].codepoint < 128 ? row[i].codepoint : '>'); \
+	bar[80] = '\0'; \
+} while (0)
+	BAR();
+	TAP_CHECKF(t, strncmp(bar, " NORMAL > F1=Help >", 19) == 0, "bar [%s]", bar);
+	TAP_CHECK(t, row[1].bg.type == COLOR_INDEXED && row[1].bg.index == 33);
+	TAP_CHECK(t, row[1].attrs & ATTR_BOLD);
+	TAP_CHECKF(t, row[8].codepoint == 0xe0b0, "glyph U+%04x", row[8].codepoint);
+	TAP_CHECK(t, row[8].fg.index == 33 && row[8].bg.index == 7);
+	TAP_CHECKF(t, strstr(bar, "> LF > Line:1  Col:1 ") != NULL, "right [%s]", bar);
+	TAP_CHECK(t, row[79].codepoint == ' ' && row[79].bg.index == 7);
+	x = (int)(strstr(bar, "> LF ") - bar);
+	TAP_CHECKF(t, row[x].codepoint == 0xe0b2, "right glyph U+%04x", row[x].codepoint);
+	TAP_CHECK(t, row[x].fg.index == 240 && row[x].bg.index == 7);
+
+	/* a message takes the mode segment; the right side stays */
+	set_status(&v->e, "hello");
+	ed_render(&v->e, v->e.d);
+	BAR();
+	TAP_CHECKF(t, strncmp(bar, " hello >", 8) == 0, "bar [%s]", bar);
+	TAP_CHECK(t, strstr(bar, "F1=Help") == NULL && strstr(bar, "Line:1") != NULL);
+	v->e.status[0] = '\0';
+
+	/* :set and the menu switch the style */
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(ex, "set sl=plain")) == REQ_CONTINUE);
+	TAP_CHECK(t, v->e.statusline == STATUS_PLAIN);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(ex, "set statusline=powerline")) == REQ_CONTINUE);
+	TAP_CHECK(t, v->e.statusline == STATUS_POWERLINE);
+	vi_ex_exec(&v->e, strcpy(ex, "set sl=fancy"));
+	TAP_CHECKF(t, strstr(v->e.status, "plain or powerline") != NULL, "status [%s]", v->e.status);
+	run_menu_act(&v->e, MA_STATUSLINE);
+	TAP_CHECK(t, v->e.statusline == STATUS_PLAIN);
+	v->e.statusline = STATUS_POWERLINE;
+	v->e.status[0] = '\0';
+
+	/* under ASCII box drawing the default glyph is a space */
+	v->e.d->t->box_mode = VEDIT_BOX_ASCII;
+	ed_render(&v->e, v->e.d);
+	TAP_CHECK(t, row[8].codepoint == ' ' && row[8].bg.index == 7);
+
+	/* the config picks the style and glyphs, a theme the colours */
+	{
+		Cfg *c = cfg_from_text("[ui]\n\tstatusline = powerline\n"
+		    "\tseparator-left = |\n\tseparator-right = \"\"\n"
+		    "[theme \"seg\"]\n\tbase = black\n\tstatus.normal = red\n"
+		    "\tstatus.a.bg = 22\n");
+
+		TAP_ASSERT(t, c != NULL);
+		v->e.statusline = STATUS_PLAIN;
+		g_cfg = c;
+		themes_load_cfg(c);
+		ed_apply_config(&v->e);
+		TAP_CHECK(t, v->e.statusline == STATUS_POWERLINE);
+		TAP_CHECKF(t, v->e.sep[0] == '|' && v->e.sep[1] == 0,
+		    "seps %u %u", v->e.sep[0], v->e.sep[1]);
+		TAP_ASSERT(t, theme_by_name("seg") >= 0);
+		v->e.scheme = SCHEME_COUNT + theme_by_name("seg");
+		ed_render(&v->e, v->e.d);
+		BAR();
+		TAP_CHECKF(t, strncmp(bar, " NORMAL | F1=Help |", 19) == 0, "bar [%s]", bar);
+		TAP_CHECK(t, row[1].bg.index == 1 && row[10].bg.index == 22);
+		TAP_CHECKF(t, strstr(bar, "  LF  Line:1  Col:1 ") != NULL, "right [%s]", bar);
+		g_cfg = NULL;
+		themes_load_cfg(NULL);
+		vedit_cfg_free(c);
+	}
+#undef BAR
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* Reflow: a C block comment hangs under " * ", a list item under its text,
  * a quote keeps its marks, an indent is kept, blank lines separate; the
  * whole rewrite is one undo step, and a second pass changes nothing. */
@@ -4410,6 +4511,7 @@ const Case tap_cases[] = {
 	{ "reflow", t_reflow },
 	{ "gq_keys", t_gq_keys },
 	{ "auto_wrap", t_auto_wrap },
+	{ "statusline_pl", t_statusline_pl },
 #ifdef VEDIT_TERM
 	{ "menu_terminal", t_menu_terminal },
 	{ "tbl_attach", t_tbl_attach },
