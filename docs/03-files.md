@@ -54,6 +54,45 @@ Some features open buffers of their own: a terminal (chapter 7), a commit
 message or a file's history (chapter 7), the parts of a mail message
 (chapter 8). They appear in the buffer list like any other.
 
+## Two panes
+
+The text area can be split in two panes, one above the other or side by
+side, each a full view with its own cursor, scrollbar, and title. The
+two panes may show two files, or the same file at two places: an edit
+made in one pane is in the other at once, since they share the buffer.
+
+| Key | Menu item | Action |
+|---|---|---|
+| Ctrl-W s | View > Split Pane | split, one pane above the other |
+| Ctrl-W v | View > Split Side by Side | split, side by side |
+| Ctrl-W w, W, p, F6 | View > Other Pane | move the focus to the other pane |
+| Ctrl-W h, j, k, l | | move the focus left, down, up, or right |
+| Ctrl-W c, q | View > Unsplit | close the focused pane; the other fills the frame |
+| Ctrl-W o | | close the other pane |
+
+A split opens with the current file in both panes; the new pane is the
+top or left one and takes the focus. It needs a plain text buffer (not
+a terminal, nor the hex, table, or art view) and a frame of at least
+five rows or twenty-four columns; the View items are grayed otherwise.
+The other split key while split turns the panes the other way. In the
+vi keys, `:split name` and `:vsplit name` open the file named in the
+new pane, `:close` and `:only` close the focused pane or the other one,
+and `:q`, `:q!`, `:wq`, and `:x` close the focused pane while two are
+open and quit the editor otherwise. Ctrl-Q, File > Exit, `ZZ`, `:qa`,
+and `ZQ` always quit. Ctrl-W is not a prefix in the vi insert mode.
+
+Each pane has its own current buffer: F8, the buffer list, and `:e`
+change the file in the focused pane and leave the other as it is. The
+focused pane's title is drawn reversed, and the status line describes
+it. A click in the other pane moves the focus there; the wheel over it
+scrolls it in place.
+
+The pane under the text (chapter 7) sits under the focused pane and
+follows the focus; Ctrl-W j enters it from the text pane above it and
+Ctrl-W w returns. Opening a split takes a text buffer out of that pane,
+and Buffer in Pane waits until the split is closed. A window too small
+for two panes shows the focused one until it grows again.
+
 ## Line endings
 
 **View > Line Endings** cycles the style a save writes: `LF` (Unix),
@@ -90,14 +129,15 @@ Unsaved changes found. (r)ecover (o)pen (d)elete (q)uit?
 ```
 
 The message adds `maybe open elsewhere` when another running process
-holds the file, and `file changed since` when the file on disk is newer
-than the journal.
+holds the file, and `file changed since` when the file on disk has
+changed since the journal was started.
 
 - `r` loads the base, replays the journal on top, and leaves the result in
   the buffer for you to check and save.
 - `o` opens the file on disk and ignores the journal.
-- `d` deletes the journal and opens the file.
-- `q` quits vedit at startup, or keeps the current buffer in File > Open.
+- `d` deletes the journal and the base and opens the file.
+- `q`, or any other key, quits vedit at startup, or keeps the current
+  buffer in File > Open and `:e`.
 
 Replay stops at the first damaged record. A crash during a write loses at
 most one edit. The journal is flushed to disk whenever input
@@ -109,24 +149,28 @@ Options in the config file (chapter 5):
 | Key | Effect |
 |---|---|
 | `edit.swap = off` | no journal at all, for a filesystem that must not be written |
-| `edit.swapdir = DIR` | keep every journal in one directory, named after the file's full path |
+| `edit.swapdir = DIR` | keep every journal in one directory, named after the file's full path with `/` turned into `%` |
 | `edit.backup = on` | after a save, keep the previous version as `name~` |
-| `edit.backupdir = DIR` | where those backups go |
+| `edit.backupdir = DIR` | where those backups go, named the same way |
+
+A directory that does not exist or cannot be written is ignored, and the
+file goes beside the original. A leading `~/` is expanded.
 
 ## The lock file
 
 At the first edit, vedit also takes an Emacs-style lock beside the file,
 `.#name`, which Emacs honors too. The owner is recorded as
-`user.pid:boot`. Opening a file whose lock belongs to a running
-process asks:
+`user@host.pid:boot`. Opening a file whose lock belongs to a running
+process on this machine asks:
 
 ```
-jon.1234:1728300000 is editing this file. (s)teal (r)ead-only (q)uit?
+jon@myhost.1234:1728300000 is editing this file. (s)teal (r)ead-only (q)uit?
 ```
 
 - `s` takes the file over.
-- `r` opens it read-only. The status line shows `RO` and edits are refused.
-- `q` leaves it unopened.
+- `r` opens it read-only. The status line shows `RO` and edits are
+  refused; `:w!` in the vi keys still writes.
+- `q`, or any other key, leaves it unopened.
 
 A lock left by a process on this machine that has exited, or from an
 earlier boot, is stale and is replaced without asking. A lock from another

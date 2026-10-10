@@ -137,7 +137,8 @@ is the prefix for terminal control:
 .B w
 and
 .B W
-switch to the next and previous buffer,
+switch to the next and previous buffer (from a terminal in the pane under
+the text, back to the text),
 .BR 1 ".." 9
 switch to that buffer,
 .B n
@@ -153,11 +154,36 @@ closes this one, and
 .B Ctrl\-W
 again sends a literal Ctrl\-W to the program.
 .TP
-.BR Ctrl\-W " " s ", " b ", " w ", " c
+.BR Ctrl\-W " " s ", " v ", " w ", " c ", " o
+From a text buffer: split the text in two panes, one above the other or
+side by side, each with its own buffer and cursor; move the focus to the
+other pane (also
+.BR F6 ,
+or
+.BR h ", " j ", " k ", " l
+by direction); close this pane; close the other pane.
+.B :split
+and
+.B :vsplit
+take a file to open in the new pane;
+.BR :close " and " :only
+close this pane or the other one;
+.BR :q ", " :wq " and " :x
+close a pane while two are open.
+.TP
+.BR Ctrl\-W " " S ", " b ", " j ", " c
 From a text buffer: open a shell in a pane under the text (or focus the one
 there), show the current buffer in the pane with another above it, move the
-focus into the pane or back, and close the pane. The build commands show
-their output in the same pane.
+focus into the pane (k or Ctrl\-W w back), and close the pane when no split
+is open. The build commands show their output in the same pane.
+.BR :sterm " [cmd]"
+runs a shell or cmd there,
+.BR :sbuffer " [N]"
+shows buffer N there,
+.BR :terminal " [cmd]"
+opens a terminal buffer instead, and
+.BR :repost " [art]"
+copies a terminal's output into a new text or art buffer.
 .TP
 .BR Ctrl\-W " " + ", " \-
 Make the pane a row taller or shorter, from the text or from a terminal in
@@ -197,7 +223,6 @@ ignores case and
 reverses. In a table the key is the cursor column's cell. Edit > Sort Lines
 asks the same in a dialog.
 .TP
-.TP
 .B :log
 List the commits that touched the file (VCS > History) and open the chosen
 one's diff in a read-only buffer.
@@ -209,6 +234,7 @@ the diff of the commit that changed it.
 .B :commit
 From a saved file: open a commit message buffer for it (VCS > Commit). From
 that buffer: commit the file with the message.
+.TP
 .BI :date " [YYYY-MM-DD]"
 Insert today, or the given day, at the cursor in the format last chosen in
 the calendar of Insert > Date (ISO by default,
@@ -300,14 +326,22 @@ format-on-save),
 start on),
 .B [vcs]
 (enable) and
-.BI [vcs\ """name"""]
+.B "[vcs \(dqname\(dq]"
 (branch, status, log, show, blame and commit, the commands behind the
 status bar mark and the VCS menu; git is built in),
 and per-language
 .BI [command\  """lang"""]
-sections for the compile, build, run, and format commands. See
-.B README.md
-for the full list.
+sections for the compile, build, run, and format commands,
+.B [theme]
+and
+.B [mouse]
+sections, and the
+.BR [language] ,
+.B [color]
+and
+.B [state]
+sections of a grammar. The manual chapter on configuration lists every
+key (see SEE ALSO).
 .PP
 Keys that commonly vary per project can be overridden by an environment
 variable named
@@ -362,6 +396,22 @@ the scroll-region fast path.
 .TP
 .BI VEDIT_ "KEY"
 Per-key overrides for the project-varying config keys (see CONFIGURATION).
+.TP
+.B VEDIT_MOUSE
+Enable
+.RB ( 1 )
+or disable
+.RB ( 0 )
+mouse reporting, over the config.
+.TP
+.BR LANG ", " LC_ALL
+A UTF-8 locale selects the UTF-8 box-drawing mode.
+.TP
+.BR TERM ", " COLORTERM
+Select the color depth when no flag or variable does.
+.TP
+.B SHELL
+The shell of terminal buffers and the pane (default /bin/sh).
 .SH FILES
 .TP
 .B $XDG_CONFIG_HOME/vedit/config
@@ -377,7 +427,7 @@ command. Overridden by
 The configuration file of a build without XDG support
 .RB ( \-DVEDIT_NO_XDG ).
 .TP
-.B %APPDATA%\\vedit\\config
+.B %APPDATA%\evedit\econfig
 The configuration file on Windows.
 .TP
 .BI . name .swpf
@@ -391,13 +441,17 @@ Crash-recovery journal of the edits made since the base was taken.
 .TP
 .BI .# name
 Emacs-style lock naming the session editing the file, as
-.IR user.pid:boot .
+.IR user@host.pid:boot .
 .TP
 .IB name ~
 Previous version kept on save when
 .B edit.backup
 is on, unless relocated with
 .BR edit.backupdir .
+.TP
+.B tags
+ctags file in the buffer's directory, or the file named by
+.BR tags.file .
 .SH EXIT STATUS
 .B vedit
 exits 0 on a normal quit and non-zero on a usage error, an unreadable file, or

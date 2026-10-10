@@ -7683,6 +7683,14 @@ typedef struct toolerr {
 } Toolerr;
 #endif
 
+/* One text pane of a split: the buffer it shows and where its view is. */
+typedef struct pview {
+	int		buf;		/* index into e->bufs */
+	size_t		cy, cx, top, left;
+} Pview;
+
+enum { SPLIT_NONE, SPLIT_H, SPLIT_V };
+
 /* One saved location on the tag stack: where a tag jump started, so a pop can
  * return there. Only named buffers are recorded (a pop reopens by path). */
 typedef struct tagloc {
@@ -7854,6 +7862,15 @@ typedef struct editor {
 	int		term_prefix;	/* 1 = Ctrl-W seen, awaiting a command key */
 	int		pane_focus;	/* keys go to the pane's terminal, not the text */
 
+	/* two text panes. split is SPLIT_NONE, SPLIT_H (one above the other)
+	 * or SPLIT_V (side by side); split_focus is the pane the flat editor
+	 * edits, whose buffer is e->cur and whose view is e->cy/e->top. The
+	 * other pane keeps its buffer and view in pv[!split_focus]; the
+	 * focused entry is refreshed only when the focus moves. */
+	int		split;
+	int		split_focus;
+	Pview		pv[2];
+
 	/* art view (VEDIT_TERM). art mirrors the active buffer's grid; the
 	 * clipboard of cells is shared across art buffers. */
 	Art		*art;		/* active buffer's art grid, or NULL */
@@ -7876,6 +7893,17 @@ typedef struct editor {
 	int		tbl_width;	/* table.width: default column width; 0 = built-in */
 } Editor;
 
+static void split_open(Editor *e, int kind, int idx);	/* two text panes */
+static void split_close(Editor *e, int which);
+static void split_focus_set(Editor *e, int which);
+#ifndef VEDIT_NO_MOUSE
+static void split_scroll_other(Editor *e, long delta);
+#endif
+static void split_buf_closed(Editor *e, int i);
+static int split_possible(const Editor *e, int kind);
+static void buf_save(Editor *e, Buf *b);
+static void buf_copy_in(Editor *e, const Buf *b);
+static const Text *buf_text_at(const Editor *e, int i);
 #ifdef VEDIT_TERM
 /* Terminal interface, defined with the emulator near end of file. The callers
  * (render_body, editor_loop, buf_close, teardown, vedit_new) precede it. */
@@ -10258,14 +10286,84 @@ ed_chrome(const Editor *e)
 	}
 }
 
-/* Height of the whole framed text area (rows minus menu, two borders,
- * status), before any bottom pane is taken out of it. */
+/* Columns reserved to the right of the text. The black scheme drops the right
+ * border and vertical scrollbar so the text reaches the last column, which lets
+ * scr_present clear trailing blanks with erase-to-EOL (see there). */
 static int
-text_height_full(const Editor *e)
+chrome_right(const Editor *e)
+{
+	if (e->scheme == SCHEME_BLACK)
+		return 0;
+	if (e->scheme >= SCHEME_COUNT) {
+		int i = e->scheme - SCHEME_COUNT;
+
+		if (i < g_user_theme_count && g_user_themes[i].borderless)
+			return 0;
+	}
+	return CHROME_RIGHT;
+}
+
+/* Rows of the whole framed area (rows minus menu, two borders, status),
+ * before a split or a bottom pane is taken out of it. */
+static int
+frame_rows(const Editor *e)
 {
 	int h = e->rows - CHROME_TOP - CHROME_BOTTOM;
 
 	return h < 1 ? 1 : h;
+}
+
+/* Columns of the whole framed area (cols minus the border columns). */
+static int
+frame_cols(const Editor *e)
+{
+	int w = e->cols - CHROME_LEFT - chrome_right(e);
+
+	return w < 1 ? 1 : w;
+}
+
+/* A rectangle of screen cells: the text rows and columns of one pane. */
+typedef struct rect {
+	int	row0, rows, col0, cols;
+} Rect;
+
+static int split_shown(const Editor *e);
+static void split_rect(const Editor *e, int which, Rect *r);
+
+/* Height of the focused pane's text area (the whole frame without a split),
+ * before any bottom pane is taken out of it. */
+static int
+text_height_full(const Editor *e)
+{
+	Rect r;
+
+	if (!split_shown(e))
+		return frame_rows(e);
+	split_rect(e, e->split_focus, &r);
+	return r.rows;
+}
+
+/* First screen row and column of the focused pane's text. */
+static int
+view_row0(const Editor *e)
+{
+	Rect r;
+
+	if (!split_shown(e))
+		return CHROME_TOP;
+	split_rect(e, e->split_focus, &r);
+	return r.row0;
+}
+
+static int
+view_col0(const Editor *e)
+{
+	Rect r;
+
+	if (!split_shown(e))
+		return CHROME_LEFT;
+	split_rect(e, e->split_focus, &r);
+	return r.col0;
 }
 
 /* Per-buffer facts read across the whole buffer list. The current buffer's
@@ -10451,30 +10549,72 @@ text_height(const Editor *e)
 	return h < 1 ? 1 : h;
 }
 
-/* Columns reserved to the right of the text. The black scheme drops the right
- * border and vertical scrollbar so the text reaches the last column, which lets
- * scr_present clear trailing blanks with erase-to-EOL (see there). */
-static int
-chrome_right(const Editor *e)
-{
-	if (e->scheme == SCHEME_BLACK)
-		return 0;
-	if (e->scheme >= SCHEME_COUNT) {
-		int i = e->scheme - SCHEME_COUNT;
 
-		if (i < g_user_theme_count && g_user_themes[i].borderless)
-			return 0;
-	}
-	return CHROME_RIGHT;
-}
-
-/* Width of the framed text area (cols minus the border columns). */
+/* Width of the focused pane's text area (the whole frame without a split). */
 static int
 text_width(const Editor *e)
 {
-	int w = e->cols - CHROME_LEFT - chrome_right(e);
+	Rect r;
 
-	return w < 1 ? 1 : w;
+	if (!split_shown(e))
+		return frame_cols(e);
+	split_rect(e, e->split_focus, &r);
+	return r.cols;
+}
+
+#define SPLIT_MIN_ROWS	5	/* frame rows before two panes stack */
+#define SPLIT_MIN_COLS	24	/* frame columns before two panes sit side by side */
+
+/* Whether the two panes are on screen: a split is set and the focused
+ * buffer is plain text (a terminal, the hex, art and table views and a
+ * buffer shown in the bottom pane take the whole area), in a frame with
+ * room for both. */
+static int
+split_shown(const Editor *e)
+{
+	if (e->split == SPLIT_NONE)
+		return 0;
+	if (e->kind != BUF_TEXT || e->hex_view || e->art || e->tbl || e->in_pane)
+		return 0;
+	if (e->split == SPLIT_V)
+		return frame_cols(e) >= SPLIT_MIN_COLS;
+	return frame_rows(e) >= SPLIT_MIN_ROWS;
+}
+
+/* The text cells of pane 0 (top or left) or pane 1, the divider row or
+ * column between them left out. The first pane gets the smaller half. */
+static void
+split_rect(const Editor *e, int which, Rect *r)
+{
+	int fr = frame_rows(e), fc = frame_cols(e);
+
+	r->row0 = CHROME_TOP;
+	r->rows = fr;
+	r->col0 = CHROME_LEFT;
+	r->cols = fc;
+	if (e->split == SPLIT_V) {
+		int c0 = (fc - 1) / 2;
+
+		if (which == 0) {
+			r->cols = c0;
+		} else {
+			r->col0 = CHROME_LEFT + c0 + 1;
+			r->cols = fc - c0 - 1;
+		}
+	} else {
+		int r0 = (fr - 1) / 2;
+
+		if (which == 0) {
+			r->rows = r0;
+		} else {
+			r->row0 = CHROME_TOP + r0 + 1;
+			r->rows = fr - r0 - 1;
+		}
+	}
+	if (r->rows < 1)
+		r->rows = 1;
+	if (r->cols < 1)
+		r->cols = 1;
 }
 
 /* Columns of the line-number gutter at the left of the text, or 0 when off. The
@@ -10516,7 +10656,7 @@ render_gutter(Screen *d, const Editor *e, int row, int gutter, size_t idx,
 	if (number && idx < text_lines(e->t))
 		n = snprintf(num, sizeof(num), "%*zu ", gutter - 1, idx + 1);
 	for (i = 0; i < gutter; i++)
-		scr_cell(d, row, CHROME_LEFT + i,
+		scr_cell(d, row, view_col0(e) + i,
 		    (uint32_t)(unsigned char)(i < n ? num[i] : ' '), fg, bg, at);
 }
 
@@ -10570,6 +10710,7 @@ typedef enum menu_act {
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS,
 	MA_VI_MODE, MA_EDIT_CONFIG, MA_RELOAD_CONFIG, MA_GLYPHS, MA_COLORS,
 	MA_TABSTOPS,
+	MA_SPLIT, MA_VSPLIT, MA_SPLIT_OTHER, MA_SPLIT_CLOSE,
 #ifndef VEDIT_NO_TOOLS
 	MA_FORMAT,
 	MA_COMPILE, MA_MAKE, MA_RUN, MA_VIEW_OUTPUT, MA_ERR_NEXT, MA_ERR_PREV,
@@ -10703,11 +10844,15 @@ static const Menuitem mi_view[] = {
 	{ "&Indent with Spaces","",	":set et",	MA_EXPAND_TABS },
 	{ "&Hex Dump",		"",	"",	MA_HEX },
 	{ "Ta&ble View",	"",	":table",	MA_TABLE },
+	{ "Split &Pane",	"Ctrl-W s",	":split",	MA_SPLIT },
+	{ "Split Side b&y Side","Ctrl-W v",	":vsplit",	MA_VSPLIT },
+	{ "&Other Pane",	"F6",	"Ctrl-W w",	MA_SPLIT_OTHER },
+	{ "&Unsplit",		"Ctrl-W c",	":close",	MA_SPLIT_CLOSE },
 };
 static const Menuitem mi_options[] = {
 	{ "&Draw Mode",		"Ins",	":draw",	MA_DRAW },
 	{ "&Glyph Palette...",	"Alt+G",	"",	MA_GLYPHS },
-#ifdef VEDIT_TERM
+#ifdef VEDIT_ART
 	{ "&Color Palette...",	"Alt+C",	"",	MA_COLORS },
 #endif
 	{ "&Tab Stops...",	"",	":tabstops",	MA_TABSTOPS },
@@ -10738,9 +10883,9 @@ static const Menuitem mi_term[] = {
 	{ "&New Terminal",	"",	":terminal",	MA_TERM_NEW },
 	{ "&Close Terminal",	"",	"",		MA_TERM_CLOSE },
 	{ "",			"",	"",		MA_SEP },
-	{ "&Split Terminal",	"Ctrl-W s",	":split",	MA_TERM_SPLIT },
+	{ "&Split Terminal",	"Ctrl-W S",	":sterm",	MA_TERM_SPLIT },
 	{ "&Buffer in Pane",	"Ctrl-W b",	":sbuffer",	MA_PANE_BUFFER },
-	{ "Close &Pane",	"Ctrl-W c",	"",		MA_PANE_CLOSE },
+	{ "Close &Pane",	"",	"",		MA_PANE_CLOSE },
 	{ "Ta&ller Pane",	"Ctrl-W +",	"",		MA_PANE_GROW },
 	{ "Sh&orter Pane",	"Ctrl-W -",	"",		MA_PANE_SHRINK },
 	{ "",			"",	"",		MA_SEP },
@@ -11026,6 +11171,10 @@ menu_checked(const Editor *e, Menuact act)
 		return e->draw_mode ? 1 : 0;
 	case MA_TABLE:
 		return e->tbl ? 1 : 0;
+	case MA_SPLIT:
+		return e->split == SPLIT_H ? 1 : 0;
+	case MA_VSPLIT:
+		return e->split == SPLIT_V ? 1 : 0;
 #ifndef VEDIT_NO_MOUSE
 	case MA_MOUSE:
 		return e->mouse ? 1 : 0;
@@ -11097,6 +11246,13 @@ menu_item_enabled(const Editor *e, Menuact act)
 			return 0;
 #endif
 		return 1;
+	case MA_SPLIT:
+		return split_possible(e, SPLIT_H);
+	case MA_VSPLIT:
+		return split_possible(e, SPLIT_V);
+	case MA_SPLIT_OTHER:
+	case MA_SPLIT_CLOSE:
+		return e->split != SPLIT_NONE;
 	case MA_PASTE:
 		return e->clip && e->clip_len > 0;
 	case MA_OSC_COPY_FILE:
@@ -11140,7 +11296,8 @@ menu_item_enabled(const Editor *e, Menuact act)
 	case MA_TERM_SPLIT:
 		return e->d->t->io.poll_fds != NULL && e->kind == BUF_TEXT;
 	case MA_PANE_BUFFER:
-		return e->kind == BUF_TEXT && (e->in_pane || e->nbuf > 1);
+		return e->kind == BUF_TEXT && e->split == SPLIT_NONE &&
+		    (e->in_pane || e->nbuf > 1);
 	case MA_PANE_CLOSE:
 		return pane_term(e, NULL) != NULL || pane_text_idx(e) >= 0;
 	case MA_PANE_GROW:
@@ -11298,7 +11455,8 @@ ui_frame(Editor *e, const Pal *p)
 	int bot = e->rows - CHROME_BOTTOM;	/* bottom border row */
 	int sb = e->cols - chrome_right(e);	/* right border / vertical bar
 						 * (off-screen when borderless) */
-	int th = text_height(e);
+	int split = split_shown(e);
+	int th = split ? frame_rows(e) : text_height(e);
 	int i;
 	size_t nlines = text_lines(e->t);
 	size_t max_top = nlines > (size_t)th ? nlines - (size_t)th : 0;
@@ -11344,7 +11502,7 @@ ui_frame(Editor *e, const Pal *p)
 		tlen = snprintf(title, sizeof(title), " %s ", name);
 	if (tlen > e->cols - 4)
 		tlen = e->cols - 4;
-	if (tlen > 0) {
+	if (tlen > 0 && !split) {	/* split_chrome titles each pane */
 		tstart = (e->cols - tlen) / 2;
 		if (tstart < 1)
 			tstart = 1;
@@ -11352,12 +11510,15 @@ ui_frame(Editor *e, const Pal *p)
 		    ATTR_BOLD);
 	}
 
-	/* left border column and the vertical scrollbar column */
+	/* left border column and the vertical scrollbar column (with a split
+	 * the border runs the whole frame and split_chrome draws the bars) */
 	for (i = 0; i < th; i++) {
 		int r = CHROME_TOP + i;
 
 		scr_cell(d, r, 0, GL_V, fg, bg, 0);
-		if (th >= 3)
+		if (split)
+			scr_cell(d, r, sb, GL_V, fg, bg, 0);
+		else if (th >= 3)
 			scrollbar_cell(d, r, sb, i, th, vthumb,
 			    GL_UP, GL_DOWN, fg, bg);
 		else
@@ -14091,7 +14252,7 @@ paint_rows(Editor *e, Screen *d, const Pal *p, int row0, int rows,
 {
 	int gutter = gutter_width(e);
 	int text_w = text_width(e) - gutter;
-	int col0 = CHROME_LEFT + gutter;
+	int col0 = view_col0(e) + gutter;
 	int wrap = e->wrap && !e->draw_mode;
 	int i;
 
@@ -14176,19 +14337,214 @@ render_parked(Editor *e, Screen *d, const Pal *p, int idx, int row0,
 }
 #endif
 
+/****************************************************************
+ * Two text panes. A split shows two views at once, one above the other or
+ * side by side, each with its own buffer, cursor and scrollbar; the same
+ * buffer may be in both. The focused pane is the flat editor; the other
+ * is painted each frame by loading its view into the flat fields for the
+ * duration, the way the bottom pane paints a parked buffer.
+ ****************************************************************/
+
+/* Clamp a stored view onto its buffer: edits in the other pane may have
+ * taken lines or bytes from under it. */
+static void
+pview_clamp(const Text *t, Pview *v)
+{
+	size_t n = text_lines(t), len = 0;
+
+	if (n == 0) {
+		v->cy = v->cx = v->top = 0;
+		return;
+	}
+	if (v->cy >= n)
+		v->cy = n - 1;
+	if (v->top > v->cy)
+		v->top = v->cy;
+	text_line(t, v->cy, &len);
+	if (v->cx > len)
+		v->cx = len;
+}
+
+/* Paint the other pane of the split into its rectangle. Its buffer and
+ * view are loaded into the flat editor for the paint, with no selection
+ * and the geometry of that pane, then everything is put back, the view
+ * as the painter scrolled it. A buffer that is not text paints blank. */
+static void
+split_paint_other(Editor *e, Screen *d, const Pal *p)
+{
+	int f = e->split_focus, o = !f, cur = e->cur;
+	Pview *v = &e->pv[o];
+	Rect r;
+	size_t cy = e->cy, cx = e->cx, top = e->top, left = e->left;
+	int sel = e->sel_active, vis = e->vi_visual;
+	size_t ptop = e->prev_top, pleft = e->prev_left;
+	int pview = e->prev_text_view, pr0 = e->prev_row0, prs = e->prev_rows;
+	int rr, sc, cc, i;
+
+	split_rect(e, o, &r);
+	if (v->buf < 0 || v->buf >= e->nbuf || buf_kind_at(e, v->buf) != BUF_TEXT) {
+		for (i = 0; i < r.rows; i++)
+			scr_fill(d, r.row0 + i, r.col0, r.cols, ' ',
+			    p->content_fg, p->content_bg, 0);
+		return;
+	}
+	if (v->buf != cur) {
+		buf_save(e, &e->bufs[cur]);
+		buf_copy_in(e, &e->bufs[v->buf]);
+		e->view_swap = 1;
+	}
+	pview_clamp(e->t, v);
+	e->cy = v->cy;
+	e->cx = v->cx;
+	e->top = v->top;
+	e->left = v->left;
+	e->sel_active = 0;
+	e->vi_visual = 0;
+	e->split_focus = o;
+	paint_rows(e, d, p, r.row0, r.rows, &rr, &sc, &cc);
+	e->split_focus = f;
+	v->top = e->top;		/* as scrolled to keep its cursor in view */
+	v->left = e->left;
+	if (v->buf != cur) {
+		e->view_swap = 0;
+		buf_save(e, &e->bufs[v->buf]);	/* its highlight cache grew */
+		buf_copy_in(e, &e->bufs[cur]);
+	}
+	e->cy = cy;
+	e->cx = cx;
+	e->top = top;
+	e->left = left;
+	e->sel_active = sel;
+	e->vi_visual = vis;
+	e->prev_top = ptop;
+	e->prev_left = pleft;
+	e->prev_text_view = pview;
+	e->prev_row0 = pr0;
+	e->prev_rows = prs;
+}
+
+/* The title of pane `which` as the frame shows it, with the buffer index
+ * when more than one file is open. */
+static int
+split_title(const Editor *e, int which, char *title, size_t size)
+{
+	int idx = which == e->split_focus ? e->cur : e->pv[which].buf;
+	const char *name;
+
+	if (idx < 0 || idx >= e->nbuf)
+		return 0;
+	name = buf_name_at(e, idx);
+	if (e->nbuf > 1)
+		return snprintf(title, size, " [%d/%d] %s ", idx + 1, e->nbuf,
+		    name);
+	return snprintf(title, size, " %s ", name);
+}
+
+/* Draw one pane's vertical scrollbar in column col over its rows. */
+static void
+split_scrollbar(Screen *d, int col, int row0, int rows, size_t top,
+    size_t nlines, Color fg, Color bg)
+{
+	size_t max_top = nlines > (size_t)rows ? nlines - (size_t)rows : 0;
+	int thumb = thumb_index(top, max_top, rows);
+	int i;
+
+	for (i = 0; i < rows; i++) {
+		if (rows >= 3)
+			scrollbar_cell(d, row0 + i, col, i, rows, thumb,
+			    GL_UP, GL_DOWN, fg, bg);
+		else
+			scr_cell(d, row0 + i, col, GL_V, fg, bg, 0);
+	}
+}
+
+/* Draw the chrome a split adds over the frame: the divider between the
+ * panes, a title for each (reversed on the focused one) and a scrollbar
+ * for each. Pane 0 titles the top border; in a stacked split pane 1
+ * titles the divider row, side by side both share the top border. */
+static void
+split_chrome(Editor *e, Screen *d, const Pal *p)
+{
+	Color fg = p->frame_fg, bg = p->frame_bg;
+	int sb = e->cols - chrome_right(e);
+	int top = CHROME_TOP - 1;
+	Rect r0, r1;
+	char title[80];
+	int i, w, tlen, tstart;
+	size_t ntop[2], nlines[2];
+
+	split_rect(e, 0, &r0);
+	split_rect(e, 1, &r1);
+	for (w = 0; w < 2; w++) {
+		int idx = w == e->split_focus ? e->cur : e->pv[w].buf;
+		const Text *t = idx >= 0 && idx < e->nbuf ? buf_text_at(e, idx) : NULL;
+
+		ntop[w] = w == e->split_focus ? e->top : e->pv[w].top;
+		nlines[w] = t ? text_lines(t) : 0;
+	}
+	if (e->split == SPLIT_V) {
+		int dc = r0.col0 + r0.cols;	/* the divider column */
+
+		for (i = 0; i < r0.rows; i++)
+			scr_cell(d, CHROME_TOP + i, dc, GL_V, fg, bg, 0);
+		split_scrollbar(d, dc, r0.row0, r0.rows, ntop[0], nlines[0],
+		    fg, bg);
+		split_scrollbar(d, sb, r1.row0, r1.rows, ntop[1], nlines[1],
+		    fg, bg);
+		for (w = 0; w < 2; w++) {
+			const Rect *r = w ? &r1 : &r0;
+
+			tlen = split_title(e, w, title, sizeof(title));
+			if (tlen > r->cols - 2)
+				tlen = r->cols - 2;
+			if (tlen <= 0)
+				continue;
+			tstart = r->col0 + (r->cols - tlen) / 2;
+			ui_field(d, top, tstart, tlen, title, p->title_fg, bg,
+			    w == e->split_focus ? (ATTR_BOLD | ATTR_REVERSE)
+			    : ATTR_BOLD);
+		}
+	} else {
+		int dr = r0.row0 + r0.rows;	/* the divider row */
+
+		scr_fill(d, dr, CHROME_LEFT, frame_cols(e), GL_H, fg, bg, 0);
+		split_scrollbar(d, sb, r0.row0, r0.rows, ntop[0], nlines[0],
+		    fg, bg);
+		split_scrollbar(d, sb, r1.row0, r1.rows, ntop[1], nlines[1],
+		    fg, bg);
+		for (w = 0; w < 2; w++) {
+			tlen = split_title(e, w, title, sizeof(title));
+			if (tlen > e->cols - 4)
+				tlen = e->cols - 4;
+			if (tlen <= 0)
+				continue;
+			tstart = (e->cols - tlen) / 2;
+			if (tstart < 1)
+				tstart = 1;
+			ui_field(d, w ? dr : top, tstart, tlen, title,
+			    p->title_fg, bg,
+			    w == e->split_focus ? (ATTR_BOLD | ATTR_REVERSE)
+			    : ATTR_BOLD);
+		}
+	}
+}
+
 /* Paint the whole frame: the current buffer's text (or terminal grid, or hex
  * view), the pane under it when one is shown, and the chrome. */
 static void
 render_body(Editor *e, Screen *d)
 {
 	const Pal *p = ed_chrome(e);
+	if (e->split != SPLIT_NONE)	/* the focused pane follows e->cur */
+		e->pv[e->split_focus].buf = e->cur;
 	int text_h = text_height(e);
-	int cur_row0 = CHROME_TOP, cur_rows = text_h;
-	int cur_col = 0, cur_row = 0, cur_scol = CHROME_LEFT;
+	int split = split_shown(e);
+	int cur_row0 = view_row0(e), cur_rows = text_h;
+	int cur_col = 0, cur_row = 0, cur_scol = view_col0(e);
 	int wrap = e->wrap && !e->draw_mode;
 #ifdef VEDIT_TERM
 	int shown = pane_shown(e), ph = shown ? pane_height(e) : 0;
-	int prow0 = CHROME_TOP + text_h + 1;
+	int prow0 = cur_row0 + text_h + 1;
 	int cur_in_pane = shown && e->in_pane;
 	Term *pt = shown ? pane_term(e, NULL) : NULL;
 #endif
@@ -14240,7 +14596,8 @@ render_body(Editor *e, Screen *d)
 	 * the same rows. Disabled under soft wrap, where a line spans a
 	 * variable row count. The shadow alone is touched, so this can follow
 	 * the paint. */
-	if (!wrap && e->term->scroll && e->term->shadow_valid &&
+	if (!wrap && !(split && e->split == SPLIT_V) &&
+	    e->term->scroll && e->term->shadow_valid &&
 	    e->prev_text_view && e->left == e->prev_left &&
 	    e->top != e->prev_top && e->prev_row0 == cur_row0 &&
 	    e->prev_rows == cur_rows) {
@@ -14249,6 +14606,8 @@ render_body(Editor *e, Screen *d)
 		if (dv > -cur_rows && dv < cur_rows)
 			scr_scroll(d, cur_row0, cur_rows, (int)dv);
 	}
+	if (split)
+		split_paint_other(e, d, p);
 
 #ifdef VEDIT_TERM
 	if (cur_in_pane) {
@@ -14268,6 +14627,8 @@ render_body(Editor *e, Screen *d)
 	ui_menubar(e, p, -1);
 	ui_frame(e, p);
 #endif
+	if (split)
+		split_chrome(e, d, p);
 	ui_statusbar(e, p, cur_col);
 
 	/* cursor shape follows the mode: a block in normal mode, a bar while
@@ -17906,9 +18267,12 @@ static const struct {
 	{ "F1",			"Show this help" },
 	{ "F2",			"Toggle vi keys (modal editing)" },
 	{ "F8 / Shift+F8",	"Next / previous open buffer" },
+	{ "Ctrl-W s / v  F6",	"Split the text in two panes, stacked / side by side; F6 other pane" },
+	{ "Ctrl-W w h j k l",	"Other pane / the pane left, below, above, right of this one" },
+	{ "Ctrl-W c / o",	"Close this pane / close the other pane" },
 #ifdef VEDIT_TERM
-	{ "Ctrl-W s / b / w / c",	"Pane below: a shell / this buffer / focus / close" },
-	{ "Ctrl-W + / -  :set ph=N",	"Pane a row taller / shorter; set its rows" },
+	{ "Ctrl-W S / b / j",	"Pane below: a shell / this buffer / focus it (k, Ctrl-W w back)" },
+	{ "Ctrl-W + / -  :set ph=N",	"Pane below a row taller / shorter; set its rows" },
 	{ "Ctrl-W m / :",	"In a terminal: the menu bar / an ex command line" },
 	{ "Ctrl-W w / W / 1..9",	"In a terminal: next / previous buffer / buffer N" },
 	{ "Ctrl-W n / c / q",	"In a terminal: new terminal / close it / close dead" },
@@ -17974,12 +18338,17 @@ static const struct {
 	{ ":commit",		"Commit this file: write the message, :commit again sends" },
 	{ "F9 Alt+F9 Ctrl+F9",	"Make / compile / run; F4 steps the errors" },
 #endif
+	{ ":split [file]  :vsplit",	"Two panes, stacked / side by side; the file in the new one" },
+	{ ":close  :only  :q",	"Close this pane / the other pane (:q closes a pane while split)" },
+	{ "Ctrl-W s / v  F6",	"Split the text in two panes, stacked / side by side; F6 other pane" },
+	{ "Ctrl-W w h j k l",	"Other pane / the pane left, below, above, right of this one" },
+	{ "Ctrl-W c / o",	"Close this pane / close the other pane" },
 #ifdef VEDIT_TERM
 	{ ":terminal [cmd]",	"Open a terminal buffer (keys go to the program)" },
-	{ ":split [cmd]",	"Run a shell or cmd in a pane under the text" },
-	{ ":sbuffer [N]",	"Show buffer N (or this one) in the pane" },
-	{ "Ctrl-W s / b / w / c",	"Pane below: a shell / this buffer / focus / close" },
-	{ "Ctrl-W + / -  :set ph=N",	"Pane a row taller / shorter; set its rows" },
+	{ ":sterm [cmd]",	"Run a shell or cmd in a pane under the text" },
+	{ ":sbuffer [N]",	"Show buffer N (or this one) in the pane below" },
+	{ "Ctrl-W S / b / j",	"Pane below: a shell / this buffer / focus it (k, Ctrl-W w back)" },
+	{ "Ctrl-W + / -  :set ph=N",	"Pane below a row taller / shorter; set its rows" },
 	{ "Ctrl-W m / :",	"In a terminal: the menu bar / an ex command line" },
 	{ "Ctrl-W w / W / 1..9",	"In a terminal: next / previous buffer / buffer N" },
 	{ "Ctrl-W n / c / q",	"In a terminal: new terminal / close it / close dead" },
@@ -18181,13 +18550,18 @@ static const char *const tut_term[] = {
 	"  text, so a build, a shell, a log, or a second file stays in",
 	"  view while you edit. From the text:",
 	"",
-	"      Ctrl-W s        open a shell in the pane (or focus it)",
+	"      Ctrl-W S        open a shell in the pane (or focus it)",
 	"      Ctrl-W b        show this buffer in the pane, another above",
-	"      Ctrl-W w        move the focus into the pane, or back",
+	"      Ctrl-W j        move the focus into the pane (Ctrl-W w back)",
 	"      Ctrl-W c        close the pane (a buffer stays open)",
 	"      Ctrl-W + / -    make the pane a row taller or shorter",
-	"      :split [cmd]    run cmd (default: a shell) in the pane",
+	"      :sterm [cmd]    run cmd (default: a shell) in the pane",
 	"      :sbuffer [N]    show buffer N (default: this) in the pane",
+	"",
+	"  The text itself splits in two panes, each with its own buffer and",
+	"  cursor: Ctrl-W s stacked, Ctrl-W v side by side, Ctrl-W w or F6",
+	"  the other pane, Ctrl-W c closes one. The pane above sits under",
+	"  the focused text pane.",
 	"",
 	"  In a terminal pane, Ctrl-W w returns to the text and the other",
 	"  Ctrl-W keys below apply. The pane's title is reversed while it",
@@ -18761,9 +19135,10 @@ buf_save(Editor *e, Buf *b)
 #undef CP
 }
 
-/* Mirror a slot into the flat editor and drop any in-flight vi command. */
+/* Mirror a slot into the flat editor, nothing else touched: the painter
+ * of the other pane of a split loads a buffer this way mid-frame. */
 static void
-buf_load(Editor *e, const Buf *b)
+buf_copy_in(Editor *e, const Buf *b)
 {
 #define CP(f) e->f = b->f;
 	BUF_STATE_SCALARS(CP)
@@ -18772,6 +19147,13 @@ buf_load(Editor *e, const Buf *b)
 	BUF_STATE_ARRAYS(CP)
 #undef CP
 	g_tabs = e->tabs;
+}
+
+/* Mirror a slot into the flat editor and drop any in-flight vi command. */
+static void
+buf_load(Editor *e, const Buf *b)
+{
+	buf_copy_in(e, b);
 	e->vi_visual = 0;
 	e->vi_want_col = e->vi_vert_run = e->vi_vert_prev = 0;
 	e->hex_ascii = 0;
@@ -18990,6 +19372,7 @@ buf_close(Editor *e, int i)
 		e->cur = i < e->nbuf ? i : e->nbuf - 1;
 		buf_load(e, &e->bufs[e->cur]);
 		vcs_refresh(e);
+		split_buf_closed(e, i);
 	} else {
 		swap_drop(e->bufs[i].swapj);
 		swap_detach(e->bufs[i].t, e->bufs[i].swapj);
@@ -19008,6 +19391,7 @@ buf_close(Editor *e, int i)
 		e->nbuf--;
 		if (e->cur > i)
 			e->cur--;
+		split_buf_closed(e, i);
 	}
 	return 0;
 }
@@ -24617,6 +25001,18 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_TABLE:
 		tbl_command(e, "");
 		break;
+	case MA_SPLIT:
+		split_open(e, SPLIT_H, -1);
+		break;
+	case MA_VSPLIT:
+		split_open(e, SPLIT_V, -1);
+		break;
+	case MA_SPLIT_OTHER:
+		split_focus_set(e, !e->split_focus);
+		break;
+	case MA_SPLIT_CLOSE:
+		split_close(e, e->split_focus);
+		break;
 	case MA_TBL_ROWADD:
 		if (e->tbl)
 			tbl_row_add(e, 1, 0);
@@ -25051,7 +25447,8 @@ usage(void)
 	    "  F8 / Shift+F8 next / previous open buffer\n"
 	    "  F10 or Alt+letter  open the menu bar\n"
 	    "  Ctrl-W m      open the menu bar from inside a terminal buffer\n"
-	    "  Ctrl-W s/b/w/c  a shell or this buffer in a pane below / focus / close\n"
+	    "  Ctrl-W s/v/w/c  split the text in two panes / other pane / close one\n"
+	    "  Ctrl-W S/b/j    a shell or this buffer in a pane below / focus it\n"
 	    "  F1            show the key bindings\n"
 	    "  F2            toggle vi keys (modal editing)\n"
 	    "\n"
@@ -25906,7 +26303,7 @@ static Menuact
 ed_mouse_event(Editor *e, const struct tkbd_seq *m)
 {
 	int text_h = text_height(e), gutter = gutter_width(e);
-	int col0 = CHROME_LEFT + gutter, text_w = text_width(e) - gutter;
+	int row0, col0, text_w = text_width(e) - gutter;
 	int press = m->key == TKBD_MOUSE_LEFT && !(m->mod & TKBD_MOD_MOTION);
 
 	if (text_w < 1)
@@ -25926,17 +26323,354 @@ ed_mouse_event(Editor *e, const struct tkbd_seq *m)
 	if (e->art)
 		return MA_NONE;
 #endif
-	if (m->y < CHROME_TOP || m->y >= CHROME_TOP + text_h)
+	if (split_shown(e)) {
+		Rect o;
+
+		/* the other pane: the wheel scrolls it in place, a click
+		 * moves the focus there and then lands as in any pane */
+		split_rect(e, !e->split_focus, &o);
+		if (m->y >= o.row0 && m->y < o.row0 + o.rows &&
+		    m->x >= o.col0 && m->x < o.col0 + o.cols) {
+			if (m->key == TKBD_MOUSE_WHEEL_UP)
+				split_scroll_other(e, -3);
+			else if (m->key == TKBD_MOUSE_WHEEL_DOWN)
+				split_scroll_other(e, 3);
+			if (!press)
+				return MA_NONE;
+			split_focus_set(e, !e->split_focus);
+			text_h = text_height(e);
+			gutter = gutter_width(e);
+			text_w = text_width(e) - gutter;
+			if (text_w < 1)
+				text_w = 1;
+		}
+	}
+	row0 = view_row0(e);
+	col0 = view_col0(e) + gutter;
+	if (m->y < row0 || m->y >= row0 + text_h ||
+	    m->x < view_col0(e) || m->x >= view_col0(e) + text_width(e))
 		return MA_NONE;
 	if (m->key == TKBD_MOUSE_WHEEL_UP)
 		mouse_scroll(e, -3, text_h);
 	else if (m->key == TKBD_MOUSE_WHEEL_DOWN)
 		mouse_scroll(e, 3, text_h);
 	else if (press)
-		mouse_click(e, m->y - CHROME_TOP, m->x - col0, text_w);
+		mouse_click(e, m->y - row0, m->x - col0, text_w);
 	return MA_NONE;
 }
 #endif /* VEDIT_NO_MOUSE */
+
+/****************************************************************
+ * Split operations: open, close, move the focus, scroll the other pane.
+ ****************************************************************/
+
+/* Store the flat view into the focused pane's entry. */
+static void
+split_store_focus(Editor *e)
+{
+	Pview *v = &e->pv[e->split_focus];
+
+	v->buf = e->cur;
+	v->cy = e->cy;
+	v->cx = e->cx;
+	v->top = e->top;
+	v->left = e->left;
+}
+
+/* Make a stored view the flat one: its buffer current, its cursor and
+ * scroll in place. */
+static void
+split_adopt(Editor *e, const Pview *view)
+{
+	Pview v = *view;
+
+	if (v.buf < 0 || v.buf >= e->nbuf)
+		v.buf = e->cur;
+	if (v.buf != e->cur)
+		buf_switch(e, v.buf);
+	if (e->kind != BUF_TEXT)
+		return;
+	pview_clamp(e->t, &v);
+	e->cy = v.cy;
+	e->cx = v.cx;
+	e->top = v.top;
+	e->left = v.left;
+	e->sel_active = 0;
+	e->vi_visual = 0;
+	e->vi_want_col = e->vi_vert_run = e->vi_vert_prev = 0;
+}
+
+/* Whether a split could open or show now: the current buffer is plain
+ * text and the frame has room for two panes of that orientation. */
+static int
+split_possible(const Editor *e, int kind)
+{
+	if (e->kind != BUF_TEXT || e->hex_view || e->art || e->tbl)
+		return 0;
+	if (kind == SPLIT_V)
+		return frame_cols(e) >= SPLIT_MIN_COLS;
+	return frame_rows(e) >= SPLIT_MIN_ROWS;
+}
+
+/* Open a split, SPLIT_H (stacked) or SPLIT_V (side by side). The new pane
+ * is pane 0, top or left, and takes the focus with the current buffer, or
+ * with buffer idx when one is given; the view that was on screen becomes
+ * pane 1. A split that is already open only turns to the other
+ * orientation. A text buffer in the bottom pane gives that pane up. */
+static void
+split_open(Editor *e, int kind, int idx)
+{
+	if (!split_possible(e, kind)) {
+		set_status(e, e->kind == BUF_TEXT && !e->hex_view && !e->art &&
+		    !e->tbl ? "no room for two panes"
+		    : "a split needs a text buffer");
+		return;
+	}
+	if (e->split != SPLIT_NONE) {
+		if (e->split != kind) {
+			e->split = kind;
+			set_status(e, kind == SPLIT_V ? "panes side by side"
+			    : "panes stacked");
+		} else {
+			set_status(e, "already split (Ctrl-W w moves between the panes, Ctrl-W c closes one)");
+		}
+		if (idx >= 0 && idx < e->nbuf && idx != e->cur)
+			buf_switch(e, idx);
+		return;
+	}
+#ifdef VEDIT_TERM
+	{
+		int i;
+
+		e->in_pane = 0;
+		e->top_last = 0;
+		for (i = 0; i < e->nbuf; i++) {
+			e->bufs[i].in_pane = 0;
+			e->bufs[i].top_last = 0;
+		}
+	}
+#endif
+	e->split = kind;
+	e->split_focus = 1;
+	split_store_focus(e);		/* the old view is pane 1 */
+	e->split_focus = 0;
+	split_store_focus(e);		/* and the new pane starts on it */
+	e->sel_active = 0;
+	if (idx >= 0 && idx < e->nbuf && idx != e->cur)
+		buf_switch(e, idx);
+	set_status(e, "%s (Ctrl-W w moves between the panes, Ctrl-W c closes one)",
+	    kind == SPLIT_V ? "split side by side" : "split");
+}
+
+/* Close pane `which`. The other pane's view fills the frame. */
+static void
+split_close(Editor *e, int which)
+{
+	Pview keep;
+
+	if (e->split == SPLIT_NONE) {
+		set_status(e, "no split to close");
+		return;
+	}
+	if (which == e->split_focus) {
+		keep = e->pv[!which];
+		e->split = SPLIT_NONE;
+		e->split_focus = 0;
+		split_adopt(e, &keep);
+	} else {
+		e->split = SPLIT_NONE;
+		e->split_focus = 0;
+	}
+	set_status(e, "split closed");
+}
+
+/* Move the focus to pane `which`: the flat view is stored and that
+ * pane's buffer and view are loaded. */
+static void
+split_focus_set(Editor *e, int which)
+{
+	if (e->split == SPLIT_NONE || which == e->split_focus)
+		return;
+	split_store_focus(e);
+	e->split_focus = which;
+	split_adopt(e, &e->pv[which]);
+#ifdef VEDIT_TERM
+	e->pane_focus = 0;
+#endif
+}
+
+#ifndef VEDIT_NO_MOUSE
+/* Scroll the other pane by delta lines without moving the focus, its
+ * cursor pulled along to stay in view. */
+static void
+split_scroll_other(Editor *e, long delta)
+{
+	int o = !e->split_focus;
+	Pview *v = &e->pv[o];
+	const Text *t = v->buf >= 0 && v->buf < e->nbuf ? buf_text_at(e, v->buf) : NULL;
+	size_t n = t ? text_lines(t) : 0, top;
+	Rect r;
+
+	if (n == 0)
+		return;
+	split_rect(e, o, &r);
+	top = v->top;
+	if (delta < 0)
+		top = (size_t)(-delta) > top ? 0 : top - (size_t)(-delta);
+	else
+		top = top + (size_t)delta >= n ? n - 1 : top + (size_t)delta;
+	v->top = top;
+	if (v->cy < top)
+		v->cy = top;
+	else if (v->cy >= top + (size_t)r.rows)
+		v->cy = top + (size_t)r.rows - 1;
+	if (v->cy >= n)
+		v->cy = n - 1;
+}
+#endif /* VEDIT_NO_MOUSE */
+
+/* Keep the pane entries right after buffer i was removed from the list. */
+static void
+split_buf_closed(Editor *e, int i)
+{
+	int w;
+
+	for (w = 0; w < 2; w++) {
+		if (e->pv[w].buf == i) {
+			e->pv[w].buf = e->cur;
+			e->pv[w].cy = e->pv[w].cx = 0;
+			e->pv[w].top = e->pv[w].left = 0;
+		} else if (e->pv[w].buf > i) {
+			e->pv[w].buf--;
+		}
+	}
+}
+
+/* The split pane in direction dir ('h' 'j' 'k' 'l') from the focused one,
+ * or -1 when there is none that way. */
+static int
+split_toward(const Editor *e, uint32_t dir)
+{
+	int f = e->split_focus;
+
+	if (e->split == SPLIT_V) {
+		if (dir == 'h' && f == 1)
+			return 0;
+		if (dir == 'l' && f == 0)
+			return 1;
+	} else if (e->split == SPLIT_H) {
+		if (dir == 'k' && f == 1)
+			return 0;
+		if (dir == 'j' && f == 0)
+			return 1;
+	}
+	return -1;
+}
+
+/* Ctrl-W from a text buffer: one more key picks the window action. The
+ * split keys follow vi (s, v, w, h j k l, c, o); the rest go to the
+ * bottom pane. In the vi personality ':' opens the ex line, and its
+ * result is returned so a quit typed there ends the run. */
+static Req
+pane_key(Editor *e)
+{
+	Event ev;
+	uint32_t ch;
+	int split = e->split != SPLIT_NONE, to;
+
+	set_status(e, "Ctrl-W: (s)plit, (v)ertical split, (w) other pane, (c)lose pane, (o)nly, (S)hell below, (b)uffer below, (+/-) resize%s",
+	    e->mode != MODE_MODELESS ? ", (:) ex" : "");
+	ed_render(e, e->d);
+	for (;;) {
+		switch (scr_wait(e->d, &ev)) {
+		case EVENT_EOF:
+			return REQ_CONTINUE;
+		case EVENT_RESIZE:
+		case EVENT_RESUME:
+			scr_size(e->d, &e->rows, &e->cols);
+			continue;
+		case EVENT_KEY:
+			break;
+		default:
+			continue;
+		}
+		break;
+	}
+	e->status[0] = '\0';
+	if (ev.key.type != TKBD_KEY || ev.key.ch == TKBD_CH_NONE)
+		return REQ_CONTINUE;
+	ch = ev.key.ch;
+	if (ch == 's')
+		split_open(e, SPLIT_H, -1);
+	else if (ch == 'v')
+		split_open(e, SPLIT_V, -1);
+	else if (ch == 'o')
+		split_close(e, !e->split_focus);
+#ifdef VEDIT_TERM
+	else if (ch == 'k' && !split && e->in_pane)
+		pane_focus_text(e, 0);	/* up out of the text pane below */
+#endif
+	else if (ch == 'c' || ch == 'q') {
+		if (split)
+			split_close(e, e->split_focus);
+#ifdef VEDIT_TERM
+		else
+			pane_close(e);
+#else
+		else
+			set_status(e, "no split to close");
+#endif
+	} else if (split && (ch == 'w' || ch == 'W' || ch == 'p'))
+		split_focus_set(e, !e->split_focus);
+#ifdef VEDIT_TERM
+	else if (ch == 'j' && pane_shown(e) && !e->in_pane) {
+		/* down into the pane under this text, before the pane below
+		 * it in a stacked split */
+		if (pane_term(e, NULL)) {
+			e->pane_focus = 1;
+			set_status(e, "pane: keys go to the terminal; Ctrl-W w returns to the file");
+		} else {
+			pane_focus_text(e, 1);
+		}
+	}
+#endif
+	else if (split && (to = split_toward(e, ch)) >= 0)
+		split_focus_set(e, to);
+#ifdef VEDIT_TERM
+	else if (ch == 'w' || ch == 'W' || ch == 'p' || ch == 'j') {
+		if (!pane_shown(e)) {
+			set_status(e, split
+			    ? "no pane below (Ctrl-W S opens a shell in one)"
+			    : "no pane (Ctrl-W s splits, Ctrl-W S opens a shell below, Ctrl-W b a buffer)");
+		} else if (pane_term(e, NULL)) {
+			e->pane_focus = 1;
+			set_status(e, "pane: keys go to the terminal; Ctrl-W w returns to the file");
+		} else {
+			pane_focus_text(e, !e->in_pane);
+		}
+	} else if (ch == 'S') {
+		pane_run(e, NULL);
+	} else if (ch == 'b' || ch == 'B') {
+		if (split)
+			set_status(e, "close the split first (Ctrl-W c)");
+		else
+			pane_buffer(e);
+	} else if (ch == 'r') {
+		term_repost_text(e);
+	} else if (ch == 'R') {
+		term_repost_art(e);
+	} else if (ch == '+' || ch == '=') {
+		pane_resize(e, 1);
+	} else if (ch == '-' || ch == '_') {
+		pane_resize(e, -1);
+	}
+#endif
+	else if (ch == ':' && e->mode != MODE_MODELESS)
+		return vi_colon(e);	/* the ex line, as in a terminal buffer */
+	return REQ_CONTINUE;
+}
+
+
 static int
 editor_loop(Editor *e)
 {
@@ -26140,9 +26874,18 @@ editor_loop(Editor *e)
 			continue;
 		}
 
-#ifdef VEDIT_TERM
-		/* Ctrl-W is the pane prefix in a text buffer too: s opens a
-		 * shell below, w moves the focus there, c closes it. */
+		/* F6 moves the focus to the other pane of a split. */
+		if (seq.type == TKBD_KEY && seq.key == TKBD_KEY_F6) {
+			if (e->split != SPLIT_NONE)
+				split_focus_set(e, !e->split_focus);
+			else
+				set_status(e, "no split (Ctrl-W s or View > Split Pane opens one)");
+			ed_render(e, e->d);
+			continue;
+		}
+
+		/* Ctrl-W is the window prefix in a text buffer: s and v split
+		 * it, w moves the focus, c closes a pane, S opens a shell below. */
 		if (seq.type == TKBD_KEY && seq.key == TKBD_KEY_W &&
 		    (seq.mod & TKBD_MOD_CTRL) && e->mode != MODE_INSERT) {
 			switch (pane_key(e)) {
@@ -26156,7 +26899,6 @@ editor_loop(Editor *e)
 			ed_render(e, e->d);
 			continue;
 		}
-#endif
 
 #ifndef VEDIT_NO_TOOLS
 		/* The IDE keys (Compile, Make, Run, error stepping) work in both
@@ -32118,23 +32860,28 @@ static void
 pane_frame(Editor *e, Screen *d, const char *name, int focused)
 {
 	const Pal *p = ed_chrome(e);
-	int sep = CHROME_TOP + text_height(e), ph = pane_height(e);
+	int sep = view_row0(e) + text_height(e), ph = pane_height(e);
 	int sb = e->cols - chrome_right(e);
+	int split = split_shown(e);
+	int c0 = split ? view_col0(e) : 0;	/* a split pane's strip spans */
+	int cw = split ? text_width(e) : e->cols;	/* only that pane */
 	Color fg = p->frame_fg, bg = p->frame_bg;
 	char title[80];
 	int tlen, tstart, r;
 
-	scr_fill(d, sep, 0, e->cols, GL_H, fg, bg, 0);
+	scr_fill(d, sep, c0, cw, GL_H, fg, bg, 0);
 	tlen = snprintf(title, sizeof(title), " %s ", name);
-	if (tlen > e->cols - 4)
-		tlen = e->cols - 4;
+	if (tlen > cw - 4)
+		tlen = cw - 4;
 	if (tlen > 0) {
-		tstart = (e->cols - tlen) / 2;
+		tstart = c0 + (cw - tlen) / 2;
 		if (tstart < 1)
 			tstart = 1;
 		ui_field(d, sep, tstart, tlen, title, p->title_fg, bg,
 		    focused ? (ATTR_BOLD | ATTR_REVERSE) : ATTR_BOLD);
 	}
+	if (split)		/* the frame and split_chrome own the borders */
+		return;
 	for (r = 0; r < ph; r++) {
 		scr_cell(d, sep + 1 + r, 0, GL_V, fg, bg, 0);
 		scr_cell(d, sep + 1 + r, sb, GL_V, fg, bg, 0);
@@ -32149,7 +32896,8 @@ pane_render(Editor *e, Screen *d)
 	const Pal *p = ed_chrome(e);
 	Term *t = pane_term(e, NULL);
 	int ph = pane_height(e);
-	int row0 = CHROME_TOP + text_height(e) + 1;
+	int row0 = view_row0(e) + text_height(e) + 1;
+	int col0 = view_col0(e);
 	int text_w = text_width(e);
 	char title[80];
 	int r, c;
@@ -32170,10 +32918,10 @@ pane_render(Editor *e, Screen *d)
 			    ? vt_buf_cell(t->vt->buf, r, c) : NULL;
 
 			if (cell)
-				scr_cell(d, row, CHROME_LEFT + c, cell->codepoint,
+				scr_cell(d, row, col0 + c, cell->codepoint,
 				    cell->fg, cell->bg, cell->attrs);
 			else
-				scr_cell(d, row, CHROME_LEFT + c, ' ',
+				scr_cell(d, row, col0 + c, ' ',
 				    p->content_fg, p->content_bg, 0);
 		}
 	}
@@ -32194,7 +32942,7 @@ pane_render(Editor *e, Screen *d)
 			scr_cursor_shape(d, CURSOR_DEFAULT);
 			scr_cursor_vis(d,
 			    (t->vt->modes & VT_MODE_CURSOR_VIS) ? 1 : 0);
-			scr_cursor(d, row0 + cr, CHROME_LEFT + cc);
+			scr_cursor(d, row0 + cr, col0 + cc);
 		}
 	}
 }
@@ -32359,7 +33107,7 @@ term_argv(const char *cmd, char **cmdbuf, char *words[], int max)
 	return nw > 0 ? words : NULL;
 }
 
-/* :split [cmd], Ctrl-W s, Terminal > Split Terminal: run cmd (NULL = a shell)
+/* :sterm [cmd], Ctrl-W S, Terminal > Split Terminal: run cmd (NULL = a shell)
  * in the pane. A bare split with a live pane terminal just focuses it; a bare
  * split takes the focus, a command leaves it on the text. */
 static void
@@ -32383,8 +33131,8 @@ pane_run(Editor *e, const char *cmd)
 	argv = term_argv(cmd, &cmdbuf, words, 63);
 	if (pane_open(e, argv, NULL, NULL) >= 0) {
 		e->pane_focus = 0;
-		set_status(e, "pane: %.60s (Ctrl-W w focuses it, Ctrl-W c closes it)",
-		    cmd ? cmd : "shell");
+		set_status(e, "pane: %.60s (Ctrl-W %c focuses it, Ctrl-W c closes it)",
+		    cmd ? cmd : "shell", e->split != SPLIT_NONE ? 'j' : 'w');
 	}
 	free(cmdbuf);
 }
@@ -32413,66 +33161,6 @@ pane_close(Editor *e)
 		set_status(e, "cannot close the last buffer");
 	else
 		set_status(e, "pane closed");
-}
-
-/* Ctrl-W from a text buffer: one more key picks the pane action. In the vi
- * personality ':' opens the ex line, and its result is returned so a quit
- * typed there ends the run. */
-static Req
-pane_key(Editor *e)
-{
-	Event ev;
-	uint32_t ch;
-
-	set_status(e, "Ctrl-W: (s)hell below, (b)uffer below, (w) focus the pane, (c)lose it, (r)epost it, (+/-) resize it%s",
-	    e->mode != MODE_MODELESS ? ", (:) ex" : "");
-	ed_render(e, e->d);
-	for (;;) {
-		switch (scr_wait(e->d, &ev)) {
-		case EVENT_EOF:
-			return REQ_CONTINUE;
-		case EVENT_RESIZE:
-		case EVENT_RESUME:
-			scr_size(e->d, &e->rows, &e->cols);
-			continue;
-		case EVENT_KEY:
-			break;
-		default:
-			continue;
-		}
-		break;
-	}
-	e->status[0] = '\0';
-	if (ev.key.type != TKBD_KEY || ev.key.ch == TKBD_CH_NONE)
-		return REQ_CONTINUE;
-	ch = ev.key.ch;
-	if (ch == 'w' || ch == 'W' || ch == 'p' || ch == 'j') {
-		if (!pane_shown(e)) {
-			set_status(e, "no pane (Ctrl-W s opens a shell in one, Ctrl-W b a buffer)");
-		} else if (pane_term(e, NULL)) {
-			e->pane_focus = 1;
-			set_status(e, "pane: keys go to the terminal; Ctrl-W w returns to the file");
-		} else {
-			pane_focus_text(e, !e->in_pane);
-		}
-	} else if (ch == 's' || ch == 'S') {
-		pane_run(e, NULL);
-	} else if (ch == 'b' || ch == 'B') {
-		pane_buffer(e);
-	} else if (ch == 'c' || ch == 'q') {
-		pane_close(e);
-	} else if (ch == 'r') {
-		term_repost_text(e);
-	} else if (ch == 'R') {
-		term_repost_art(e);
-	} else if (ch == '+' || ch == '=') {
-		pane_resize(e, 1);
-	} else if (ch == '-' || ch == '_') {
-		pane_resize(e, -1);
-	} else if (ch == ':' && e->mode != MODE_MODELESS) {
-		return vi_colon(e);	/* the ex line, as in a terminal buffer */
-	}
-	return REQ_CONTINUE;
 }
 
 /* Match every live terminal's PTY and grid to the current text-area size. */
@@ -39631,7 +40319,7 @@ enum excmd {
 	EX_CONFIG,
 	EX_MAIL, EX_COMPOSE, EX_REPLY, EX_SEND,
 	EX_DATE, EX_LOG, EX_BLAME, EX_COMMIT,
-	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH, EX_CELL, EX_SORT, EX_TABSTOPS,
+	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_VSPLIT, EX_STERM, EX_CLOSE, EX_ONLY, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH, EX_CELL, EX_SORT, EX_TABSTOPS,
 	EX_ROWADD, EX_ROWDEL, EX_COLADD, EX_COLDEL,
 };
 
@@ -39700,9 +40388,13 @@ static const struct excmd_name {
 #ifndef VEDIT_NO_TOOLS
 	{ "format",	4, EX_FORMAT },
 #endif
+	{ "split",	2, EX_SPLIT },
+	{ "vsplit",	2, EX_VSPLIT },
+	{ "close",	3, EX_CLOSE },
+	{ "only",	2, EX_ONLY },
 #ifdef VEDIT_TERM
 	{ "terminal",	4, EX_TERM },
-	{ "split",	2, EX_SPLIT },
+	{ "sterm",	3, EX_STERM },
 	{ "sbuffer",	2, EX_SBUFFER },
 	{ "repost",	3, EX_REPOST },
 #endif
@@ -39921,8 +40613,23 @@ vi_ex_exec(Editor *e, char *buf)
 		e->save_force = 0;
 		if (rr != 0)
 			return REQ_CONTINUE;
+		if (e->split != SPLIT_NONE) {	/* vi: the window closes */
+			split_close(e, e->split_focus);
+			return REQ_CONTINUE;
+		}
+		if (!bang && (rr = buf_first_dirty(e)) >= 0) {
+			set_status(e,
+			    "E37: no write since last change in buffer %d (add ! to override)",
+			    rr + 1);
+			return REQ_CONTINUE;
+		}
 		return REQ_FORCE_QUIT;
 	case EX_QUIT:
+		if (e->split != SPLIT_NONE) {	/* vi: the window closes */
+			split_close(e, e->split_focus);
+			return REQ_CONTINUE;
+		}
+		/* fall through */
 	case EX_QALL:
 		if (!bang && (rr = buf_first_dirty(e)) >= 0) {
 			set_status(e,
@@ -39985,11 +40692,23 @@ vi_ex_exec(Editor *e, char *buf)
 	case EX_BPREV:
 		buf_cycle(e, -1);
 		return REQ_CONTINUE;
+	case EX_SPLIT:			/* :split [file], :vsplit [file] */
+	case EX_VSPLIT:
+		split_open(e, id == EX_VSPLIT ? SPLIT_V : SPLIT_H, -1);
+		if (*rest && e->split != SPLIT_NONE)
+			buf_open(e, rest);
+		return REQ_CONTINUE;
+	case EX_CLOSE:
+		split_close(e, e->split_focus);
+		return REQ_CONTINUE;
+	case EX_ONLY:
+		split_close(e, !e->split_focus);
+		return REQ_CONTINUE;
 #ifdef VEDIT_TERM
 	case EX_TERM:
 		term_open(e, *rest ? rest : NULL);
 		return REQ_CONTINUE;
-	case EX_SPLIT:
+	case EX_STERM:
 		pane_run(e, *rest ? rest : NULL);
 		return REQ_CONTINUE;
 	case EX_REPOST:			/* :repost [art] */

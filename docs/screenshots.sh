@@ -239,10 +239,10 @@ render "$here/shot-draw.png" pipeline.txt \
 render "$here/shot-term.png" ring.c \
     F2 "colon t e r m i n a l space c a t space t e r m period t x t Return"
 
-# The pane: the same build log runs under the text with :split cat term.txt.
+# The pane: the same build log runs under the text with :sterm cat term.txt.
 # A new pane leaves the focus in the file, so the cursor stays on line 1.
 render "$here/shot-pane.png" ring.c \
-    F2 "colon s p l i t space c a t space t e r m period t x t Return"
+    F2 "colon s t e r m space c a t space t e r m period t x t Return"
 
 # The table view: a .csv opens as a grid. :colwidth fit all sizes every column
 # to its cells, then the cursor moves to the quoted supplier on row 4.

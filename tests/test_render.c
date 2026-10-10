@@ -3059,13 +3059,261 @@ t_menu_narrow(Test *t)
 	memio_free(&m);
 }
 
+#define CELL(sb, y, x) ((sb)->cur[(size_t)(y) * (sb)->cols + (x)].codepoint)
+
+/* A stacked split: Ctrl-W s puts the current buffer in both panes, the new
+ * one on top with the focus; each pane keeps its own cursor on the shared
+ * text; the other pane may show another buffer; closing the focused pane
+ * leaves the other's view in the frame. */
+static void
+t_split_stacked(Test *t)
+{
+	static const char *const L[] = { "one", "two", "three", "four" };
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Scrbuf *sb;
+	Rect r0, r1;
+	int full;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, buf_slot(&v->e) == 0);
+	buf_save(&v->e, &v->e.bufs[0]);
+	text_insert(v->e.t, 0, 0, "first file", 10);
+	TAP_ASSERT(t, buf_open(&v->e, NULL) == 1);
+	fill_lines(v->e.t, L, 4);
+	full = text_height_full(&v->e);
+	TAP_CHECK(t, !split_shown(&v->e) && v->e.split == SPLIT_NONE);
+
+	split_open(&v->e, SPLIT_H, -1);
+	TAP_CHECK(t, v->e.split == SPLIT_H && v->e.split_focus == 0);
+	TAP_CHECK(t, split_shown(&v->e) && v->e.cur == 1 && v->e.pv[1].buf == 1);
+	split_rect(&v->e, 0, &r0);
+	split_rect(&v->e, 1, &r1);
+	TAP_CHECKF(t, r0.rows + 1 + r1.rows == full && r1.row0 == r0.row0 + r0.rows + 1,
+	    "rects %d+%d of %d", r0.rows, r1.rows, full);
+	TAP_CHECKF(t, text_height_full(&v->e) == r0.rows, "focused height %d want %d",
+	    text_height_full(&v->e), r0.rows);
+	TAP_CHECK(t, view_row0(&v->e) == CHROME_TOP && view_col0(&v->e) == CHROME_LEFT);
+
+	ed_render(&v->e, v->e.d);
+	sb = v->e.d->t;
+	TAP_CHECKF(t, CELL(sb, r0.row0, CHROME_LEFT) == 'o', "pane 0 shows U+%04X", CELL(sb, r0.row0, CHROME_LEFT));
+	TAP_CHECKF(t, CELL(sb, r1.row0, CHROME_LEFT) == 'o', "pane 1 shows U+%04X", CELL(sb, r1.row0, CHROME_LEFT));
+	TAP_CHECK(t, CELL(sb, r1.row0 - 1, CHROME_LEFT) == GL_H);	/* the divider */
+	TAP_CHECKF(t, sb->cursor_r == r0.row0, "cursor row %d want %d", sb->cursor_r, r0.row0);
+
+	/* each pane has its own cursor on the one text */
+	v->e.cy = 3;
+	split_focus_set(&v->e, 1);
+	TAP_CHECK(t, v->e.split_focus == 1 && v->e.cur == 1);
+	TAP_CHECKF(t, v->e.cy == 0 && v->e.pv[0].cy == 3, "pane 1 cy %zu, pane 0 kept %zu",
+	    v->e.cy, v->e.pv[0].cy);
+	TAP_CHECK(t, view_row0(&v->e) == r1.row0);
+	ed_render(&v->e, v->e.d);
+	TAP_CHECKF(t, sb->cursor_r == r1.row0, "cursor row %d want %d", sb->cursor_r, r1.row0);
+	/* the other pane painted with its own cursor line highlighted? no:
+	 * only its text; its stored view survives the paint */
+	TAP_CHECK(t, v->e.pv[0].cy == 3 && v->e.pv[0].buf == 1);
+
+	/* the focused pane switches buffers on its own; the other keeps its */
+	buf_switch(&v->e, 0);
+	ed_render(&v->e, v->e.d);
+	TAP_CHECKF(t, CELL(sb, r1.row0, CHROME_LEFT) == 'f', "pane 1 shows U+%04X", CELL(sb, r1.row0, CHROME_LEFT));
+	TAP_CHECKF(t, CELL(sb, r0.row0, CHROME_LEFT) == 'o', "pane 0 shows U+%04X", CELL(sb, r0.row0, CHROME_LEFT));
+	TAP_CHECK(t, v->e.pv[1].buf == 0 && v->e.pv[0].buf == 1 && v->e.cur == 0);
+	TAP_CHECK(t, strcmp(v->e.status, "") == 0);	/* the paint left no mark */
+
+	/* the pane's text moved under its stored cursor: the view clamps */
+	v->e.pv[0].cy = 40;
+	ed_render(&v->e, v->e.d);
+	TAP_CHECK(t, v->e.pv[0].cy == 40 || v->e.pv[0].cy == 3);	/* clamped at paint */
+
+	/* back to pane 0: buffer 1 at its line 3 */
+	split_focus_set(&v->e, 0);
+	TAP_CHECKF(t, v->e.cur == 1 && v->e.cy == 3, "cur %d cy %zu", v->e.cur, v->e.cy);
+
+	/* closing the focused pane adopts the other's view: buffer 0 */
+	split_close(&v->e, 0);
+	TAP_CHECK(t, v->e.split == SPLIT_NONE && v->e.cur == 0 && !split_shown(&v->e));
+	TAP_CHECK(t, text_height_full(&v->e) == full);
+	TAP_CHECK(t, strcmp(v->e.status, "split closed") == 0);
+
+	/* and the other way: the focused view stays */
+	split_open(&v->e, SPLIT_H, 1);
+	TAP_CHECK(t, v->e.split == SPLIT_H && v->e.cur == 1 && v->e.pv[1].buf == 0);
+	split_close(&v->e, 1);
+	TAP_CHECK(t, v->e.split == SPLIT_NONE && v->e.cur == 1);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* Side by side: the divider column, both texts, the titles over each pane,
+ * a click in the other pane moving the focus there, and the wheel over
+ * the other pane scrolling it in place. */
+static void
+t_split_side(Test *t)
+{
+	static const char *const L[] = {
+		"l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9", "l10",
+		"l11", "l12", "l13", "l14", "l15", "l16", "l17", "l18", "l19", "l20"
+	};
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Scrbuf *sb;
+	Rect r0, r1;
+	struct tkbd_seq ms;
+	int fc, dc;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, buf_slot(&v->e) == 0);
+	buf_save(&v->e, &v->e.bufs[0]);
+	fill_lines(v->e.t, L, 20);
+	fc = frame_cols(&v->e);
+
+	split_open(&v->e, SPLIT_V, -1);
+	TAP_CHECK(t, v->e.split == SPLIT_V && split_shown(&v->e));
+	split_rect(&v->e, 0, &r0);
+	split_rect(&v->e, 1, &r1);
+	dc = r0.col0 + r0.cols;
+	TAP_CHECKF(t, r0.cols + 1 + r1.cols == fc && r1.col0 == dc + 1,
+	    "cols %d+%d of %d", r0.cols, r1.cols, fc);
+	TAP_CHECK(t, text_width(&v->e) == r0.cols);
+
+	ed_render(&v->e, v->e.d);
+	sb = v->e.d->t;
+	/* the divider column carries the left pane's scrollbar */
+	TAP_CHECKF(t, CELL(sb, CHROME_TOP, dc) == GL_UP, "divider top shows U+%04X", CELL(sb, CHROME_TOP, dc));
+	TAP_CHECK(t, CELL(sb, CHROME_TOP + r0.rows - 1, dc) == GL_DOWN);
+	TAP_CHECK(t, CELL(sb, CHROME_TOP + 1, dc) == GL_THUMB || CELL(sb, CHROME_TOP + 1, dc) == GL_TRACK);
+	TAP_CHECK(t, CELL(sb, CHROME_TOP, r0.col0) == 'l' && CELL(sb, CHROME_TOP, r1.col0) == 'l');
+	TAP_CHECK(t, CELL(sb, CHROME_TOP + 19, r1.col0 + 1) == '2');	/* l20 */
+	TAP_CHECK(t, sb->cursor_c == r0.col0 && sb->cursor_r == CHROME_TOP);
+
+	/* a click in the right pane moves the focus and the cursor there */
+	memset(&ms, 0, sizeof(ms));
+	ms.type = TKBD_MOUSE;
+	ms.key = TKBD_MOUSE_LEFT;
+	ms.x = r1.col0 + 1;
+	ms.y = CHROME_TOP + 4;
+	TAP_CHECK(t, ed_mouse_event(&v->e, &ms) == MA_NONE);
+	TAP_CHECKF(t, v->e.split_focus == 1 && v->e.cy == 4 && v->e.cx == 1,
+	    "focus %d cy %zu cx %zu", v->e.split_focus, v->e.cy, v->e.cx);
+	TAP_CHECK(t, view_col0(&v->e) == r1.col0);
+
+	/* the wheel over the left pane scrolls it without taking the focus */
+	ms.key = TKBD_MOUSE_WHEEL_DOWN;
+	ms.x = r0.col0 + 1;
+	ms.y = CHROME_TOP + 1;
+	TAP_CHECK(t, ed_mouse_event(&v->e, &ms) == MA_NONE);
+	TAP_CHECKF(t, v->e.split_focus == 1 && v->e.pv[0].top == 3 && v->e.pv[0].cy == 3,
+	    "focus %d other top %zu cy %zu", v->e.split_focus, v->e.pv[0].top, v->e.pv[0].cy);
+	ed_render(&v->e, v->e.d);
+	TAP_CHECKF(t, CELL(sb, CHROME_TOP, r0.col0 + 1) == '4', "left pane row 0 shows l%c",
+	    (char)CELL(sb, CHROME_TOP, r0.col0 + 1));
+	TAP_CHECK(t, sb->cursor_c == r1.col0 + 1 && sb->cursor_r == CHROME_TOP + 4);
+
+	/* Ctrl-W v on an open split only turns it; h and l move across */
+	split_open(&v->e, SPLIT_H, -1);
+	TAP_CHECK(t, v->e.split == SPLIT_H && strcmp(v->e.status, "panes stacked") == 0);
+	TAP_CHECK(t, split_toward(&v->e, 'k') == 0 && split_toward(&v->e, 'j') < 0);
+	split_open(&v->e, SPLIT_V, -1);
+	TAP_CHECK(t, split_toward(&v->e, 'h') == 0 && split_toward(&v->e, 'l') < 0);
+
+	/* a narrow window hides the split but keeps it */
+	v->e.cols = SPLIT_MIN_COLS;
+	TAP_CHECK(t, !split_shown(&v->e) && v->e.split == SPLIT_V);
+	TAP_CHECK(t, text_width(&v->e) == frame_cols(&v->e));
+	v->e.cols = 80;
+	TAP_CHECK(t, split_shown(&v->e));
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* The ex side: :vsplit file opens the file in the new pane, :q closes a
+ * pane while split and quits otherwise, :only keeps the focused pane,
+ * and closing a buffer keeps the other pane pointed at the right one. */
+static void
+t_split_ex(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	char ex[64];
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, buf_slot(&v->e) == 0);
+	buf_save(&v->e, &v->e.bufs[0]);
+	TAP_ASSERT(t, buf_open(&v->e, NULL) == 1);
+	TAP_ASSERT(t, buf_open(&v->e, NULL) == 2);
+
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(ex, "vsplit")) == REQ_CONTINUE);
+	TAP_CHECK(t, v->e.split == SPLIT_V && v->e.cur == 2 && v->e.pv[1].buf == 2);
+	buf_switch(&v->e, 1);			/* the left pane shows buffer 1 */
+	ed_render(&v->e, v->e.d);
+	TAP_CHECK(t, v->e.pv[0].buf == 1 && v->e.pv[1].buf == 2);
+
+	/* closing buffer 0 shifts the indexes the panes hold */
+	TAP_CHECK(t, buf_close(&v->e, 0) == 0);
+	TAP_CHECK(t, v->e.cur == 0 && v->e.pv[1].buf == 1);
+	ed_render(&v->e, v->e.d);
+	TAP_CHECK(t, v->e.pv[0].buf == 0 && v->e.pv[1].buf == 1);
+	/* closing the other pane's buffer points it at the focused one */
+	TAP_CHECK(t, buf_close(&v->e, 1) == 0);
+	TAP_CHECK(t, v->e.nbuf == 1 && v->e.pv[1].buf == 0 && v->e.cur == 0);
+
+	/* :q closes the pane, the second :q would quit */
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(ex, "q")) == REQ_CONTINUE);
+	TAP_CHECK(t, v->e.split == SPLIT_NONE);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(ex, "q")) == REQ_FORCE_QUIT);
+
+	/* :split then :only keeps the focused pane; :close with none says so */
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(ex, "split")) == REQ_CONTINUE);
+	TAP_CHECK(t, v->e.split == SPLIT_H);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(ex, "only")) == REQ_CONTINUE);
+	TAP_CHECK(t, v->e.split == SPLIT_NONE);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(ex, "close")) == REQ_CONTINUE);
+	TAP_CHECK(t, strcmp(v->e.status, "no split to close") == 0);
+
+	/* F6 and the View menu reach the same */
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_SPLIT) && !menu_item_enabled(&v->e, MA_SPLIT_CLOSE));
+	TAP_CHECK(t, run_menu_act(&v->e, MA_VSPLIT) == 0);
+	TAP_CHECK(t, v->e.split == SPLIT_V && menu_checked(&v->e, MA_VSPLIT) == 1);
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_SPLIT_OTHER));
+	TAP_CHECK(t, run_menu_act(&v->e, MA_SPLIT_OTHER) == 0 && v->e.split_focus == 1);
+	TAP_CHECK(t, run_menu_act(&v->e, MA_SPLIT_CLOSE) == 0 && v->e.split == SPLIT_NONE);
+
+	/* no split in the hex view */
+	v->e.hex_view = 1;
+	TAP_CHECK(t, !menu_item_enabled(&v->e, MA_SPLIT));
+	split_open(&v->e, SPLIT_H, -1);
+	TAP_CHECK(t, v->e.split == SPLIT_NONE && strstr(v->e.status, "text buffer") != NULL);
+	v->e.hex_view = 0;
+
+	vedit_free(v);
+	memio_free(&m);
+}
+#undef CELL
+
 /* The key-bindings screen scrolls, so an entry past the first screen is reached
  * by paging down. Drives F2 (vi keys), F1 (help), then Space to page down on a
  * short window, and checks a near-bottom vi entry becomes visible. */
 static void
 t_help_scroll(Test *t)
 {
-	const char keys[] = "\033OQ\033OP     ";	/* F2, F1, five page-downs */
+	const char keys[] = "\033OQ\033OP      ";	/* F2, F1, six page-downs */
 	Memio m;
 	struct vedit_io io;
 	struct vedit *v;
@@ -4027,6 +4275,9 @@ const Case tap_cases[] = {
 	{ "format", t_format },
 	{ "format_on_save", t_format_on_save },
 #endif
+	{ "split_stacked", t_split_stacked },
+	{ "split_side", t_split_side },
+	{ "split_ex", t_split_ex },
 #ifdef VEDIT_TERM
 	{ "menu_terminal", t_menu_terminal },
 	{ "tbl_attach", t_tbl_attach },
