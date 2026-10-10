@@ -228,6 +228,9 @@ struct vedit_mail_api {
 	/* Hand a complete message over for delivery. The backend decides what
 	 * that means (queue it, submit it); 0 when accepted. */
 	int	(*send)(void *ctx, const char *data, size_t len);
+	/* Remove the messages of folder that carry VEDIT_MAIL_TRASHED. May be
+	 * NULL when the backend cannot. */
+	int	(*expunge)(void *ctx, const char *folder);
 };
 
 /* Install the mail backend. The api is borrowed, not copied, so it must

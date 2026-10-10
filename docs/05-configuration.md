@@ -199,6 +199,7 @@ define a language.
 |---|---|
 | `dir` | a Maildir++ tree. Setting it enables the Mail menu at the next start; a leading `~/` is expanded |
 | `from` | the `From:` line of new messages |
+| `sendcmd` | the command Mail > Deliver Outbox runs per queued message, reading it on standard input, such as `msmtp -t` |
 
 ### `[theme "<name>"]`
 

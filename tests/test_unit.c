@@ -829,6 +829,45 @@ t_mouse_default(Test *t)
 #ifdef VEDIT_MAIL
 /* Header unfolding, content-type parsing, the two transfer decoders, and
  * splitting a nested multipart message into its leaf parts. */
+/* Encoded words decode (Q and B, UTF-8 and Latin-1, joined across the gap
+ * between two words); base64 encodes; a header with non-ASCII text goes out
+ * as encoded words, with the addresses of an address header left bare. */
+static void
+t_mail_words(Test *t)
+{
+	char out[256], b64[32], *buf = NULL;
+	size_t blen = 0;
+	FILE *fp;
+
+	mail_decode_words("=?UTF-8?Q?Caf=C3=A9_au_lait?= =?utf-8?B?w6k=?= plain",
+	    out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "Caf\xc3\xa9 au lait\xc3\xa9 plain") == 0,
+	    "decoded [%s]", out);
+	mail_decode_words("=?iso-8859-1?Q?=E9t=E9?= x", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "\xc3\xa9t\xc3\xa9 x") == 0, "latin1 [%s]", out);
+	mail_decode_words("no =?words here", out, sizeof(out));
+	TAP_CHECK(t, strcmp(out, "no =?words here") == 0);
+
+	mail_b64_encode((const unsigned char *)"ab", 2, b64);
+	TAP_CHECK(t, strcmp(b64, "YWI=") == 0);
+	mail_b64_encode((const unsigned char *)"abc", 3, b64);
+	TAP_CHECK(t, strcmp(b64, "YWJj") == 0);
+	mail_b64_encode((const unsigned char *)"a", 1, b64);
+	TAP_CHECK(t, strcmp(b64, "YQ==") == 0);
+
+	fp = open_memstream(&buf, &blen);
+	TAP_ASSERT(t, fp != NULL);
+	mail_put_header(fp, "Subject", 7, "Caf\xc3\xa9");
+	mail_put_header(fp, "To", 2, "J\xc3\xb6rg <j@x>, bob@y");
+	mail_put_header(fp, "Cc", 2, "plain <p@x>");
+	fclose(fp);
+	TAP_CHECKF(t, strcmp(buf,
+	    "Subject: =?utf-8?B?Q2Fmw6k=?=\n"
+	    "To: =?utf-8?B?SsO2cmc=?= <j@x>, bob@y\n"
+	    "Cc: plain <p@x>\n") == 0, "headers [%s]", buf);
+	free(buf);
+}
+
 static void
 t_mail_parse(Test *t)
 {
@@ -1059,6 +1098,17 @@ t_maildir(Test *t)
 	TAP_CHECK(t, api->fetch(api->ctx, "Outbox", acc.uid, &data, &len) == 0 &&
 	    len == 10 && memcmp(data, "To: x\n\ny\n", 10) == 0);
 	free(data);
+
+	/* expunge removes only the messages flagged deleted */
+	maildir_plant(root, "cur", "1700000003.e.host:2,S",
+	    "From: x\nSubject: doomed\n\nx\n");
+	TAP_CHECK(t, api->store(api->ctx, "INBOX", "1700000003.e.host",
+	    VEDIT_MAIL_TRASHED, 0) == 0);
+	TAP_CHECK(t, api->expunge(api->ctx, "INBOX") == 0);
+	snprintf(path, sizeof(path), "%s/cur/1700000003.e.host:2,ST", root);
+	TAP_CHECK(t, stat(path, &st) != 0);
+	snprintf(path, sizeof(path), "%s/cur/1700000002.a.host:2,S", root);
+	TAP_CHECK(t, stat(path, &st) == 0);
 
 	{
 		char cmd[PATH_MAX + 16];
@@ -3858,6 +3908,7 @@ const Case tap_cases[] = {
 #endif
 #ifdef VEDIT_MAIL
 	{ "mail_parse", t_mail_parse },
+	{ "mail_words", t_mail_words },
 	{ "maildir", t_maildir },
 #endif
 	{ "entry_scroll", t_entry_scroll },

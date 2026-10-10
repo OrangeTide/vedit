@@ -241,8 +241,8 @@ program submits those.
        from = Jon Mayo <jon@example.org>
    ```
 
-   `mail.dir` enables the Mail menu. Without it, the `:mail`, `:compose`,
-   `:reply`, and `:send` commands report that there is no mail backend.
+   `mail.dir` enables the Mail menu. Without it, the `:mail` commands
+   report that there is no mail backend.
    `mail.from` is the From line of every message you write.
 
 3. **Arrange delivery** for the `Outbox` folder (below).
@@ -250,9 +250,15 @@ program submits those.
 ### Reading
 
 - **Mail > Folders** (`:mail`) lists the folders. Choosing one lists its
-  messages newest first, with `N` on unread ones, `A` on answered
-  ones, and `F` on flagged ones. **Mail > Messages** (`:mail .`) returns to the last folder, and
-  `:mail Sent` lists a folder by name.
+  messages newest first, with `N` on unread ones, `D` on ones marked
+  deleted, `A` on answered ones, and `F` on flagged ones. **Mail >
+  Messages** (`:mail .`) returns to the last folder, and `:mail Sent`
+  lists a folder by name. Encoded header text (`=?utf-8?...?=`) is
+  decoded in the list and in the opened message.
+- In the message list, `d` marks the message under the cursor deleted
+  and `u` unmarks it, `m` moves it to a folder picked from the folder
+  list, and `x` removes every marked message from the folder after a
+  confirmation. The bottom border names these keys.
 - Choosing a message opens it: the text part in a buffer headed by From,
   To, Cc, Date, and Subject, and every other MIME part as its own buffer
   named by part number and type, reachable through File > Buffer List.
@@ -263,7 +269,8 @@ program submits those.
 
 ### Writing
 
-- **Mail > Compose** (`:compose`, or `:compose address` to fill in To)
+- **Mail > Compose** (`:mail compose`, or `:mail compose address` to
+  fill in To)
   opens a buffer with the header lines to complete, a blank line, and the
   body:
 
@@ -277,17 +284,40 @@ program submits those.
 
   A header left empty is dropped when the message is sent. Others, such
   as `Bcc:` or `Reply-To:`, can be added.
-- **Mail > Reply** (`:reply`) does the same for the message shown,
+- **Mail > Reply** (`:mail reply`) does the same for the message shown,
   addressed to its Reply-To or From, with `Re:` on the subject, the
-  threading headers set, and the text quoted with `> `.
-- **Mail > Send** (`:send`) completes the message (Date, Message-ID, and
-  the MIME headers for a UTF-8 text body) and stores it under
-  `.Outbox/new` in the Maildir++ tree. The buffer is then clean, and a replied-to message is
-  marked answered. Sending needs a `To:` line.
+  threading headers set, and the text quoted with `> `. **Mail > Reply
+  All** (`:mail replyall`) also puts the other recipients of the
+  original on `Cc:`, leaving out the sender and the `mail.from` address.
+- **Mail > Forward** (`:mail forward`, or `:mail forward address`) starts
+  a message with `Fwd:` on the subject and the original's From, Date,
+  Subject, To, and Cc lines followed by its text, below a marker line.
+  The original's other parts are not attached.
+- **Mail > Send** (`:mail send`) completes the message (Date,
+  Message-ID, and the MIME headers for a UTF-8 text body) and stores it
+  under `.Outbox/new` in the Maildir++ tree. Header text outside ASCII,
+  such as an accented name or subject, goes out as encoded words; the
+  addresses themselves stay as typed. The buffer is then clean, and a
+  replied-to message is marked answered. Sending needs a `To:` line.
 
 ### Delivery
 
-Something has to submit each file under `.Outbox/new` and move it to
+**Mail > Deliver Outbox** (`:mail deliver`) runs the command in
+`mail.sendcmd` once per queued message, feeding the message on standard
+input, and files each delivered message under `Sent` as read. Any
+submission client that reads a message from standard input works:
+
+```ini
+[mail]
+    sendcmd = msmtp -t
+```
+
+A message whose command exits with an error stays queued, and the status
+line shows the exit status. The command runs through the tool runner, so
+a build without the tools (`VEDIT_NO_TOOLS`) cannot deliver.
+
+Without the editor, something else has to submit each file under
+`.Outbox/new` and move it to
 `Sent`. Any submission client that takes a message on standard input
 works: `sendmail -t`, `msmtp -t`, or `ssmtp -t`. This script drains the
 queue and can run from cron or from a terminal buffer:
@@ -307,6 +337,4 @@ done
 
 A message that fails to submit stays in the Outbox.
 
-Not supported: reply-all, attachments on outgoing mail, decoding of
-encoded-word (`=?utf-8?...?=`) header values, deleting or moving messages
-from the editor.
+Not supported: attachments on outgoing mail.

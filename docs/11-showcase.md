@@ -62,7 +62,7 @@ revision, and Commit writes the message in a buffer. Chapter 7.
 ![The INBOX message list over an open message](shot-mail.png)
 
 With `mail.dir` pointed at a Maildir, Mail > Folders lists the folders,
-a message opens as a buffer, and `:reply` quotes it. Chapter 8.
+a message opens as a buffer, and `:mail reply` quotes it. Chapter 8.
 
 ## A diagram drawn in a source file
 

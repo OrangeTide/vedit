@@ -42,9 +42,11 @@ on the key-bindings screen, for the built-in tutorials.
 With
 .B mail.dir
 set in the configuration, the Mail menu (and the
-.BR :mail ", " :compose ", " :reply ", and " :send
-commands) reads a Maildir++ tree and composes replies and new messages, which
-are queued in its Outbox folder for delivery by other means.
+.B :mail
+commands: folders, compose, reply, replyall, forward, send, deliver) reads a
+Maildir++ tree, marks, moves and expunges messages, and composes replies and
+new messages, which are queued in its Outbox folder and delivered through
+.BR mail.sendcmd .
 .SH OPTIONS
 .TP
 .BR \-h ", " \-\-help
@@ -341,7 +343,7 @@ file mapping, format-on-save),
 .BR [error] ,
 .BR [syntax] ,
 .B [mail]
-(dir, a Maildir++ tree that enables the Mail menu, and from),
+(dir, a Maildir++ tree that enables the Mail menu, from, and sendcmd),
 .B [gitcommit]
 (subject and body, the columns past which a commit message is marked),
 .B [insert]

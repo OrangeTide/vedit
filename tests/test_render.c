@@ -1015,7 +1015,7 @@ t_mail_flow(Test *t)
 	TAP_CHECK(t, stat(path, &st) == 0);	/* marked seen */
 
 	/* reply: addressed, Re:, threaded, quoted */
-	TAP_CHECK(t, mail_reply(&v->e) == 0);
+	TAP_CHECK(t, mail_reply(&v->e, 0) == 0);
 	TAP_CHECK(t, v->e.mref && v->e.mref->kind == MREF_COMPOSE);
 	TAP_CHECK(t, vline_is(v, 1, "To: Ann <ann@example.org>"));
 	TAP_CHECK(t, vline_is(v, 3, "Subject: Re: lunch"));
@@ -1026,7 +1026,7 @@ t_mail_flow(Test *t)
 	TAP_CHECKF(t, v->e.cy == 7, "cursor row %zu", v->e.cy);
 
 	/* send: the Outbox gets the message with the added headers */
-	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "send")) == REQ_CONTINUE);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "mail send")) == REQ_CONTINUE);
 	TAP_CHECKF(t, strstr(v->e.status, "handed to") != NULL, "status: %s",
 	    v->e.status);
 	TAP_CHECK(t, !text_dirty(v->e.t));
@@ -1049,13 +1049,13 @@ t_mail_flow(Test *t)
 
 	/* compose with an address lands the cursor on the body; without, on
 	 * the To line; sending without a To is refused */
-	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "compose bob@x")) ==
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "mail compose bob@x")) ==
 	    REQ_CONTINUE);
 	TAP_CHECK(t, vline_is(v, 1, "To: bob@x") && v->e.cy == 5);
-	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "compose")) == REQ_CONTINUE);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "mail compose")) == REQ_CONTINUE);
 	line = text_line(v->e.t, 1, &ll);
 	TAP_CHECK(t, line && ll == 4 && v->e.cy == 1 && v->e.cx == 4);
-	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "send")) == REQ_CONTINUE &&
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "mail send")) == REQ_CONTINUE &&
 	    strstr(v->e.status, "no To") != NULL);
 	TAP_CHECK(t, text_dirty(v->e.t));
 
@@ -1066,7 +1066,7 @@ t_mail_flow(Test *t)
 	    v->e.mail_folder);
 
 	/* a message buffer is not a compose buffer */
-	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "reply")) == REQ_CONTINUE &&
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "mail reply")) == REQ_CONTINUE &&
 	    strstr(v->e.status, "not a mail message") != NULL);
 
 	vedit_free(v);
@@ -1112,7 +1112,7 @@ t_mail_menu(Test *t)
 
 	snprintf(v->e.mail_folder, sizeof(v->e.mail_folder), "INBOX");
 	TAP_CHECK(t, menu_item_enabled(&v->e, MA_MAIL_INDEX));
-	TAP_CHECK(t, mail_compose(&v->e, "a@b", NULL, NULL, NULL, NULL, NULL,
+	TAP_CHECK(t, mail_compose(&v->e, "a@b", NULL, NULL, NULL, NULL, NULL, NULL,
 	    NULL) == 0);
 	TAP_CHECK(t, menu_item_enabled(&v->e, MA_MAIL_SEND));
 	TAP_CHECK(t, !menu_item_enabled(&v->e, MA_MAIL_REPLY));
@@ -3537,6 +3537,142 @@ t_auto_wrap(Test *t)
 	memio_free(&m);
 }
 
+#ifdef VEDIT_MAIL
+/* The second mail slice: encoded headers decode on display and encode on
+ * send, reply-all collects the other recipients minus the user, forward
+ * quotes the original inline, :mail deliver runs mail.sendcmd on the queue
+ * and files the sent ones, and the index keys mark, expunge, and move. */
+static void
+t_mail_more(Test *t)
+{
+	char root[] = "/tmp/vedit_m2XXXXXX";
+	char path[PATH_MAX], exbuf[64], *data;
+	static const char keys[] = "dxy\033";	/* in the index: mark, expunge, yes, leave */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Cfg *c;
+	size_t len;
+	struct stat st;
+	FILE *f;
+	Sumacc2 acc;
+
+	TAP_ASSERT(t, mkdtemp(root) != NULL);
+	snprintf(path, sizeof(path), "%s/new", root);
+	mkdir_p(path);
+	snprintf(path, sizeof(path), "%s/new/1700000010.a.host", root);
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("From: =?utf-8?B?SsO2cmc=?= <j@x>\nTo: Me <me@example.org>, Carol <carol@x>\n"
+	    "Cc: dan@x, j@x\nSubject: =?UTF-8?Q?Gr=C3=BC=C3=9Fe?=\n"
+	    "Date: Tue, 7 Oct 2026 10:00:00 +0000\nMessage-ID: <m2@x>\n\n"
+	    "hallo\n", f);
+	fclose(f);
+	snprintf(path, sizeof(path), "%s/new/1700000011.b.host", root);
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("From: x@x\nSubject: second\nDate: Tue, 7 Oct 2026 11:00:00 +0000\n\nb\n", f);
+	fclose(f);
+
+	c = cfg_from_text("[mail]\n\tfrom = Me <me@example.org>\n"
+	    "\tsendcmd = fakesend -t\n");
+	TAP_ASSERT(t, c != NULL);
+	g_cfg = c;
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_mail(v, cli_mail_setup(root));
+	vedit_set_tools(v, &fake_tools);
+	vedit_run(v);
+
+	/* decoded on display */
+	TAP_CHECK(t, mail_open_message(&v->e, "INBOX", "1700000010.a.host") == 0);
+	TAP_CHECK(t, vline_is(v, 0, "From: J\xc3\xb6rg <j@x>"));
+	TAP_CHECK(t, vline_is(v, 4, "Subject: Gr\xc3\xbc\xc3\x9f" "e"));
+	TAP_CHECK(t, v->e.mref && strcmp(v->e.mref->label,
+	    "[mail] Gr\xc3\xbc\xc3\x9f" "e") == 0);
+
+	/* reply-all: To the sender, Cc the rest without me or the sender */
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "mail replyall")) ==
+	    REQ_CONTINUE);
+	TAP_CHECK(t, vline_is(v, 1, "To: J\xc3\xb6rg <j@x>"));
+	TAP_CHECKF(t, vline_is(v, 2, "Cc: Carol <carol@x>, dan@x"), "cc line");
+	TAP_CHECK(t, vline_is(v, 3, "Subject: Re: Gr\xc3\xbc\xc3\x9f" "e"));
+
+	/* sent: the non-ASCII header text is encoded, the address stays bare */
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "mail send")) == REQ_CONTINUE);
+	memset(&acc, 0, sizeof(acc));
+	TAP_CHECK(t, v->e.mail->list(v->e.mail->ctx, "Outbox", sum2_emit, &acc)
+	    == 0 && acc.n == 1);
+	TAP_ASSERT(t, v->e.mail->fetch(v->e.mail->ctx, "Outbox", acc.uid, &data,
+	    &len) == 0);
+	TAP_CHECKF(t, strstr(data, "\nTo: =?utf-8?B?SsO2cmc=?= <j@x>\n") != NULL,
+	    "to [%s]", data);
+	TAP_CHECK(t, strstr(data, "\nSubject: =?utf-8?B?UmU6IEdyw7zDn2U=?=\n") != NULL);
+	TAP_CHECK(t, strstr(data, "\nCc: Carol <carol@x>, dan@x\n") != NULL);
+	free(data);
+
+	/* forward: inline header block and text, To filled in */
+	TAP_CHECK(t, mail_open_message(&v->e, "INBOX", "1700000010.a.host") == 0);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "mail forward bob@y")) ==
+	    REQ_CONTINUE);
+	TAP_CHECK(t, vline_is(v, 1, "To: bob@y"));
+	TAP_CHECK(t, vline_is(v, 3, "Subject: Fwd: Gr\xc3\xbc\xc3\x9f" "e"));
+	TAP_CHECK(t, vline_is(v, 6, "---------- Forwarded message ----------"));
+	TAP_CHECK(t, vline_is(v, 7, "From: J\xc3\xb6rg <j@x>"));
+	TAP_CHECK(t, vline_is(v, 13, "hallo"));
+	TAP_CHECKF(t, v->e.cy == 5, "cursor row %zu", v->e.cy);
+
+	/* deliver: the fake command takes the queued message, which moves to
+	 * Sent as read; a failing command leaves the message queued */
+	g_fake_filter_rc = 0;
+	g_fake_filter_called = 0;
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "mail deliver")) ==
+	    REQ_CONTINUE);
+	TAP_CHECKF(t, strstr(v->e.status, "1 message delivered") != NULL,
+	    "status [%s]", v->e.status);
+	TAP_CHECK(t, g_fake_filter_called && strcmp(g_fake_cmd, "fakesend -t") == 0);
+	memset(&acc, 0, sizeof(acc));
+	TAP_CHECK(t, v->e.mail->list(v->e.mail->ctx, "Outbox", sum2_emit, &acc)
+	    == 0 && acc.n == 0);
+	memset(&acc, 0, sizeof(acc));
+	TAP_CHECK(t, v->e.mail->list(v->e.mail->ctx, "Sent", sum2_emit, &acc)
+	    == 0 && acc.n == 1);
+	snprintf(path, sizeof(path), "%s/.Sent/cur/%s:2,S", root, acc.uid);
+	TAP_CHECK(t, stat(path, &st) == 0);
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "mail send")) == REQ_CONTINUE);
+	g_fake_filter_rc = 3;
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "mail deliver")) ==
+	    REQ_CONTINUE);
+	TAP_CHECKF(t, strstr(v->e.status, "0 delivered, 1 still queued (last exit 3)")
+	    != NULL, "status [%s]", v->e.status);
+	g_fake_filter_rc = 0;
+
+	/* the index keys: d marks the newest message, x expunges it after y */
+	m.in = (const unsigned char *)keys;
+	m.inlen = sizeof(keys) - 1;
+	m.inpos = 0;
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "mail INBOX")) == REQ_CONTINUE);
+	TAP_CHECKF(t, strstr(v->e.status, "1 message expunged") != NULL,
+	    "status [%s]", v->e.status);
+	memset(&acc, 0, sizeof(acc));
+	TAP_CHECK(t, v->e.mail->list(v->e.mail->ctx, "INBOX", sum2_emit, &acc)
+	    == 0 && acc.n == 1 && strcmp(acc.uid, "1700000010.a.host") == 0);
+
+	/* a bad subcommand word is a folder name */
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "mail Nope")) == REQ_CONTINUE);
+	TAP_CHECK(t, strstr(v->e.status, "cannot list Nope") != NULL);
+
+	g_cfg = NULL;
+	vedit_cfg_free(c);
+	vedit_free(v);
+	memio_free(&m);
+	snprintf(path, sizeof(path), "rm -rf %s", root);
+	(void)system(path);
+}
+#endif /* VEDIT_MAIL */
+
 /* The key-bindings screen scrolls, so an entry past the first screen is reached
  * by paging down. Drives F2 (vi keys), F1 (help), then Space to page down on a
  * short window, and checks a near-bottom vi entry becomes visible. */
@@ -4461,6 +4597,7 @@ const Case tap_cases[] = {
 	{ "save_creates_dir", t_save_creates_dir },
 #ifdef VEDIT_MAIL
 	{ "mail_flow", t_mail_flow },
+	{ "mail_more", t_mail_more },
 	{ "mail_menu", t_mail_menu },
 #endif
 	{ "swap_file_created", t_swap_file_created },
