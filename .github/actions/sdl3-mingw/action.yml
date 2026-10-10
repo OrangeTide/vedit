@@ -1,0 +1,37 @@
+name: SDL3 for mingw
+description: >
+  Fetch the SDL3 development package for mingw-w64 at the version in
+  .github/sdl3-version. Outputs the x86_64 prefix holding include/, lib/
+  and bin/SDL3.dll.
+
+outputs:
+  prefix:
+    description: The x86_64-w64-mingw32 directory of the package
+    value: ${{ steps.paths.outputs.prefix }}
+  version:
+    description: The SDL3 version fetched
+    value: ${{ steps.paths.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - id: paths
+      shell: bash
+      run: |
+        v=$(tr -d '[:space:]' < "$GITHUB_WORKSPACE/.github/sdl3-version")
+        echo "version=$v" >> "$GITHUB_OUTPUT"
+        echo "prefix=$GITHUB_WORKSPACE/sdl3-mingw/x86_64-w64-mingw32" >> "$GITHUB_OUTPUT"
+    - uses: actions/cache@v4
+      id: cache
+      with:
+        path: sdl3-mingw
+        key: sdl3-mingw-${{ steps.paths.outputs.version }}
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        v="${{ steps.paths.outputs.version }}"
+        curl -fsSL -o sdl3-mingw.tar.gz \
+          "https://github.com/libsdl-org/SDL/releases/download/release-$v/SDL3-devel-$v-mingw.tar.gz"
+        mkdir -p sdl3-mingw
+        tar -xzf sdl3-mingw.tar.gz --strip-components=1 -C sdl3-mingw
+        rm sdl3-mingw.tar.gz

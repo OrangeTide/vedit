@@ -65,7 +65,8 @@ size the screen shows `window too small` until the window grows.
 
 gvedit is the editor in a window of its own, for a desktop without a
 terminal emulator and for Windows and macOS. It draws the screen with a
-bitmap font and needs SDL3 at build and run time. It always draws the
+bitmap font and needs SDL3 at build and run time; the release archives for
+x86_64 Linux and Windows carry a ready-made gvedit. It always draws the
 UTF-8 frame in 256 colors with the scroll path on; the flags, variables,
 and config keys above for those three have no effect in it.
 

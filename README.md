@@ -25,7 +25,9 @@ make gvedit             # the window build (needs SDL3)
 
 Prebuilt binaries are on the
 [releases page](https://github.com/OrangeTide/vedit/releases): static Linux
-builds for x86_64 and aarch64 and a Windows x86_64 console build.
+builds for x86_64 and aarch64, and a Windows x86_64 build. The x86_64
+archives also hold gvedit, the window build, with the SDL3 it needs
+built in (Linux) or beside it as `SDL3.dll` (Windows).
 
 ## Quick start
 

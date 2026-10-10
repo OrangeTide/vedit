@@ -167,20 +167,15 @@ jobs:
     name: gvedit-windows
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      SDL3_VERSION: 3.2.24
     steps:
       - uses: actions/checkout@v6
       - run: sudo apt-get update && sudo apt-get install -y mingw-w64 wine64
       - name: Fetch the SDL3 mingw development package
-        run: |
-          curl -fsSL -o sdl3-mingw.tar.gz \
-            "https://github.com/libsdl-org/SDL/releases/download/release-${SDL3_VERSION}/SDL3-devel-${SDL3_VERSION}-mingw.tar.gz"
-          mkdir sdl3-mingw
-          tar -xzf sdl3-mingw.tar.gz --strip-components=1 -C sdl3-mingw
+        id: sdl3
+        uses: ./.github/actions/sdl3-mingw
       - name: Cross compile gvedit
         run: |
-          SDL=$PWD/sdl3-mingw/x86_64-w64-mingw32
+          SDL="${{ steps.sdl3.outputs.prefix }}"
           make gvedit CC=x86_64-w64-mingw32-gcc \
             SDL_CFLAGS="-I$SDL/include" \
             SDL_LIBS="-L$SDL/lib -lSDL3 -lmingw32 -mwindows"
@@ -188,19 +183,40 @@ jobs:
       - name: Start it under wine
         run: WINEDEBUG=-all wine _out/x86_64-w64-mingw32/bin/gvedit.exe --version
 
+  # gvedit as the release ships it for Linux: linked against a static SDL3
+  # built from source on the oldest runner, so the binary runs without a
+  # system libSDL3. Checks the link and that it starts.
+  gvedit-static:
+    name: gvedit-static
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build SDL3 static
+        id: sdl3
+        uses: ./.github/actions/sdl3-static
+      - name: Build gvedit against it
+        run: |
+          export PKG_CONFIG_PATH="${{ steps.sdl3.outputs.prefix }}/lib/pkgconfig"
+          make gvedit SDL_CFLAGS="$(pkg-config --cflags sdl3)" \
+            SDL_LIBS="$(pkg-config --static --libs sdl3)"
+          ldd gvedit
+          if ldd gvedit | grep -q SDL3; then echo "gvedit links libSDL3 dynamically"; exit 1; fi
+          ./gvedit --version
+
   # Single required status check for the branch ruleset. It passes only when
   # every other job passed, so the ruleset gates on this one name and the job
   # list can change without touching the ruleset.
   ci-ok:
     name: ci-ok
-    needs: [build-test, sanitize, torture, cross, static, no-term, macos, gvedit, gvedit-windows]
+    needs: [build-test, sanitize, torture, cross, static, no-term, macos, gvedit, gvedit-windows, gvedit-static]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Check that the required jobs succeeded
         run: |
-          results="${{ needs.build-test.result }} ${{ needs.sanitize.result }} ${{ needs.torture.result }} ${{ needs.cross.result }} ${{ needs.static.result }} ${{ needs.no-term.result }} ${{ needs.macos.result }} ${{ needs.gvedit.result }} ${{ needs.gvedit-windows.result }}"
+          results="${{ needs.build-test.result }} ${{ needs.sanitize.result }} ${{ needs.torture.result }} ${{ needs.cross.result }} ${{ needs.static.result }} ${{ needs.no-term.result }} ${{ needs.macos.result }} ${{ needs.gvedit.result }} ${{ needs.gvedit-windows.result }} ${{ needs.gvedit-static.result }}"
           echo "results: $results"
           for r in $results; do
             if [ "$r" != "success" ]; then

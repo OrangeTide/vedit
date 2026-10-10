@@ -39,7 +39,10 @@ jobs:
 
   # Static musl binaries for Linux, one per architecture, built natively on
   # the matching runner with the `make static` target. The man page rides
-  # along in the tarball.
+  # along in the tarball. The x86_64 tarball also carries gvedit, linked
+  # against a static SDL3 built from source (the sdl3-static action), so it
+  # needs no libSDL3 on the user's system; it is dynamic against glibc and
+  # loads X11 or Wayland at run time.
   linux:
     name: linux ${{ matrix.arch }}
     needs: check
@@ -51,6 +54,7 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-latest
+            gvedit: true
           - arch: aarch64
             runner: ubuntu-24.04-arm
     steps:
@@ -65,11 +69,27 @@ jobs:
           if ldd vedit 2>/dev/null; then echo "vedit is not static"; exit 1; fi
           test "$(uname -m)" = "${{ matrix.arch }}"
           ./vedit --version
+      - name: Build SDL3 static
+        if: matrix.gvedit
+        id: sdl3
+        uses: ./.github/actions/sdl3-static
+      - name: Build gvedit
+        if: matrix.gvedit
+        run: |
+          export PKG_CONFIG_PATH="${{ steps.sdl3.outputs.prefix }}/lib/pkgconfig"
+          make gvedit RELEASE=1 \
+            SDL_CFLAGS="$(pkg-config --cflags sdl3)" \
+            SDL_LIBS="$(pkg-config --static --libs sdl3)"
+          file -L gvedit
+          ldd gvedit
+          if ldd gvedit | grep -q SDL3; then echo "gvedit links libSDL3 dynamically"; exit 1; fi
+          ./gvedit --version
       - name: Package
         run: |
           name="vedit-${{ needs.check.outputs.version }}-linux-${{ matrix.arch }}"
           mkdir -p "dist/$name"
           cp vedit man/vedit.1 README.md "dist/$name/"
+          if [ "${{ matrix.gvedit }}" = "true" ]; then cp gvedit "dist/$name/"; fi
           mkdir -p "dist/$name/docs" && cp docs/*.md docs/shot-*.png "dist/$name/docs/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
       - uses: actions/upload-artifact@v6
@@ -78,7 +98,9 @@ jobs:
           path: dist/*.tar.gz
           retention-days: 7
 
-  # The Windows console build, cross-compiled with mingw-w64.
+  # The Windows build, cross-compiled with mingw-w64: the console vedit.exe
+  # and gvedit.exe with the SDL3.dll it loads (the sdl3-mingw action), in
+  # one zip. Both are started under wine to check they load and run.
   windows:
     name: windows x86_64
     needs: check
@@ -87,16 +109,32 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install mingw-w64
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 zip
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 zip wine64
       - name: Build
         run: make CC=x86_64-w64-mingw32-gcc RELEASE=1
-      - name: Check the binary
-        run: file _out/x86_64-w64-mingw32/bin/vedit.exe | grep -q 'PE32+'
+      - name: Fetch SDL3 for mingw
+        id: sdl3
+        uses: ./.github/actions/sdl3-mingw
+      - name: Build gvedit
+        run: |
+          SDL="${{ steps.sdl3.outputs.prefix }}"
+          make gvedit CC=x86_64-w64-mingw32-gcc RELEASE=1 \
+            SDL_CFLAGS="-I$SDL/include" \
+            SDL_LIBS="-L$SDL/lib -lSDL3 -lmingw32 -mwindows"
+          cp "$SDL/bin/SDL3.dll" _out/x86_64-w64-mingw32/bin/
+      - name: Check the binaries
+        run: |
+          cd _out/x86_64-w64-mingw32/bin
+          file vedit.exe | grep -q 'PE32+'
+          file gvedit.exe | grep -q 'PE32+'
+          WINEDEBUG=-all wine vedit.exe --version
+          WINEDEBUG=-all wine gvedit.exe --version
       - name: Package
         run: |
           name="vedit-${{ needs.check.outputs.version }}-windows-x86_64"
           mkdir -p "dist/$name"
-          cp _out/x86_64-w64-mingw32/bin/vedit.exe README.md "dist/$name/"
+          cp _out/x86_64-w64-mingw32/bin/vedit.exe _out/x86_64-w64-mingw32/bin/gvedit.exe \
+            _out/x86_64-w64-mingw32/bin/SDL3.dll README.md "dist/$name/"
           mkdir -p "dist/$name/docs" && cp docs/*.md docs/shot-*.png "dist/$name/docs/"
           (cd dist && zip -r "$name.zip" "$name")
       - uses: actions/upload-artifact@v6

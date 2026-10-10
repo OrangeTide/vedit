@@ -97,7 +97,8 @@ request against it:
 - a static musl build
 - the slim builds (`VEDIT_NO_TERM`, `VEDIT_NO_ART`, both) with their tests
 - macOS, without the fault tests
-- gvedit on Linux, and a gvedit cross build for Windows
+- gvedit on Linux against the distro SDL3, against a static SDL3 built
+  from source as the release ships it, and a cross build for Windows
 
 `.github/workflows/docs.yml` renders `docs/site` and publishes it to GitHub
 Pages on a push to `main` that touches `docs/`.
@@ -126,9 +127,20 @@ which:
 1. checks that the tag matches `VEDIT_VERSION` in `vedit.c` and stops if
    not, before anything is built
 2. builds static Linux binaries for x86_64 and aarch64, each packaged with
-   the man page and the manual
-3. cross-builds the Windows x86_64 console binary
+   the man page and the manual. The x86_64 tarball also gets gvedit,
+   linked against a static SDL3 built from source by the
+   `.github/actions/sdl3-static` action, so it runs without a system
+   libSDL3 (it loads X11 or Wayland at run time)
+3. cross-builds the Windows x86_64 console binary and gvedit.exe, the
+   latter against the SDL3 mingw package fetched by
+   `.github/actions/sdl3-mingw`, and zips them with `SDL3.dll`; both
+   are started under wine first
 4. publishes the archives and a `SHA256SUMS` file on the GitHub release for
    the tag, creating the release when it does not exist
 
 So a release is: bump `VEDIT_VERSION`, commit, tag, push the tag.
+
+The SDL3 version both actions fetch is the one line in
+`.github/sdl3-version`; CI builds gvedit the same two ways on every
+push (the `gvedit-windows` and `gvedit-static` jobs), so a bump is
+checked before a release uses it.

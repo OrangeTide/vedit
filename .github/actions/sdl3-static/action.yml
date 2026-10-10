@@ -1,0 +1,55 @@
+name: SDL3 static for Linux
+description: >
+  Build SDL3 from source as a static library at the version in
+  .github/sdl3-version, with the X11 and Wayland video backends and the
+  usual audio backends enabled (SDL loads their system libraries at run
+  time). Outputs the install prefix; its pkg-config file gives the link
+  line with `pkg-config --static --libs sdl3`.
+
+outputs:
+  prefix:
+    description: The install prefix holding include/, lib/ and lib/pkgconfig/
+    value: ${{ steps.paths.outputs.prefix }}
+  version:
+    description: The SDL3 version built
+    value: ${{ steps.paths.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - id: paths
+      shell: bash
+      run: |
+        v=$(tr -d '[:space:]' < "$GITHUB_WORKSPACE/.github/sdl3-version")
+        echo "version=$v" >> "$GITHUB_OUTPUT"
+        echo "prefix=$GITHUB_WORKSPACE/sdl3-static" >> "$GITHUB_OUTPUT"
+    - name: Install the build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build pkg-config \
+          libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+          libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev libwayland-dev \
+          wayland-protocols libdecor-0-dev libegl-dev libgl-dev libgles2-mesa-dev libdrm-dev \
+          libgbm-dev libdbus-1-dev libibus-1.0-dev libudev-dev libasound2-dev \
+          libpulse-dev libpipewire-0.3-dev
+    - uses: actions/cache@v4
+      id: cache
+      with:
+        path: sdl3-static
+        key: sdl3-static-${{ runner.os }}-${{ runner.arch }}-${{ steps.paths.outputs.version }}
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        v="${{ steps.paths.outputs.version }}"
+        curl -fsSL -o sdl3-src.tar.gz \
+          "https://github.com/libsdl-org/SDL/releases/download/release-$v/SDL3-$v.tar.gz"
+        mkdir -p sdl3-src
+        tar -xzf sdl3-src.tar.gz --strip-components=1 -C sdl3-src
+        cmake -S sdl3-src -B sdl3-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+          -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST_LIBRARY=OFF \
+          -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF \
+          -DCMAKE_INSTALL_PREFIX="${{ steps.paths.outputs.prefix }}"
+        cmake --build sdl3-build
+        cmake --install sdl3-build
+        rm -rf sdl3-src sdl3-build sdl3-src.tar.gz
