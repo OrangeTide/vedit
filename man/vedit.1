@@ -229,6 +229,10 @@ asks the same in a dialog.
 List the commits that touched the file (VCS > History) and open the chosen
 one's diff in a read-only buffer.
 .TP
+.BI :diff " [rev [rev]]"
+Open the diff of the file against HEAD (VCS > Diff), against a revision, or
+between two revisions, read-only; running it again refreshes the buffer.
+.TP
 .B :blame
 Open the blame of the file (VCS > Blame) read-only; Enter on a line opens
 the diff of the commit that changed it.

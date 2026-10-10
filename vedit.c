@@ -7597,8 +7597,8 @@ typedef struct ebuf {
 	char		swap_path[PATH_MAX];	/* this buffer's swap file, or "" */
 	char		vcs[48];	/* "name:branch*" from the VCS, or "" */
 	char		label[64];	/* title of an unnamed buffer, or "" */
-	char		vcs_src[PATH_MAX];	/* blame: "name:path" it annotates, or "" */
-	int		vcs_kind;	/* 1 blame buffer, 2 commit message, else 0 */
+	char		vcs_src[PATH_MAX];	/* blame or diff: "name:path" it shows, or "" */
+	int		vcs_kind;	/* 1 blame buffer, 2 commit message, 3 diff, else 0 */
 	struct swapj	*swapj;		/* its swap journal state, or NULL */
 	int		swap_on;	/* a swap file exists on disk for it */
 	size_t		swap_rev;	/* text rev at the last swap write */
@@ -7776,8 +7776,8 @@ typedef struct editor {
 	char		swap_path[PATH_MAX];	/* active buffer's swap file, or "" */
 	char		vcs[48];	/* active buffer's "name:branch*", or "" */
 	char		label[64];	/* active buffer's title when unnamed, or "" */
-	char		vcs_src[PATH_MAX];	/* active blame buffer's "name:path", or "" */
-	int		vcs_kind;	/* active buffer: 1 blame, 2 commit message */
+	char		vcs_src[PATH_MAX];	/* active blame or diff buffer's "name:path", or "" */
+	int		vcs_kind;	/* active buffer: 1 blame, 2 commit message, 3 diff */
 	struct swapj	*swapj;		/* active buffer's swap journal state */
 	int		swap_on;	/* a swap file exists on disk for it */
 	size_t		swap_rev;	/* text rev at the last swap write */
@@ -10771,7 +10771,7 @@ typedef enum menu_act {
 #ifndef VEDIT_NO_TOOLS
 	MA_FORMAT,
 	MA_COMPILE, MA_MAKE, MA_RUN, MA_VIEW_OUTPUT, MA_ERR_NEXT, MA_ERR_PREV,
-	MA_VCS_LOG, MA_VCS_BLAME, MA_VCS_COMMIT,
+	MA_VCS_LOG, MA_VCS_DIFF, MA_VCS_BLAME, MA_VCS_COMMIT,
 #endif
 #ifdef VEDIT_TERM
 	MA_TERM_NEW, MA_TERM_CLOSE, MA_TERM_SPLIT, MA_PANE_BUFFER, MA_PANE_CLOSE,
@@ -10935,6 +10935,7 @@ static const Menuitem mi_run[] = {
 };
 static const Menuitem mi_vcs[] = {
 	{ "&History...",	"",	":log",	MA_VCS_LOG },
+	{ "&Diff",	"",	":diff",	MA_VCS_DIFF },
 	{ "&Blame",	"",	":blame",	MA_VCS_BLAME },
 	{ "&Commit...",	"",	":commit",	MA_VCS_COMMIT },
 };
@@ -11352,6 +11353,8 @@ menu_item_enabled(const Editor *e, Menuact act)
 	case MA_VCS_LOG:
 	case MA_VCS_BLAME:
 		return e->vcs[0] != '\0';
+	case MA_VCS_DIFF:
+		return e->vcs[0] != '\0' || e->vcs_kind == 1 || e->vcs_kind == 3;
 	case MA_VCS_COMMIT:
 		return e->vcs[0] != '\0' || e->vcs_kind == 2;
 #endif
@@ -19121,6 +19124,7 @@ static const struct {
 #ifndef VEDIT_NO_TOOLS
 	{ ":format  :set fos",	"Run the formatter / format on every save" },
 	{ ":log",		"File history: pick a commit, see its diff (VCS menu)" },
+	{ ":diff [rev [rev]]",	"Diff of the file against HEAD, a revision, or between two" },
 	{ ":blame",		"Who changed each line; Enter there shows the commit" },
 	{ ":commit",		"Commit this file: write the message, :commit again sends" },
 	{ "F9 Alt+F9 Ctrl+F9",	"Make / compile / run; F4 steps the errors" },
@@ -25227,6 +25231,10 @@ vcs_template(const char *name, const char *which)
 		return "git log --format='%h %as %s' -n 200 -- $(file)";
 	if (strcmp(which, "show") == 0)
 		return "git show $(rev) -- $(file)";
+	if (strcmp(which, "diff") == 0)
+		return "git diff $(rev) -- $(file)";
+	if (strcmp(which, "head") == 0)
+		return "HEAD";
 	if (strcmp(which, "blame") == 0)
 		return "git blame --date=short -- $(file)";
 	if (strcmp(which, "commit") == 0)
@@ -25847,6 +25855,7 @@ typedef struct vcslog {
 	char	**line;			/* each line */
 	int	n;
 	int	chosen;
+	int	diff;			/* chosen with d: diff the file against it */
 } Vcslog;
 
 static const char *
@@ -25879,6 +25888,26 @@ vcslog_choose(void *ctx, int i)
 		return PICK_STAY;
 	l->chosen = i;
 	return PICK_DONE;
+}
+
+/* d diffs the working file against the commit under the cursor. */
+static int
+vcslog_key(void *ctx, int i, uint32_t ch)
+{
+	Vcslog *l = ctx;
+
+	if (ch != 'd' || i < 0 || i >= l->n)
+		return PICK_PASS;
+	l->chosen = i;
+	l->diff = 1;
+	return PICK_DONE;
+}
+
+static const char *
+vcslog_footer(void *ctx)
+{
+	(void)ctx;
+	return "Enter show the commit  d diff the file against it";
 }
 
 /* Open text as a read-only buffer titled label with the named grammar. */
@@ -25933,12 +25962,104 @@ vcs_show_rev(Editor *e, const char *name, const char *path, const char *rev)
 	return rc;
 }
 
+/* VCS > Diff and :diff [rev [rev]]. vcs.<name>.diff prints the diff of
+ * $(file) against $(rev): the revision words as typed, or vcs.<name>.head
+ * (HEAD for git) when none. The output opens read-only as file@diff with
+ * diff highlighting; a second run replaces that buffer's text. Nothing
+ * opens when the diff is empty. Returns 0, or -1 with a status. */
+static int
+vcs_diff(Editor *e, const char *revs)
+{
+	const char *tmpl, *rev;
+	char name[32], label[64];
+	const char *base;
+	struct fmtbuf d;
+	int rc, i;
+
+	char path[PATH_MAX], src[PATH_MAX];
+
+	if ((e->vcs_kind == 1 || e->vcs_kind == 3) && e->vcs_src[0]) {
+		const char *colon = strchr(e->vcs_src, ':');
+
+		/* from a blame or diff buffer: the file it shows */
+		snprintf(name, sizeof(name), "%.*s", colon ?
+		    (int)(colon - e->vcs_src) : 0, e->vcs_src);
+		snprintf(path, sizeof(path), "%s", colon ? colon + 1 : "");
+	} else if (!e->has_name) {
+		set_status(e, "no version control for this buffer");
+		return -1;
+	} else if (vcs_name(e, name, sizeof(name)) < 0) {
+		set_status(e, "no version control for this file");
+		return -1;
+	} else {
+		snprintf(path, sizeof(path), "%s", e->path);
+	}
+	snprintf(src, sizeof(src), "%s:%.*s", name, (int)sizeof(src) - 40, path);
+	tmpl = vcs_template(name, "diff");
+	if (!tmpl) {
+		set_status(e, "vcs.%s.diff is not set", name);
+		return -1;
+	}
+	while (*revs == ' ' || *revs == '\t')
+		revs++;
+	rev = *revs ? revs : vcs_template(name, "head");
+	if (!rev)
+		rev = "";
+	rc = vcs_capture(e, tmpl, "$(rev)", rev, path, &d);
+	if (rc < 0) {
+		set_status(e, "could not run the diff command");
+		free(d.buf);
+		return -1;
+	}
+	if (rc != 0 && d.len == 0) {
+		set_status(e, "the diff command failed (exit %d)", rc);
+		free(d.buf);
+		return -1;
+	}
+	if (d.len == 0) {
+		set_status(e, "no changes against %.40s", rev[0] ? rev : "the base");
+		free(d.buf);
+		return 0;
+	}
+	base = strrchr(path, '/');
+	base = base ? base + 1 : path;
+	snprintf(label, sizeof(label), "%.50s@diff", base);
+	for (i = 0; i < e->nbuf; i++) {	/* a diff of this file is open: reuse it */
+		const char *l = i == e->cur ? e->label : e->bufs[i].label;
+
+		if (strcmp(l, label) == 0)
+			break;
+	}
+	if (i < e->nbuf) {
+		buf_switch(e, i);
+		e->t->readonly = 0;
+		text_load_mem(e->t, d.buf, d.len);
+		e->t->dirty = 0;
+		e->t->readonly = 1;
+		e->hl_valid = 0;
+		e->cy = e->cx = e->top = e->left = 0;
+		rc = 0;
+	} else {
+		rc = vcs_open_text(e, d.buf, d.len, label, "diff") < 0 ? -1 : 0;
+	}
+	if (rc == 0) {
+		snprintf(e->vcs_src, sizeof(e->vcs_src), "%s", src);
+		e->vcs_kind = 3;
+		buf_save(e, &e->bufs[e->cur]);
+	}
+	if (rc == 0)
+		set_status(e, "%s against %.40s (read-only)", label, rev);
+	free(d.buf);
+	return rc;
+}
+
 static int
 vcs_history(Editor *e)
 {
 	Picksrc s = {
 		.title = vcslog_title, .count = vcslog_count,
 		.label = vcslog_label, .choose = vcslog_choose,
+		.key = vcslog_key, .footer = vcslog_footer,
 	};
 	Vcslog l;
 	struct fmtbuf b;
@@ -26000,7 +26121,7 @@ vcs_history(Editor *e)
 			rl = sizeof(rev) - 1;
 		memcpy(rev, ln, rl);
 		rev[rl] = '\0';
-		rc = vcs_show_rev(e, name, e->path, rev);
+		rc = l.diff ? vcs_diff(e, rev) : vcs_show_rev(e, name, e->path, rev);
 	}
 	free(l.line);
 	free(l.text);
@@ -26567,6 +26688,9 @@ run_menu_act(Editor *e, Menuact act)
 		break;
 	case MA_VCS_LOG:
 		vcs_history(e);
+		break;
+	case MA_VCS_DIFF:
+		vcs_diff(e, "");
 		break;
 	case MA_VCS_BLAME:
 		vcs_blame(e);
@@ -28836,6 +28960,8 @@ static const char g_config_template[] =
 	"#	status = git status --porcelain -- $(file)\n"
 	"#	log = git log --format='%h %as %s' -n 200 -- $(file)\n"
 	"#	show = git show $(rev) -- $(file)\n"
+	"#	diff = git diff $(rev) -- $(file)\n"
+	"#	head = HEAD          # what :diff compares against when no revision is given\n"
 	"#	blame = git blame --date=short -- $(file)\n"
 	"#	commit = git commit --only -F $(msg) -- $(file)\n"
 	"\n"
@@ -41968,7 +42094,7 @@ enum excmd {
 	EX_BDELETE, EX_TAG, EX_SYMBOL, EX_POP, EX_RETAB, EX_DRAW, EX_RELOAD,
 	EX_CONFIG,
 	EX_MAIL,
-	EX_DATE, EX_LOG, EX_BLAME, EX_COMMIT,
+	EX_DATE, EX_LOG, EX_DIFF, EX_BLAME, EX_COMMIT,
 	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_VSPLIT, EX_STERM, EX_CLOSE, EX_ONLY, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH, EX_CELL, EX_SORT, EX_TABSTOPS,
 	EX_ROWADD, EX_ROWDEL, EX_COLADD, EX_COLDEL,
 };
@@ -42017,6 +42143,7 @@ static const struct excmd_name {
 	{ "sort",	3, EX_SORT },
 	{ "date",	4, EX_DATE },
 	{ "log",	3, EX_LOG },
+	{ "diff",	4, EX_DIFF },
 	{ "blame",	2, EX_BLAME },
 	{ "commit",	4, EX_COMMIT },
 	{ "tabstops",	4, EX_TABSTOPS },
@@ -42459,6 +42586,13 @@ vi_ex_exec(Editor *e, char *buf)
 	case EX_LOG:
 #ifndef VEDIT_NO_TOOLS
 		vcs_history(e);
+#else
+		set_status(e, "version control is not available");
+#endif
+		return REQ_CONTINUE;
+	case EX_DIFF:			/* :diff [rev [rev]] */
+#ifndef VEDIT_NO_TOOLS
+		vcs_diff(e, rest);
 #else
 		set_status(e, "version control is not available");
 #endif

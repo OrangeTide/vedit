@@ -236,6 +236,15 @@ A **VCS** menu appears while the file has version control. Its mnemonic is
   buffer named `file@rev`, with diff highlighting. `RO` shows on the
   status line and edits are refused. Close it with `:bd` or leave it in
   the buffer list.
+- **Diff** (`:diff`) shows the file's uncommitted changes against HEAD
+  in a read-only buffer named `file@diff` with diff highlighting.
+  `:diff REV` compares the working file against a revision, and
+  `:diff REV1 REV2` compares two revisions; the words are passed to the
+  command as typed. Running it again replaces the buffer's text, also
+  from inside that buffer or a blame buffer of the same file. When there
+  are no changes the status line says so and nothing opens. In the
+  History list, `d` diffs the working file against the chosen commit
+  and Enter shows the commit itself.
 - **Blame** (`:blame`) opens the blame output read-only as `file@blame`,
   each line led by the revision that last changed it, with the cursor on
   the line you were on. Enter there opens that commit's diff.

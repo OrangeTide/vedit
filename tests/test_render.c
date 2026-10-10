@@ -2260,6 +2260,81 @@ t_vcs_history(Test *t)
 	memio_free(&m);
 }
 
+/* :diff opens the file's diff against HEAD read-only as file@diff with the
+ * diff grammar, :diff REV1 REV2 passes the revisions as typed and reuses
+ * that buffer, d in the history picker diffs against the chosen commit, and
+ * an empty diff only reports. */
+static void
+t_vcs_diff(Test *t)
+{
+	const char keys[] = "\033OQ:diff\r:diff v1 v2\r";
+	const char keys2[] = "\033OQ:log\rd";
+	const char keys3[] = "\033OQ:diff\r";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	g_fake_output = "diff --git a/test.c b/test.c\n+added\n";
+	g_fake_rc = 0;
+	g_fake_cmd[0] = '\0';
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_tools(v, &fake_tools);
+	vedit_open(v, "test.c");
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_VCS_DIFF) == 1);
+	vedit_run(v);
+	TAP_CHECKF(t, strcmp(g_fake_cmd, "git diff v1 v2 -- ./test.c") == 0,
+	    "ran '%s'", g_fake_cmd);
+	TAP_CHECKF(t, v->e.nbuf == 2, "nbuf %d", v->e.nbuf);	/* reused */
+	TAP_CHECKF(t, strcmp(v->e.label, "test.c@diff") == 0, "label '%s'",
+	    v->e.label);
+	TAP_CHECK(t, v->e.t->readonly && !text_dirty(v->e.t));
+	TAP_CHECK(t, v->e.syn != NULL && strcmp(v->e.syn->name, "diff") == 0);
+	TAP_CHECK(t, vline_is(v, 1, "+added"));
+	TAP_CHECKF(t, strstr(v->e.status, "against v1 v2") != NULL, "status '%s'",
+	    v->e.status);
+	TAP_CHECK(t, menu_item_enabled(&v->e, MA_VCS_DIFF) == 1);	/* the diff buffer knows its file */
+	TAP_CHECK(t, v->e.vcs_kind == 3 && strcmp(v->e.vcs_src, "git:test.c") == 0);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* d in the history picker */
+	g_fake_output = "abc1234 2026-10-07 First\ndef5678 2026-10-06 Second\n";
+	g_fake_cmd[0] = '\0';
+	memio_init(&m, keys2, sizeof(keys2) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_tools(v, &fake_tools);
+	vedit_open(v, "test.c");
+	vedit_run(v);
+	TAP_CHECKF(t, strcmp(g_fake_cmd, "git diff abc1234 -- ./test.c") == 0,
+	    "ran '%s'", g_fake_cmd);
+	TAP_CHECK(t, v->e.nbuf == 2 && strcmp(v->e.label, "test.c@diff") == 0);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* nothing to show */
+	g_fake_output = "main\n";
+	g_fake_cmd[0] = '\0';
+	memio_init(&m, keys3, sizeof(keys3) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_tools(v, &fake_tools);
+	vedit_open(v, "test.c");
+	g_fake_output = "";
+	vedit_run(v);
+	TAP_CHECKF(t, strcmp(g_fake_cmd, "git diff HEAD -- ./test.c") == 0,
+	    "ran '%s'", g_fake_cmd);
+	TAP_CHECKF(t, v->e.nbuf == 1 && strstr(v->e.status, "no changes") != NULL,
+	    "nbuf %d status '%s'", v->e.nbuf, v->e.status);
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* :blame opens the blame output read-only as file@blame with the cursor on
  * the line it was on, and Enter there opens the diff of the revision that
  * leads the cursor line (a git boundary "^" is dropped). */
@@ -4634,6 +4709,7 @@ const Case tap_cases[] = {
 #ifndef VEDIT_NO_TOOLS
 	{ "vcs_status", t_vcs_status },
 	{ "vcs_history", t_vcs_history },
+	{ "vcs_diff", t_vcs_diff },
 	{ "vcs_blame", t_vcs_blame },
 	{ "vcs_commit", t_vcs_commit },
 	{ "tool_f9_make", t_tool_f9_make },

@@ -152,6 +152,8 @@ first whose `branch` command succeeds owns the file. For Mercurial:
     status = hg status $(file)
     log = hg log --template "{node|short} {date|shortdate} {desc|firstline}\n" $(file)
     show = hg diff -c $(rev) $(file)
+    diff = hg diff -r $(rev) $(file)
+    head = .
     blame = hg annotate -c -u -d $(file)
     commit = hg commit -l $(msg) $(file)
 ```
@@ -162,6 +164,8 @@ first whose `branch` command succeeds owns the file. For Mercurial:
 | `status` | print one porcelain-style line for `$(file)` when it has changed, starting with `??` when untracked, and nothing when clean |
 | `log` | print one line per commit, the revision first, the rest as the picker shows it |
 | `show` | print the diff for `$(rev)` and `$(file)` |
+| `diff` | print the diff of `$(file)` against `$(rev)`: the revision words typed after `:diff`, or `head` when none |
+| `head` | the revision `:diff` compares against by default (`HEAD` for git) |
 | `blame` | print the file with each line led by its revision |
 | `commit` | record `$(file)` with the message in the file `$(msg)` |
 
