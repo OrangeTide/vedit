@@ -7760,6 +7760,8 @@ typedef struct editor {
 	int		auto_indent;	/* a new line copies the previous indent */
 	int		expand_tabs;	/* Tab and auto-indent use spaces (per buffer) */
 	int		shiftwidth;	/* >> / << shift size in columns; 0 = a tab stop */
+	int		textwidth;	/* gq and the insert wrap pack to this; 0 = the window */
+	int		vi_gq_width;	/* a count typed before gq: the width for this one */
 	int		swap_enabled;	/* keep a crash-recovery swap (base + journal) */
 	int		save_force;	/* :w! in progress: save despite readonly */
 	int		backup_enabled;	/* keep the previous version on save */
@@ -7904,6 +7906,7 @@ static int split_possible(const Editor *e, int kind);
 static void buf_save(Editor *e, Buf *b);
 static void buf_copy_in(Editor *e, const Buf *b);
 static const Text *buf_text_at(const Editor *e, int i);
+static Req ex_set(Editor *e, const char *arg);	/* :set, also View > Text Width */
 #ifdef VEDIT_TERM
 /* Terminal interface, defined with the emulator near end of file. The callers
  * (render_body, editor_loop, buf_close, teardown, vedit_new) precede it. */
@@ -10707,7 +10710,7 @@ typedef enum menu_act {
 	MA_TBL_ROWADD, MA_TBL_ROWDEL, MA_TBL_COLADD, MA_TBL_COLDEL, MA_TBL_FIT,
 	MA_SORT, MA_INS_DATE, MA_INS_FILE,
 	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS, MA_MOUSE,
-	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS,
+	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS, MA_REFLOW, MA_TEXTWIDTH,
 	MA_VI_MODE, MA_EDIT_CONFIG, MA_RELOAD_CONFIG, MA_GLYPHS, MA_COLORS,
 	MA_TABSTOPS,
 	MA_SPLIT, MA_VSPLIT, MA_SPLIT_OTHER, MA_SPLIT_CLOSE,
@@ -10806,6 +10809,7 @@ static const Menuitem mi_edit[] = {
 	{ "De&lete Column",	"",	":coldel",	MA_TBL_COLDEL },
 	{ "Fit Column Widt&hs",	"",	":colwidth fit all",	MA_TBL_FIT },
 	{ "S&ort Lines...",	"",	":sort",	MA_SORT },
+	{ "Reflow Para&graph",	"",	"gq",		MA_REFLOW },
 	{ "",		"",		"",		MA_SEP },
 	{ "Copy to T&erminal",	 "",	"",	MA_OSC_COPY },
 	{ "Copy &File to Terminal","",	"",	MA_OSC_COPY_FILE },
@@ -10844,6 +10848,7 @@ static const Menuitem mi_view[] = {
 	{ "&Indent with Spaces","",	":set et",	MA_EXPAND_TABS },
 	{ "&Hex Dump",		"",	"",	MA_HEX },
 	{ "Ta&ble View",	"",	":table",	MA_TABLE },
+	{ "Text Wi&dth...",	"",	":set tw=",	MA_TEXTWIDTH },
 	{ "Split &Pane",	"Ctrl-W s",	":split",	MA_SPLIT },
 	{ "Split Side b&y Side","Ctrl-W v",	":vsplit",	MA_VSPLIT },
 	{ "&Other Pane",	"F6",	"Ctrl-W w",	MA_SPLIT_OTHER },
@@ -15962,6 +15967,474 @@ ed_retab(Editor *e, int to_spaces)
 	    n == 1 ? "" : "s");
 }
 
+/****************************************************************
+ * Paragraph re-wrap: gq, Edit > Reflow Paragraph, and the insert-mode
+ * wrap at textwidth. A line is a prefix (its indent, a run of quote
+ * marks, a comment leader of the buffer's language) and its text.
+ * Consecutive lines with the same prefix form a paragraph; a blank line
+ * or a list marker starts a new one, and the item's later lines hang
+ * under its text. The words are packed to the width, one space apart.
+ ****************************************************************/
+
+#define TEXTWIDTH_MAX	500
+#define GQ_WIDTH_MIN	20	/* a count this big before gq is a width */
+
+/* The comment leaders a line of the buffer's language may carry after
+ * its indent and quote marks, each followed by a blank or the end. */
+static const char *const *
+reflow_leaders(const Editor *e)
+{
+	static const char *const c_like[] = { "//", "/*", "*", NULL };
+	static const char *const hash[] = { "#", NULL };
+	static const char *const ini[] = { "#", ";", NULL };
+	static const char *const none[] = { NULL };
+	const char *n = e->syn ? e->syn->name : NULL;
+
+	if (!n)
+		return none;
+	if (strcmp(n, "c") == 0 || strcmp(n, "javascript") == 0 ||
+	    strcmp(n, "html") == 0)
+		return c_like;
+	if (strcmp(n, "sh") == 0 || strcmp(n, "gitcommit") == 0)
+		return hash;
+	if (strcmp(n, "ini") == 0)
+		return ini;
+	return none;
+}
+
+/* How a line starts: the bytes of prefix its paragraph shares, the list
+ * marker when the line opens an item, and where its text begins. */
+typedef struct linepfx {
+	size_t	pfx;	/* indent, quote marks, comment leader and a blank */
+	size_t	mark;	/* bytes of a list marker after the prefix, or 0 */
+	size_t	text;	/* first byte of the text (pfx + mark + blanks) */
+} Linepfx;
+
+static void
+reflow_scan(const char *s, size_t len, const char *const *leaders,
+    Linepfx *p)
+{
+	size_t i = 0, j;
+	int k;
+
+	while (i < len && (s[i] == ' ' || s[i] == '\t'))
+		i++;
+	while (i < len && s[i] == '>') {	/* quote marks, "> > text" */
+		i++;
+		if (i < len && s[i] == ' ')
+			i++;
+	}
+	for (k = 0; leaders[k]; k++) {
+		size_t n = strlen(leaders[k]);
+
+		if (len - i >= n && memcmp(s + i, leaders[k], n) == 0 &&
+		    (i + n == len || s[i + n] == ' ' || s[i + n] == '\t')) {
+			i += n;
+			while (i < len && (s[i] == ' ' || s[i] == '\t'))
+				i++;
+			break;
+		}
+	}
+	p->pfx = i;
+	p->mark = 0;
+	j = i;
+	if (j + 1 < len && (s[j] == '-' || s[j] == '*' || s[j] == '+') &&
+	    s[j + 1] == ' ') {
+		p->mark = 1;
+	} else {
+		while (j < len && s[j] >= '0' && s[j] <= '9')
+			j++;
+		if (j > i && j + 1 < len && (s[j] == '.' || s[j] == ')') &&
+		    s[j + 1] == ' ')
+			p->mark = j + 1 - i;
+	}
+	i += p->mark;
+	while (i < len && s[i] == ' ')
+		i++;
+	p->text = i;
+}
+
+/* A growable byte buffer for the rewritten lines. */
+typedef struct rbuf {
+	char	*s;
+	size_t	len, cap;
+} Rbuf;
+
+static int
+rbuf_add(Rbuf *b, const char *s, size_t n)
+{
+	if (b->len + n + 1 > b->cap) {
+		size_t nc = b->cap ? b->cap * 2 : 256;
+		char *ns;
+
+		while (nc < b->len + n + 1)
+			nc *= 2;
+		ns = realloc(b->s, nc);
+		if (!ns)
+			return -1;
+		b->s = ns;
+		b->cap = nc;
+	}
+	memcpy(b->s + b->len, s, n);
+	b->len += n;
+	return 0;
+}
+
+/* One paragraph being gathered: its first-line prefix, the prefix of its
+ * other lines, and its words. */
+typedef struct para {
+	Rbuf	first, cont, words;	/* words are NUL separated */
+	int	open;
+} Para;
+
+/* Pack a paragraph's words into lines of at most width columns (one
+ * word always fits) and append them to out, each ending in '\n'. */
+static int
+para_flush(Para *p, int width, Rbuf *out)
+{
+	size_t i = 0;
+	int col = 0, have = 0;
+	const Rbuf *pfx = &p->first;
+
+	if (!p->open)
+		return 0;
+	p->open = 0;
+	if (rbuf_add(out, pfx->s, pfx->len) < 0)
+		return -1;
+	col = disp_cols(pfx->s, pfx->len);
+	while (i < p->words.len) {
+		const char *w = p->words.s + i;
+		size_t n = strlen(w);
+		int wc = disp_cols(w, n);
+
+		if (have && col + 1 + wc > width) {
+			if (rbuf_add(out, "\n", 1) < 0 ||
+			    rbuf_add(out, p->cont.s, p->cont.len) < 0)
+				return -1;
+			col = disp_cols(p->cont.s, p->cont.len);
+			have = 0;
+		}
+		if (have) {
+			if (rbuf_add(out, " ", 1) < 0)
+				return -1;
+			col++;
+		}
+		if (rbuf_add(out, w, n) < 0)
+			return -1;
+		col += wc;
+		have = 1;
+		i += n + 1;
+	}
+	p->first.len = p->cont.len = p->words.len = 0;
+	return rbuf_add(out, "\n", 1);
+}
+
+/* Start a paragraph on a line: its own start is the first-line prefix;
+ * later lines take the same prefix, or hang under a list marker. */
+static int
+para_start(Para *p, const char *s, const Linepfx *lp)
+{
+	size_t i, ind = 0;
+
+	p->open = 1;
+	p->first.len = p->cont.len = p->words.len = 0;
+	if (rbuf_add(&p->first, s, lp->text) < 0)
+		return -1;
+	while (ind < lp->pfx && (s[ind] == ' ' || s[ind] == '\t'))
+		ind++;
+	if (lp->pfx >= ind + 2 && s[ind] == '/' && s[ind + 1] == '*') {
+		/* a block comment opener: its later lines hang under " * " */
+		if (rbuf_add(&p->cont, s, ind) < 0 ||
+		    rbuf_add(&p->cont, " * ", 3) < 0)
+			return -1;
+	} else if (rbuf_add(&p->cont, s, lp->pfx) < 0) {
+		return -1;
+	}
+	if (lp->mark) {
+		int w = disp_cols(s + lp->pfx, lp->text - lp->pfx);
+
+		for (i = 0; i < (size_t)w; i++)
+			if (rbuf_add(&p->cont, " ", 1) < 0)
+				return -1;
+	}
+	return 0;
+}
+
+/* Append the words of s[from..len) to the paragraph. */
+static int
+para_words(Para *p, const char *s, size_t from, size_t len)
+{
+	size_t i = from;
+
+	while (i < len) {
+		size_t j;
+
+		while (i < len && (s[i] == ' ' || s[i] == '\t'))
+			i++;
+		j = i;
+		while (j < len && s[j] != ' ' && s[j] != '\t')
+			j++;
+		if (j > i && (rbuf_add(&p->words, s + i, j - i) < 0 ||
+		    rbuf_add(&p->words, "", 1) < 0))
+			return -1;
+		i = j;
+	}
+	return 0;
+}
+
+/* Whether a line continues the open paragraph: no list marker, text
+ * after its prefix, and the prefix the paragraph's later lines carry. */
+static int
+para_continues(const Para *p, const char *s, size_t len, const Linepfx *lp)
+{
+	size_t n = p->cont.len;
+
+	if (!p->open || lp->mark || lp->text >= len)
+		return 0;
+	if (lp->pfx != n)
+		return 0;
+	return memcmp(s, p->cont.s, n) == 0;
+}
+
+/* The rewrapped form of lines [lo, hi] at the width, as text with a '\n'
+ * after every line. Blank lines (nothing after the prefix) are kept as
+ * they are. Returns -1 when out of memory. */
+static int
+reflow_build(Editor *e, size_t lo, size_t hi, int width, Rbuf *out)
+{
+	const char *const *leaders = reflow_leaders(e);
+	Para p;
+	size_t y;
+	int rc = 0;
+
+	memset(&p, 0, sizeof(p));
+	for (y = lo; y <= hi && rc == 0; y++) {
+		size_t len = 0;
+		const char *s = text_line(e->t, y, &len);
+		Linepfx lp;
+
+		if (!s)
+			break;
+		reflow_scan(s, len, leaders, &lp);
+		if (lp.text >= len) {		/* blank: a separator, kept */
+			rc = para_flush(&p, width, out);
+			if (rc == 0)
+				rc = rbuf_add(out, s, len);
+			if (rc == 0)
+				rc = rbuf_add(out, "\n", 1);
+			continue;
+		}
+		if (!para_continues(&p, s, len, &lp)) {
+			rc = para_flush(&p, width, out);
+			if (rc == 0)
+				rc = para_start(&p, s, &lp);
+		}
+		if (rc == 0)
+			rc = para_words(&p, s, lp.text, len);
+	}
+	if (rc == 0)
+		rc = para_flush(&p, width, out);
+	free(p.first.s);
+	free(p.cont.s);
+	free(p.words.s);
+	return rc;
+}
+
+/* Whether lines [lo, hi] already read as text (with '\n' after each). */
+static int
+reflow_same(const Editor *e, size_t lo, size_t hi, const Rbuf *out)
+{
+	size_t y, off = 0;
+
+	for (y = lo; y <= hi; y++) {
+		size_t len = 0;
+		const char *s = text_line(e->t, y, &len);
+
+		if (!s || off + len + 1 > out->len ||
+		    memcmp(out->s + off, s, len) != 0 || out->s[off + len] != '\n')
+			return 0;
+		off += len + 1;
+	}
+	return off == out->len;
+}
+
+/* The width gq and the menu use: textwidth, or the text area when it is 0. */
+static int
+reflow_width(const Editor *e)
+{
+	return e->textwidth > 0 ? e->textwidth : text_width(e);
+}
+
+/* Rewrap lines [lo, hi] at the width in one undo step and leave the
+ * cursor on the last line written, at its first non-blank. Returns the
+ * number of lines the range became, or -1. */
+static long
+reflow_range(Editor *e, size_t lo, size_t hi, int width)
+{
+	Rbuf out;
+	size_t n = text_lines(e->t), y, i, line0, nl = 0, len;
+	const char *s;
+
+	if (n == 0)
+		return 0;
+	if (hi >= n)
+		hi = n - 1;
+	if (lo > hi)
+		lo = hi;
+	if (width < 1)
+		width = 1;
+	memset(&out, 0, sizeof(out));
+	if (reflow_build(e, lo, hi, width, &out) < 0) {
+		free(out.s);
+		set_status(e, "out of memory");
+		return -1;
+	}
+	for (i = 0; i < out.len; i++)
+		if (out.s[i] == '\n')
+			nl++;
+	if (reflow_same(e, lo, hi, &out)) {
+		free(out.s);
+		e->cy = hi;
+		e->cx = 0;
+		return (long)nl;
+	}
+	text_undo_group_begin(e->t);
+	hl_touch(e, lo);
+	/* collapse the range to one empty line, then write the new lines */
+	for (y = lo; y < hi; y++) {
+		text_delete(e->t, lo, 0, text_line_len(e->t, lo));
+		text_join(e->t, lo);
+	}
+	text_delete(e->t, lo, 0, text_line_len(e->t, lo));
+	y = lo;
+	line0 = 0;
+	for (i = 0; i < out.len; i++) {
+		if (out.s[i] != '\n')
+			continue;
+		if (y > lo)
+			text_split(e->t, y - 1, text_line_len(e->t, y - 1));
+		text_insert(e->t, y, 0, out.s + line0, i - line0);
+		line0 = i + 1;
+		y++;
+	}
+	text_undo_group_end(e->t);
+	free(out.s);
+	e->cy = lo + (nl ? nl - 1 : 0);
+	s = text_line(e->t, e->cy, &len);
+	for (e->cx = 0; s && e->cx < len && (s[e->cx] == ' ' || s[e->cx] == '\t');
+	    e->cx++)
+		;
+	e->sel_active = 0;
+	return (long)nl;
+}
+
+/* The paragraph around line y as the vi text objects see it: the run of
+ * non-empty lines holding y (or of empty ones, when y is empty). With
+ * around set, the blank lines after it (or, on a blank run, the text
+ * after it) are included, as ap does. */
+static void
+para_lines(const Editor *e, size_t y, int around, size_t *lo, size_t *hi)
+{
+	size_t n = text_lines(e->t), a = y, b = y;
+	int blank;
+
+	if (n == 0) {
+		*lo = *hi = 0;
+		return;
+	}
+	if (y >= n)
+		y = a = b = n - 1;
+	blank = text_line_len(e->t, y) == 0;
+	while (a > 0 && (text_line_len(e->t, a - 1) == 0) == blank)
+		a--;
+	while (b + 1 < n && (text_line_len(e->t, b + 1) == 0) == blank)
+		b++;
+	if (around)
+		while (b + 1 < n && (text_line_len(e->t, b + 1) == 0) != blank)
+			b++;
+	*lo = a;
+	*hi = b;
+}
+
+/* Edit > Reflow Paragraph: the selected lines, else the paragraph under
+ * the cursor, at textwidth. */
+static void
+ed_reflow(Editor *e)
+{
+	size_t lo, hi, x1, x2;
+	long n;
+
+	if (e->kind != BUF_TEXT || e->tbl || e->hex_view) {
+		set_status(e, "reflow works in a text buffer");
+		return;
+	}
+	if (e->sel_active) {
+		sel_bounds(e, &lo, &x1, &hi, &x2);
+		if (hi > lo && x2 == 0)
+			hi--;
+	} else {
+		para_lines(e, e->cy, 0, &lo, &hi);
+	}
+	n = reflow_range(e, lo, hi, reflow_width(e));
+	if (n >= 0)
+		set_status(e, "reflowed to %d columns: %ld line%s", reflow_width(e),
+		    n, n == 1 ? "" : "s");
+}
+
+/* Insert-mode wrap: after a non-blank was typed past textwidth, with word
+ * wrap on, the word being typed moves to a new line under the same
+ * prefix (or the hanging indent of a list item). */
+static void
+ed_auto_wrap(Editor *e)
+{
+	size_t len = 0, w, b, clen;
+	const char *s;
+	Linepfx lp;
+	Rbuf cont;
+	int col;
+
+	if (e->textwidth <= 0 || !e->wrap || e->draw_mode)
+		return;
+	s = text_line(e->t, e->cy, &len);
+	if (!s)
+		return;
+	col = disp_cols(s, e->cx);
+	if (col <= e->textwidth)
+		return;
+	reflow_scan(s, len, reflow_leaders(e), &lp);
+	if (e->cx <= lp.text)
+		return;
+	w = e->cx;				/* start of the word being typed */
+	while (w > lp.text && s[w - 1] != ' ' && s[w - 1] != '\t')
+		w--;
+	b = w;					/* and the blanks before it */
+	while (b > lp.text && (s[b - 1] == ' ' || s[b - 1] == '\t'))
+		b--;
+	if (b <= lp.text || b == w)		/* one long word: leave it */
+		return;
+	memset(&cont, 0, sizeof(cont));
+	if (rbuf_add(&cont, s, lp.pfx) < 0)
+		return;
+	if (lp.mark) {
+		int i, pw = disp_cols(s + lp.pfx, lp.text - lp.pfx);
+
+		for (i = 0; i < pw; i++)
+			if (rbuf_add(&cont, " ", 1) < 0) {
+				free(cont.s);
+				return;
+			}
+	}
+	clen = cont.len;
+	hl_touch(e, e->cy);
+	text_delete(e->t, e->cy, b, w - b);
+	text_split(e->t, e->cy, b);
+	if (clen)
+		text_insert(e->t, e->cy + 1, 0, cont.s, clen);
+	free(cont.s);
+	e->cx = clen + (e->cx - w);
+	e->cy++;
+}
+
 
 /* Consume a bracketed-paste payload (PASTE_BEGIN was just read) and insert
  * it literally, so control bytes in the paste never fire editor commands.
@@ -16415,8 +16888,11 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 		return REQ_HELP;
 	case CMD_INSERT:
 		n = utf8_encode(buf, seq->ch);
-		if (n > 0)
+		if (n > 0) {
 			ed_insert(e, (char *)buf, (size_t)n);
+			if (seq->ch != ' ')
+				ed_auto_wrap(e);
+		}
 		break;
 	case CMD_TAB:
 		ed_indent_tab(e);
@@ -18328,6 +18804,7 @@ static const struct {
 	{ ":set mouse",		"Click to place the cursor, wheel to scroll (View menu)" },
 	{ ":set ai et ff=",	"Auto-indent, indent with spaces, line endings" },
 	{ ":retab  :set sw=N",	"Convert tabs <-> spaces; set the shift width" },
+	{ "gq+motion gqq gqap  :set tw=N",	"Reflow lines to textwidth (79; a count of 20+ before gq is the width)" },
 	{ ":tabstops 5 9 17|off",	"Tab stops for this buffer; :set ts=N the interval" },
 	{ ":[range]sort[!] n i N",	"Sort lines: decimal, ignore case, key at col N" },
 	{ ":set swapfile bk",	"Crash-recovery swap file / keep a ~ backup" },
@@ -25036,6 +25513,20 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_SORT:
 		dlg_sort(e);
 		break;
+	case MA_REFLOW:
+		ed_reflow(e);
+		break;
+	case MA_TEXTWIDTH: {
+		char buf[32], arg[48];
+
+		snprintf(buf, sizeof(buf), "%d", e->textwidth);
+		if (prompt_line(e, "Text width (columns, 0 = the window): ",
+		    buf, sizeof(buf), 0)) {
+			snprintf(arg, sizeof(arg), "tw=%s", buf);
+			ex_set(e, arg);
+		}
+		break;
+	}
 	case MA_VI_MODE:
 		toggle_vi(e);
 		break;
@@ -26180,6 +26671,7 @@ editor_init(Editor *e)
 	e->mouse = mouse_default();
 	e->auto_indent = 1;	/* copy the previous line's indent by default */
 	e->swap_enabled = 1;	/* write crash-recovery swap files by default */
+	e->textwidth = 79;	/* gq and the insert wrap pack to this width */
 	e->backup_enabled = 0;	/* keep no previous-version backup by default */
 	e->format_on_save = 0;	/* do not reformat on save unless asked */
 #ifndef VEDIT_NO_TOOLS
@@ -27214,6 +27706,13 @@ ed_apply_config(Editor *e)
 		if (v >= 0 && v <= 32)
 			e->shiftwidth = v;
 	}
+	s = cfg_get(g_cfg, "edit.textwidth");
+	if (s) {
+		int v = atoi(s);
+
+		if (v >= 0 && v <= TEXTWIDTH_MAX)
+			e->textwidth = v;
+	}
 	e->expand_tabs = indent_expand_default(e->syn ? e->syn->name : NULL);
 	tabs_config(e);
 	e->hl_on = cfg_bool(g_cfg, "syntax.enable", e->hl_on);
@@ -27321,6 +27820,7 @@ static const char g_config_template[] =
 	"#	autoindent = on      # new lines copy the previous indent\n"
 	"#	ignorecase = off     # on = searches match regardless of case\n"
 	"#	shiftwidth = 0       # >> / << indent width; 0 = one tab stop\n"
+	"#	textwidth = 79       # gq and Reflow Paragraph wrap here; 0 = the window\n"
 	"#	tabstop = 8          # the interval between tab stops\n"
 	"#	tabstops =           # a ruler of stops, e.g. \"5 9 17\"\n"
 	"#	swap = on            # keep a crash-recovery swap (.swpf base, .swpm journal)\n"
@@ -37256,6 +37756,8 @@ enter_insert(Editor *e)
 }
 
 static void vi_shift_lines(Editor *e, size_t y1, size_t y2, int dir);
+static void vi_reflow_lines(Editor *e, size_t y1, size_t y2);
+static Req vi_gq_lines(Editor *e);
 
 /* Apply operator op linewise over lines [lo,hi]. The caller has already opened
  * the undo group; this closes it (except for a change, which stays open until
@@ -37310,6 +37812,13 @@ vi_apply_operator(Editor *e, char op, Motion m)
 		size_t hi = e->cy < m.y ? m.y : e->cy;
 
 		vi_shift_lines(e, lo, hi, op == '>' ? 1 : -1);
+		return REQ_CONTINUE;
+	}
+	if (op == 'q') {			/* gq: reflow the lines spanned */
+		size_t lo = e->cy < m.y ? e->cy : m.y;
+		size_t hi = e->cy < m.y ? m.y : e->cy;
+
+		vi_reflow_lines(e, lo, hi);
 		return REQ_CONTINUE;
 	}
 
@@ -37796,6 +38305,38 @@ vi_shift_lines(Editor *e, size_t y1, size_t y2, int dir)
 	text_undo_group_end(e->t);
 }
 
+/* gq over lines y1..y2 (either order): reflow at textwidth, or at the
+ * width a count of GQ_WIDTH_MIN or more gave before the gq. */
+static void
+vi_reflow_lines(Editor *e, size_t y1, size_t y2)
+{
+	int width = e->vi_gq_width > 0 ? e->vi_gq_width : reflow_width(e);
+	size_t lo = y1 < y2 ? y1 : y2, hi = y1 < y2 ? y2 : y1;
+	long n;
+
+	e->vi_gq_width = 0;
+	n = reflow_range(e, lo, hi, width);
+	if (n >= 0)
+		set_status(e, "%ld line%s reflowed to %d columns", n,
+		    n == 1 ? "" : "s", width);
+	vi_clamp(e);
+}
+
+/* gqq and gqgq: this line and count - 1 more below it. */
+static Req
+vi_gq_lines(Editor *e)
+{
+	int oc = e->vi_op_count > 0 ? e->vi_op_count : 1;
+	int mc = e->vi_count > 0 ? e->vi_count : 1;
+	size_t n = text_lines(e->t), y2 = e->cy + (size_t)(oc * mc - 1);
+
+	if (n && y2 >= n)
+		y2 = n - 1;
+	vi_reset_pending(e);
+	vi_reflow_lines(e, e->cy, y2);
+	return REQ_CONTINUE;
+}
+
 /* Carry out a motion character: move the cursor, or, when an operator is
  * armed, apply it over the motion's span. */
 static Req
@@ -38150,6 +38691,10 @@ vi_apply_textobject_op(Editor *e, char op, size_t sy, size_t sx,
 {
 	if (op == '>' || op == '<') {		/* shift the object's lines */
 		vi_shift_lines(e, sy, ey, op == '>' ? 1 : -1);
+		return REQ_CONTINUE;
+	}
+	if (op == 'q') {
+		vi_reflow_lines(e, sy, ey);
 		return REQ_CONTINUE;
 	}
 	text_undo_group_begin(e->t);
@@ -38563,6 +39108,15 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 		size_t sy, sx, ey, ex;
 
 		e->vi_textobj = 0;
+		if (c == 'p' && op && !ctrl) {	/* ip / ap: whole lines */
+			Motion m = { 0, 0, 1, 0, 1 };
+
+			para_lines(e, e->cy, kind == 'a', &sy, &m.y);
+			vi_reset_pending(e);
+			e->cy = sy;
+			e->cx = 0;
+			return vi_apply_operator(e, op, m);
+		}
 		if (ctrl || seq->ch == TKBD_CH_NONE ||
 		    (seq->type == TKBD_KEY && seq->key == TKBD_KEY_ESC) ||
 		    !op || !vi_text_object(e, kind, c, &sy, &sx, &ey, &ex)) {
@@ -38816,6 +39370,24 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 		e->vi_gpending = 0;
 		if (c == 'g')
 			return vi_do_motion(e, 'g');
+		if (c == 'q') {		/* gq: the reflow operator; gqgq a line */
+			if (e->vi_op == 'q')
+				return vi_gq_lines(e);
+			if (e->vi_op) {
+				vi_reset_pending(e);
+				return REQ_CONTINUE;
+			}
+			e->vi_op = 'q';
+			if (e->vi_count >= GQ_WIDTH_MIN) {
+				e->vi_gq_width = e->vi_count;
+				e->vi_op_count = 0;
+			} else {
+				e->vi_gq_width = 0;
+				e->vi_op_count = e->vi_count;
+			}
+			e->vi_count = 0;
+			return REQ_CONTINUE;
+		}
 		if (c == '`' || c == '\'') {	/* g` / g': jump without a jumplist push */
 			e->vi_markcmd = (char)c;
 			e->vi_mark_norec = 1;
@@ -39008,6 +39580,8 @@ vi_normal_key(Editor *e, const struct tkbd_seq *seq)
 		e->vi_atpending = 1;
 		return REQ_CONTINUE;
 	case 'q':			/* record keystrokes into a register */
+		if (e->vi_op == 'q')		/* gqq: this line (and a count) */
+			return vi_gq_lines(e);
 		vi_reset_pending(e);
 		if (e->vi_recording)
 			vi_record_stop(e);
@@ -39205,6 +39779,8 @@ vi_insert_key(Editor *e, const struct tkbd_seq *seq)
 					    rune_len_at(s, len, e->cx));
 			}
 			ed_insert(e, (char *)buf, (size_t)n);
+			if (seq->ch != ' ')
+				ed_auto_wrap(e);
 		}
 	}
 	return REQ_CONTINUE;
@@ -39263,6 +39839,19 @@ vi_visual_key(Editor *e, const struct tkbd_seq *seq)
 		vi_mark_set(e, MARK_VISGT, e->ay, e->ax);
 	}
 
+	/* gq on the selection reflows its lines (the g came through the
+	 * normal handler and left vi_gpending set). */
+	if (e->vi_gpending && c == 'q' && !ctrl) {
+		size_t lo = e->cy < e->ay ? e->cy : e->ay;
+		size_t hi = e->cy < e->ay ? e->ay : e->cy;
+
+		e->vi_gpending = 0;
+		vi_reset_pending(e);
+		vi_reflow_lines(e, lo, hi);
+		vi_leave_visual(e);
+		return REQ_CONTINUE;
+	}
+
 	/* A pending i/a takes the next key as the object name (viw, va(): the
 	 * object becomes the selection, cursor on its last rune. */
 	if (e->vi_textobj) {
@@ -39270,6 +39859,17 @@ vi_visual_key(Editor *e, const struct tkbd_seq *seq)
 		size_t sy, sx, ey, ex, y, x;
 
 		e->vi_textobj = 0;
+		if (c == 'p' && !ctrl) {	/* ip / ap: the lines, linewise */
+			para_lines(e, e->cy, kind == 'a', &sy, &ey);
+			e->ay = sy;
+			e->ax = 0;
+			e->cy = ey;
+			e->cx = 0;
+			e->vi_visual = 'V';
+			e->sel_block = 0;
+			vi_clamp(e);
+			return REQ_CONTINUE;
+		}
 		if (ctrl || seq->ch == TKBD_CH_NONE ||
 		    (seq->type == TKBD_KEY && seq->key == TKBD_KEY_ESC) ||
 		    !vi_text_object(e, kind, c, &sy, &sx, &ey, &ex) ||
@@ -40245,6 +40845,19 @@ ex_set(Editor *e, const char *arg)
 		e->shiftwidth = v;
 		set_status(e, "shiftwidth %d%s", v,
 		    v == 0 ? " (one tab stop)" : "");
+		return REQ_CONTINUE;
+	} else if (strncmp(arg, "textwidth=", 10) == 0 ||
+	    strncmp(arg, "tw=", 3) == 0) {
+		int v = atoi(strchr(arg, '=') + 1);
+
+		if (v < 0 || v > TEXTWIDTH_MAX) {
+			set_status(e, "textwidth out of range (0-%d)",
+			    TEXTWIDTH_MAX);
+			return REQ_CONTINUE;
+		}
+		e->textwidth = v;
+		set_status(e, "textwidth %d%s", v,
+		    v == 0 ? " (the window width)" : "");
 		return REQ_CONTINUE;
 	} else if (strncmp(arg, "ff=", 3) == 0 ||
 	    strncmp(arg, "fileformat=", 11) == 0) {

@@ -156,6 +156,21 @@ cursor line.
 
 Both items are unavailable in the table and art views and in draw mode.
 
+## Reflowing a paragraph
+
+**Edit > Reflow Paragraph** re-wraps the paragraph under the cursor so
+that no line runs past the text width. A paragraph is the run of lines
+around the cursor up to an empty line. Each line keeps its prefix: the
+indentation, `>` quote marks, and the comment leader of the language. A
+list item hangs its continuation lines under its text. The rewrite is
+one undo step. **View > Text Width** sets the width, 79 columns unless
+changed; 0 means the window width. Chapter 6 describes the `gq` keys and
+the prefixes in detail.
+
+With Word Wrap on (chapter 4) and a text width other than 0, typing
+past the width moves the word being typed to a new line with the same
+prefix.
+
 ## Converting tabs and spaces
 
 **Edit > Tabs to Spaces** expands every tab in the selected lines, or the

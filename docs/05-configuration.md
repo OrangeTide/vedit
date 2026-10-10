@@ -114,6 +114,7 @@ environment variables say; it starts with `ui.clipboard = on`.
 | `autoindent` | `on` | new lines copy the previous indent |
 | `ignorecase` | `off` | searches ignore case |
 | `shiftwidth` | `0` | columns for vi `>>` and `<<`, 0 to 32; 0 is one tab stop |
+| `textwidth` | `79` | where Reflow Paragraph, `gq`, and typing with Word Wrap on break lines, 0 to 500; 0 is the window width (chapter 2) |
 | `tabstop` | `8` | the interval between tab stops, 1 to 256 |
 | `tabstops` | | a ruler of stops, such as `5 9 17` |
 | `swap` | `on` | keep the crash-recovery journal (chapter 3) |

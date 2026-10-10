@@ -273,6 +273,29 @@ runs ex commands and
 searches. Press
 .B F2
 to return to the modeless keys.
+.PP
+.B gq
+with a motion, or
+.B gqq
+for the line, reflows the lines into paragraphs no wider than
+.B textwidth
+.RB ( ":set tw=N" ,
+.B edit.textwidth
+in the configuration, 79 by default, 0 for the window width). A count of 20
+or more before
+.B gq
+is the width for that one command. Indentation, runs of
+.B >
+quote marks, the comment leader of the language, and list markers are kept
+as prefixes; a list item hangs its continuation lines under the text. The
+.B ip
+and
+.B ap
+text objects select the paragraph, so
+.B gqap
+is Edit > Reflow Paragraph. View > Text Width sets the width. When word wrap
+is on and the width is not 0, typing past it in insert mode moves the word to
+a new line.
 .SH CONFIGURATION
 Settings are read from a gitconfig-style file. Without
 .BR \-\-config ,
@@ -304,8 +327,8 @@ The main sections are
 .B [ui]
 (scheme, line numbers, word wrap, box mode, colors, mouse),
 .B [edit]
-(personality, auto-indent, tab stops, swap and backup files, file mapping,
-format-on-save),
+(personality, auto-indent, tab stops, text width, swap and backup files,
+file mapping, format-on-save),
 .B [indent]
 (tabs versus spaces),
 .B [art]

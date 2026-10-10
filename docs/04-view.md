@@ -22,6 +22,17 @@ the start and end of the buffer line, and Left and Right move by
 character. `WRAP` shows on the status line.
 Config: `ui.wrap`.
 
+Word wrap changes only the display. To break the lines in the file, see
+Reflow Paragraph in chapter 2. With Word Wrap on, typing past the text
+width breaks the line being typed as well.
+
+## Text width
+
+**View > Text Width** asks for the column at which Edit > Reflow
+Paragraph and the vi `gq` operator break lines, and at which typing wraps
+when Word Wrap is on. The default is 79. 0 means the window width.
+Config: `edit.textwidth`, or `:set tw=N` for the session.
+
 ## Tabs
 
 A tab character advances to the next tab stop, every 8 columns unless the

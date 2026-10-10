@@ -3307,6 +3307,135 @@ t_split_ex(Test *t)
 }
 #undef CELL
 
+/* Reflow: a C block comment hangs under " * ", a list item under its text,
+ * a quote keeps its marks, an indent is kept, blank lines separate; the
+ * whole rewrite is one undo step, and a second pass changes nothing. */
+static void
+t_reflow(Test *t)
+{
+	static const char *const L[] = {
+		"/* aaa bbb ccc ddd eee fff ggg", " * hhh iii", " */", "",
+		"  - item one two three four five six", "  - two", "",
+		"> q1 q2 q3 q4 q5 q6 q7", "> q8", "",
+		"    indented words here and there", "plain words"
+	};
+	static const char *const W[] = {
+		"/* aaa bbb ccc ddd", " * eee fff ggg hhh", " * iii", " */", "",
+		"  - item one two", "    three four five", "    six", "  - two", "",
+		"> q1 q2 q3 q4 q5 q6", "> q7 q8", "",
+		"    indented words", "    here and there", "plain words"
+	};
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	size_t i, rev;
+	long n;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 12);
+	v->e.syn = syn_for_ext("c");
+	TAP_ASSERT(t, v->e.syn != NULL);
+	n = reflow_range(&v->e, 0, 11, 20);
+	TAP_CHECKF(t, n == 16, "reflow made %ld lines, want 16", n);
+	TAP_CHECKF(t, text_lines(v->e.t) == 16, "buffer has %zu lines", text_lines(v->e.t));
+	for (i = 0; i < 16 && i < text_lines(v->e.t); i++)
+		TAP_CHECKF(t, vline_is(v, i, W[i]), "line %zu wrong", i);
+	TAP_CHECKF(t, v->e.cy == 15 && v->e.cx == 0, "cursor %zu,%zu", v->e.cy, v->e.cx);
+
+	/* idempotent, and no edit when nothing changes */
+	rev = text_revision(v->e.t);
+	n = reflow_range(&v->e, 0, 15, 20);
+	TAP_CHECK(t, n == 16 && text_revision(v->e.t) == rev);
+
+	/* one undo step brings the original back */
+	text_undo(v->e.t, NULL, NULL);
+	TAP_CHECKF(t, text_lines(v->e.t) == 12, "after undo %zu lines", text_lines(v->e.t));
+	TAP_CHECK(t, vline_is(v, 0, L[0]) && vline_is(v, 4, L[4]));
+
+	/* the paragraph object: ip is the run, ap takes the blank after it */
+	{
+		size_t lo, hi;
+
+		para_lines(&v->e, 5, 0, &lo, &hi);
+		TAP_CHECKF(t, lo == 4 && hi == 5, "ip %zu..%zu", lo, hi);
+		para_lines(&v->e, 5, 1, &lo, &hi);
+		TAP_CHECKF(t, lo == 4 && hi == 6, "ap %zu..%zu", lo, hi);
+		para_lines(&v->e, 3, 0, &lo, &hi);
+		TAP_CHECK(t, lo == 3 && hi == 3);	/* a blank line alone */
+	}
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* gq from the keys: :set tw, gqap reflows the paragraph, u undoes it, and
+ * a count of 20 or more before gq is the width for that one. */
+static void
+t_gq_keys(Test *t)
+{
+	static const char *const L[] = {
+		"one two three four five six seven", "", "eight nine ten eleven twelve"
+	};
+	const char keys[] = "\033OQ:set tw=20\rgqapu30gqq";	/* F2 first */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, L, 3);
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.textwidth == 20, "textwidth %d", v->e.textwidth);
+	/* gqap wrapped at 20 (two lines), u restored one line, then 30gqq
+	 * wrapped the same paragraph at 30: "one two three four five six" */
+	TAP_CHECKF(t, text_lines(v->e.t) == 4, "%zu lines", text_lines(v->e.t));
+	TAP_CHECK(t, vline_is(v, 0, "one two three four five six"));
+	TAP_CHECK(t, vline_is(v, 1, "seven"));
+	TAP_CHECK(t, vline_is(v, 3, "eight nine ten eleven twelve"));
+	TAP_CHECK(t, v->e.vi_gq_width == 0 && v->e.vi_op == 0);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* Typing past textwidth with word wrap on moves the word to a new line;
+ * without word wrap nothing moves. */
+static void
+t_auto_wrap(Test *t)
+{
+	const char keys[] = "aaa bbb ccc";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	v->e.wrap = 1;
+	v->e.textwidth = 8;
+	vedit_run(v);
+	TAP_CHECKF(t, text_lines(v->e.t) == 2, "%zu lines", text_lines(v->e.t));
+	TAP_CHECK(t, vline_is(v, 0, "aaa bbb") && vline_is(v, 1, "ccc"));
+	TAP_CHECKF(t, v->e.cy == 1 && v->e.cx == 3, "cursor %zu,%zu", v->e.cy, v->e.cx);
+	vedit_free(v);
+	memio_free(&m);
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	v->e.wrap = 0;
+	v->e.textwidth = 8;
+	vedit_run(v);
+	TAP_CHECK(t, text_lines(v->e.t) == 1 && vline_is(v, 0, "aaa bbb ccc"));
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* The key-bindings screen scrolls, so an entry past the first screen is reached
  * by paging down. Drives F2 (vi keys), F1 (help), then Space to page down on a
  * short window, and checks a near-bottom vi entry becomes visible. */
@@ -4278,6 +4407,9 @@ const Case tap_cases[] = {
 	{ "split_stacked", t_split_stacked },
 	{ "split_side", t_split_side },
 	{ "split_ex", t_split_ex },
+	{ "reflow", t_reflow },
+	{ "gq_keys", t_gq_keys },
+	{ "auto_wrap", t_auto_wrap },
 #ifdef VEDIT_TERM
 	{ "menu_terminal", t_menu_terminal },
 	{ "tbl_attach", t_tbl_attach },
