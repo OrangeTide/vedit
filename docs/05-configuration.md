@@ -13,13 +13,16 @@ options, and the per-project commands.
 
 `$VEDIT_CONFIG` names a different file. On the command line, `--config
 FILE` names one and `--no-config` skips it. A missing file is ignored. A
-file with a syntax error (a line without `=`, or an unclosed `[`) is
-dropped as a whole; only an explicit `--config` path reports it.
+file with a syntax error (a line without `=`, or an unclosed `[` or
+quote) is dropped as a whole; only an explicit `--config` path reports
+a missing or broken file.
 
 The easiest way to start is **Options > Edit Config** (`:config` in the vi
 keys). It opens the file in a buffer and, when the file does not exist
-yet, fills the buffer with a commented template of every key. Nothing is
-written until you save. Saving the config file applies it at once.
+yet, fills the buffer with a commented template of the common keys.
+Nothing is written until you save. Saving the config file applies it at
+once: a key that is present is applied, a key that was removed keeps
+its last value until restart, and `mail.dir` is read at startup only.
 
 **Options > Reload Config** (`:reload`) re-reads the file after it was
 changed by other means.
@@ -77,14 +80,16 @@ key in upper case with each `.` turned into `_`:
 | `command.<lang>.<name>` | `VEDIT_COMMAND_<LANG>_<NAME>` |
 | `vcs.<name>.<cmd>` | `VEDIT_VCS_<NAME>_<CMD>` |
 
-Those keys and the rendering flags, which have their own variables
-listed in chapter 9, are the only ones that read the environment.
+Those keys, `VEDIT_MOUSE` (chapter 2), and the rendering flags, which
+have their own variables listed in chapter 9, are the only ones that
+read the environment.
 
 ## Every key
 
-The values shown are the defaults in a terminal. gvedit starts with
-`ui.box = utf8`, `ui.colors = 256`, `ui.scroll = on`, and
-`ui.clipboard = on`.
+The values shown are the defaults in a terminal. gvedit draws its own
+window, so it fixes the frame at UTF-8, the colors at 256, and the
+scroll path on, whatever `ui.box`, `ui.colors`, `ui.scroll`, or their
+environment variables say; it starts with `ui.clipboard = on`.
 
 ### `[ui]`: the look
 
@@ -98,7 +103,7 @@ The values shown are the defaults in a terminal. gvedit starts with
 | `scroll` | `off` | use the terminal scroll region when scrolling (chapter 9) |
 | `clipboard` | `off` | also send every copy and cut to the terminal clipboard (chapter 2) |
 | `tabs` | `on` | mark hard tabs with a guide glyph |
-| `paneheight` | `0` | rows for the pane under the text; 0 is a third (chapter 7) |
+| `paneheight` | `0` | rows for the pane under the text, 0 to 500; 0 is a third (chapter 7; builds with terminals) |
 | `mouse` | `on` | mouse reporting (chapter 2) |
 
 ### `[edit]`: editing
@@ -108,8 +113,8 @@ The values shown are the defaults in a terminal. gvedit starts with
 | `mode` | `modeless` | `vi` or `modeless` |
 | `autoindent` | `on` | new lines copy the previous indent |
 | `ignorecase` | `off` | searches ignore case |
-| `shiftwidth` | `0` | columns for vi `>>` and `<<`; 0 is one tab stop |
-| `tabstop` | `8` | the interval between tab stops |
+| `shiftwidth` | `0` | columns for vi `>>` and `<<`, 0 to 32; 0 is one tab stop |
+| `tabstop` | `8` | the interval between tab stops, 1 to 256 |
 | `tabstops` | | a ruler of stops, such as `5 9 17` |
 | `swap` | `on` | keep the crash-recovery journal (chapter 3) |
 | `swapdir` | | where journals go; empty is beside the file |
@@ -123,7 +128,7 @@ The values shown are the defaults in a terminal. gvedit starts with
 | Key | Default | Meaning |
 |---|---|---|
 | `expand` | `off` | `on` indents with spaces |
-| `indent.<lang>.expand` | | the same for one language, such as `[indent "python"]` |
+| `indent.<lang>.expand` | | the same for one language, named as in the table in chapter 4, such as `[indent "sh"]` |
 
 ### `[art]` and `[table]`: the views (chapter 8)
 
@@ -135,9 +140,9 @@ The `[art]` keys apply to a build with terminals.
 | `art.width` | `0` | grid columns, 80 to 1024; 0 takes it from the file |
 | `table.view` | `on` | open `.csv`, `.tsv`, and `.tab` files in the table view |
 | `table.header` | `on` | line 1 is a frozen header row |
-| `table.width` | `10` | the default column width |
+| `table.width` | `10` | the default column width, 1 to 200; 0 means 10 |
 
-### `[syntax]`, `[color]`, `[words]`, `[state]`: highlighting
+### `[syntax]`, `[gitcommit]`, `[color]`, `[words]`, `[state]`: highlighting
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -160,7 +165,7 @@ define a language.
 | `command.<lang>.compile` | | the per-language commands, in a `[command "c"]` section |
 | `command.<lang>.build` | | |
 | `command.<lang>.run` | | |
-| `command.<lang>.run.interactive` | `off` | run on the real terminal rather than in a buffer |
+| `command.<lang>.run.interactive` | `off` | run on the real terminal rather than in a buffer; `compile.interactive` and `build.interactive` do the same for those |
 | `command.<lang>.format` | | a filter that reformats the buffer |
 | `error.pattern` | | an extra build-error pattern; may be repeated |
 
@@ -188,7 +193,7 @@ define a language.
 
 | Key | Meaning |
 |---|---|
-| `dir` | a Maildir++ tree. Setting it enables the Mail menu |
+| `dir` | a Maildir++ tree. Setting it enables the Mail menu at the next start; a leading `~/` is expanded |
 | `from` | the `From:` line of new messages |
 
 ### `[theme "<name>"]`

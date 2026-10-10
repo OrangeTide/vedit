@@ -39,7 +39,7 @@ A new buffer takes its default from the config, per language or globally:
 [indent]
     expand = off         # off = tabs, on = spaces
 
-[indent "c"]
+[indent "c"]              # the language name from the table above
     expand = on          # buffers of this language indent with spaces
 ```
 
@@ -101,7 +101,8 @@ files such as `config` and `COMMIT_EDITMSG`:
 | HTML | `.html .htm .xhtml` |
 | INI | `.ini .cfg .conf .gitconfig .editorconfig .veditrc .desktop .service`, and a file named `config` |
 | git commit message | `COMMIT_EDITMSG`, `MERGE_MSG`, `SQUASH_MSG`, `TAG_EDITMSG`, `.gitmessage` |
-| diff | `.diff .patch .rej`, and the buffers that History and Blame open (chapter 7) |
+| diff | `.diff .patch .rej`, and the buffer that History opens (chapter 7) |
+| blame | the buffer that Blame opens (chapter 7) |
 
 The C grammar colors keywords, types, strings, character and number
 literals, comments, and preprocessor lines. The shell grammar also colors

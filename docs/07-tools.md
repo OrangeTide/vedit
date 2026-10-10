@@ -28,8 +28,9 @@ variables:
 | `$(fileext)` | the extension, without the dot |
 | `$(dir)` | the directory holding the file |
 
-Once a command is configured for the file's language, the **Compile** and
-**Run** menus appear:
+Once a compile or build command is configured for the file's language the
+**Compile** menu appears, and **Run** once a run command is, or once a
+build has produced output:
 
 | Key | Command | Action |
 |---|---|---|
@@ -40,15 +41,19 @@ Once a command is configured for the file's language, the **Compile** and
 | F4 | Next Error | move to the next diagnostic |
 | Shift-F4 | Prev Error | move to the previous diagnostic |
 
-A modified file asks `Save before building? (y)es (n)o` first.
+A modified file asks `Save before building? (y)es (n)o` first; Enter
+means yes and any other key cancels.
 
 The command runs in a terminal buffer (below) shown in the pane under the
 file, labelled Compile, Make, or Run, so the output appears live and in
 color, and a program that prompts can be answered. The buffer stays after
 the command exits, with the exit status on its status line, and the next
-build replaces it. `command.split = off` makes the terminal fill the frame
-instead, and `command.terminal = off` captures the output into a plain
-output pane with no terminal.
+build replaces it; a build still running must be stopped first (Ctrl-W c
+in its buffer). A window too short for the pane runs the command in a
+full-frame terminal buffer. `command.split = off` makes the terminal fill
+the frame instead, and `command.terminal = off` captures the output into
+a full-screen list with no terminal, where `n` and `N` step the
+diagnostics, Enter jumps to one, and Esc or `q` closes it.
 
 A command with a sibling key `run.interactive = on` (or `compile.`,
 `build.`) runs on the real terminal instead, for a program that needs the
@@ -66,7 +71,8 @@ The word after the location is read as the severity. Errors are red in
 the pane, warnings yellow, notes cyan, and the status line counts errors
 and warnings separately. When a build ends with errors the cursor lands on
 the first one; a clean build leaves the terminal in front. F4 steps
-through errors only, or through warnings when there are no errors. A line
+through errors only, or through warnings when there are no errors, or
+through notes when there are only notes. A line
 in the location form with no recognized severity word, such as a linker
 error, counts as an error.
 
@@ -122,8 +128,8 @@ talking to the editor instead:
 |---|---|
 | Ctrl-W m | open the menu bar |
 | Ctrl-W : | an ex command line |
-| Ctrl-W w | the next buffer |
-| Ctrl-W W, Ctrl-W p | the previous buffer |
+| Ctrl-W w | the next buffer (from a terminal in the pane: back to the text) |
+| Ctrl-W W, Ctrl-W p | the previous buffer (the same from the pane) |
 | Ctrl-W 1 to Ctrl-W 9 | switch to that buffer |
 | Ctrl-W n | open another terminal |
 | Ctrl-W r | copy the terminal's output into a new text buffer |
@@ -150,26 +156,31 @@ From a text buffer, Ctrl-W followed by one of these:
 
 | Key | Menu item | Action |
 |---|---|---|
-| s | Terminal > Split Terminal | open a shell in the pane, or focus the one there |
+| S | Terminal > Split Terminal | open a shell in the pane, or focus the one there |
 | b | Terminal > Buffer in Pane | show this buffer in the pane with the previous one above; again to undo |
-| w, W, p, j | | move the focus into the pane, or back out |
+| j, k | | `j` moves the focus into the pane (`w` and `p` too without two text panes), `k` back out of a text buffer there; a terminal there returns with `w` |
 | c, q | Terminal > Close Pane | close the pane. A terminal is closed, a text buffer kept |
 | r, R | Terminal > Repost as Text, as Art | copy the pane terminal's output into a new buffer |
 | +, - | Terminal > Taller Pane, Shorter Pane | change the height a row at a time |
 | : | | an ex command line, in the vi keys |
 
-In the vi keys, `:split` opens a shell in the pane and `:split cmd` runs
+In the vi keys, `:sterm` opens a shell in the pane and `:sterm cmd` runs
 a command there, `:sbuffer [N]` shows this buffer or buffer N there, and
 `:set paneheight=N` sets its height. `ui.paneheight` in the config sets
 the default.
 
 A new pane leaves the focus in the file. The pane's title is drawn
 reversed while the focus is there. With a text buffer there, Ctrl-W w switches between the two buffers and
-editing follows the focused one. The pane holds one thing: opening another
-there hands a terminal back as a plain terminal buffer, or closes it when
-its program has exited. F8 still reaches the pane's buffer, which fills
+editing follows the focused one. The pane holds one thing: a shell or
+build opened there hands a terminal back as a plain terminal buffer, or
+closes it when its program has exited; Buffer in Pane hands it back
+either way. F8 still reaches the pane's buffer, which fills
 the frame while it is current. A window under eight text rows hides the
-pane.
+pane. With two text panes (chapter 3), the pane sits under the
+focused one, Ctrl-W s, w, and c act on the text panes, and Buffer in
+Pane waits until the split is closed. The pane keys work from a text
+buffer outside the vi insert mode; the draw, hex, table, and art views
+take Ctrl-W for themselves and hide the pane.
 
 ## Symbols and tags
 
@@ -220,8 +231,8 @@ saved, or switched to. `vcs.enable = off` turns it off.
 A **VCS** menu appears while the file has version control. Its mnemonic is
 `%`, so F10 then `%` opens it.
 
-- **History** (`:log`) lists the commits that touched the file, newest
-  first. Choosing one opens the commit's diff of the file in a read-only
+- **History** (`:log`) lists the last 200 commits that touched the file,
+  newest first. Choosing one opens the commit's diff of the file in a read-only
   buffer named `file@rev`, with diff highlighting. `RO` shows on the
   status line and edits are refused. Close it with `:bd` or leave it in
   the buffer list.
@@ -231,8 +242,9 @@ A **VCS** menu appears while the file has version control. Its mnemonic is
 - **Commit** (`:commit`) commits the current file on its own. The file
   must be saved first. It opens a message buffer named `file@commit` with
   the file named in `#` comment lines. Write the message, then choose
-  Commit again (or `:commit`) to send it. On success the message buffer
-  closes and the status line shows the commit's first output line.
+  Commit again (or `:commit`) to send it. A message with only comments is
+  refused. On success the message buffer closes, the file's buffer
+  returns, and the status line shows the commit's first output line.
   `:bd!` abandons a message.
 
 ![The history picker over a file in this repository](shot-history.png)

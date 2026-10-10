@@ -30,7 +30,8 @@ View > Indent with Spaces is on. Shift-Tab does the same as Tab.
 
 Hold Shift with any movement key except Ctrl-Home and Ctrl-End to select
 from the cursor. The selection is shown in reverse video. A movement
-without Shift drops it; Ctrl-Home, Ctrl-End, and Esc leave it in place.
+without Shift drops it, Ctrl-Home and Ctrl-End stretch it to the start
+or end of the file, and Esc leaves it in place.
 Typing, Tab, Enter, or a paste replaces the selection with what was
 typed. Backspace and Delete delete it.
 
@@ -55,7 +56,9 @@ clipboard escape; one that does not ignores it. The limit is 100000
 bytes. With `ui.clipboard = on` in the config, every Ctrl-C and Ctrl-X
 also goes to the terminal clipboard.
 
-Text pasted by the terminal (bracketed paste) is inserted as typed.
+Text pasted by the terminal (bracketed paste) is inserted literally: a
+newline takes no auto-indent, a tab stays a tab, and control keys in
+the paste are dropped. It replaces a selection like typing does.
 
 ## Undo and redo
 
@@ -109,8 +112,10 @@ end goes to the last line.
 A left click in the text puts the cursor there. The wheel scrolls three
 lines, and the cursor is pulled along when it would leave the window. A
 click on the menu bar opens that menu, and clicks work in the menus and in
-the Yes/No/Cancel dialogs. Dragging and the right and middle buttons are
-ignored.
+the Yes/No/Cancel dialogs. A click drops the selection. Dragging and the
+right and middle buttons are ignored, and so is the mouse in the hex,
+table, and art views, in terminal buffers, and in the pane under the
+text; only the menu bar answers there.
 
 With the mouse on, the terminal's own text selection usually needs Shift
 held. View > Mouse turns reporting off for the session. `ui.mouse` in the
@@ -123,7 +128,8 @@ config sets the default and a `[mouse "<glob>"]` section matched against
 one undo step. The dialog has a key column, a string or decimal
 comparison, reverse order, and ignore case. Tab moves between the fields,
 Space toggles one, and Enter sorts. With a decimal sort, lines that hold no
-number sort after the rest.
+number sort after the rest, or before them in reverse order. In the
+table view the dialog sorts the data rows by the cursor's column.
 
 ## Inserting a date or a file
 
@@ -172,7 +178,8 @@ tab stops and the indent settings.
 | Ctrl-L | go to line |
 | Ctrl-T | go to a symbol (chapter 7) |
 | Ctrl-] | jump to the tag under the cursor (chapter 7) |
-| Ctrl-W | pane and terminal prefix (chapter 7) |
+| Ctrl-W | split, pane, and terminal prefix (chapters 3 and 7) |
+| F6 | the other pane of a split (chapter 3) |
 | Ctrl-S | save |
 | Ctrl-Q | quit |
 | Insert | draw mode (chapter 8) |

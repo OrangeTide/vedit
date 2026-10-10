@@ -44,8 +44,9 @@ error, and F4 steps through the rest. Chapter 7.
 
 ![A terminal buffer running a build inside the editor frame](shot-term.png)
 
-`:terminal` opens a shell in a buffer, `:split` opens one in the pane,
-and Ctrl-W R turns a terminal's colored output into an `.ans` file.
+`:terminal` opens a shell in a buffer, `:sterm` opens one in the pane,
+and Ctrl-W R turns a terminal's colored output into an art buffer to
+save as an `.ans` file.
 Chapter 7.
 
 ## Git history without leaving the file
@@ -95,7 +96,7 @@ Chapter 10.
 Ctrl-V 5j I// Esc
 ```
 
-Select a block five lines tall, then `I`, type `//`, and Esc comments all
+Select a block six lines tall, then `I`, type `//`, and Esc comments all
 six lines. `:g/TODO/d` deletes every line containing `TODO`, and
 `:%s/\<foo\>/bar/g` renames a word throughout the file. Chapter 6.
 

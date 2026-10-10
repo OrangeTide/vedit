@@ -20,17 +20,26 @@ and standard output.
 
 From top to bottom:
 
-- **The menu bar.** File, Edit, Insert, Search, View, Options, Help, and
-  menus that appear only when they apply: Compile, Run, VCS%, Terminal,
-  and Mail.
-- **The frame.** The file name sits in the top border. The right border is
-  a scrollbar.
+- **The menu bar.** File, Edit, Insert, Search, View, Options, Terminal,
+  Help, and menus that appear only when they apply: Compile, Run, VCS%,
+  and Mail. A menu none of whose items can act right now is hidden, so
+  Insert leaves while a view has no text cursor. On a narrow screen the
+  titles that would collide with Help are not drawn, but Alt+letter
+  still opens them.
+- **The frame.** The file name sits in the top border, as `[2/3] name`
+  when more than one file is open, or `Untitled` for a new buffer. The
+  right border is a scrollbar, and the bottom border scrolls sideways.
+  With two panes (chapter 3) each pane has its own title.
 - **The text.**
-- **The status line.** On the left, `F1=Help` and, in a git working copy,
-  the branch. On the right, the line-ending style (`LF`, `CRLF`, or
-  `NUL`), the cursor's line and column, and a `*` when the buffer has
-  unsaved changes. Flags such as `WRAP` and `NUM` appear here when those
-  view settings are on. A message from the editor, such as `wrote
+- **The status line.** On the left, `F1=Help` and, in a version control
+  working copy, the system and branch, as `git:main`, with `*` added
+  when the file has uncommitted changes and `?` when it is untracked. A
+  mode tag such as `-- DRAW --` comes before `F1=Help`, and the table
+  view puts the cell address and value there. On the right, the
+  line-ending style (`LF`, `CRLF`, or `NUL`), `Line:N  Col:N`, and a `*`
+  when the buffer has unsaved changes. Flags such as `WRAP`, `NUM`, and
+  `RO` appear here when those view settings are on or the buffer is
+  read-only. A message from the editor, such as `wrote
   notes.txt`, replaces the left part until the next key.
 
 ## Typing and moving
@@ -83,13 +92,15 @@ when it has one, so the menus are the place to look when you forget a key.
 
 An item that cannot act right now is grayed and skipped: Paste with an
 empty clipboard, Undo with nothing to undo. A whole menu is hidden when
-none of its items apply: Compile and Run appear once a build command is
-configured for the file's language.
+none of its items apply: Compile appears once a compile or build command
+is configured for the file's language, and Run once a run command is, or
+once a build has produced output.
 
 ## Help
 
 - **F1** shows the key bindings of the active personality. Up and Down
-  scroll it, and Esc or `q` returns.
+  scroll it, PgUp, PgDn, and Space page, Home and End jump, and Esc,
+  Enter, or `q` returns.
 - **Help > Tutorial**, or `t` on the F1 screen, opens the built-in
   walkthroughs: draw mode, terminal buffers, the art view, the table view,
   and crash recovery.
@@ -100,8 +111,8 @@ configured for the file's language.
 vedit has two personalities. The default is the modeless EDIT personality
 described in this chapter and the next: keys always insert text, and
 commands are control keys and menus. The other is a vi: keys are commands
-until you enter insert mode. **F2** switches between them, and the status
-line shows `-- NORMAL --` or `-- INSERT --` while the vi keys are active.
+until you enter insert mode. **F2** switches between them (from the vi insert mode, press Esc
+first), and the status line shows `-- NORMAL --` or `-- INSERT --` while the vi keys are active.
 The vi personality is described in chapter 6, which assumes no previous
 knowledge of vi. The config file can make it the default (chapter 5).
 

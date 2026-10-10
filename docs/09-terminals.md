@@ -46,13 +46,13 @@ including the syntax colors, maps to the nearest ANSI color. Config:
 ## Slow links
 
 Only the rows that changed are sent on each redraw, and within a row only
-the columns between the first and last change. On the `black` scheme a
-run of trailing blanks is cleared with one erase-to-end-of-line.
+the columns between the first and last change. A long run of blanks on
+the default background is cleared with one erase-to-end-of-line.
 
 `--scroll`, or `VEDIT_SCROLL=1`, or `ui.scroll = on`, also uses the
 terminal's scroll region when the view scrolls or a line is inserted, so
-only the one newly exposed row is repainted. It is off by default and
-needs VT100 scroll-region support. `docs/demo.html` shows the byte
+only the one newly exposed row is repainted. It is off by default in a
+terminal, on in gvedit, and needs VT100 scroll-region support. `docs/demo.html` shows the byte
 counts with and without it.
 
 ## Small windows
@@ -65,7 +65,9 @@ size the screen shows `window too small` until the window grows.
 
 gvedit is the editor in a window of its own, for a desktop without a
 terminal emulator and for Windows and macOS. It draws the screen with a
-bitmap font and needs SDL3 at build and run time.
+bitmap font and needs SDL3 at build and run time. It always draws the
+UTF-8 frame in 256 colors with the scroll path on; the flags, variables,
+and config keys above for those three have no effect in it.
 
 ```sh
 make gvedit
@@ -124,3 +126,7 @@ Unix terminal, a lone Escape does not reach the program.
 | `VEDIT_MOUSE=1` or `0` (also `on`, `off`, `yes`, `no`) | mouse reporting, overriding the config |
 | `VEDIT_TAGS_FILE`, `VEDIT_CC_FILE`, and the other per-project keys | chapter 5 |
 | `VEDIT_GUI_TRACE`, `VEDIT_WIN_LOG`, `VEDIT_WIN_TRACE`, `VEDIT_WIN_RENDER` | gvedit and Windows, above |
+| `LANG`, then `LC_ALL` | the UTF-8 test behind the frame default |
+| `TERM`, `COLORTERM` | the color depth default |
+| `SHELL` | the shell of `:terminal` and the pane; `/bin/sh` without it |
+| `XDG_CONFIG_HOME`, `HOME` | where the config file is (chapter 5) |

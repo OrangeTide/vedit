@@ -12,7 +12,8 @@ chapter.
 | `guterm.h` | the vendored window binding used by gvedit |
 | `Makefile` | build, test, install, screenshots |
 | `man/vedit.1` | the man page |
-| `docs/` | this manual, the screenshots, and the sample `.ans` scenes |
+| `docs/` | this manual, the screenshots and `screenshots.sh` that renders them, `demo.html`, and the sample `.ans` scenes |
+| `docs/site/` | the pandoc build of the manual for GitHub Pages (`make -C docs/site`) |
 | `tests/` | the test suite and the vendored `taptest` driver |
 | `_out/<triple>/bin/` | build output, one directory per target |
 
@@ -53,10 +54,10 @@ the user's point of view.
 ## Tests
 
 ```sh
-make test               # unit and render tests through the taptest driver
+make test               # unit, render, terminal, and fault tests through taptest
 make torture            # pseudo-random fuzz of the parsers and regex engine
-make asan               # tests and torture under AddressSanitizer
-make ubsan              # tests and torture under UndefinedBehaviorSanitizer
+make asan               # unit and render tests and torture under AddressSanitizer
+make ubsan              # the same under UndefinedBehaviorSanitizer
 make cov                # line coverage of vedit.c from the unit tests
 make cov-term           # line coverage of the terminal-buffer code
 ```
@@ -72,10 +73,13 @@ helpers: UTF-8, rune width, color mapping, word-wrap layout, the syntax
 tokenizer, buffer edits and undo. `test_render.c` drives the whole editor
 over an in-memory `vedit_io` (`tests/memio.h`) that feeds scripted
 keystrokes and captures the output, so cursor movement, wrap, the gutter,
-and status flags are tested without a terminal.
+and status flags are tested without a terminal. `test_term.c` drives the
+terminal buffers and the pane over a pipe instead of a PTY, and
+`test_termfault.c` wraps the allocator to fail on demand.
 
 `tests/torture.c` fuzzes the untrusted-input surfaces: the regex engine as
-search and replace use it, the config parser, and the UTF-8 codec. It uses
+search and replace use it, the config parser, the UTF-8 codec, the
+clipboard, and random edits with undo. It uses
 a deterministic PRNG and checks a few invariants, leaning on the sanitizers
 to catch memory and undefined-behavior faults. `TORTURE_ROUNDS` sets the
 iteration count. To reproduce a run, pass its seed as the second argument to
@@ -89,11 +93,14 @@ request against it:
 - build and test on gcc and clang
 - the asan and ubsan suites
 - the torture fuzz
-- cross builds run under qemu
+- cross builds (aarch64, armhf, riscv64) run under qemu
 - a static musl build
 - the slim builds (`VEDIT_NO_TERM`, `VEDIT_NO_ART`, both) with their tests
-- macOS
+- macOS, without the fault tests
 - gvedit on Linux, and a gvedit cross build for Windows
+
+`.github/workflows/docs.yml` renders `docs/site` and publishes it to GitHub
+Pages on a push to `main` that touches `docs/`.
 
 A single `ci-ok` job gates on all of them, so branch protection needs only
 that one check.

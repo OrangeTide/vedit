@@ -56,7 +56,8 @@ The manual is in `docs/`, in reading order:
 2. [Editing](docs/02-editing.md): moving, selecting, clipboard, undo,
    find and replace, with the EDIT keys
 3. [Files and buffers](docs/03-files.md): the file browser, several files
-   at once, line endings, crash recovery, large files
+   at once, two panes, line endings, crash recovery, the lock file,
+   large files
 4. [View settings](docs/04-view.md): line numbers, word wrap, tabs and
    indentation, color schemes, syntax highlighting
 5. [Configuration](docs/05-configuration.md): the config file and every key

@@ -23,7 +23,7 @@ names the next state.
     list = if else while return
     list = for do break continue
 
-[state "mini.idle"]       # the first state is the start state
+[state "mini.idle"]       # the first state is the start state (or start = in [language])
     color = text
     rule = "0-9"       num   recolor
     rule = "a-zA-Z_"   word  buffer
@@ -210,11 +210,12 @@ use different clients.
 
 Each define removes a feature from the binary. `VEDIT_NO_TERM` and
 `VEDIT_NO_ART` are also make variables (`make VEDIT_NO_TERM=1`); the
-others go in `CFLAGS`.
+others go in `CFLAGS` (`make CFLAGS+=-DVEDIT_NO_MAIL`, so the default
+flags stay).
 
 | Define | Removes |
 |---|---|
-| `VEDIT_NO_TERM` | terminal buffers, the pane's shell, `:terminal`, `:split`, `:sbuffer`, `:repost`, and the Terminal menu |
+| `VEDIT_NO_TERM` | terminal buffers, the pane under the text with its Ctrl-W keys and `:set paneheight`, `:terminal`, `:sterm`, `:sbuffer`, `:repost`, and the Terminal menu. The two text panes stay |
 | `VEDIT_NO_ART` | the art view. The VT emulator goes once both this and `NO_TERM` are set |
 | `VEDIT_NO_TOOLS` | the build commands, the Compile, Run, and VCS menus, the output pane, and `:format`. `:!`, `:log`, `:blame`, and `:commit` remain and report that the feature is unavailable |
 | `VEDIT_NO_MAIL` | the Mail menu and commands |

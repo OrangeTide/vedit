@@ -60,7 +60,7 @@ The keys are draw mode's, applied to cells:
 | Tab | the next 8-column stop |
 | typing | overwrite the cell with the glyph in the current pen. Wide glyphs take two cells |
 | Backspace, Delete | erase the cell to the left, or under the cursor |
-| Shift+arrows, Ctrl-C, Ctrl-X, Ctrl-V, Ctrl-B | rectangles, as in draw mode. Cells keep their colors |
+| Shift+arrows, Ctrl-C, Ctrl-X, Ctrl-V, Ctrl-B | rectangles, as in draw mode, but Ctrl-B draws the box with line-drawing glyphs in the pen. Cells keep their colors |
 | Ctrl-Z, Ctrl-Y | undo, redo |
 | Ctrl-S, Ctrl-Q, F1, F8 | as usual |
 
@@ -126,7 +126,7 @@ again.
 | go to a cell | | `:cell C7` |
 | insert a row above, below | Edit menu inserts above; `:rowadd`, `:rowadd!` | `O`, `o` |
 | delete the row | Edit menu, `:rowdel` | `dd` |
-| copy, paste rows | `:rowdel` copies; `p`, `P` paste | `yy`, `p` (below), `P` (above) |
+| copy, paste rows | | `yy`, `p` (below), `P` (above); `dd` copies too |
 | insert a column left, right | Edit menu, `:coladd`, `:coladd!` | the same |
 | delete the column | Edit menu, `:coldel` | the same |
 | undo, redo | Ctrl-Z, Ctrl-Y | `u`, Ctrl-R |
@@ -157,7 +157,9 @@ row's only cell is cleared rather than removed.
 
 Other commands:
 
-- `:table ,`, `:table ;`, `:table tab`, `:table pipe` force a delimiter.
+- `:table ,`, `:table ;`, `:table tab`, `:table pipe`, or any single
+  character, force a delimiter; `comma` and `semicolon` are accepted
+  too, and a bare `:table` toggles the view.
   `:table off` leaves the view. `:table header` and `:table noheader` say
   whether line 1 is a frozen header row.
 - `:colwidth N` sets the current column's width and `:colwidth N all`
@@ -174,7 +176,9 @@ quote cannot swallow the rest of the file.
 **View > Hex Dump** shows the buffer as a hex dump and lets you edit the
 bytes. Choose it again, or press `q`, or Esc with no selection, to return to
 the text view.
-It works from either personality and has no key of its own.
+It works from either personality and has no key of its own. The letter
+commands below act in the hex column; in the text column every printable
+character writes a byte.
 
 Each row shows an offset, the bytes in hex with a gap after every eight,
 and the same bytes as text with `.` for the unprintable ones. The cursor
@@ -246,8 +250,8 @@ program submits those.
 ### Reading
 
 - **Mail > Folders** (`:mail`) lists the folders. Choosing one lists its
-  messages newest first, with `N` on unread ones and `A` on answered
-  ones. **Mail > Messages** (`:mail .`) returns to the last folder, and
+  messages newest first, with `N` on unread ones, `A` on answered
+  ones, and `F` on flagged ones. **Mail > Messages** (`:mail .`) returns to the last folder, and
   `:mail Sent` lists a folder by name.
 - Choosing a message opens it: the text part in a buffer headed by From,
   To, Cc, Date, and Subject, and every other MIME part as its own buffer
@@ -278,12 +282,12 @@ program submits those.
   threading headers set, and the text quoted with `> `.
 - **Mail > Send** (`:send`) completes the message (Date, Message-ID, and
   the MIME headers for a UTF-8 text body) and stores it under
-  `Outbox/new`. The buffer is then clean, and a replied-to message is
+  `.Outbox/new` in the Maildir++ tree. The buffer is then clean, and a replied-to message is
   marked answered. Sending needs a `To:` line.
 
 ### Delivery
 
-Something has to submit each file under `Outbox/new` and move it to
+Something has to submit each file under `.Outbox/new` and move it to
 `Sent`. Any submission client that takes a message on standard input
 works: `sendmail -t`, `msmtp -t`, or `ssmtp -t`. This script drains the
 queue and can run from cron or from a terminal buffer:
