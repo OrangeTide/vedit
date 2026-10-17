@@ -260,10 +260,13 @@ program submits those.
   list, and `x` removes every marked message from the folder after a
   confirmation. The bottom border names these keys.
 - Choosing a message opens it: the text part in a buffer headed by From,
-  To, Cc, Date, and Subject, and every other MIME part as its own buffer
+  To, Cc, Date, and Subject, and every other text part as its own buffer
   named by part number and type, reachable through File > Buffer List.
-  Save As writes a part to a file. Quoted-printable and base64 are
-  decoded. Opening a message marks it read.
+  Non-text parts (images, PDFs, and the like) are not opened; the header
+  block lists them with a number, type, and size. **Mail > Save
+  Attachment** (`:mail save N`, or `:mail save N path`) writes part N to a
+  file, by default its own name in the current directory. Quoted-printable
+  and base64 are decoded. Opening a message marks it read.
 - The message buffers are ordinary buffers, so search, copy, and the vi
   keys work in them, and `:bd` closes one.
 
@@ -284,6 +287,10 @@ program submits those.
 
   A header left empty is dropped when the message is sent. Others, such
   as `Bcc:` or `Reply-To:`, can be added.
+- **Mail > Attach File** (`:mail attach path`) adds an `Attach: path` line
+  to the top of the compose buffer. Each such line attaches that file when
+  the message is sent. The lines are ordinary text, so you can add or
+  remove them by hand.
 - **Mail > Reply** (`:mail reply`) does the same for the message shown,
   addressed to its Reply-To or From, with `Re:` on the subject, the
   threading headers set, and the text quoted with `> `. **Mail > Reply
@@ -294,11 +301,15 @@ program submits those.
   Subject, To, and Cc lines followed by its text, below a marker line.
   The original's other parts are not attached.
 - **Mail > Send** (`:mail send`) completes the message (Date,
-  Message-ID, and the MIME headers for a UTF-8 text body) and stores it
-  under `.Outbox/new` in the Maildir++ tree. Header text outside ASCII,
-  such as an accented name or subject, goes out as encoded words; the
-  addresses themselves stay as typed. The buffer is then clean, and a
-  replied-to message is marked answered. Sending needs a `To:` line.
+  Message-ID, and the MIME headers) and stores it under `.Outbox/new` in
+  the Maildir++ tree. With no attachments the body goes out as a UTF-8
+  text part. With `Attach:` lines it becomes a `multipart/mixed` message:
+  the body first, then each file base64-encoded, with a type guessed from
+  its extension. Header text outside ASCII, such as an accented name or
+  subject, goes out as encoded words; the addresses themselves stay as
+  typed. An attachment larger than `mail.maxattach` megabytes (25 by
+  default) fails the send. The buffer is then clean, and a replied-to
+  message is marked answered. Sending needs a `To:` line.
 
 ### Delivery
 
@@ -336,5 +347,3 @@ done
 ```
 
 A message that fails to submit stays in the Outbox.
-
-Not supported: attachments on outgoing mail.

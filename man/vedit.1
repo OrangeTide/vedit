@@ -43,9 +43,11 @@ With
 .B mail.dir
 set in the configuration, the Mail menu (and the
 .B :mail
-commands: folders, compose, reply, replyall, forward, send, deliver) reads a
+commands: folders, compose, reply, replyall, forward, attach, send, save,
+deliver) reads a
 Maildir++ tree, marks, moves and expunges messages, and composes replies and
-new messages, which are queued in its Outbox folder and delivered through
+new messages with file attachments, which are queued in its Outbox folder and
+delivered through
 .BR mail.sendcmd .
 .SH OPTIONS
 .TP
@@ -347,7 +349,8 @@ file mapping, format-on-save),
 .BR [error] ,
 .BR [syntax] ,
 .B [mail]
-(dir, a Maildir++ tree that enables the Mail menu, from, and sendcmd),
+(dir, a Maildir++ tree that enables the Mail menu, from, sendcmd, and
+maxattach),
 .B [gitcommit]
 (subject and body, the columns past which a commit message is marked),
 .B [insert]

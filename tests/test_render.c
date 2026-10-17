@@ -1075,6 +1075,122 @@ t_mail_flow(Test *t)
 	(void)system(path);
 }
 
+/* Outbound: :mail attach adds a file to a compose and :mail send emits a
+ * multipart/mixed message with the file base64-encoded, the Attach: line
+ * gone. Inbound: a binary part is listed, not opened as a buffer, and
+ * :mail save writes its decoded bytes to disk. */
+static void
+t_mail_attach(Test *t)
+{
+	char root[] = "/tmp/vedit_maXXXXXX";
+	char path[PATH_MAX], att[PATH_MAX], out[PATH_MAX], exbuf[256], *data;
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	size_t len;
+	FILE *f;
+	int i, found;
+
+	TAP_ASSERT(t, mkdtemp(root) != NULL);
+	snprintf(path, sizeof(path), "%s/new", root);
+	mkdir_p(path);
+
+	/* a file to attach: "hi there\n" base64-encodes to aGkgdGhlcmUK */
+	snprintf(att, sizeof(att), "%s/pic.png", root);
+	f = fopen(att, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("hi there\n", f);
+	fclose(f);
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_mail(v, cli_mail_setup(root));
+	vedit_run(v);
+
+	/* compose, attach, send */
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "mail compose bob@x")) ==
+	    REQ_CONTINUE);
+	snprintf(exbuf, sizeof(exbuf), "mail attach %s", att);
+	TAP_CHECK(t, vi_ex_exec(&v->e, exbuf) == REQ_CONTINUE);
+	snprintf(path, sizeof(path), "Attach: %s", att);
+	TAP_CHECK(t, vline_is(v, 0, path));
+	TAP_CHECK(t, vi_ex_exec(&v->e, strcpy(exbuf, "mail send")) == REQ_CONTINUE);
+	TAP_CHECKF(t, strstr(v->e.status, "attachment") != NULL, "status: %s",
+	    v->e.status);
+	{
+		Sumacc2 acc = { 0, "" };
+
+		TAP_CHECK(t, v->e.mail->list(v->e.mail->ctx, "Outbox", sum2_emit,
+		    &acc) == 0 && acc.n == 1);
+		TAP_ASSERT(t, v->e.mail->fetch(v->e.mail->ctx, "Outbox", acc.uid,
+		    &data, &len) == 0);
+	}
+	TAP_CHECK(t, strstr(data, "Content-Type: multipart/mixed;") != NULL);
+	TAP_CHECK(t, strstr(data, "Content-Type: text/plain; charset=utf-8")
+	    != NULL);
+	TAP_CHECK(t, strstr(data, "Content-Type: image/png; name=\"pic.png\"")
+	    != NULL);
+	TAP_CHECK(t, strstr(data,
+	    "Content-Disposition: attachment; filename=\"pic.png\"") != NULL);
+	TAP_CHECK(t, strstr(data, "Content-Transfer-Encoding: base64") != NULL);
+	TAP_CHECK(t, strstr(data, "aGkgdGhlcmUK") != NULL);
+	TAP_CHECK(t, strstr(data, "\nAttach:") == NULL);	/* stripped */
+	free(data);
+
+	/* inbound: a message with a binary attachment part */
+	snprintf(path, sizeof(path), "%s/new/1700000009.z.host", root);
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("From: Zoe <zoe@x>\nTo: me@example.org\nSubject: files\n"
+	    "Date: Tue, 7 Oct 2026 11:00:00 +0000\n"
+	    "Content-Type: multipart/mixed; boundary=cc\n\n"
+	    "--cc\nContent-Type: text/plain\n\nsee attached\n"
+	    "--cc\nContent-Type: application/octet-stream; name=blob.dat\n"
+	    "Content-Transfer-Encoding: base64\n"
+	    "Content-Disposition: attachment; filename=blob.dat\n\n"
+	    "aGkgdGhlcmUK\n--cc--\n", f);
+	fclose(f);
+	TAP_CHECK(t, mail_open_message(&v->e, "INBOX", "1700000009.z.host") == 0);
+	/* the binary part did NOT open as a buffer: only the main text did */
+	found = 0;
+	for (i = 0; i < v->e.nbuf; i++)
+		if (v->e.bufs[i].mref &&
+		    strstr(v->e.bufs[i].mref->label, "blob.dat"))
+			found = 1;
+	TAP_CHECK(t, !found);
+	/* it is listed in the header block of the open message */
+	found = 0;
+	for (i = 0; i < 12; i++) {
+		size_t ll;
+		const char *ln = text_line(v->e.t, i, &ll);
+
+		if (ln && ll && memmem(ln, ll, "blob.dat", 8))
+			found = 1;
+	}
+	TAP_CHECK(t, found);
+	/* save part 2 to disk; the decoded bytes are "hi there\n" */
+	snprintf(out, sizeof(out), "%s/saved.bin", root);
+	snprintf(exbuf, sizeof(exbuf), "mail save 2 %s", out);
+	TAP_CHECK(t, vi_ex_exec(&v->e, exbuf) == REQ_CONTINUE);
+	f = fopen(out, "rb");
+	TAP_ASSERT(t, f != NULL);
+	{
+		char got[32];
+		size_t gl = fread(got, 1, sizeof(got), f);
+
+		fclose(f);
+		TAP_CHECKF(t, gl == 9 && memcmp(got, "hi there\n", 9) == 0,
+		    "saved %zu bytes", gl);
+	}
+
+	vedit_free(v);
+	memio_free(&m);
+	snprintf(path, sizeof(path), "rm -rf %s", root);
+	(void)system(path);
+}
+
 #ifdef VEDIT_MAIL
 /* The Mail menu is hidden without a backend. With one, Folders and Compose
  * are enabled, Messages waits for a listed folder, Reply for a message
@@ -4778,6 +4894,7 @@ const Case tap_cases[] = {
 	{ "save_creates_dir", t_save_creates_dir },
 #ifdef VEDIT_MAIL
 	{ "mail_flow", t_mail_flow },
+	{ "mail_attach", t_mail_attach },
 	{ "mail_more", t_mail_more },
 	{ "mail_menu", t_mail_menu },
 #endif

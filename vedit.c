@@ -10953,7 +10953,8 @@ typedef enum menu_act {
 #endif
 #ifdef VEDIT_MAIL
 	MA_MAIL_FOLDERS, MA_MAIL_INDEX, MA_MAIL_COMPOSE, MA_MAIL_REPLY,
-	MA_MAIL_REPLY_ALL, MA_MAIL_FORWARD, MA_MAIL_SEND, MA_MAIL_DELIVER,
+	MA_MAIL_REPLY_ALL, MA_MAIL_FORWARD, MA_MAIL_ATTACH, MA_MAIL_SEND,
+	MA_MAIL_SAVE, MA_MAIL_DELIVER,
 #endif
 	MA_HELP, MA_TUTORIAL, MA_ABOUT,
 } Menuact;
@@ -11137,7 +11138,9 @@ static const Menuitem mi_mail[] = {
 	{ "&Reply",		"",	":mail reply",	MA_MAIL_REPLY },
 	{ "Reply &All",		"",	":mail replyall",	MA_MAIL_REPLY_ALL },
 	{ "For&ward",		"",	":mail forward",	MA_MAIL_FORWARD },
+	{ "Attac&h File...",	"",	":mail attach",	MA_MAIL_ATTACH },
 	{ "&Send",		"",	":mail send",	MA_MAIL_SEND },
+	{ "Sa&ve Attachment...","",	":mail save",	MA_MAIL_SAVE },
 	{ "",			"",	"",		MA_SEP },
 	{ "&Deliver Outbox",	"",	":mail deliver",	MA_MAIL_DELIVER },
 };
@@ -11567,9 +11570,12 @@ menu_item_enabled(const Editor *e, Menuact act)
 	case MA_MAIL_REPLY:
 	case MA_MAIL_REPLY_ALL:
 	case MA_MAIL_FORWARD:
+	case MA_MAIL_SAVE:
 		return e->mail != NULL && e->mref && e->mref->kind == MREF_MESSAGE;
 	case MA_MAIL_DELIVER:
 		return e->mail != NULL && e->mail->move != NULL;
+	case MA_MAIL_ATTACH:
+		return e->mref && e->mref->kind == MREF_COMPOSE;
 	case MA_MAIL_SEND:
 		return e->mail != NULL && e->mail->send && e->mref &&
 		    e->mref->kind == MREF_COMPOSE;
@@ -19711,6 +19717,7 @@ static const struct {
 	{ ":mail [folder|.]",	"Mail: pick a folder, or list one (. = the last)" },
 	{ "  d u m x in the list",	"Mark deleted, unmark, move, expunge the marked" },
 	{ ":mail compose [to]",	"Start a message; :mail reply, replyall, forward [to]" },
+	{ ":mail attach PATH",	"Attach a file to the compose; :mail save [N] saves a part" },
 	{ ":mail send  :mail deliver",	"Queue the compose buffer / run mail.sendcmd on the queue" },
 #endif
 	{ "F1 / F2",		"Show this help / back to modeless keys" },
@@ -22892,6 +22899,93 @@ mail_b64_encode(const unsigned char *in, size_t n, char *out)
 	return o;
 }
 
+/* Write data[0..n) as base64 to fp, wrapped at 76 columns (57 input bytes a
+ * line) as mail bodies want. */
+static void
+mail_b64_write(FILE *fp, const unsigned char *data, size_t n)
+{
+	char line[80];			/* 57 bytes -> 76 chars + NUL */
+	size_t i;
+
+	for (i = 0; i < n; i += 57) {
+		size_t chunk = n - i < 57 ? n - i : 57;
+
+		mail_b64_encode(data + i, chunk, line);
+		fputs(line, fp);
+		fputc('\n', fp);
+	}
+}
+
+/* A MIME media type for an outgoing attachment, from its extension. Anything
+ * not in the small table is application/octet-stream. */
+static const char *
+mail_ctype_for(const char *path)
+{
+	static const struct { const char *ext, *type; } map[] = {
+		{ "txt", "text/plain" }, { "md", "text/markdown" },
+		{ "csv", "text/csv" }, { "html", "text/html" },
+		{ "htm", "text/html" }, { "c", "text/x-c" },
+		{ "h", "text/x-c" }, { "patch", "text/x-patch" },
+		{ "diff", "text/x-patch" }, { "png", "image/png" },
+		{ "jpg", "image/jpeg" }, { "jpeg", "image/jpeg" },
+		{ "gif", "image/gif" }, { "svg", "image/svg+xml" },
+		{ "pdf", "application/pdf" }, { "zip", "application/zip" },
+		{ "gz", "application/gzip" }, { "tar", "application/x-tar" },
+		{ "json", "application/json" }, { NULL, NULL }
+	};
+	const char *dot = strrchr(path, '.');
+	const char *slash = strrchr(path, '/');
+	int i;
+
+	if (!dot || (slash && dot < slash) || !dot[1])
+		return "application/octet-stream";
+	dot++;
+	for (i = 0; map[i].ext; i++)
+		if (strcasecmp(dot, map[i].ext) == 0)
+			return map[i].type;
+	return "application/octet-stream";
+}
+
+/* Read the whole file at path into *buf (malloc'd), with *len its size.
+ * Returns 0, -1 on an open/read error, or -2 when it is larger than cap. */
+static int
+mail_read_file(const char *path, unsigned char **buf, size_t *len, size_t cap)
+{
+	FILE *f = fopen(path, "rb");
+	long sz;
+	size_t got;
+
+	if (!f)
+		return -1;
+	if (fseek(f, 0, SEEK_END) != 0 || (sz = ftell(f)) < 0 ||
+	    fseek(f, 0, SEEK_SET) != 0) {
+		fclose(f);
+		return -1;
+	}
+	if ((size_t)sz > cap) {
+		fclose(f);
+		return -2;
+	}
+	*buf = malloc((size_t)sz ? (size_t)sz : 1);
+	if (!*buf) {
+		fclose(f);
+		return -1;
+	}
+	got = fread(*buf, 1, (size_t)sz, f);
+	fclose(f);
+	*len = got;
+	return 0;
+}
+
+/* The basename of path (the part after the last '/'). */
+static const char *
+mail_basename(const char *path)
+{
+	const char *slash = strrchr(path, '/');
+
+	return slash ? slash + 1 : path;
+}
+
 /* ---- RFC 2047 encoded words ---- */
 
 /* Append the bytes buf[0..n) of charset cs to out as UTF-8: UTF-8 and ASCII
@@ -23082,6 +23176,7 @@ mail_put_header(FILE *fp, const char *name, size_t nlen, const char *val)
 /* ---- MIME parts ---- */
 
 #define MAIL_PARTS_MAX	32
+#define MAIL_ATTACH_MAX	16	/* outgoing attachments per message */
 
 /* One leaf of the MIME tree: its own headers and its raw (still encoded)
  * body, both pointing into the fetched message. */
@@ -23330,11 +23425,13 @@ mail_open_message(Editor *e, const char *folder, const char *uid)
 	snprintf(ref.folder, sizeof(ref.folder), "%s", folder);
 	snprintf(ref.uid, sizeof(ref.uid), "%s", uid);
 
-	/* the other parts first, each in its own buffer */
+	/* other text parts open as their own buffers; non-text parts are left
+	 * on disk and listed in the main part's header block below, to be
+	 * written out on demand with :mail save */
 	for (i = 0; i < n; i++) {
 		char plabel[160];
 
-		if (i == main_i)
+		if (i == main_i || strncmp(parts[i].type, "text/", 5) != 0)
 			continue;
 		body = mail_part_decode(&parts[i], &blen);
 		if (!body)
@@ -23365,8 +23462,40 @@ mail_open_message(Editor *e, const char *folder, const char *uid)
 	if (cc[0])
 		fprintf(fp, "Cc: %s\n", cc);
 	fprintf(fp, "Date: %s\nSubject: %s\n", date, subject);
-	if (n > 1)
-		fprintf(fp, "Parts: %d (the others are open as buffers)\n", n);
+	{
+		int bufparts = 0, listed = 0;
+
+		for (i = 0; i < n; i++)
+			if (i != main_i &&
+			    strncmp(parts[i].type, "text/", 5) == 0)
+				bufparts++;
+		if (bufparts > 0)
+			fprintf(fp, "Parts: %d text part%s open as buffer%s\n",
+			    bufparts, bufparts == 1 ? "" : "s",
+			    bufparts == 1 ? "" : "s");
+		for (i = 0; i < n; i++) {
+			size_t approx;
+
+			if (i == main_i ||
+			    strncmp(parts[i].type, "text/", 5) == 0)
+				continue;
+			if (!listed) {
+				fprintf(fp, "Attachments (save with "
+				    ":mail save N [path]):\n");
+				listed = 1;
+			}
+			approx = strcmp(parts[i].enc, "base64") == 0
+			    ? parts[i].blen / 4 * 3 : parts[i].blen;
+			if (approx >= 1024)
+				fprintf(fp, "  [%d] %s (%s, ~%zu KB)\n", i + 1,
+				    parts[i].name[0] ? parts[i].name : "(no name)",
+				    parts[i].type, approx / 1024);
+			else
+				fprintf(fp, "  [%d] %s (%s, %zu bytes)\n", i + 1,
+				    parts[i].name[0] ? parts[i].name : "(no name)",
+				    parts[i].type, approx);
+		}
+	}
 	fputc('\n', fp);
 	fwrite(body, 1, blen, fp);
 	fclose(fp);
@@ -23382,7 +23511,8 @@ mail_open_message(Editor *e, const char *folder, const char *uid)
 	if (e->mail->store)
 		(void)e->mail->store(e->mail->ctx, folder, uid, VEDIT_MAIL_SEEN, 0);
 	set_status(e, "%.60s  [%d/%d]%s", subject[0] ? subject : "(no subject)",
-	    e->cur + 1, e->nbuf, n > 1 ? "  (more parts in the buffer list)" : "");
+	    e->cur + 1, e->nbuf,
+	    n > 1 ? "  (parts in the buffer list and header block)" : "");
 	return 0;
 }
 
@@ -23725,6 +23855,14 @@ mail_send(Editor *e)
 	char *buf = NULL, *out = NULL;
 	size_t len = 0, olen = 0, hlen, i;
 	char to[1000], date[80], host[256], msgid[320];
+	char *att_path[MAIL_ATTACH_MAX];
+	unsigned char *att_data[MAIL_ATTACH_MAX];
+	size_t att_len[MAIL_ATTACH_MAX];
+	int natt = 0, a;
+	long capmb;
+	size_t cap;
+	const char *mcap;
+	char boundary[80];
 	FILE *fp;
 	int rc;
 	static unsigned seq;
@@ -23800,9 +23938,49 @@ mail_send(Editor *e)
 			break;
 		}
 		val[vl] = '\0';
-		if (vl > 0)
-			mail_put_header(fp, buf + name_i, colon - name_i, val);
+		if (vl > 0) {
+			/* Attach: PATH lines name files to attach; they drive the
+			 * MIME assembly below and are not sent as headers. */
+			if (colon - name_i == 6 &&
+			    strncasecmp(buf + name_i, "Attach", 6) == 0) {
+				if (natt < MAIL_ATTACH_MAX &&
+				    (att_path[natt] = strdup(val)) != NULL)
+					natt++;
+			} else {
+				mail_put_header(fp, buf + name_i, colon - name_i,
+				    val);
+			}
+		}
 		i = eol + 1;
+	}
+	/* Read the attachments now, so a missing or oversized file aborts the
+	 * send before anything reaches the backend. */
+	mcap = cfg_get(g_cfg, "mail.maxattach");
+	capmb = mcap ? atol(mcap) : 25;
+	if (capmb <= 0)
+		capmb = 25;
+	cap = (size_t)capmb * 1024 * 1024;
+	for (a = 0; a < natt; a++) {
+		int r = mail_read_file(att_path[a], &att_data[a], &att_len[a],
+		    cap);
+		int k;
+
+		if (r != 0) {
+			if (r == -2)
+				set_status(e, "attachment over %ld MB: %.80s",
+				    capmb, att_path[a]);
+			else
+				set_status(e, "cannot read attachment: %.80s",
+				    att_path[a]);
+			for (k = 0; k < a; k++)
+				free(att_data[k]);
+			for (k = 0; k < natt; k++)
+				free(att_path[k]);
+			fclose(fp);
+			free(out);
+			free(buf);
+			return -1;
+		}
 	}
 	mail_date_now(date, sizeof(date));
 	if (gethostname(host, sizeof(host)) != 0 || !host[0])
@@ -23810,13 +23988,45 @@ mail_send(Editor *e)
 	host[sizeof(host) - 1] = '\0';
 	snprintf(msgid, sizeof(msgid), "<%ld.%ld.%u@%s>", (long)time(NULL),
 	    (long)getpid(), ++seq, host);
-	fprintf(fp, "Date: %s\nMessage-ID: %s\nMIME-Version: 1.0\n"
-	    "Content-Type: text/plain; charset=utf-8\n"
-	    "Content-Transfer-Encoding: 8bit\n\n", date, msgid);
-	if (hlen < len)
-		fwrite(buf + hlen, 1, len - hlen, fp);
+	if (natt == 0) {
+		fprintf(fp, "Date: %s\nMessage-ID: %s\nMIME-Version: 1.0\n"
+		    "Content-Type: text/plain; charset=utf-8\n"
+		    "Content-Transfer-Encoding: 8bit\n\n", date, msgid);
+		if (hlen < len)
+			fwrite(buf + hlen, 1, len - hlen, fp);
+	} else {
+		/* multipart/mixed: the body as the first text part, then each
+		 * attachment base64-encoded. */
+		snprintf(boundary, sizeof(boundary), "=_vedit_%ld_%ld_%u",
+		    (long)time(NULL), (long)getpid(), seq);
+		fprintf(fp, "Date: %s\nMessage-ID: %s\nMIME-Version: 1.0\n"
+		    "Content-Type: multipart/mixed; boundary=\"%s\"\n\n"
+		    "This is a multipart message in MIME format.\n\n",
+		    date, msgid, boundary);
+		fprintf(fp, "--%s\nContent-Type: text/plain; charset=utf-8\n"
+		    "Content-Transfer-Encoding: 8bit\n\n", boundary);
+		if (hlen < len) {
+			fwrite(buf + hlen, 1, len - hlen, fp);
+			if (buf[len - 1] != '\n')
+				fputc('\n', fp);
+		}
+		for (a = 0; a < natt; a++) {
+			const char *bn = mail_basename(att_path[a]);
+
+			fprintf(fp, "--%s\nContent-Type: %s; name=\"%s\"\n"
+			    "Content-Transfer-Encoding: base64\n"
+			    "Content-Disposition: attachment; filename=\"%s\"\n\n",
+			    boundary, mail_ctype_for(att_path[a]), bn, bn);
+			mail_b64_write(fp, att_data[a], att_len[a]);
+		}
+		fprintf(fp, "--%s--\n", boundary);
+	}
 	fclose(fp);
 	free(buf);
+	for (a = 0; a < natt; a++) {
+		free(att_data[a]);
+		free(att_path[a]);
+	}
 	rc = e->mail->send(e->mail->ctx, out, olen);
 	if (rc != 0) {
 		set_status(e, "send failed: %s", strerror(errno));
@@ -23825,11 +24035,125 @@ mail_send(Editor *e)
 			(void)e->mail->store(e->mail->ctx, m->rfolder, m->ruid,
 			    VEDIT_MAIL_ANSWERED, 0);
 		e->t->dirty = 0;
-		set_status(e, "message handed to the mail backend (%zu bytes)",
-		    olen);
+		if (natt > 0)
+			set_status(e, "sent to the backend (%zu bytes, %d "
+			    "attachment%s)", olen, natt, natt == 1 ? "" : "s");
+		else
+			set_status(e, "message handed to the mail backend "
+			    "(%zu bytes)", olen);
 	}
 	free(out);
 	return rc == 0 ? 0 : -1;
+}
+
+/* :mail attach PATH. Insert an "Attach: PATH" line at the top of the compose
+ * buffer; mail_send turns each such line into a MIME attachment. */
+static void
+mail_attach_cmd(Editor *e, const char *path)
+{
+	char line[PATH_MAX + 16];
+
+	if (!e->mref || e->mref->kind != MREF_COMPOSE) {
+		set_status(e, "not a compose buffer (:mail compose starts one)");
+		return;
+	}
+	if (!path || !path[0]) {
+		set_status(e, "usage: :mail attach PATH");
+		return;
+	}
+	if (access(path, R_OK) != 0) {
+		set_status(e, "cannot read %.80s", path);
+		return;
+	}
+	snprintf(line, sizeof(line), "Attach: %s\n", path);
+	e->cy = 0;
+	e->cx = 0;
+	text_undo_group_begin(e->t);
+	insert_bytes(e, line, strlen(line));
+	text_undo_group_end(e->t);
+	e->cy = 0;
+	e->cx = 0;
+	e->hl_valid = 0;
+	set_status(e, "attached %.80s (sent on :mail send)", mail_basename(path));
+}
+
+/* :mail save [N] [path]. Re-fetch the open message and write the decoded
+ * bytes of part N (1-based, as the header block lists them) to disk. With no
+ * N, saves the first attachment. The default path is the part's filename in
+ * the current directory. */
+static void
+mail_save_part(Editor *e, const char *arg)
+{
+	Mailref *m = e->mref;
+	char *msg = NULL, *body;
+	size_t len = 0, blen;
+	Mailpart parts[MAIL_PARTS_MAX];
+	int n, idx = -1, i;
+	char path[PATH_MAX];
+	const char *p = arg;
+	FILE *f;
+
+	if (!mail_require(e))
+		return;
+	if (!m || m->kind != MREF_MESSAGE || !m->uid[0]) {
+		set_status(e, "not a mail message");
+		return;
+	}
+	while (*p == ' ' || *p == '\t')
+		p++;
+	if (*p >= '0' && *p <= '9') {		/* a part number */
+		idx = (int)strtol(p, (char **)&p, 10) - 1;
+		while (*p == ' ' || *p == '\t')
+			p++;
+	}
+	if (e->mail->fetch(e->mail->ctx, m->folder, m->uid, &msg, &len) != 0) {
+		set_status(e, "cannot fetch message: %s", strerror(errno));
+		return;
+	}
+	n = mail_parts(msg, len, parts);
+	if (idx < 0) {				/* first part with a filename */
+		for (i = 0; i < n; i++)
+			if (parts[i].name[0]) {
+				idx = i;
+				break;
+			}
+		if (idx < 0) {
+			set_status(e, "no attachment to save");
+			free(msg);
+			return;
+		}
+	}
+	if (idx < 0 || idx >= n) {
+		set_status(e, "no part %d (message has %d)", idx + 1, n);
+		free(msg);
+		return;
+	}
+	if (*p) {				/* an explicit target path */
+		snprintf(path, sizeof(path), "%s", p);
+	} else if (parts[idx].name[0]) {
+		snprintf(path, sizeof(path), "%s", mail_basename(parts[idx].name));
+	} else {
+		snprintf(path, sizeof(path), "part-%d.bin", idx + 1);
+	}
+	body = mail_part_decode(&parts[idx], &blen);
+	if (!body) {
+		set_status(e, "out of memory");
+		free(msg);
+		return;
+	}
+	f = fopen(path, "wb");
+	if (!f || fwrite(body, 1, blen, f) != blen) {
+		if (f)
+			fclose(f);
+		set_status(e, "cannot write %.80s: %s", path, strerror(errno));
+		free(body);
+		free(msg);
+		return;
+	}
+	fclose(f);
+	set_status(e, "saved part %d to %.80s (%zu bytes)", idx + 1, path, blen);
+	free(body);
+	free(msg);
 }
 
 /* ---- the folder and message pickers ---- */
@@ -24283,8 +24607,9 @@ mail_deliver(Editor *e)
 }
 
 /* :mail [arg]. No argument picks a folder, "." lists the last one, a
- * subcommand (folders, compose [to], reply, replyall, forward [to], send,
- * deliver) runs that, and any other word lists the folder of that name. */
+ * subcommand (folders, compose [to], reply, replyall, forward [to], attach
+ * PATH, send, save [N] [path], deliver) runs that, and any other word lists
+ * the folder of that name. */
 static void
 mail_ex(Editor *e, const char *rest)
 {
@@ -24316,6 +24641,10 @@ mail_ex(Editor *e, const char *rest)
 		mail_forward(e, *arg ? arg : NULL);
 	else if (strcmp(word, "send") == 0)
 		mail_send(e);
+	else if (strcmp(word, "attach") == 0)
+		mail_attach_cmd(e, arg);
+	else if (strcmp(word, "save") == 0)
+		mail_save_part(e, arg);
 	else if (strcmp(word, "deliver") == 0)
 		mail_deliver(e);
 	else
@@ -27268,6 +27597,23 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_MAIL_SEND:
 		mail_send(e);
 		break;
+	case MA_MAIL_ATTACH: {
+		char path[PATH_MAX];
+
+		path[0] = '\0';
+		if (dlg_file(e, "Attach", NULL, NULL, 0, path, sizeof(path)))
+			mail_attach_cmd(e, path);
+		break;
+	}
+	case MA_MAIL_SAVE: {
+		char arg[PATH_MAX];
+
+		arg[0] = '\0';
+		if (dlg_prompt_line(e, "Save part (N [path]): ", arg,
+		    sizeof(arg)))
+			mail_save_part(e, arg);
+		break;
+	}
 #endif
 #ifndef VEDIT_NO_TOOLS
 	case MA_COMPILE:
@@ -29643,7 +29989,8 @@ static const char g_config_template[] =
 	"[mail]\n"
 	"#	dir = ~/Maildir      # a Maildir++ tree; enables the Mail menu\n"
 	"#	from = Me <me@example.org>  # the From: line of new messages\n"
-	"#	sendcmd = msmtp -t   # Mail > Deliver Outbox feeds each queued message to this\n";
+	"#	sendcmd = msmtp -t   # Mail > Deliver Outbox feeds each queued message to this\n"
+	"#	maxattach = 25       # largest attachment to send, in megabytes\n";
 
 /* Options > Edit Config and :config. Opens the config file in a buffer, the
  * one named at startup or the default location the front end chose. A file
