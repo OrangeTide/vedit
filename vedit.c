@@ -19775,10 +19775,14 @@ static const struct {
 	{ ":set mouse",		"Click to place the cursor, wheel to scroll (View menu)" },
 	{ ":set ai et ff=",	"Auto-indent, indent with spaces, line endings" },
 	{ ":retab  :set sw=N",	"Convert tabs <-> spaces; set the shift width" },
+#ifndef VEDIT_NO_REFLOW
 	{ "gq+motion gqq gqap  :set tw=N",	"Reflow lines to textwidth (79; a count of 20+ before gq is the width)" },
+#endif
 	{ ":tabstops 5 9 17|off",	"Tab stops for this buffer; :set ts=N the interval" },
 	{ ":[range]sort[!] n i N",	"Sort lines: decimal, ignore case, key at col N" },
+#ifndef VEDIT_NO_SWAP
 	{ ":set swapfile bk",	"Crash-recovery swap file / keep a ~ backup" },
+#endif
 #ifndef VEDIT_NO_TOOLS
 	{ ":format  :set fos",	"Run the formatter / format on every save" },
 	{ ":log",		"File history: pick a commit, see its diff (VCS menu)" },
@@ -20097,6 +20101,7 @@ static const char *const tut_table[] = {
 	"Set table.view = off in the config to open these files as text.",
 };
 
+#ifndef VEDIT_NO_SWAP
 static const char *const tut_recover[] = {
 	"vedit guards against losing unsaved work when the editor or the",
 	"connection dies. While you edit a named file it keeps a swap",
@@ -20135,6 +20140,7 @@ static const char *const tut_recover[] = {
 	"  - Saving is atomic, so a crash mid-save never leaves a",
 	"    half-written file.",
 };
+#endif	/* VEDIT_NO_SWAP */
 
 typedef struct tutorial {
 	const char	*title;
@@ -20154,7 +20160,9 @@ static const Tutorial g_tutorials[] = {
 	{ "Art View (.ans)",	TUT(tut_art) },
 #endif
 	{ "Table View (CSV)",	TUT(tut_table) },
+#ifndef VEDIT_NO_SWAP
 	{ "Crash Recovery",	TUT(tut_recover) },
+#endif
 };
 #undef TUT
 #define TUTORIAL_COUNT ((int)(sizeof(g_tutorials) / sizeof(g_tutorials[0])))
