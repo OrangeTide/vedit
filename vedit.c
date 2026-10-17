@@ -46,7 +46,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -192,6 +192,116 @@ win_fclose(FILE *fp)
 }
 #define fclose win_fclose
 #endif /* _WIN32 */
+
+#ifdef __wasi__
+/****************************************************************
+ * WASI compatibility. WebAssembly System Interface has no tty, no
+ * processes, and a reduced libc. The editor core needs a few POSIX
+ * calls beyond what wasi-libc provides; stub them here. The input
+ * binding and entry point are a WASI-specific pair at the end of the
+ * file. Build with -D_WASI_EMULATED_MMAN, -D_WASI_EMULATED_SIGNAL and
+ * -D_WASI_EMULATED_GETPID, linking the matching -lwasi-emulated-* libs.
+ ****************************************************************/
+#include <poll.h>
+
+/* No path-based permission calls on WASI; the swap and save paths only
+ * need them to succeed. chmod is gated in vfd_chmod (the file vtable has a
+ * member of that name, so a macro cannot stand in for it here). */
+#define umask(m)	((mode_t)0)
+
+/* WASI has no other processes, so a lock owner is never live and a stale
+ * lock is always reclaimable. */
+static int
+wasi_kill(int pid, int sig)
+{
+	(void)pid;
+	(void)sig;
+	errno = ESRCH;
+	return -1;
+}
+#define kill(p, s)	wasi_kill((int)(p), (int)(s))
+
+/* WASI paths are already relative to a preopened directory, so canonical
+ * resolution is a copy; "." becomes the working directory. */
+static char *
+wasi_realpath(const char *path, char *resolved)
+{
+	if (!path || !resolved)
+		return NULL;
+	if (path[0] == '.' && path[1] == '\0')
+		return getcwd(resolved, PATH_MAX);
+	snprintf(resolved, PATH_MAX, "%s", path);
+	return resolved;
+}
+#define realpath(p, r)	wasi_realpath((p), (r))
+
+/* Minimal mkstemp: fill the trailing XXXXXX and create exclusively. */
+static int
+wasi_mkstemp(char *tmpl)
+{
+	static unsigned long seq;
+	size_t n = strlen(tmpl);
+	char *x;
+	int t;
+
+	if (n < 6) {
+		errno = EINVAL;
+		return -1;
+	}
+	x = tmpl + n - 6;
+	for (t = 0; t < 1000; t++) {
+		unsigned long v = (unsigned long)time(NULL) ^
+		    (seq++ * 2654435761UL) ^ ((unsigned long)getpid() << 8);
+		int i, fd;
+
+		for (i = 0; i < 6; i++) {
+			x[i] = "abcdefghijklmnopqrstuvwxyz0123456789"[v % 36];
+			v /= 36;
+		}
+		fd = open(tmpl, O_RDWR | O_CREAT | O_EXCL, 0600);
+		if (fd >= 0)
+			return fd;
+		if (errno != EEXIST)
+			return -1;
+	}
+	return -1;
+}
+#define mkstemp(t)	wasi_mkstemp(t)
+
+/* wasi-libc declares gethostname but ships no implementation; the swap lock
+ * and mail message-id only need a stable name. */
+int
+gethostname(char *name, size_t len)
+{
+	snprintf(name, len, "localhost");
+	return 0;
+}
+
+/* 128-bit multiply. The compiler lowers 128-bit multiplies (libc's number
+ * parsing uses them) to __multi3, normally supplied by the wasm32 compiler-rt
+ * builtins. This environment ships no such archive, so provide it here, built
+ * from 32x32->64 products so it never recurses into itself. A build with
+ * wasi-sdk (which bundles the builtins) does not reach this. */
+unsigned __int128
+__multi3(unsigned __int128 a, unsigned __int128 b)
+{
+	unsigned long long alo = (unsigned long long)a;
+	unsigned long long ahi = (unsigned long long)(a >> 64);
+	unsigned long long blo = (unsigned long long)b;
+	unsigned long long bhi = (unsigned long long)(b >> 64);
+	unsigned long long a0 = (unsigned)alo, a1 = alo >> 32;
+	unsigned long long b0 = (unsigned)blo, b1 = blo >> 32;
+	unsigned __int128 lo;
+
+	/* alo*blo as a full 128-bit product, from 32-bit parts (i64 muls). */
+	lo = (unsigned __int128)(a1 * b1) << 64;
+	lo += (unsigned __int128)(a0 * b1) << 32;
+	lo += (unsigned __int128)(a1 * b0) << 32;
+	lo += (unsigned __int128)(a0 * b0);
+	/* cross terms only contribute to the high 64 bits (64-bit muls). */
+	return lo + ((unsigned __int128)(alo * bhi + ahi * blo) << 64);
+}
+#endif /* __wasi__ */
 
 /****************************************************************
  * File access
@@ -399,7 +509,13 @@ vfd_remove(const char *path)
 static int
 vfd_chmod(const char *path, unsigned perm)
 {
+#ifdef __wasi__
+	(void)path;
+	(void)perm;
+	return 0;		/* WASI has no path-based chmod */
+#else
 	return chmod(path, (mode_t)perm);
+#endif
 }
 
 static int
@@ -8486,7 +8602,7 @@ static struct {
 	Text *t;
 } g_maps[MAP_MAX];
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
 static void (*g_bus_fallback)(int);
 
 /* The SIGBUS handler: a fault inside a registered map gets a zero page
@@ -9847,7 +9963,9 @@ found:
 
 
 
+#ifndef __wasi__
 static const char *progname = "vedit";
+#endif
 
 
 /* One parsed compiler/make diagnostic (see the build section). */
@@ -27354,6 +27472,7 @@ menu_trigger(const Editor *e, const struct tkbd_seq *seq)
  * Terminal / lifecycle
  ****************************************************************/
 
+#ifndef __wasi__
 static void
 usage(void)
 {
@@ -27427,6 +27546,7 @@ usage(void)
 	    " paste).\n",
 	    progname);
 }
+#endif /* !__wasi__ */
 
 /* Carry out a request produced by a key handler, for the views that share the
  * editor's request framework (the text and hex views). Prompts and edits run
@@ -29576,7 +29696,7 @@ tty_log(const char *fmt, ...)
 }
 #endif /* _WIN32 console or pseudo console */
 
-#ifndef VEDIT_GUI
+#if !defined(VEDIT_GUI) && !defined(__wasi__)
 #ifndef _WIN32
 
 typedef struct tty_io {
@@ -37927,6 +38047,7 @@ cli_mail_setup(const char *root)
  * to create it. Writes buf and returns 1 when the file should be read (as
  * given, or found), 0 when it does not exist yet, and -1 when no path can be
  * formed (no HOME). */
+#ifndef __wasi__
 static int
 cli_config_path(const char *opt, char *buf, size_t bufsz)
 {
@@ -37966,6 +38087,7 @@ cli_config_path(const char *opt, char *buf, size_t bufsz)
 		return -1;
 	return access(buf, R_OK) == 0 ? 1 : 0;
 }
+#endif /* !__wasi__ */
 
 #ifdef VEDIT_TERM
 /* Proof-of-concept for the embedded VT emulator: parse a canned stream of
@@ -38057,6 +38179,7 @@ term_demo(const struct vedit_io *io)
 #endif /* VEDIT_GUI */
 #endif /* VEDIT_TERM */
 
+#ifndef __wasi__
 int
 main(int argc, char **argv)
 {
@@ -38307,6 +38430,107 @@ main(int argc, char **argv)
 #endif
 	return rc;
 }
+#endif /* !__wasi__ */
+
+#ifdef __wasi__
+/****************************************************************
+ * WASI binding and entry point: stdin/stdout over fd 0 and 1, size from
+ * COLUMNS/LINES. There is no tty, raw mode, or resize signal; a host
+ * feeds bytes and reads the cell output. Terminal buffers and the tool
+ * runner are compiled out.
+ ****************************************************************/
+static long
+wasi_io_read(void *ctx, void *buf, long n)
+{
+	ssize_t r;
+
+	(void)ctx;
+	r = read(0, buf, (size_t)n);
+	if (r == 0)
+		return -1;		/* end of input */
+	if (r < 0)
+		return (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1;
+	return (long)r;
+}
+
+static long
+wasi_io_write(void *ctx, const void *buf, long n)
+{
+	const char *p = buf;
+	long off = 0;
+
+	(void)ctx;
+	while (off < n) {
+		ssize_t w = write(1, p + off, (size_t)(n - off));
+
+		if (w < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		off += w;
+	}
+	return n;
+}
+
+static int
+wasi_io_poll(void *ctx, int timeout_ms)
+{
+	struct pollfd pf;
+	int r;
+
+	(void)ctx;
+	pf.fd = 0;
+	pf.events = POLLIN;
+	pf.revents = 0;
+	r = poll(&pf, 1, timeout_ms);
+	return r < 0 ? -1 : (r > 0 ? 1 : 0);
+}
+
+static int
+wasi_io_getsize(void *ctx, int *rows, int *cols)
+{
+	const char *c = getenv("COLUMNS"), *r = getenv("LINES");
+
+	(void)ctx;
+	*cols = c ? atoi(c) : 0;
+	*rows = r ? atoi(r) : 0;
+	if (*cols <= 0)
+		*cols = 80;
+	if (*rows <= 0)
+		*rows = 24;
+	return 0;
+}
+
+int
+main(int argc, char **argv)
+{
+	struct vedit_io io = {0};
+	struct vedit *v;
+	const char *file = NULL;
+	int i, rc;
+
+	for (i = 1; i < argc; i++)
+		if (argv[i][0] != '-') {
+			file = argv[i];
+			break;
+		}
+	io.read = wasi_io_read;
+	io.write = wasi_io_write;
+	io.poll = wasi_io_poll;
+	io.getsize = wasi_io_getsize;
+	v = vedit_new(&io);
+	if (!v)
+		return 1;
+	if (file && vedit_open(v, file) < 0) {
+		vedit_free(v);
+		return 1;
+	}
+	rc = vedit_run(v);
+	vedit_free(v);
+	return rc;
+}
+#endif /* __wasi__ */
 
 /****************************************************************
  * vi personality

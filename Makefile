@@ -101,7 +101,7 @@ TORTURE_ROUNDS ?= 20000
 SANCFLAGS = -std=gnu11 -Wall -Wextra -g -O1 -fno-omit-frame-pointer
 
 .PHONY: all link clean install uninstall test torture asan ubsan cov cov-term \
-    screenshots static gvedit guterm-sync
+    screenshots static gvedit wasm guterm-sync
 
 all: $(BIN) link
 
@@ -125,6 +125,44 @@ $(GBIN): $(SRC) $(HDR) guterm.h | $(OUTBIN)
 	$(CC) $(CFLAGS) -DVEDIT_GUI $(if $(EXE),,-pthread) $(SDL_CFLAGS) -o $@ \
 	    $(SRC) $(SDL_LIBS) -lm \
 	    $(LDFLAGS)
+
+# A headless CLI vedit for wasm32-wasi, run under a WASI runtime such as
+# wasmtime: stdin and stdout carry the key bytes and the cell output, and a
+# preopened directory (wasmtime --dir) is the only file system it sees. There
+# is no tty, no processes, and no PTY in the sandbox, so the terminal panel,
+# tools, art, and mail are compiled out. Built on request with `make wasm`:
+#   make wasm
+#   wasmtime run --dir . --env COLUMNS=80 --env LINES=24 \
+#       _out/wasm32-wasi/bin/vedit.wasm note.txt
+# Defaults target Debian's wasi-libc (headers under /usr, builtins from the
+# clang resource dir). For a wasi-sdk install, override the toolchain vars:
+#   make wasm WASI_CC=$$WASI_SDK/bin/clang \
+#       WASI_INC="--sysroot=$$WASI_SDK/share/wasi-sysroot" \
+#       WASI_LIBDIR=$$WASI_SDK/share/wasi-sysroot/lib/wasm32-wasi
+WASI_CC     ?= clang
+WASI_RESDIR  = $(shell $(WASI_CC) -print-resource-dir)
+WASI_INC    ?= -nostdinc -isystem /usr/include/wasm32-wasi \
+               -isystem $(WASI_RESDIR)/include
+WASI_LIBDIR ?= /usr/lib/wasm32-wasi
+WASI_BIN     = $(OUT)/wasm32-wasi/bin/vedit.wasm
+# WASI has no signals, mmap, or process ids; wasi-libc ships emulated shims.
+# -nodefaultlibs stops clang pulling the wasm32 compiler-rt archive (absent in
+# this layout; vedit provides the one 128-bit-multiply builtin libc needs).
+WASI_DEFS    = -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL \
+               -D_WASI_EMULATED_GETPID \
+               -DVEDIT_NO_TERM -DVEDIT_NO_ART -DVEDIT_NO_TOOLS -DVEDIT_NO_MAIL
+WASI_LIBS    = -lc -lwasi-emulated-mman -lwasi-emulated-signal \
+               -lwasi-emulated-getpid
+
+wasm: $(WASI_BIN)
+
+$(WASI_BIN): $(SRC) $(HDR) | $(OUT)/wasm32-wasi/bin
+	$(WASI_CC) --target=wasm32-wasi $(WASI_INC) -std=gnu11 -Wall -Wextra \
+	    -O2 $(WASI_DEFS) -nodefaultlibs -L$(WASI_LIBDIR) \
+	    $(SRC) $(WASI_LIBS) -o $@
+
+$(OUT)/wasm32-wasi/bin:
+	mkdir -p $@
 
 # Refresh the vendored header from a guterm checkout and stamp its commit.
 guterm-sync:
