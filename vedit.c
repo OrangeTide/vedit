@@ -15007,6 +15007,35 @@ split_chrome(Editor *e, Screen *d, const Pal *p)
 	}
 }
 
+/* The grid views (art, hex, table) render the buffer their own way and take
+ * the whole text area. Returns 1 when one of them painted the frame, so
+ * render_body stops and paints no text. This is the one place that dispatches a
+ * special view's rendering, so compiling a view out stays local to it. */
+static int
+view_render(Editor *e, Screen *d)
+{
+#ifdef VEDIT_ART
+	if (e->art) {
+		e->prev_text_view = 0;	/* a cell grid, not the text view */
+		art_render(e, d);
+		return 1;
+	}
+#endif
+#ifndef VEDIT_NO_HEX
+	if (e->hex_view) {
+		e->prev_text_view = 0;	/* hex uses hex_top, not e->top */
+		hex_render(e, d);
+		return 1;
+	}
+#endif
+	if (e->tbl) {
+		e->prev_text_view = 0;	/* a grid, not the text view */
+		tbl_render(e, d);
+		return 1;
+	}
+	return 0;
+}
+
 /* Paint the whole frame: the current buffer's text (or terminal grid, or hex
  * view), the pane under it when one is shown, and the chrome. */
 static void
@@ -15045,26 +15074,8 @@ render_body(Editor *e, Screen *d)
 	}
 #endif
 
-#ifdef VEDIT_ART
-	if (e->art) {
-		e->prev_text_view = 0;	/* a cell grid, not the text view */
-		art_render(e, d);
+	if (view_render(e, d))
 		return;
-	}
-#endif
-
-#ifndef VEDIT_NO_HEX
-	if (e->hex_view) {
-		e->prev_text_view = 0;	/* hex uses hex_top, not e->top */
-		hex_render(e, d);
-		return;
-	}
-#endif
-	if (e->tbl) {
-		e->prev_text_view = 0;	/* a grid, not the text view */
-		tbl_render(e, d);
-		return;
-	}
 
 	scr_clear(d);
 	paint_rows(e, d, p, cur_row0, cur_rows, &cur_row, &cur_scol, &cur_col);
