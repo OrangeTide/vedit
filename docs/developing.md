@@ -14,6 +14,7 @@ chapter.
 | `man/vedit.1` | the man page |
 | `docs/` | this manual, the screenshots and `screenshots.sh` that renders them, `demo.html`, and the sample `.ans` scenes |
 | `docs/site/` | the pandoc build of the manual for GitHub Pages (`make -C docs/site`) |
+| `web/` | the browser demo page and its sample file; `make web` builds the WebAssembly beside them |
 | `tests/` | the test suite and the vendored `taptest` driver |
 | `_out/<triple>/bin/` | build output, one directory per target |
 
@@ -50,6 +51,44 @@ The other knobs are plain defines passed through `CFLAGS`:
 `-DVEDIT_NO_MOUSE`, and `-DVEDIT_NO_XDG` (use `~/.veditrc` instead of the
 XDG config path). Chapter 10 of the manual lists what each one removes from
 the user's point of view.
+
+## WebAssembly
+
+Two WebAssembly builds run the same `vedit.c` with terminals, tools, art,
+and mail compiled out.
+
+`make wasm` builds a headless `wasm32-wasi` binary at
+`_out/wasm32-wasi/bin/vedit.wasm`. It speaks to stdin and stdout and reads
+its window size from the `COLUMNS` and `LINES` environment variables. Run it
+under any WASI runtime, giving it a directory so it can reach the file:
+
+```sh
+make wasm
+wasmtime run --dir .::/w --env COLUMNS=80 --env LINES=24 \
+    _out/wasm32-wasi/bin/vedit.wasm /w/note.txt
+```
+
+The build needs a `wasm32-wasi` clang and the wasi-libc headers and
+libraries. The `WASI_CC`, `WASI_INC`, and `WASI_LIBDIR` make variables point
+at them, with defaults for a Debian `wasi-libc` layout. A runtime passes keys
+through its own stdin, so interactive use wants the host terminal in raw
+mode; piping bytes in and reading the ANSI frames out works without it.
+
+`make web` builds the browser version with emscripten, producing
+`web/vedit.js` and `web/vedit.wasm` beside the committed `web/index.html`.
+The page runs the editor in an xterm.js terminal and opens a file that lives
+only in an in-memory filesystem, so nothing touches the visitor's disk.
+ASYNCIFY lets the editor loop wait for a key without a worker or
+SharedArrayBuffer, so the page needs no special COOP or COEP headers. Serve
+the `web/` directory with any static file server and open the page:
+
+```sh
+make web
+npx serve web
+```
+
+This build needs the emscripten SDK (`emcc`) on PATH. The artifacts in
+`web/` are build output and are not committed.
 
 ## Tests
 
