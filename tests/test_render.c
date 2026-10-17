@@ -3015,6 +3015,39 @@ t_menu_item_enabled(Test *t)
 	memio_free(&m);
 }
 
+/* The four View toggles that used to report no state now track their field. */
+static void
+t_menu_checked_toggles(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+
+	TAP_CHECK(t, menu_checked(&v->e, MA_SHOW_TABS) == (v->e.show_tabs ? 1 : 0));
+	run_menu_act(&v->e, MA_SHOW_TABS);
+	TAP_CHECK(t, menu_checked(&v->e, MA_SHOW_TABS) == (v->e.show_tabs ? 1 : 0));
+
+	TAP_CHECK(t, menu_checked(&v->e, MA_AUTO_INDENT) == (v->e.auto_indent ? 1 : 0));
+	run_menu_act(&v->e, MA_AUTO_INDENT);
+	TAP_CHECK(t, menu_checked(&v->e, MA_AUTO_INDENT) == (v->e.auto_indent ? 1 : 0));
+
+	TAP_CHECK(t, menu_checked(&v->e, MA_EXPAND_TABS) == (v->e.expand_tabs ? 1 : 0));
+	run_menu_act(&v->e, MA_EXPAND_TABS);
+	TAP_CHECK(t, menu_checked(&v->e, MA_EXPAND_TABS) == (v->e.expand_tabs ? 1 : 0));
+
+	TAP_CHECK(t, menu_checked(&v->e, MA_HEX) == 0);
+	run_menu_act(&v->e, MA_HEX);
+	TAP_CHECK(t, v->e.hex_view && menu_checked(&v->e, MA_HEX) == 1);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 #ifndef VEDIT_NO_TOOLS
 /* The Compile menu is hidden with no build command and shown once one exists. */
 static void
@@ -4701,6 +4734,7 @@ const Case tap_cases[] = {
 	{ "pick_symbol_cancel", t_pick_symbol_cancel },
 	{ "pick_open_entry", t_pick_open_entry },
 	{ "menu_item_enabled", t_menu_item_enabled },
+	{ "menu_checked_toggles", t_menu_checked_toggles },
 	{ "menu_col_pack", t_menu_col_pack },
 	{ "menu_narrow", t_menu_narrow },
 	{ "win_too_small", t_win_too_small },

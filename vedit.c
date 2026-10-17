@@ -11052,7 +11052,7 @@ static const Menuitem mi_insert[] = {
 };
 static const Menuitem mi_search[] = {
 	{ "&Find...",		"Ctrl+F",	"/",	MA_FIND },
-	{ "&Repeat Find",	"",		"n",	MA_FIND_NEXT },
+	{ "Repea&t Find",	"",		"n",	MA_FIND_NEXT },
 	{ "&Replace...",	"Ctrl+R",	":s",	MA_REPLACE },
 	{ "Go to S&ymbol...",	"Ctrl+T",	":symbol",	MA_SYMBOL },
 	{ "&Pop Tag",		"",		":pop",	MA_TAG_POP },
@@ -11405,6 +11405,14 @@ menu_checked(const Editor *e, Menuact act)
 		return e->show_lineno ? 1 : 0;
 	case MA_WRAP:
 		return e->wrap ? 1 : 0;
+	case MA_SHOW_TABS:
+		return e->show_tabs ? 1 : 0;
+	case MA_AUTO_INDENT:
+		return e->auto_indent ? 1 : 0;
+	case MA_EXPAND_TABS:
+		return e->expand_tabs ? 1 : 0;
+	case MA_HEX:
+		return e->hex_view ? 1 : 0;
 	case MA_DRAW:
 		return e->draw_mode ? 1 : 0;
 	case MA_TABLE:
