@@ -243,6 +243,11 @@ the diff of the commit that changed it.
 From a saved file: open a commit message buffer for it (VCS > Commit). From
 that buffer: commit the file with the message.
 .TP
+.B :format
+Pass the buffer through the configured formatter (Edit > Format); set
+.B edit.formatonsave
+to run it on every save.
+.TP
 .BI :date " [YYYY-MM-DD]"
 Insert today, or the given day, at the cursor in the format last chosen in
 the calendar of Insert > Date (ISO by default,

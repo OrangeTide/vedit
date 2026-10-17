@@ -19600,7 +19600,7 @@ static const struct {
 	{ "Shift+arrows",	"Extend a selection" },
 	{ "Enter",		"Split the line" },
 	{ "Backspace / Del",	"Delete before / after the cursor" },
-	{ "Ctrl-F",		"Incremental find (Enter repeats the last)" },
+	{ "Ctrl-F",		"Incremental find (arrows edit, Up/Down recall; Enter repeats)" },
 	{ "Ctrl-R",		"Replace, confirming each match (y/n/a/q)" },
 	{ "Ctrl-T",		"Go to a symbol (buffer, plus a tags file if any)" },
 	{ "Ctrl-]",		"Jump to the tag under the cursor (tags file)" },
@@ -19662,7 +19662,7 @@ static const struct {
 	{ "ma  `a  'a",		"Set mark a, jump to it (exact / line)" },
 	{ "Ctrl-O / Ctrl-I",	"Jump list: older / newer (`` toggles ends)" },
 	{ "u / Ctrl-R",		"Undo / redo" },
-	{ "/ text  n",		"Search forward, repeat the last search" },
+	{ "/ text  n",		"Search forward (arrows edit, Up/Down recall); n repeats" },
 	{ ":w  :q  :wq / :x",	"Write, quit, write and quit" },
 	{ ":q!  ZZ  ZQ",	"Quit discarding, save and quit, quit" },
 	{ ":N  :cq",		"Go to a line, quit with an error code" },
@@ -19673,6 +19673,7 @@ static const struct {
 	{ "gf",			"Open the header or file named under the cursor" },
 	{ ":bn :bp :bd :ls",	"Next / prev / delete / list buffers (also F8)" },
 	{ ":set nu wrap list",	"Toggle line numbers, word wrap, show-tabs" },
+	{ ":set sl=plain|powerline",	"Status bar style (View > Status Line cycles)" },
 	{ ":set mouse",		"Click to place the cursor, wheel to scroll (View menu)" },
 	{ ":set ai et ff=",	"Auto-indent, indent with spaces, line endings" },
 	{ ":retab  :set sw=N",	"Convert tabs <-> spaces; set the shift width" },
@@ -27987,7 +27988,7 @@ usage(void)
 	    "  Shift-arrows  extend a selection\n"
 	    "  Ctrl-C / Ctrl-X  copy / cut (Ctrl-C with no selection copies the line)\n"
 	    "  Ctrl-V        paste the internal clipboard\n"
-	    "  Ctrl-F        incremental find (Enter repeats the last)\n"
+	    "  Ctrl-F        incremental find (arrows edit, Up/Down recall)\n"
 	    "  Ctrl-R        replace, confirming each match (y/n/a/q)\n"
 	    "  Ctrl-T        go to a symbol (buffer, plus a tags file if any)\n"
 	    "  Ctrl-]        jump to the tag under the cursor\n"
