@@ -74,7 +74,9 @@ started, and the view follows. The prompt reads `ISearch:`, with
 
 | Key | Action |
 |---|---|
-| typing | extends the pattern; Backspace shortens it |
+| typing | inserts at the caret; Backspace and Delete erase around it |
+| Left, Right, Home, End | move the caret within the pattern to edit it |
+| Up, Down | recall earlier patterns, newest first |
 | Enter | stop here. With an empty pattern, repeat the last search |
 | Esc, Ctrl-C | cancel and return to where you started |
 

@@ -7760,6 +7760,7 @@ struct tkbd_seq;
 /* Fixed-size text buffers carried on the Editor struct. */
 #define STATUS_MAX	160	/* transient status/message line */
 #define FIND_MAX	256	/* last search and replacement strings */
+#define FIND_HIST_MAX	16	/* recent search strings kept for recall */
 #define HEXPAT_MAX	64	/* last searched byte pattern (hex view) */
 
 /* Editing personality. The default is a modeless (nano-style) editor;
@@ -7916,6 +7917,8 @@ typedef struct editor {
 	int		glyph_set;	/* active set of the glyph palette (Alt+digit) */
 	char		last_find[FIND_MAX];	/* last search string, for repeat */
 	char		last_replace[FIND_MAX]; /* last replacement string */
+	char		find_hist[FIND_HIST_MAX][FIND_MAX]; /* recent searches */
+	int		find_hist_n;	/* used history slots, newest at n-1 */
 	int		vi_search_dir;	/* last search direction: 1 fwd, -1 back */
 	int		search_icase;	/* match searches case-insensitively */
 	int		vi_want_col;	/* display column j/k aim for (INT_MAX=EOL) */
@@ -19288,7 +19291,7 @@ isearch_scan_dir(Editor *e, const char *q, size_t oy, size_t ox, int dir,
  * hardware cursor at the match, and ui_field does not move it, so the cursor
  * sits on the match. */
 static void
-isearch_draw(Editor *e, const char *label, const char *q, int found)
+isearch_draw(Editor *e, const char *label, const char *q, int found, int caret)
 {
 	const Pal *p = ed_chrome(e);
 	uint16_t at = (p->reverse_bars ? ATTR_REVERSE : 0) | ATTR_BOLD;
@@ -19299,6 +19302,10 @@ isearch_draw(Editor *e, const char *label, const char *q, int found)
 	snprintf(line, sizeof(line), "%s%s%s",
 	    found ? "" : "(failing) ", label, q);
 	ui_field(e->d, status_row, 0, e->cols, line, p->bar_fg, p->bar_bg, at);
+	if (caret >= 0) {		/* editing mid-query: caret in the field */
+		scr_cursor_vis(e->d, 1);
+		scr_cursor(e->d, status_row, caret);
+	}
 	scr_present(e->d);
 }
 
@@ -19315,23 +19322,48 @@ static void jump_record_at(Editor *e, size_t cy, size_t cx);
 typedef struct incsearch_ctx {
 	size_t	oy, ox, otop, oleft;	/* origin cursor and scroll */
 	char	q[256];			/* the query */
-	size_t	len;
+	size_t	len;			/* query length in bytes */
+	size_t	pos;			/* caret byte offset within the query */
 	int	dir;			/* 1 forward, -1 backward */
 	int	found;			/* the current query matched */
+	int	hist_idx;		/* browsing slot, == find_hist_n when live */
 	char	label[16];		/* "/", "?", "ISearch: " */
 } IncsearchCtx;
 
 _Static_assert(sizeof(IncsearchCtx) <= sizeof(UiCtx),
     "IncsearchCtx must fit inline in a UiFrame");
 
+/* Record q as the newest search in the history ring, dropping a duplicate of
+ * the current newest and the oldest entry when the ring is full. */
+static void
+find_hist_add(Editor *e, const char *q)
+{
+	int i;
+
+	if (!q[0])
+		return;
+	if (e->find_hist_n > 0 &&
+	    strcmp(e->find_hist[e->find_hist_n - 1], q) == 0)
+		return;
+	if (e->find_hist_n == FIND_HIST_MAX) {
+		for (i = 1; i < FIND_HIST_MAX; i++)
+			memcpy(e->find_hist[i - 1], e->find_hist[i], FIND_MAX);
+		e->find_hist_n--;
+	}
+	snprintf(e->find_hist[e->find_hist_n], FIND_MAX, "%s", q);
+	e->find_hist_n++;
+}
+
 /* Re-scan for the current query, move the cursor to the match (or rest at the
  * origin), then draw the search line. Done each frame so the cursor follows
- * the query as it is typed. */
+ * the query as it is typed. While the caret sits inside the query (after Left
+ * or Home), it shows in the query field instead of on the match. */
 static void
 incsearch_frame_draw(Editor *e, UiFrame *f)
 {
 	IncsearchCtx *ic = (IncsearchCtx *)&f->ctx;
 	size_t my = ic->oy, mx = ic->ox;
+	int caret = -1;
 
 	if (ic->len > 0 &&
 	    (ic->found = isearch_scan_dir(e, ic->q, ic->oy, ic->ox, ic->dir,
@@ -19347,7 +19379,14 @@ incsearch_frame_draw(Editor *e, UiFrame *f)
 		if (ic->len == 0)
 			ic->found = 1;
 	}
-	isearch_draw(e, ic->label, ic->q, ic->found);
+	if (ic->pos < ic->len) {
+		caret = (ic->found ? 0 : disp_cols("(failing) ", 10)) +
+		    disp_cols(ic->label, strlen(ic->label)) +
+		    disp_cols(ic->q, ic->pos);
+		if (caret >= e->cols)
+			caret = e->cols - 1;
+	}
+	isearch_draw(e, ic->label, ic->q, ic->found, caret);
 }
 
 static int
@@ -19370,6 +19409,7 @@ incsearch_frame_key(Editor *e, UiFrame *f, const Event *ev)
 			return 1;
 		}
 		snprintf(e->last_find, sizeof(e->last_find), "%s", ic->q);
+		find_hist_add(e, ic->q);
 		e->vi_search_dir = ic->dir;
 		if (ic->found) {
 			jump_record_at(e, ic->oy, ic->ox);	/* came from here */
@@ -19384,14 +19424,79 @@ incsearch_frame_key(Editor *e, UiFrame *f, const Event *ev)
 		set_status(e, "search cancelled");
 		return 1;
 	}
+	/* Up and Down walk the search history into the query (any typed-but-
+	 * unaccepted text is replaced). Down past the newest leaves it empty. */
+	if (seq.key == TKBD_KEY_UP || seq.key == TKBD_KEY_DOWN) {
+		int idx = ic->hist_idx;
+
+		if (seq.key == TKBD_KEY_UP) {
+			if (idx <= 0 || e->find_hist_n == 0)
+				return 0;	/* nothing older */
+			idx--;
+		} else {
+			if (idx >= e->find_hist_n)
+				return 0;	/* already at the live query */
+			idx++;
+		}
+		ic->hist_idx = idx;
+		if (idx >= e->find_hist_n)
+			ic->q[0] = '\0';
+		else
+			snprintf(ic->q, sizeof(ic->q), "%s", e->find_hist[idx]);
+		ic->len = strlen(ic->q);
+		ic->pos = ic->len;
+		return 0;
+	}
+	switch (seq.key) {
+	case TKBD_KEY_LEFT:
+		if (ic->pos > 0) {
+			ic->pos--;
+			while (ic->pos > 0 &&
+			    ((unsigned char)ic->q[ic->pos] & 0xc0) == 0x80)
+				ic->pos--;
+		}
+		return 0;
+	case TKBD_KEY_RIGHT:
+		if (ic->pos < ic->len) {
+			ic->pos++;
+			while (ic->pos < ic->len &&
+			    ((unsigned char)ic->q[ic->pos] & 0xc0) == 0x80)
+				ic->pos++;
+		}
+		return 0;
+	case TKBD_KEY_HOME:
+		ic->pos = 0;
+		return 0;
+	case TKBD_KEY_END:
+		ic->pos = ic->len;
+		return 0;
+	case TKBD_KEY_DEL:
+		if (ic->pos < ic->len) {
+			size_t k = ic->pos + 1;
+
+			while (k < ic->len &&
+			    ((unsigned char)ic->q[k] & 0xc0) == 0x80)
+				k++;
+			memmove(ic->q + ic->pos, ic->q + k, ic->len - k + 1);
+			ic->len -= k - ic->pos;
+			ic->hist_idx = e->find_hist_n;
+		}
+		return 0;
+	default:
+		break;
+	}
 	if (seq.key == TKBD_KEY_BACKSPACE ||
 	    seq.key == TKBD_KEY_BACKSPACE2) {
-		while (ic->len > 0 &&
-		    ((unsigned char)ic->q[ic->len - 1] & 0xc0) == 0x80)
-			ic->len--;
-		if (ic->len > 0)
-			ic->len--;
-		ic->q[ic->len] = '\0';
+		if (ic->pos > 0) {
+			size_t k = ic->pos - 1;
+
+			while (k > 0 && ((unsigned char)ic->q[k] & 0xc0) == 0x80)
+				k--;
+			memmove(ic->q + k, ic->q + ic->pos, ic->len - ic->pos + 1);
+			ic->len -= ic->pos - k;
+			ic->pos = k;
+			ic->hist_idx = e->find_hist_n;
+		}
 		return 0;
 	}
 	if (!(seq.mod & TKBD_MOD_CTRL) && seq.ch != TKBD_CH_NONE &&
@@ -19400,9 +19505,12 @@ incsearch_frame_key(Editor *e, UiFrame *f, const Event *ev)
 		int el = utf8_encode(enc, seq.ch);
 
 		if (el > 0 && ic->len + (size_t)el < sizeof(ic->q)) {
-			memcpy(ic->q + ic->len, enc, (size_t)el);
+			memmove(ic->q + ic->pos + (size_t)el, ic->q + ic->pos,
+			    ic->len - ic->pos + 1);
+			memcpy(ic->q + ic->pos, enc, (size_t)el);
+			ic->pos += (size_t)el;
 			ic->len += (size_t)el;
-			ic->q[ic->len] = '\0';
+			ic->hist_idx = e->find_hist_n;
 		}
 	}
 	return 0;
@@ -19431,8 +19539,10 @@ incsearch(Editor *e, int dir, const char *label)
 	ic->oleft = e->left;
 	ic->q[0] = '\0';
 	ic->len = 0;
+	ic->pos = 0;
 	ic->dir = dir;
 	ic->found = 1;
+	ic->hist_idx = e->find_hist_n;
 	snprintf(ic->label, sizeof(ic->label), "%s", label);
 	ui_pump_modal(e, base);
 }

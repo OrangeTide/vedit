@@ -3048,6 +3048,79 @@ t_menu_checked_toggles(Test *t)
 	memio_free(&m);
 }
 
+/* The incremental-search prompt edits mid-query (Left/Right/Home/End, insert,
+ * Backspace, Delete) and recalls the search history with Up and Down. */
+static void
+t_find_prompt_edit(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	UiFrame f;
+	IncsearchCtx *ic;
+	Event ev;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+
+	memset(&f, 0, sizeof(f));
+	ic = (IncsearchCtx *)&f.ctx;
+	ic->dir = 1;
+	ic->found = 1;
+	ic->hist_idx = v->e.find_hist_n;
+	snprintf(ic->label, sizeof(ic->label), "/");
+
+	memset(&ev, 0, sizeof(ev));
+	ev.type = EVENT_KEY;
+	ev.key.type = TKBD_KEY;
+
+#define SEND_CH(c) do { ev.key.key = TKBD_KEY_NONE; ev.key.ch = (c); \
+	incsearch_frame_key(&v->e, &f, &ev); } while (0)
+#define SEND_KEY(k) do { ev.key.key = (k); ev.key.ch = TKBD_CH_NONE; \
+	incsearch_frame_key(&v->e, &f, &ev); } while (0)
+
+	SEND_CH('a'); SEND_CH('b'); SEND_CH('c');
+	TAP_CHECK(t, strcmp(ic->q, "abc") == 0 && ic->pos == 3 && ic->len == 3);
+
+	SEND_KEY(TKBD_KEY_LEFT); SEND_KEY(TKBD_KEY_LEFT);
+	TAP_CHECK(t, ic->pos == 1);
+	SEND_CH('X');				/* insert mid-query */
+	TAP_CHECK(t, strcmp(ic->q, "aXbc") == 0 && ic->pos == 2 && ic->len == 4);
+	SEND_KEY(TKBD_KEY_BACKSPACE);		/* erase X before the caret */
+	TAP_CHECK(t, strcmp(ic->q, "abc") == 0 && ic->pos == 1);
+	SEND_KEY(TKBD_KEY_DEL);			/* erase 'b' at the caret */
+	TAP_CHECK(t, strcmp(ic->q, "ac") == 0 && ic->pos == 1 && ic->len == 2);
+	SEND_KEY(TKBD_KEY_HOME);
+	TAP_CHECK(t, ic->pos == 0);
+	SEND_KEY(TKBD_KEY_END);
+	TAP_CHECK(t, ic->pos == 2);
+
+	find_hist_add(&v->e, "foo");
+	find_hist_add(&v->e, "bar");
+	find_hist_add(&v->e, "bar");		/* dedup of the newest */
+	TAP_CHECK(t, v->e.find_hist_n == 2);
+
+	ic->q[0] = '\0'; ic->len = 0; ic->pos = 0;
+	ic->hist_idx = v->e.find_hist_n;
+	SEND_KEY(TKBD_KEY_UP);
+	TAP_CHECK(t, strcmp(ic->q, "bar") == 0 && ic->pos == 3);
+	SEND_KEY(TKBD_KEY_UP);
+	TAP_CHECK(t, strcmp(ic->q, "foo") == 0);
+	SEND_KEY(TKBD_KEY_UP);			/* nothing older */
+	TAP_CHECK(t, strcmp(ic->q, "foo") == 0);
+	SEND_KEY(TKBD_KEY_DOWN);
+	TAP_CHECK(t, strcmp(ic->q, "bar") == 0);
+	SEND_KEY(TKBD_KEY_DOWN);		/* back to a live, empty query */
+	TAP_CHECK(t, ic->q[0] == '\0' && ic->len == 0);
+
+#undef SEND_CH
+#undef SEND_KEY
+	vedit_free(v);
+	memio_free(&m);
+}
+
 #ifndef VEDIT_NO_TOOLS
 /* The Compile menu is hidden with no build command and shown once one exists. */
 static void
@@ -4735,6 +4808,7 @@ const Case tap_cases[] = {
 	{ "pick_open_entry", t_pick_open_entry },
 	{ "menu_item_enabled", t_menu_item_enabled },
 	{ "menu_checked_toggles", t_menu_checked_toggles },
+	{ "find_prompt_edit", t_find_prompt_edit },
 	{ "menu_col_pack", t_menu_col_pack },
 	{ "menu_narrow", t_menu_narrow },
 	{ "win_too_small", t_win_too_small },
