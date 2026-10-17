@@ -1265,6 +1265,18 @@ vf_mtime(const Vstat *st)
 #define VEDIT_VT 1
 #endif
 
+/* The 2D block draw mode (free cursor and overtype, the Insert key) is built
+ * by default; -DVEDIT_NO_DRAW drops it. Its code is guarded by VEDIT_DRAW. */
+#if !defined(VEDIT_NO_DRAW) && !defined(VEDIT_DRAW)
+#define VEDIT_DRAW 1
+#endif
+
+/* The glyph palette (box-drawing and symbol picker) serves both the draw mode
+ * and the art view, so it is built when either is. */
+#if (defined(VEDIT_DRAW) || defined(VEDIT_ART)) && !defined(VEDIT_GLYPHS)
+#define VEDIT_GLYPHS 1
+#endif
+
 /* The mail reader and composer is built by default; -DVEDIT_NO_MAIL drops it.
  * Its code is guarded by VEDIT_MAIL. */
 #if !defined(VEDIT_NO_MAIL) && !defined(VEDIT_MAIL)
@@ -10937,7 +10949,10 @@ typedef enum menu_act {
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE, MA_OSC_COPY, MA_OSC_COPY_FILE,
 	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_TAG_POP, MA_OPEN_HEADER,
 	MA_GOTO,
-	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_TABLE, MA_DRAW,
+	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_TABLE,
+#ifdef VEDIT_DRAW
+	MA_DRAW,
+#endif
 #ifndef VEDIT_NO_HEX
 	MA_HEX,
 #endif
@@ -10945,7 +10960,11 @@ typedef enum menu_act {
 	MA_SORT, MA_INS_DATE, MA_INS_FILE,
 	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS, MA_MOUSE, MA_STATUSLINE,
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS, MA_REFLOW, MA_TEXTWIDTH,
-	MA_VI_MODE, MA_EDIT_CONFIG, MA_RELOAD_CONFIG, MA_GLYPHS, MA_COLORS,
+	MA_VI_MODE, MA_EDIT_CONFIG, MA_RELOAD_CONFIG,
+#ifdef VEDIT_GLYPHS
+	MA_GLYPHS,
+#endif
+	MA_COLORS,
 	MA_TABSTOPS,
 	MA_SPLIT, MA_VSPLIT, MA_SPLIT_OTHER, MA_SPLIT_CLOSE,
 #ifndef VEDIT_NO_TOOLS
@@ -10967,8 +10986,12 @@ typedef enum menu_act {
 } Menuact;
 
 /* draw mode toggle, defined with the draw-mode module further down */
+#ifdef VEDIT_DRAW
 static void draw_toggle(Editor *e);
+#endif
+#ifdef VEDIT_GLYPHS
 static void dlg_glyphs(Editor *e);	/* the glyph palette dialog */
+#endif
 static void tbl_sync_file(Editor *e);	/* .csv/.tsv files get the table view */
 static void tbl_detach(Editor *e);
 static void tbl_free(Tbl *tb);
@@ -10998,7 +11021,9 @@ static void vi_delete_lines(Editor *e, size_t y1, size_t y2);
 static int prompt_edit(Editor *e, const char *q, char *buf, size_t bufsz,
     int allow_empty, size_t pos, int allow_nl);
 static void tbl_cell_status(const Editor *e, char *buf, size_t n);
+#ifdef VEDIT_GLYPHS
 static int glyph_alt_key(Editor *e, const struct tkbd_seq *seq);
+#endif
 static int ed_reload_config(Editor *e);
 static void ed_edit_config(Editor *e);
 static void ed_insert_date(Editor *e);
@@ -11094,8 +11119,12 @@ static const Menuitem mi_view[] = {
 	{ "&Unsplit",		"Ctrl-W c",	":close",	MA_SPLIT_CLOSE },
 };
 static const Menuitem mi_options[] = {
+#ifdef VEDIT_DRAW
 	{ "&Draw Mode",		"Ins",	":draw",	MA_DRAW },
+#endif
+#ifdef VEDIT_GLYPHS
 	{ "&Glyph Palette...",	"Alt+G",	"",	MA_GLYPHS },
+#endif
 #ifdef VEDIT_ART
 	{ "&Color Palette...",	"Alt+C",	"",	MA_COLORS },
 #endif
@@ -11430,8 +11459,10 @@ menu_checked(const Editor *e, Menuact act)
 	case MA_HEX:
 		return e->hex_view ? 1 : 0;
 #endif
+#ifdef VEDIT_DRAW
 	case MA_DRAW:
 		return e->draw_mode ? 1 : 0;
+#endif
 	case MA_TABLE:
 		return e->tbl ? 1 : 0;
 	case MA_SPLIT:
@@ -11482,12 +11513,14 @@ menu_item_enabled(const Editor *e, Menuact act)
 		return text_can_redo(e->t);
 	case MA_CUT:
 		return e->sel_active;
+#ifdef VEDIT_GLYPHS
 	case MA_GLYPHS:
 #ifdef VEDIT_ART
 		if (e->art)
 			return 1;
 #endif
 		return e->draw_mode;
+#endif
 	case MA_COLORS:
 #ifdef VEDIT_ART
 		return e->art != NULL;
@@ -19673,7 +19706,9 @@ static const struct {
 	{ "Ctrl-Z / Ctrl-Y",	"Undo / redo" },
 	{ "Ctrl-S",		"Save (asks for a name if none)" },
 	{ "Ctrl-Q",		"Quit (asks if there are unsaved changes)" },
+#ifdef VEDIT_DRAW
 	{ "Insert",		"Toggle draw mode (press t here for the tutorial)" },
+#endif
 	{ "F10 / Alt+letter",	"Open the menu bar (View/Edit options live there)" },
 	{ "F1",			"Show this help" },
 	{ "F2",			"Toggle vi keys (modal editing)" },
@@ -19841,6 +19876,7 @@ help_line(Editor *e, void *ctx, int idx)
  * 72 columns so it fits a narrow terminal). Add a tutorial by writing its line
  * array and appending an entry to g_tutorials. */
 
+#ifdef VEDIT_DRAW
 static const char *const tut_draw[] = {
 	"Draw mode turns the editor into a 2D canvas for box diagrams,",
 	"maps, and block art. The blanks you draw are real spaces, so a",
@@ -19902,6 +19938,7 @@ static const char *const tut_draw[] = {
 	"Because a drawing is made of real spaces, draw mode does not",
 	"trim trailing whitespace when it saves.",
 };
+#endif	/* VEDIT_DRAW */
 
 #ifdef VEDIT_ART
 static const char *const tut_art[] = {
@@ -20107,7 +20144,9 @@ typedef struct tutorial {
 
 #define TUT(arr) (arr), (int)(sizeof(arr) / sizeof((arr)[0]))
 static const Tutorial g_tutorials[] = {
+#ifdef VEDIT_DRAW
 	{ "Line Draw Mode",	TUT(tut_draw) },
+#endif
 #ifdef VEDIT_TERM
 	{ "Terminal Buffers",	TUT(tut_term) },
 #endif
@@ -27543,9 +27582,11 @@ run_menu_act(Editor *e, Menuact act)
 		    e->hex_view ? "hex" : "text");
 		break;
 #endif
+#ifdef VEDIT_DRAW
 	case MA_DRAW:
 		draw_toggle(e);
 		break;
+#endif
 	case MA_TABLE:
 		tbl_command(e, "");
 		break;
@@ -27601,9 +27642,11 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_VI_MODE:
 		toggle_vi(e);
 		break;
+#ifdef VEDIT_GLYPHS
 	case MA_GLYPHS:
 		dlg_glyphs(e);
 		break;
+#endif
 	case MA_TABSTOPS: {
 		char buf[256];
 
@@ -28130,6 +28173,7 @@ run_req(Editor *e, Req req)
  * cut (erase to spaces), paste (overlay), and box (ASCII border) act on.
  ****************************************************************/
 
+#ifdef VEDIT_DRAW
 /* Append blank lines until row y exists. */
 static void
 draw_ensure_row(Editor *e, size_t y)
@@ -28235,8 +28279,10 @@ draw_move(Editor *e, int dy, int dx)
 		}
 	}
 }
+#endif	/* VEDIT_DRAW */
 
-/* Rectangle bounds (inclusive) of the current block selection. */
+/* Rectangle bounds (inclusive) of the current block selection. Shared by the
+ * draw mode and the vi visual-block yank, so it is built unconditionally. */
 static void
 draw_block_bounds(Editor *e, size_t *y1, size_t *y2, size_t *x1,
     size_t *x2)
@@ -28284,6 +28330,7 @@ draw_block_copy(Editor *e)
 	    w, y2 - y1 + 1);
 }
 
+#ifdef VEDIT_DRAW
 /* Blank the selected rectangle in place (overlay model). */
 static void
 draw_block_erase(Editor *e, size_t y1, size_t y2, size_t x1, size_t x2)
@@ -28577,7 +28624,9 @@ draw_key(Editor *e, const struct tkbd_seq *seq)
 	}
 	return REQ_CONTINUE;
 }
+#endif	/* VEDIT_DRAW */
 
+#ifdef VEDIT_GLYPHS
 /****************************************************************
  * Glyph palette: sets of ten drawing glyphs on Alt+1 .. Alt+0
  *
@@ -28634,9 +28683,6 @@ glyph_slot(uint32_t ch)
 static void
 glyph_insert(Editor *e, uint32_t cp)
 {
-	unsigned char buf[8];
-	int n;
-
 #ifdef VEDIT_ART
 	if (e->art) {
 		int w;
@@ -28649,11 +28695,20 @@ glyph_insert(Editor *e, uint32_t cp)
 		return;
 	}
 #endif
-	n = utf8_encode(buf, cp);
-	if (n > 0) {
-		e->sel_active = 0;
-		draw_overtype(e, (char *)buf, (size_t)n);
+#ifdef VEDIT_DRAW
+	{
+		unsigned char buf[8];
+		int n = utf8_encode(buf, cp);
+
+		if (n > 0) {
+			e->sel_active = 0;
+			draw_overtype(e, (char *)buf, (size_t)n);
+		}
 	}
+#else
+	(void)e;
+	(void)cp;
+#endif
 }
 
 /* The palette dialog: a row per set, the active set marked, a cursor over
@@ -28781,6 +28836,7 @@ glyph_alt_key(Editor *e, const struct tkbd_seq *seq)
 	}
 	return 0;
 }
+#endif	/* VEDIT_GLYPHS */
 
 /****************************************************************
  * The editor loop, shared by the command-line binding and an
@@ -29358,6 +29414,7 @@ edit_view_key(Editor *e, const struct tkbd_seq *seq)
 	if (e->art)			/* the art view while a .ans is current */
 		return run_req(e, art_key(e, seq)) ? VK_QUIT : VK_DONE;
 #endif
+#ifdef VEDIT_DRAW
 	if (seq->type == TKBD_KEY && seq->key == TKBD_KEY_INS &&
 	    !(seq->mod & TKBD_MOD_CTRL)) {
 		draw_toggle(e);
@@ -29365,6 +29422,7 @@ edit_view_key(Editor *e, const struct tkbd_seq *seq)
 	}
 	if (e->draw_mode)
 		return run_req(e, draw_key(e, seq)) ? VK_QUIT : VK_DONE;
+#endif
 	return VK_PASS;
 }
 
@@ -43445,7 +43503,9 @@ static const struct excmd_name {
 	{ "symbol",	3, EX_SYMBOL },
 	{ "pop",	2, EX_POP },
 	{ "retab",	3, EX_RETAB },
+#ifdef VEDIT_DRAW
 	{ "draw",	2, EX_DRAW },
+#endif
 	{ "table",	3, EX_TABLE },
 	{ "colwidth",	4, EX_COLWIDTH },
 	{ "cell",	4, EX_CELL },
@@ -43849,9 +43909,11 @@ vi_ex_exec(Editor *e, char *buf)
 		ed_format(e);
 		return REQ_CONTINUE;
 #endif
+#ifdef VEDIT_DRAW
 	case EX_DRAW:
 		draw_toggle(e);
 		return REQ_CONTINUE;
+#endif
 	case EX_TABLE:
 		tbl_command(e, rest);
 		return REQ_CONTINUE;
