@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vedit in the browser</title>
+<link rel="stylesheet"
+    href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0;
+    background: #12141a;
+    color: #c9d1d9;
+    font: 15px/1.5 system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+  }
+  header { max-width: 820px; padding: 24px 16px 8px; }
+  h1 { margin: 0 0 4px; font-size: 20px; }
+  header p { margin: 4px 0; color: #8b949e; font-size: 13px; }
+  code { color: #d2a8ff; }
+  #term {
+    width: min(100%, 820px);
+    padding: 10px 16px 24px;
+    box-sizing: border-box;
+  }
+  #status { color: #8b949e; font-size: 12px; min-height: 1.4em; }
+</style>
+</head>
+<body>
+<header>
+  <h1>vedit, running in WebAssembly</h1>
+  <p>The editor is compiled to wasm with emscripten. The file it opens,
+  <code>/note.txt</code>, lives only in an in-memory filesystem (MEMFS) in
+  this tab. Nothing touches your disk, and edits vanish on reload.</p>
+  <p>Keys: <code>F1</code> help, <code>F2</code> toggles vi/modeless, arrows
+  move, <code>Ctrl-Q</code> quits (modeless).</p>
+  <p id="status">loading&hellip;</p>
+</header>
+<div id="term"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+<script>
+  "use strict";
+  var COLS = 80, ROWS = 24;
+  var term = new Terminal({
+    cols: COLS, rows: ROWS,
+    convertEol: false,
+    cursorBlink: true,
+    fontFamily: "ui-monospace, Menlo, Consolas, monospace",
+    fontSize: 14,
+    theme: { background: "#0b0d12" }
+  });
+  term.open(document.getElementById("term"));
+
+  var enc = new TextEncoder();
+
+  /* The contract the wasm binding (EM_JS in vedit.c) reads: a byte queue the
+     page fills on each keystroke, a resolver the editor's poll waits on, the
+     terminal to write to, and the size. */
+  globalThis.VEDIT = {
+    term: term,
+    in: [],
+    pending: null,
+    rows: ROWS,
+    cols: COLS
+  };
+
+  function wake() {
+    var r = VEDIT.pending;
+    VEDIT.pending = null;
+    if (r) r();
+  }
+
+  term.onData(function (data) {
+    var bytes = enc.encode(data);
+    for (var i = 0; i < bytes.length; i++)
+      VEDIT.in.push(bytes[i]);
+    wake();
+  });
+
+  var statusEl = document.getElementById("status");
+
+  /* emscripten (non-modularized) augments this global, then runs. INVOKE_RUN is
+     off so the editor starts only when we call it, once the runtime is up. */
+  var Module = {
+    print: function () {},         /* stdout is the editor's own binding */
+    printErr: function (s) { if (s) console.warn(s); },
+    onRuntimeInitialized: function () {
+      statusEl.textContent = "running — click the terminal and type";
+      term.focus();
+      try {
+        Module.callMain(["/note.txt"]);
+      } catch (e) {
+        /* ASYNCIFY unwinds the stack while the editor waits for a key;
+           that surfaces here as a thrown unwind sentinel, which is normal. */
+      }
+    },
+    onExit: function () {
+      statusEl.textContent = "editor exited — reload to start again";
+    }
+  };
+</script>
+<script src="vedit.js"></script>
+</body>
+</html>

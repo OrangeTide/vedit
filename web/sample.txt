@@ -1,0 +1,6 @@
+Welcome to vedit, running in your browser via WebAssembly.
+
+This file lives only in the in-memory filesystem (MEMFS).
+Edit freely: F1 help, F2 toggles vi/modeless keys.
+
+abc def ghi

@@ -101,7 +101,7 @@ TORTURE_ROUNDS ?= 20000
 SANCFLAGS = -std=gnu11 -Wall -Wextra -g -O1 -fno-omit-frame-pointer
 
 .PHONY: all link clean install uninstall test torture asan ubsan cov cov-term \
-    screenshots static gvedit wasm guterm-sync
+    screenshots static gvedit wasm web guterm-sync
 
 all: $(BIN) link
 
@@ -163,6 +163,27 @@ $(WASI_BIN): $(SRC) $(HDR) | $(OUT)/wasm32-wasi/bin
 
 $(OUT)/wasm32-wasi/bin:
 	mkdir -p $@
+
+# Browser build: vedit compiled with emscripten and wired to an xterm.js
+# terminal, editing a file in an in-memory filesystem (MEMFS). ASYNCIFY lets
+# the blocking editor loop yield to the browser event loop while it waits for a
+# key, so no worker or SharedArrayBuffer (and no COOP/COEP headers) are needed.
+# Needs the emscripten SDK on PATH (`emcc`); `make web` then serve web/ with
+# any static file server (for example `npx serve web`) and open the page it
+# prints. Build artifacts land in web/ beside the committed page and are
+# git-ignored.
+EMCC        ?= emcc
+WEB_SAMPLE  ?= web/sample.txt
+WEB_DEFS     = -DVEDIT_NO_TERM -DVEDIT_NO_ART -DVEDIT_NO_TOOLS -DVEDIT_NO_MAIL
+WEB_EMFLAGS  = -sASYNCIFY -sINVOKE_RUN=0 -sEXIT_RUNTIME=1 \
+               -sEXPORTED_RUNTIME_METHODS=callMain,FS
+
+web: web/vedit.js
+
+web/vedit.js: $(SRC) $(HDR) web/index.html $(WEB_SAMPLE)
+	$(EMCC) -std=gnu11 -O2 $(WEB_DEFS) $(WEB_EMFLAGS) \
+	    --embed-file $(WEB_SAMPLE)@/note.txt \
+	    $(SRC) -o $@
 
 # Refresh the vendored header from a guterm checkout and stamp its commit.
 guterm-sync:

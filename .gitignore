@@ -15,3 +15,5 @@
 /tests/*.gcov
 /tests/vedit.c.gcov.*
 /gvedit
+/web/vedit.js
+/web/vedit.wasm

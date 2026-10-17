@@ -59,6 +59,13 @@
 /* Public interface (struct vedit_io, enum vedit_box_mode, the embed API). */
 #include "vedit.h"
 
+/* A build for a non-tty host (WASI, or the browser through emscripten) supplies
+ * its own io binding and entry point; the tty command-line binding and main are
+ * left out. */
+#if defined(__wasi__) || defined(__EMSCRIPTEN__)
+#define VEDIT_HOSTED_IO 1
+#endif
+
 #ifdef _WIN32
 /****************************************************************
  * Windows (mingw) compatibility. The editor core is plain C; what
@@ -8602,7 +8609,7 @@ static struct {
 	Text *t;
 } g_maps[MAP_MAX];
 
-#if !defined(_WIN32) && !defined(__wasi__)
+#if !defined(_WIN32) && !defined(VEDIT_HOSTED_IO)
 static void (*g_bus_fallback)(int);
 
 /* The SIGBUS handler: a fault inside a registered map gets a zero page
@@ -9963,7 +9970,7 @@ found:
 
 
 
-#ifndef __wasi__
+#ifndef VEDIT_HOSTED_IO
 static const char *progname = "vedit";
 #endif
 
@@ -27472,7 +27479,7 @@ menu_trigger(const Editor *e, const struct tkbd_seq *seq)
  * Terminal / lifecycle
  ****************************************************************/
 
-#ifndef __wasi__
+#ifndef VEDIT_HOSTED_IO
 static void
 usage(void)
 {
@@ -27546,7 +27553,7 @@ usage(void)
 	    " paste).\n",
 	    progname);
 }
-#endif /* !__wasi__ */
+#endif /* !VEDIT_HOSTED_IO */
 
 /* Carry out a request produced by a key handler, for the views that share the
  * editor's request framework (the text and hex views). Prompts and edits run
@@ -29696,7 +29703,7 @@ tty_log(const char *fmt, ...)
 }
 #endif /* _WIN32 console or pseudo console */
 
-#if !defined(VEDIT_GUI) && !defined(__wasi__)
+#if !defined(VEDIT_GUI) && !defined(VEDIT_HOSTED_IO)
 #ifndef _WIN32
 
 typedef struct tty_io {
@@ -38047,7 +38054,7 @@ cli_mail_setup(const char *root)
  * to create it. Writes buf and returns 1 when the file should be read (as
  * given, or found), 0 when it does not exist yet, and -1 when no path can be
  * formed (no HOME). */
-#ifndef __wasi__
+#ifndef VEDIT_HOSTED_IO
 static int
 cli_config_path(const char *opt, char *buf, size_t bufsz)
 {
@@ -38087,7 +38094,7 @@ cli_config_path(const char *opt, char *buf, size_t bufsz)
 		return -1;
 	return access(buf, R_OK) == 0 ? 1 : 0;
 }
-#endif /* !__wasi__ */
+#endif /* !VEDIT_HOSTED_IO */
 
 #ifdef VEDIT_TERM
 /* Proof-of-concept for the embedded VT emulator: parse a canned stream of
@@ -38179,7 +38186,7 @@ term_demo(const struct vedit_io *io)
 #endif /* VEDIT_GUI */
 #endif /* VEDIT_TERM */
 
-#ifndef __wasi__
+#ifndef VEDIT_HOSTED_IO
 int
 main(int argc, char **argv)
 {
@@ -38430,7 +38437,7 @@ main(int argc, char **argv)
 #endif
 	return rc;
 }
-#endif /* !__wasi__ */
+#endif /* !VEDIT_HOSTED_IO */
 
 #ifdef __wasi__
 /****************************************************************
@@ -38531,6 +38538,112 @@ main(int argc, char **argv)
 	return rc;
 }
 #endif /* __wasi__ */
+
+#ifdef __EMSCRIPTEN__
+/****************************************************************
+ * Browser binding and entry point (emscripten). stdin and stdout are a
+ * JS terminal (xterm.js): writes go straight to it, and input is pulled
+ * from a queue the page fills on each keystroke. ASYNCIFY lets the
+ * blocking editor loop yield to the browser event loop while it waits
+ * for a key, so no worker or SharedArrayBuffer is needed. The page sets
+ * up a global VEDIT object (term, in[] byte queue, a pending resolver,
+ * rows, cols) before it runs the module. Terminal buffers, tools, art,
+ * and mail are compiled out.
+ ****************************************************************/
+#include <emscripten.h>
+
+EM_JS(void, vedit_js_write, (const char *buf, int n), {
+	VEDIT.term.write(UTF8ToString(buf, n));
+})
+
+/* Wait up to timeout_ms for a key (negative blocks); returns the number of
+ * bytes now queued. Yields to the event loop through ASYNCIFY. */
+EM_ASYNC_JS(int, vedit_js_wait, (int timeout_ms), {
+	if (VEDIT.in.length === 0)
+		await new Promise(function (resolve) {
+			VEDIT.pending = resolve;
+			if (timeout_ms >= 0)
+				setTimeout(function () {
+					var r = VEDIT.pending;
+					VEDIT.pending = null;
+					if (r)
+						r();
+				}, timeout_ms);
+		});
+	VEDIT.pending = null;
+	return VEDIT.in.length;
+})
+
+EM_JS(int, vedit_js_read, (char *buf, int n), {
+	var k = Math.min(n, VEDIT.in.length);
+	for (var i = 0; i < k; i++)
+		HEAPU8[buf + i] = VEDIT.in[i];
+	VEDIT.in.splice(0, k);
+	return k;
+})
+
+EM_JS(void, vedit_js_size, (int *rp, int *cp), {
+	HEAP32[rp >> 2] = VEDIT.rows | 0;
+	HEAP32[cp >> 2] = VEDIT.cols | 0;
+})
+
+static long
+em_io_read(void *ctx, void *buf, long n)
+{
+	(void)ctx;
+	return vedit_js_read((char *)buf, (int)n);
+}
+
+static long
+em_io_write(void *ctx, const void *buf, long n)
+{
+	(void)ctx;
+	vedit_js_write((const char *)buf, (int)n);
+	return n;
+}
+
+static int
+em_io_poll(void *ctx, int timeout_ms)
+{
+	(void)ctx;
+	return vedit_js_wait(timeout_ms) > 0 ? 1 : 0;
+}
+
+static int
+em_io_getsize(void *ctx, int *rows, int *cols)
+{
+	(void)ctx;
+	vedit_js_size(rows, cols);
+	if (*cols <= 0)
+		*cols = 80;
+	if (*rows <= 0)
+		*rows = 24;
+	return 0;
+}
+
+int
+main(int argc, char **argv)
+{
+	struct vedit_io io = {0};
+	struct vedit *v;
+	const char *file = (argc > 1) ? argv[1] : NULL;
+
+	io.read = em_io_read;
+	io.write = em_io_write;
+	io.poll = em_io_poll;
+	io.getsize = em_io_getsize;
+	v = vedit_new(&io);
+	if (!v)
+		return 1;
+	if (file && vedit_open(v, file) < 0) {
+		vedit_free(v);
+		return 1;
+	}
+	vedit_run(v);
+	vedit_free(v);
+	return 0;
+}
+#endif /* __EMSCRIPTEN__ */
 
 /****************************************************************
  * vi personality
