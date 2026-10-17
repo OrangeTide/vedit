@@ -101,7 +101,7 @@ TORTURE_ROUNDS ?= 20000
 SANCFLAGS = -std=gnu11 -Wall -Wextra -g -O1 -fno-omit-frame-pointer
 
 .PHONY: all link clean install uninstall test torture asan ubsan cov cov-term \
-    screenshots static gvedit wasm web guterm-sync
+    screenshots static gvedit veditmin wasm web guterm-sync
 
 all: $(BIN) link
 
@@ -110,6 +110,20 @@ $(BIN): $(SRC) $(HDR) | $(OUTBIN)
 
 $(OUTBIN):
 	mkdir -p $@
+
+# veditmin: a reduced native build for embedding vedit in a host (such as a
+# MUD) that does not need the full feature set. It keeps the text editor, the
+# vi keys, and search, and drops features a host does not need. The dropped
+# set grows as the VEDIT_NO_* gates are wired.
+VEDITMIN_DEFS = -DVEDIT_NO_TERM -DVEDIT_NO_ART -DVEDIT_NO_TOOLS \
+    -DVEDIT_NO_MAIL -DVEDIT_NO_MOUSE -DVEDIT_NO_XDG -DVEDIT_NO_HEX
+MINBIN = $(OUTBIN)/veditmin$(EXE)
+
+veditmin: $(MINBIN)
+	$(if $(EXE),,ln -sfn $(MINBIN) veditmin)
+
+$(MINBIN): $(SRC) $(HDR) | $(OUTBIN)
+	$(CC) $(CFLAGS) $(VEDITMIN_DEFS) -o $@ $(SRC) $(LDFLAGS)
 
 # Point the top-level symlink at this target's binary. Always rerun, so
 # `make static` and a plain `make` each leave ./vedit on the build just made.

@@ -9664,6 +9664,7 @@ text_redo(Text *t, size_t *line, size_t *col)
 
 
 
+#ifndef VEDIT_NO_HEX
 /* Whether an implied newline follows line i (a separator before the next line,
  * or the trailing newline after the last line when the file carried one). */
 static int
@@ -9964,6 +9965,7 @@ found:
 	free(buf);
 	return hit;
 }
+#endif /* !VEDIT_NO_HEX */
 
 /****************************************************************
  * Modeless editor / MS-EDIT personality
@@ -10933,7 +10935,10 @@ typedef enum menu_act {
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE, MA_OSC_COPY, MA_OSC_COPY_FILE,
 	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_TAG_POP, MA_OPEN_HEADER,
 	MA_GOTO,
-	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_HEX, MA_TABLE, MA_DRAW,
+	MA_SYNTAX, MA_SCHEME, MA_LINENO, MA_WRAP, MA_EOL, MA_TABLE, MA_DRAW,
+#ifndef VEDIT_NO_HEX
+	MA_HEX,
+#endif
 	MA_TBL_ROWADD, MA_TBL_ROWDEL, MA_TBL_COLADD, MA_TBL_COLDEL, MA_TBL_FIT,
 	MA_SORT, MA_INS_DATE, MA_INS_FILE,
 	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS, MA_MOUSE, MA_STATUSLINE,
@@ -11076,7 +11081,9 @@ static const Menuitem mi_view[] = {
 #endif
 	{ "&Auto Indent",	"",	":set ai",	MA_AUTO_INDENT },
 	{ "&Indent with Spaces","",	":set et",	MA_EXPAND_TABS },
+#ifndef VEDIT_NO_HEX
 	{ "&Hex Dump",		"",	"",	MA_HEX },
+#endif
 	{ "Ta&ble View",	"",	":table",	MA_TABLE },
 	{ "Text Wi&dth...",	"",	":set tw=",	MA_TEXTWIDTH },
 	{ "Split &Pane",	"Ctrl-W s",	":split",	MA_SPLIT },
@@ -11417,8 +11424,10 @@ menu_checked(const Editor *e, Menuact act)
 		return e->auto_indent ? 1 : 0;
 	case MA_EXPAND_TABS:
 		return e->expand_tabs ? 1 : 0;
+#ifndef VEDIT_NO_HEX
 	case MA_HEX:
 		return e->hex_view ? 1 : 0;
+#endif
 	case MA_DRAW:
 		return e->draw_mode ? 1 : 0;
 	case MA_TABLE:
@@ -12275,6 +12284,7 @@ ui_field(Screen *d, int row, int col, int width, const char *s,
 	scr_text(d, row, col, s, fg, bg, attrs);
 }
 
+#ifndef VEDIT_NO_HEX
 /* Prompt for a byte offset (hex, an optional 0x accepted) and move the cursor
  * there. */
 static void
@@ -12870,6 +12880,7 @@ hex_render(Editor *e, Screen *d)
 		scr_cursor(d, 1 + (int)(currow - e->hex_top),
 		    e->hex_ascii ? hex_asciicol(curj, (int)cols) : hex_hexcol(curj));
 }
+#endif /* !VEDIT_NO_HEX */
 
 /****************************************************************
  * Table view: CSV and TSV as a grid of cells
@@ -15042,11 +15053,13 @@ render_body(Editor *e, Screen *d)
 	}
 #endif
 
+#ifndef VEDIT_NO_HEX
 	if (e->hex_view) {
 		e->prev_text_view = 0;	/* hex uses hex_top, not e->top */
 		hex_render(e, d);
 		return;
 	}
+#endif
 	if (e->tbl) {
 		e->prev_text_view = 0;	/* a grid, not the text view */
 		tbl_render(e, d);
@@ -27468,6 +27481,7 @@ run_menu_act(Editor *e, Menuact act)
 		ed_format(e);
 		break;
 #endif
+#ifndef VEDIT_NO_HEX
 	case MA_HEX:
 		e->hex_view = !e->hex_view;
 		e->hex_top = 0;
@@ -27478,6 +27492,7 @@ run_menu_act(Editor *e, Menuact act)
 		set_status(e, "%s view",
 		    e->hex_view ? "hex" : "text");
 		break;
+#endif
 	case MA_DRAW:
 		draw_toggle(e);
 		break;
@@ -29374,12 +29389,14 @@ editor_loop(Editor *e)
 
 		/* In the hex view, keys drive the hex navigator. It shares the
 		 * request handling, so Ctrl-S and Ctrl-Q behave as usual. */
+#ifndef VEDIT_NO_HEX
 		if (e->hex_view) {
 			if (run_req(e, hex_key(e, &seq)))
 				return 0;
 			ed_render(e, e->d);
 			continue;
 		}
+#endif
 
 		/* The table view takes every key; its : prompt is vi's. */
 		if (e->tbl) {
