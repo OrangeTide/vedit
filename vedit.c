@@ -8730,6 +8730,7 @@ text_materialize(const Text *ct)
 	return OK;
 }
 
+#ifndef VEDIT_NO_SWAP
 /* Move the borrowed lines onto a map of path, which must hold exactly the
  * bytes of the current map (the swap base cloned from the mapped file).
  * The records hold offsets, so only the base pointer changes. OK, or ERR
@@ -8759,6 +8760,7 @@ text_remap(const Text *ct, const char *path)
 	map_register(t);
 	return OK;
 }
+#endif	/* VEDIT_NO_SWAP */
 
 /* Whether path names the file t has mapped. */
 static int
@@ -18155,6 +18157,11 @@ typedef struct swapj {
 	long long	disk_mtime_ns;	/* matching file can be cloned as the base */
 } Swapj;
 
+/* The running editor, recorded while vedit_run drives the event loop so the
+ * out-of-memory and crash paths can find it. NULL when nothing is running. */
+static Editor *g_crash_ed;
+
+#ifndef VEDIT_NO_SWAP
 /* Copy a path into out with every '/' turned into '%', for a collision-free
  * name when swap or backup files share one directory (Vim's convention). */
 static void
@@ -18762,10 +18769,6 @@ swap_maybe_write(Editor *e)
 	}
 }
 
-/* The running editor, recorded while vedit_run drives the event loop so the
- * out-of-memory and crash paths can find it. NULL when nothing is running. */
-static Editor *g_crash_ed;
-
 /* Sync every buffer's journal (the active one from the flat editor, the
  * rest from their parked slots). Runs at most once and touches nothing but
  * the file descriptors, so it is safe from the fatal-signal handler: the
@@ -19001,6 +19004,31 @@ swap_recover(Editor *e, const char *path, Text *t, time_t orig_mtime)
 		return SWAP_ABORT;
 	}
 }
+
+#else	/* VEDIT_NO_SWAP: a host owns persistence, no crash-recovery sidecars */
+
+static int backup_path_for(const char *p, char *out, size_t sz)
+{ (void)p; (void)out; (void)sz; return 0; }
+static void swap_attach(Editor *e) { (void)e; }
+static void swap_rebind(Editor *e) { (void)e; }
+static void swap_drop(Swapj *j) { (void)j; }
+static void swap_detach(Text *t, Swapj *j) { (void)t; (void)j; }
+static void swap_remove(Editor *e) { (void)e; }
+static void swap_maybe_write(Editor *e) { (void)e; }
+static void swap_flush_all(Editor *e) { (void)e; }
+static void vedit_flush_swaps(void) {}
+static void swap_adopt(Editor *e, time_t orig_mtime, int action)
+{
+	(void)orig_mtime;
+	(void)action;
+	e->swap_path[0] = '\0';
+	e->swap_on = 0;
+	e->swap_rev = e->t->rev;
+}
+static int swap_recover(Editor *e, const char *path, Text *t, time_t orig_mtime)
+{ (void)e; (void)path; (void)t; (void)orig_mtime; return SWAP_NONE; }
+
+#endif	/* VEDIT_NO_SWAP */
 
 #ifndef VEDIT_NO_TOOLS
 static int ed_format(Editor *e);	/* reformat the buffer in place (below) */
@@ -43148,6 +43176,7 @@ ex_set(Editor *e, const char *arg)
 		set_status(e, "indent with %s",
 		    e->expand_tabs ? "spaces" : "tabs");
 		return REQ_CONTINUE;
+#ifndef VEDIT_NO_SWAP
 	} else if (strcmp(arg, "swapfile") == 0 || strcmp(arg, "swf") == 0 ||
 	    strcmp(arg, "noswapfile") == 0 || strcmp(arg, "noswf") == 0 ||
 	    strcmp(arg, "swapfile!") == 0 || strcmp(arg, "invswapfile") == 0) {
@@ -43178,6 +43207,7 @@ ex_set(Editor *e, const char *arg)
 		set_status(e, "backup %s",
 		    e->backup_enabled ? "on" : "off");
 		return REQ_CONTINUE;
+#endif	/* VEDIT_NO_SWAP */
 	} else if (strcmp(arg, "formatonsave") == 0 || strcmp(arg, "fos") == 0 ||
 	    strcmp(arg, "noformatonsave") == 0 || strcmp(arg, "nofos") == 0 ||
 	    strcmp(arg, "formatonsave!") == 0 || strcmp(arg, "invformatonsave") == 0) {

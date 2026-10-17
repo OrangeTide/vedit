@@ -116,7 +116,8 @@ $(OUTBIN):
 # vi keys, and search, and drops features a host does not need. The dropped
 # set grows as the VEDIT_NO_* gates are wired.
 VEDITMIN_DEFS = -DVEDIT_NO_TERM -DVEDIT_NO_ART -DVEDIT_NO_TOOLS \
-    -DVEDIT_NO_MAIL -DVEDIT_NO_MOUSE -DVEDIT_NO_XDG -DVEDIT_NO_HEX
+    -DVEDIT_NO_MAIL -DVEDIT_NO_MOUSE -DVEDIT_NO_XDG -DVEDIT_NO_HEX \
+    -DVEDIT_NO_SWAP
 MINBIN = $(OUTBIN)/veditmin$(EXE)
 
 veditmin: $(MINBIN)
