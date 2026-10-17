@@ -16916,6 +16916,62 @@ ed_auto_wrap(Editor *e)
 }
 
 
+/* A bracketed paste while it is a frame: the CR/LF-collapse flag and whether to
+ * insert the payload or drop it (vi normal mode). The frame is silent (no draw)
+ * so a large paste does not repaint per character. */
+typedef struct paste_ctx {
+	int	saw_cr;		/* the previous char was a CR */
+	int	discard;	/* drain and drop instead of inserting */
+} PasteCtx;
+
+_Static_assert(sizeof(PasteCtx) <= sizeof(UiCtx),
+    "PasteCtx must fit inline in a UiFrame");
+
+/* One event of a paste: insert (or drop) one char, or close at PASTE_END. */
+static int
+paste_frame_key(Editor *e, UiFrame *f, const Event *ev)
+{
+	PasteCtx *pc = (PasteCtx *)&f->ctx;
+	struct tkbd_seq seq;
+	unsigned char buf[8];
+	int n;
+
+	if (ev->type != EVENT_KEY)
+		return 0;
+	seq = ev->key;
+	if (seq.type != TKBD_KEY)
+		return 0;
+	if (seq.key == TKBD_KEY_PASTE_END) {
+		if (!pc->discard)
+			text_undo_boundary(e->t);
+		return 1;
+	}
+	if (pc->discard)
+		return 0;			/* drain everything else */
+	if (seq.key == TKBD_KEY_ENTER) {
+		/* collapse a CR immediately followed by LF */
+		if (seq.ch == 0x0a && pc->saw_cr) {
+			pc->saw_cr = 0;
+			return 0;
+		}
+		ed_newline(e);
+		pc->saw_cr = (seq.ch == 0x0d);
+		return 0;
+	}
+	pc->saw_cr = 0;
+	if (seq.key == TKBD_KEY_TAB) {
+		ed_insert(e, "\t", 1);
+		return 0;
+	}
+	if (seq.ch != TKBD_CH_NONE && seq.ch >= 0x20 && seq.ch != 0x7f) {
+		n = utf8_encode(buf, seq.ch);
+		if (n > 0)
+			ed_insert(e, (char *)buf, (size_t)n);
+	}
+	/* other control and function keys are dropped inside a paste */
+	return 0;
+}
+
 /* Consume a bracketed-paste payload (PASTE_BEGIN was just read) and insert
  * it literally, so control bytes in the paste never fire editor commands.
  * CR, LF, and CRLF all become one newline. Undo boundaries fence the paste
@@ -16923,7 +16979,9 @@ ed_auto_wrap(Editor *e)
 static void
 paste_input(Editor *e)
 {
-	int saw_cr = 0;
+	int base = e->ui_depth;
+	UiFrame *f;
+	PasteCtx *pc;
 
 	if (e->sel_active) {		/* a paste replaces the selection */
 		size_t y1, x1, y2, x2;
@@ -16933,48 +16991,15 @@ paste_input(Editor *e)
 		e->sel_active = 0;
 	}
 	text_undo_boundary(e->t);	/* separate the paste from prior typing */
-	for (;;) {
-		Event ev;
-		struct tkbd_seq seq;
-		unsigned char buf[8];
-		int n;
-
-		if (scr_wait(e->d, &ev) == EVENT_EOF)
-			break;			/* input closed ends the paste */
-		if (ev.type != EVENT_KEY) {
-			scr_size(e->d, &e->rows, &e->cols);	/* resize/resume */
-			continue;
-		}
-		seq = ev.key;
-		if (seq.type != TKBD_KEY)
-			continue;
-		if (seq.key == TKBD_KEY_PASTE_END)
-			break;
-
-		if (seq.key == TKBD_KEY_ENTER) {
-			/* collapse a CR immediately followed by LF */
-			if (seq.ch == 0x0a && saw_cr) {
-				saw_cr = 0;
-				continue;
-			}
-			ed_newline(e);
-			saw_cr = (seq.ch == 0x0d);
-			continue;
-		}
-		saw_cr = 0;
-		if (seq.key == TKBD_KEY_TAB) {
-			ed_insert(e, "\t", 1);
-			continue;
-		}
-		if (seq.ch != TKBD_CH_NONE && seq.ch >= 0x20 &&
-		    seq.ch != 0x7f) {
-			n = utf8_encode(buf, seq.ch);
-			if (n > 0)
-				ed_insert(e, (char *)buf, (size_t)n);
-		}
-		/* other control and function keys are dropped inside a paste */
+	f = ui_push(e, UI_PASTE, NULL, paste_frame_key, NULL);
+	if (!f) {
+		text_undo_boundary(e->t);
+		return;
 	}
-	text_undo_boundary(e->t);
+	pc = (PasteCtx *)&f->ctx;
+	pc->saw_cr = 0;
+	pc->discard = 0;
+	ui_pump_modal(e, base);
 }
 
 /* Consume and discard a bracketed-paste payload without inserting it. Used in
@@ -16982,20 +17007,17 @@ paste_input(Editor *e)
 static void
 paste_discard(Editor *e)
 {
-	for (;;) {
-		Event ev;
-		struct tkbd_seq seq;
+	int base = e->ui_depth;
+	UiFrame *f;
+	PasteCtx *pc;
 
-		if (scr_wait(e->d, &ev) == EVENT_EOF)
-			break;
-		if (ev.type != EVENT_KEY) {
-			scr_size(e->d, &e->rows, &e->cols);	/* resize/resume */
-			continue;
-		}
-		seq = ev.key;
-		if (seq.type == TKBD_KEY && seq.key == TKBD_KEY_PASTE_END)
-			break;
-	}
+	f = ui_push(e, UI_PASTE, NULL, paste_frame_key, NULL);
+	if (!f)
+		return;
+	pc = (PasteCtx *)&f->ctx;
+	pc->saw_cr = 0;
+	pc->discard = 1;
+	ui_pump_modal(e, base);
 }
 
 static int
@@ -19155,93 +19177,131 @@ isearch_draw(Editor *e, const char *label, const char *q, int found)
 static void jump_record(Editor *e);
 static void jump_record_at(Editor *e, size_t cy, size_t cx);
 
+/* Incremental search while it is a frame: the origin to rest at or restore to,
+ * the query, direction, last match status, and the status-line label. */
+typedef struct incsearch_ctx {
+	size_t	oy, ox, otop, oleft;	/* origin cursor and scroll */
+	char	q[256];			/* the query */
+	size_t	len;
+	int	dir;			/* 1 forward, -1 backward */
+	int	found;			/* the current query matched */
+	char	label[16];		/* "/", "?", "ISearch: " */
+} IncsearchCtx;
+
+_Static_assert(sizeof(IncsearchCtx) <= sizeof(UiCtx),
+    "IncsearchCtx must fit inline in a UiFrame");
+
+/* Re-scan for the current query, move the cursor to the match (or rest at the
+ * origin), then draw the search line. Done each frame so the cursor follows
+ * the query as it is typed. */
+static void
+incsearch_frame_draw(Editor *e, UiFrame *f)
+{
+	IncsearchCtx *ic = (IncsearchCtx *)&f->ctx;
+	size_t my = ic->oy, mx = ic->ox;
+
+	if (ic->len > 0 &&
+	    (ic->found = isearch_scan_dir(e, ic->q, ic->oy, ic->ox, ic->dir,
+	    &my, &mx))) {
+		e->cy = my;
+		e->cx = mx;
+		e->sel_active = 0;
+	} else {			/* empty or failing: rest at origin */
+		e->cy = ic->oy;
+		e->cx = ic->ox;
+		e->top = ic->otop;
+		e->left = ic->oleft;
+		if (ic->len == 0)
+			ic->found = 1;
+	}
+	isearch_draw(e, ic->label, ic->q, ic->found);
+}
+
+static int
+incsearch_frame_key(Editor *e, UiFrame *f, const Event *ev)
+{
+	IncsearchCtx *ic = (IncsearchCtx *)&f->ctx;
+	struct tkbd_seq seq;
+
+	if (ev->type != EVENT_KEY)
+		return 0;
+	seq = ev->key;
+	if (seq.type != TKBD_KEY)
+		return 0;
+	if (seq.key == TKBD_KEY_ENTER) {
+		if (ic->len == 0) {
+			if (e->last_find[0]) {
+				jump_record(e);	/* at the origin now */
+				ed_find_dir(e, e->last_find, ic->dir);
+			}
+			return 1;
+		}
+		snprintf(e->last_find, sizeof(e->last_find), "%s", ic->q);
+		e->vi_search_dir = ic->dir;
+		if (ic->found) {
+			jump_record_at(e, ic->oy, ic->ox);	/* came from here */
+			set_status(e, "found '%.80s'", ic->q);
+		} else
+			set_status(e, "not found: %.80s", ic->q);
+		return 1;
+	}
+	if (seq.key == TKBD_KEY_ESC ||
+	    ((seq.mod & TKBD_MOD_CTRL) && seq.key == TKBD_KEY_C)) {
+		e->cy = ic->oy, e->cx = ic->ox, e->top = ic->otop, e->left = ic->oleft;
+		set_status(e, "search cancelled");
+		return 1;
+	}
+	if (seq.key == TKBD_KEY_BACKSPACE ||
+	    seq.key == TKBD_KEY_BACKSPACE2) {
+		while (ic->len > 0 &&
+		    ((unsigned char)ic->q[ic->len - 1] & 0xc0) == 0x80)
+			ic->len--;
+		if (ic->len > 0)
+			ic->len--;
+		ic->q[ic->len] = '\0';
+		return 0;
+	}
+	if (!(seq.mod & TKBD_MOD_CTRL) && seq.ch != TKBD_CH_NONE &&
+	    seq.ch >= 0x20 && seq.ch != 0x7f) {
+		unsigned char enc[8];
+		int el = utf8_encode(enc, seq.ch);
+
+		if (el > 0 && ic->len + (size_t)el < sizeof(ic->q)) {
+			memcpy(ic->q + ic->len, enc, (size_t)el);
+			ic->len += (size_t)el;
+			ic->q[ic->len] = '\0';
+		}
+	}
+	return 0;
+}
+
+/* Incremental search in direction dir (1 forward, -1 backward). The cursor
+ * follows the first match from the starting position as the query is typed.
+ * Enter accepts (storing the query and direction for repeats); an empty query
+ * repeats the last search. Esc or Ctrl-C cancels and restores the start. label
+ * is the status-line prompt ("/" or "?" for vi, "ISearch: " for modeless). */
 static void
 incsearch(Editor *e, int dir, const char *label)
 {
-	size_t oy = e->cy, ox = e->cx, otop = e->top, oleft = e->left;
-	char q[256];
-	size_t len = 0;
-	int found = 1;
+	int base = e->ui_depth;
+	UiFrame *f;
+	IncsearchCtx *ic;
 
-	q[0] = '\0';
-	for (;;) {
-		Event ev;
-		struct tkbd_seq seq;
-		size_t my = oy, mx = ox;
-
-		if (len > 0 &&
-		    (found = isearch_scan_dir(e, q, oy, ox, dir, &my, &mx))) {
-			e->cy = my;
-			e->cx = mx;
-			e->sel_active = 0;
-		} else {			/* empty or failing: rest at origin */
-			e->cy = oy;
-			e->cx = ox;
-			e->top = otop;
-			e->left = oleft;
-			if (len == 0)
-				found = 1;
-		}
-		isearch_draw(e, label, q, found);
-
-		if (scr_wait(e->d, &ev) == EVENT_EOF) {
-			e->cy = oy, e->cx = ox, e->top = otop, e->left = oleft;
-			return;
-		}
-		if (ev.type != EVENT_KEY) {
-			scr_size(e->d, &e->rows, &e->cols);
-			continue;
-		}
-		seq = ev.key;
-		if (seq.type != TKBD_KEY)
-			continue;
-		if (seq.key == TKBD_KEY_ENTER) {
-			if (len == 0) {
-				if (e->last_find[0]) {
-					jump_record(e);	/* at the origin now */
-					ed_find_dir(e, e->last_find, dir);
-				}
-				return;
-			}
-			snprintf(e->last_find, sizeof(e->last_find), "%s", q);
-			e->vi_search_dir = dir;
-			if (found) {
-				jump_record_at(e, oy, ox);	/* came from here */
-				set_status(e,
-				    "found '%.80s'", q);
-			} else
-				set_status(e,
-				    "not found: %.80s", q);
-			return;
-		}
-		if (seq.key == TKBD_KEY_ESC ||
-		    ((seq.mod & TKBD_MOD_CTRL) && seq.key == TKBD_KEY_C)) {
-			e->cy = oy, e->cx = ox, e->top = otop, e->left = oleft;
-			set_status(e, "search cancelled");
-			return;
-		}
-		if (seq.key == TKBD_KEY_BACKSPACE ||
-		    seq.key == TKBD_KEY_BACKSPACE2) {
-			while (len > 0 &&
-			    ((unsigned char)q[len - 1] & 0xc0) == 0x80)
-				len--;
-			if (len > 0)
-				len--;
-			q[len] = '\0';
-			continue;
-		}
-		if (!(seq.mod & TKBD_MOD_CTRL) && seq.ch != TKBD_CH_NONE &&
-		    seq.ch >= 0x20 && seq.ch != 0x7f) {
-			unsigned char enc[8];
-			int el = utf8_encode(enc, seq.ch);
-
-			if (el > 0 && len + (size_t)el < sizeof(q)) {
-				memcpy(q + len, enc, (size_t)el);
-				len += (size_t)el;
-				q[len] = '\0';
-			}
-		}
-	}
+	f = ui_push(e, UI_INCSEARCH, incsearch_frame_draw, incsearch_frame_key,
+	    NULL);
+	if (!f)
+		return;
+	ic = (IncsearchCtx *)&f->ctx;
+	ic->oy = e->cy;
+	ic->ox = e->cx;
+	ic->otop = e->top;
+	ic->oleft = e->left;
+	ic->q[0] = '\0';
+	ic->len = 0;
+	ic->dir = dir;
+	ic->found = 1;
+	snprintf(ic->label, sizeof(ic->label), "%s", label);
+	ui_pump_modal(e, base);
 }
 
 /* Modeless find: forward incremental search. */
@@ -27100,15 +27160,159 @@ menu_nav(const Editor *e, int cur, int dir)
 	return cur;
 }
 
+/* The menu bar while it is a frame: the current top-level menu, the selected
+ * dropdown item, whether a dropdown is shown, and the chosen action. */
+typedef struct menu_ctx {
+	int	cur;		/* current top-level menu */
+	int	sel;		/* selected dropdown item */
+	int	menu_open;	/* 1: a dropdown is shown; 0: the bar is armed */
+	Menuact	result;		/* chosen action (set when done) */
+} MenuCtx;
+
+_Static_assert(sizeof(MenuCtx) <= sizeof(UiCtx),
+    "MenuCtx must fit inline in a UiFrame");
+
+static void
+menu_frame_draw(Editor *e, UiFrame *f)
+{
+	MenuCtx *mc = (MenuCtx *)&f->ctx;
+
+	ui_menubar(e, ed_chrome(e), mc->cur);
+	if (mc->menu_open)
+		ui_dropdown(e, mc->cur, mc->sel);
+	scr_cursor_vis(e->d, 0);
+}
+
+static int
+menu_frame_key(Editor *e, UiFrame *f, const Event *ev)
+{
+	MenuCtx *mc = (MenuCtx *)&f->ctx;
+	uint32_t ch;
+
+	if (ev->type != EVENT_KEY)
+		return 0;
+	if (ev->key.type == TKBD_MOUSE) {
+		int boxw, x0, y0, item;
+
+		if (ev->key.key != TKBD_MOUSE_LEFT)
+			return 0;	/* ignore drag/release/wheel */
+		if (ev->key.y == 0) {	/* click on the bar */
+			int m = menu_hit(e, ev->key.x);
+
+			if (m < 0) {
+				mc->result = MA_NONE;	/* off a title: close */
+				return 1;
+			}
+			mc->cur = m;
+			mc->sel = menu_first(e, mc->cur);
+			return 0;
+		}
+		/* click inside the open drop-down selects an item */
+		boxw = dropdown_width(e, mc->cur) + 2;
+		x0 = dropdown_x(e, mc->cur, boxw);
+		y0 = 1;			/* top border row */
+		item = ev->key.y - (y0 + 1);
+		if (ev->key.x > x0 && ev->key.x < x0 + boxw - 1 &&
+		    item >= 0 && item < MENUS[mc->cur].n &&
+		    menu_item_sel_ok(e, mc->cur, item)) {
+			mc->result = MENUS[mc->cur].items[item].act;
+			return 1;
+		}
+		mc->result = MA_NONE;		/* click elsewhere closes */
+		return 1;
+	}
+	if (ev->key.type != TKBD_KEY)
+		return 0;
+
+	/* Alt+letter jumps straight to another menu and opens it. */
+	ch = ev->key.ch;
+	if ((ev->key.mod & TKBD_MOD_ALT) && ch != TKBD_CH_NONE && ch < 128) {
+		int m = menu_title_by_mnemonic(e, tolower((int)ch));
+
+		if (m >= 0) {
+			mc->cur = m;
+			mc->sel = menu_first(e, mc->cur);
+			mc->menu_open = 1;
+		}
+		return 0;
+	}
+
+	switch (ev->key.key) {
+	case TKBD_KEY_ESC:
+		if (mc->menu_open) {
+			mc->menu_open = 0;	/* close the drop-down, keep bar */
+			return 0;
+		}
+		mc->result = MA_NONE;		/* armed bar: Esc leaves the menu */
+		return 1;
+	case TKBD_KEY_LEFT:
+		mc->cur = menu_nav(e, mc->cur, -1);
+		mc->sel = menu_first(e, mc->cur);
+		return 0;
+	case TKBD_KEY_RIGHT:
+		mc->cur = menu_nav(e, mc->cur, 1);
+		mc->sel = menu_first(e, mc->cur);
+		return 0;
+	case TKBD_KEY_UP:
+		if (mc->menu_open)
+			mc->sel = menu_step(e, mc->cur, mc->sel, -1);
+		else
+			mc->menu_open = 1;	/* open the armed menu */
+		return 0;
+	case TKBD_KEY_DOWN:
+		if (mc->menu_open)
+			mc->sel = menu_step(e, mc->cur, mc->sel, 1);
+		else {
+			mc->menu_open = 1;	/* open the armed menu */
+			mc->sel = menu_first(e, mc->cur);
+		}
+		return 0;
+	case TKBD_KEY_ENTER:
+		if (!mc->menu_open) {
+			mc->menu_open = 1;	/* open the armed menu */
+			mc->sel = menu_first(e, mc->cur);
+		} else if (menu_item_sel_ok(e, mc->cur, mc->sel)) {
+			mc->result = MENUS[mc->cur].items[mc->sel].act;
+			return 1;
+		}
+		return 0;
+	default:
+		/* A plain letter: when the bar is only armed (F10), it opens the
+		 * top-level menu with that mnemonic (MS-EDIT style). Once a menu
+		 * is open, it selects an item. */
+		if (ch == TKBD_CH_NONE || ch >= 128 ||
+		    (ev->key.mod & (TKBD_MOD_CTRL | TKBD_MOD_ALT)))
+			return 0;
+		if (!mc->menu_open) {
+			int m = menu_title_by_mnemonic(e, tolower((int)ch));
+
+			if (m >= 0) {
+				mc->cur = m;
+				mc->sel = menu_first(e, mc->cur);
+				mc->menu_open = 1;
+			}
+		} else {
+			int it = menu_item_by_mnemonic(e, mc->cur,
+			    tolower((int)ch));
+
+			if (it >= 0) {
+				mc->result = MENUS[mc->cur].items[it].act;
+				return 1;
+			}
+		}
+		return 0;
+	}
+}
+
 /* Run the menu bar with menu `start` open. Returns the chosen action, or
  * MA_NONE when the user backs out with Esc. */
 static Menuact
 menu_bar_run(Editor *e, int start, int open)
 {
+	int base = e->ui_depth;
 	int cur = start;
-	int sel;
-	int menu_open = open;	/* 1: a dropdown is shown; 0: the bar is armed
-				 * (MS-EDIT style) and a letter opens a menu */
+	UiFrame *f;
+	MenuCtx *mc;
 
 	if (cur < 0)
 		cur = 0;
@@ -27116,136 +27320,17 @@ menu_bar_run(Editor *e, int start, int open)
 		cur = MENU_COUNT - 1;
 	if (!menu_visible(e, cur))		/* land on a shown menu */
 		cur = menu_nav(e, cur, 1);
-	sel = menu_first(e, cur);
 
-	for (;;) {
-		Event ev;
-		uint32_t ch;
-
-		render_body(e, e->d);
-		ui_menubar(e, ed_chrome(e), cur);
-		if (menu_open)
-			ui_dropdown(e, cur, sel);
-		scr_cursor_vis(e->d, 0);
-		scr_present(e->d);
-
-		switch (scr_wait(e->d, &ev)) {
-		case EVENT_EOF:
-			return MA_EXIT;
-		case EVENT_RESIZE:
-		case EVENT_RESUME:
-			scr_size(e->d, &e->rows, &e->cols);
-			continue;
-		case EVENT_KEY:
-			break;
-		default:
-			continue;
-		}
-		if (ev.key.type == TKBD_MOUSE) {
-			int boxw, x0, y0, item;
-
-			if (ev.key.key != TKBD_MOUSE_LEFT)
-				continue;	/* ignore drag/release/wheel */
-			if (ev.key.y == 0) {	/* click on the bar */
-				int m = menu_hit(e, ev.key.x);
-
-				if (m < 0)
-					return MA_NONE;	/* off a title: close */
-				cur = m;
-				sel = menu_first(e, cur);
-				continue;
-			}
-			/* click inside the open drop-down selects an item */
-			boxw = dropdown_width(e, cur) + 2;
-			x0 = dropdown_x(e, cur, boxw);
-			y0 = 1;			/* top border row */
-			item = ev.key.y - (y0 + 1);
-			if (ev.key.x > x0 && ev.key.x < x0 + boxw - 1 &&
-			    item >= 0 && item < MENUS[cur].n &&
-			    menu_item_sel_ok(e, cur, item))
-				return MENUS[cur].items[item].act;
-			return MA_NONE;		/* click elsewhere closes */
-		}
-		if (ev.key.type != TKBD_KEY)
-			continue;
-
-		/* Alt+letter jumps straight to another menu and opens it. */
-		ch = ev.key.ch;
-		if ((ev.key.mod & TKBD_MOD_ALT) && ch != TKBD_CH_NONE &&
-		    ch < 128) {
-			int m = menu_title_by_mnemonic(e, tolower((int)ch));
-
-			if (m >= 0) {
-				cur = m;
-				sel = menu_first(e, cur);
-				menu_open = 1;
-			}
-			continue;
-		}
-
-		switch (ev.key.key) {
-		case TKBD_KEY_ESC:
-			if (menu_open) {
-				menu_open = 0;	/* close the drop-down, keep bar */
-				break;
-			}
-			return MA_NONE;		/* armed bar: Esc leaves the menu */
-		case TKBD_KEY_LEFT:
-			cur = menu_nav(e, cur, -1);
-			sel = menu_first(e, cur);
-			break;
-		case TKBD_KEY_RIGHT:
-			cur = menu_nav(e, cur, 1);
-			sel = menu_first(e, cur);
-			break;
-		case TKBD_KEY_UP:
-			if (menu_open)
-				sel = menu_step(e, cur, sel, -1);
-			else
-				menu_open = 1;	/* open the armed menu */
-			break;
-		case TKBD_KEY_DOWN:
-			if (menu_open)
-				sel = menu_step(e, cur, sel, 1);
-			else {
-				menu_open = 1;	/* open the armed menu */
-				sel = menu_first(e, cur);
-			}
-			break;
-		case TKBD_KEY_ENTER:
-			if (!menu_open) {
-				menu_open = 1;	/* open the armed menu */
-				sel = menu_first(e, cur);
-			} else if (menu_item_sel_ok(e, cur, sel)) {
-				return MENUS[cur].items[sel].act;
-			}
-			break;
-		default:
-			/* A plain letter: when the bar is only armed (F10), it
-			 * opens the top-level menu with that mnemonic (MS-EDIT
-			 * style). Once a menu is open, it selects an item. */
-			if (ch == TKBD_CH_NONE || ch >= 128 ||
-			    (ev.key.mod & (TKBD_MOD_CTRL | TKBD_MOD_ALT)))
-				break;
-			if (!menu_open) {
-				int m = menu_title_by_mnemonic(e,
-				    tolower((int)ch));
-
-				if (m >= 0) {
-					cur = m;
-					sel = menu_first(e, cur);
-					menu_open = 1;
-				}
-			} else {
-				int it = menu_item_by_mnemonic(e, cur,
-				    tolower((int)ch));
-
-				if (it >= 0)
-					return MENUS[cur].items[it].act;
-			}
-			break;
-		}
-	}
+	f = ui_push(e, UI_MENU, menu_frame_draw, menu_frame_key, NULL);
+	if (!f)
+		return MA_NONE;
+	mc = (MenuCtx *)&f->ctx;
+	mc->cur = cur;
+	mc->sel = menu_first(e, cur);
+	mc->menu_open = open;
+	mc->result = MA_EXIT;		/* EOF closes the bar as exit */
+	ui_pump_modal(e, base);
+	return mc->result;
 }
 
 /* Which menu a keypress opens, or -1 for none. F10 opens the bar; Alt+letter
@@ -28445,39 +28530,36 @@ split_toward(const Editor *e, uint32_t dir)
 	return -1;
 }
 
-/* Ctrl-W from a text buffer: one more key picks the window action. The
- * split keys follow vi (s, v, w, h j k l, c, o); the rest go to the
- * bottom pane. In the vi personality ':' opens the ex line, and its
- * result is returned so a quit typed there ends the run. */
-static Req
-pane_key(Editor *e)
+/* The Ctrl-W window prefix while it is a frame: just the Req to hand back. It
+ * reads exactly one key, acts on it, and closes. */
+typedef struct panekey_ctx {
+	Req	result;
+} PaneKeyCtx;
+
+_Static_assert(sizeof(PaneKeyCtx) <= sizeof(UiCtx),
+    "PaneKeyCtx must fit inline in a UiFrame");
+
+static void
+panekey_frame_draw(Editor *e, UiFrame *f)
 {
-	Event ev;
+	(void)f;
+	ed_render(e, e->d);		/* shows the Ctrl-W prompt in the status */
+}
+
+static int
+panekey_frame_key(Editor *e, UiFrame *f, const Event *ev)
+{
+	PaneKeyCtx *pk = (PaneKeyCtx *)&f->ctx;
 	uint32_t ch;
 	int split = e->split != SPLIT_NONE, to;
 
-	set_status(e, "Ctrl-W: (s)plit, (v)ertical split, (w) other pane, (c)lose pane, (o)nly, (S)hell below, (b)uffer below, (+/-) resize%s",
-	    e->mode != MODE_MODELESS ? ", (:) ex" : "");
-	ed_render(e, e->d);
-	for (;;) {
-		switch (scr_wait(e->d, &ev)) {
-		case EVENT_EOF:
-			return REQ_CONTINUE;
-		case EVENT_RESIZE:
-		case EVENT_RESUME:
-			scr_size(e->d, &e->rows, &e->cols);
-			continue;
-		case EVENT_KEY:
-			break;
-		default:
-			continue;
-		}
-		break;
-	}
+	if (ev->type != EVENT_KEY)
+		return 0;
 	e->status[0] = '\0';
-	if (ev.key.type != TKBD_KEY || ev.key.ch == TKBD_CH_NONE)
-		return REQ_CONTINUE;
-	ch = ev.key.ch;
+	pk->result = REQ_CONTINUE;
+	if (ev->key.type != TKBD_KEY || ev->key.ch == TKBD_CH_NONE)
+		return 1;
+	ch = ev->key.ch;
 	if (ch == 's')
 		split_open(e, SPLIT_H, -1);
 	else if (ch == 'v')
@@ -28544,8 +28626,30 @@ pane_key(Editor *e)
 	}
 #endif
 	else if (ch == ':' && e->mode != MODE_MODELESS)
-		return vi_colon(e);	/* the ex line, as in a terminal buffer */
-	return REQ_CONTINUE;
+		pk->result = vi_colon(e);	/* the ex line, as in a terminal */
+	return 1;
+}
+
+/* Ctrl-W from a text buffer: one more key picks the window action. The
+ * split keys follow vi (s, v, w, h j k l, c, o); the rest go to the
+ * bottom pane. In the vi personality ':' opens the ex line, and its
+ * result is returned so a quit typed there ends the run. */
+static Req
+pane_key(Editor *e)
+{
+	int base = e->ui_depth;
+	UiFrame *f;
+	PaneKeyCtx *pk;
+
+	set_status(e, "Ctrl-W: (s)plit, (v)ertical split, (w) other pane, (c)lose pane, (o)nly, (S)hell below, (b)uffer below, (+/-) resize%s",
+	    e->mode != MODE_MODELESS ? ", (:) ex" : "");
+	f = ui_push(e, UI_PANEKEY, panekey_frame_draw, panekey_frame_key, NULL);
+	if (!f)
+		return REQ_CONTINUE;
+	pk = (PaneKeyCtx *)&f->ctx;
+	pk->result = REQ_CONTINUE;
+	ui_pump_modal(e, base);
+	return pk->result;
 }
 
 
