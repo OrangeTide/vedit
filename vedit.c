@@ -1277,6 +1277,15 @@ vf_mtime(const Vstat *st)
 #define VEDIT_GLYPHS 1
 #endif
 
+/* The per-project config lookup (cfg_proj_get) is used only by the optional
+ * subsystems that read project-varying keys: the swap files, the ctags and
+ * header navigation, and the build and VCS tools. It is built when any of
+ * them is. */
+#if (!defined(VEDIT_NO_SWAP) || !defined(VEDIT_NO_TAGS) || \
+    !defined(VEDIT_NO_TOOLS)) && !defined(VEDIT_PROJ_CFG)
+#define VEDIT_PROJ_CFG 1
+#endif
+
 /* The mail reader and composer is built by default; -DVEDIT_NO_MAIL drops it.
  * Its code is guarded by VEDIT_MAIL. */
 #if !defined(VEDIT_NO_MAIL) && !defined(VEDIT_MAIL)
@@ -3893,6 +3902,7 @@ static const Cfg *g_cfg;
  * otherwise the config value is used. Returns NULL when neither is set. This is
  * reserved for keys that genuinely vary per project (an include or tags path, a
  * build command), not for editor preferences. */
+#ifdef VEDIT_PROJ_CFG
 static const char *
 cfg_proj_get(const char *key)
 {
@@ -3912,6 +3922,7 @@ cfg_proj_get(const char *key)
 	}
 	return g_cfg ? cfg_get(g_cfg, key) : NULL;
 }
+#endif	/* VEDIT_PROJ_CFG */
 
 /* A forced mode set from the command line, or -1 for "decide from the
  * environment". box_default() resolves it. */
@@ -11102,9 +11113,11 @@ static const Menuitem mi_search[] = {
 	{ "&Find...",		"Ctrl+F",	"/",	MA_FIND },
 	{ "Repea&t Find",	"",		"n",	MA_FIND_NEXT },
 	{ "&Replace...",	"Ctrl+R",	":s",	MA_REPLACE },
+#ifndef VEDIT_NO_TAGS
 	{ "Go to S&ymbol...",	"Ctrl+T",	":symbol",	MA_SYMBOL },
 	{ "&Pop Tag",		"",		":pop",	MA_TAG_POP },
 	{ "Open &Header",	"",		"gf",	MA_OPEN_HEADER },
+#endif
 	{ "&Go to Line...",	"Ctrl+L",	"G",	MA_GOTO },
 };
 static const Menuitem mi_view[] = {
@@ -19710,8 +19723,10 @@ static const struct {
 	{ "Backspace / Del",	"Delete before / after the cursor" },
 	{ "Ctrl-F",		"Incremental find (arrows edit, Up/Down recall; Enter repeats)" },
 	{ "Ctrl-R",		"Replace, confirming each match (y/n/a/q)" },
+#ifndef VEDIT_NO_TAGS
 	{ "Ctrl-T",		"Go to a symbol (buffer, plus a tags file if any)" },
 	{ "Ctrl-]",		"Jump to the tag under the cursor (tags file)" },
+#endif
 	{ "Ctrl-L",		"Go to a line number" },
 	{ "Ctrl-C / Ctrl-X",	"Copy (line if none selected) / cut" },
 	{ "Ctrl-V",		"Paste the clipboard" },
@@ -19776,11 +19791,15 @@ static const struct {
 	{ ":w  :q  :wq / :x",	"Write, quit, write and quit" },
 	{ ":q!  ZZ  ZQ",	"Quit discarding, save and quit, quit" },
 	{ ":N  :cq",		"Go to a line, quit with an error code" },
+#ifndef VEDIT_NO_TAGS
 	{ "Ctrl-]  :tag",	"Jump to a tag (under cursor / by name)" },
 	{ "Ctrl-T  :pop",	"Pop the tag stack back to the last jump" },
 	{ ":symbol [text]",	"Pick a definition from the buffer and tags" },
+#endif
 	{ ":marks  :jumps",	"List marks / the jump list (:delmarks clears)" },
+#ifndef VEDIT_NO_TAGS
 	{ "gf",			"Open the header or file named under the cursor" },
+#endif
 	{ ":bn :bp :bd :ls",	"Next / prev / delete / list buffers (also F8)" },
 	{ ":set nu wrap list",	"Toggle line numbers, word wrap, show-tabs" },
 	{ ":set sl=plain|powerline",	"Status bar style (View > Status Line cycles)" },
@@ -21028,6 +21047,7 @@ dlg_buffer_pick(Editor *e)
  * https://ctags.sourceforge.net/.
  ****************************************************************/
 
+#ifndef VEDIT_NO_TAGS
 /* Directory part of path (everything up to the last '/'), or "." when none. */
 static void
 path_dir(const char *path, char *out, size_t outsz)
@@ -22275,6 +22295,15 @@ ed_tag_pop(Editor *e)
 	    tl.path, e->cy + 1, e->tag_sp);
 }
 
+#else	/* VEDIT_NO_TAGS: no ctags index or header navigation */
+
+static void ed_open_header(Editor *e)
+{ set_status(e, "header navigation is not built in this edition"); }
+static void ed_tag_pop(Editor *e)
+{ set_status(e, "tags are not built in this edition"); }
+
+#endif	/* VEDIT_NO_TAGS */
+
 /****************************************************************
  * Jump list: a history of the positions a "jump" command left, so Ctrl-O and
  * Ctrl-I can walk back and forth across it (and the `` / '' marks name the most
@@ -22598,6 +22627,7 @@ ex_delmarks(Editor *e, const char *rest, int bang)
 	set_status(e, "marks cleared");
 }
 
+#ifndef VEDIT_NO_TAGS
 /* Jump to the chosen entry: a buffer line, or a tags entry in another file. */
 static void
 sym_goto(Editor *e, Sympick *sp, int i)
@@ -22714,6 +22744,24 @@ ed_tag_under_cursor(Editor *e)
 	}
 	symbol_pick_filtered(e, word, NULL, 1);
 }
+
+#else	/* VEDIT_NO_TAGS */
+
+static void
+symbol_pick_filtered(Editor *e, const char *want, const char *sub,
+    int auto_single)
+{
+	(void)want;
+	(void)sub;
+	(void)auto_single;
+	set_status(e, "the symbol picker is not built in this edition");
+}
+static void dlg_symbol_pick(Editor *e)
+{ set_status(e, "the symbol picker is not built in this edition"); }
+static void ed_tag_under_cursor(Editor *e)
+{ set_status(e, "tags are not built in this edition"); }
+
+#endif	/* VEDIT_NO_TAGS */
 
 static void
 ed_new(Editor *e)
