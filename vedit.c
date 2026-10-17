@@ -1277,6 +1277,14 @@ vf_mtime(const Vstat *st)
 #define VEDIT_TABLE 1
 #endif
 
+/* Syntax highlighting (the data-driven FSM lexer and the built-in grammars) is
+ * built by default; -DVEDIT_NO_SYNTAX drops it. Its code is guarded by
+ * VEDIT_SYNTAX. The render path still compiles with it off and paints the base
+ * color. */
+#if !defined(VEDIT_NO_SYNTAX) && !defined(VEDIT_SYNTAX)
+#define VEDIT_SYNTAX 1
+#endif
+
 /* The glyph palette (box-drawing and symbol picker) serves both the draw mode
  * and the art view, so it is built when either is. */
 #if (defined(VEDIT_DRAW) || defined(VEDIT_ART)) && !defined(VEDIT_GLYPHS)
@@ -3760,7 +3768,9 @@ art_cell_blank(const Cell *c)
 
 /* Parse a color: "default", a 0-255 palette index, "#rrggbb", or one of the 16
  * ANSI names (with a "bright-" prefix for 8-15). Returns 1 on success. Used by
- * the config file for both chrome themes and syntax classes. */
+ * the config file for both chrome themes and syntax classes, so it drops only
+ * when both are compiled out. */
+#if defined(VEDIT_SYNTAX) || !defined(VEDIT_NO_THEMES)
 static int
 cfg_color(const char *s, Color *out)
 {
@@ -3816,9 +3826,12 @@ cfg_color(const char *s, Color *out)
 	}
 	return 0;
 }
+#endif	/* cfg_color: VEDIT_SYNTAX || !VEDIT_NO_THEMES */
 
+#ifdef VEDIT_SYNTAX
 /* Parse a color spec "COLOR [attr...]" (attrs: bold, underline, reverse, dim,
- * italic) into fg and attr. Returns 1 when the color parsed. */
+ * italic) into fg and attr. Returns 1 when the color parsed. Only the syntax
+ * grammar loader reads per-class styles this way. */
 static int
 cfg_style(const char *spec, Color *fg, uint16_t *attr)
 {
@@ -3847,6 +3860,7 @@ cfg_style(const char *spec, Color *fg, uint16_t *attr)
 	}
 	return ok;
 }
+#endif	/* VEDIT_SYNTAX */
 
 /****************************************************************
  * Box-drawing abstraction
@@ -4197,13 +4211,18 @@ typedef struct jsf_reg {
 	int	count;
 } Jsfreg;
 
-static Jsfreg	g_user;		/* grammars from the user's config */
-static Jsfreg	g_def;		/* built-in default grammars (C, shell) */
-
 /* The grammars a rendered line's styles may index: g[0] is the buffer's own,
  * g[id] the one a style's id tags (an embedded grammar). Built per paint by
- * syn_palette; the ids are explained with syn_line. */
-typedef struct hlpal { const Jsf *g[2 * JSF_LANG_MAX + 1]; } Hlpal;
+ * syn_palette; the ids are explained with syn_line. The render path references
+ * this type and JSF_GID_MAX even when highlighting is compiled out, so both
+ * stay outside VEDIT_SYNTAX. */
+#define JSF_GID_MAX	(2 * JSF_LANG_MAX)
+typedef struct hlpal { const Jsf *g[JSF_GID_MAX + 1]; } Hlpal;
+
+#ifdef VEDIT_SYNTAX
+
+static Jsfreg	g_user;		/* grammars from the user's config */
+static Jsfreg	g_def;		/* built-in default grammars (C, shell) */
 
 static int
 jsf_find(const Jsfreg *r, const char *name)
@@ -5772,7 +5791,6 @@ syn_for_path(const char *path)
  * then the built-in ones), which also tags each style the embedded grammar
  * writes, so the renderer colors it from that grammar's table. */
 
-#define JSF_GID_MAX	(2 * JSF_LANG_MAX)
 #define SYN_OUTER(c)	((uint16_t)((c) & 0xffff))
 #define SYN_GID(c)	((int)(((c) >> 16) & 0xff))
 #define SYN_INNER(c)	((uint16_t)(((c) >> 24) & 0xff))
@@ -5925,6 +5943,24 @@ syn_line(const Syntax *sy, uint32_t state_in, const char *bytes,
 		/* no grammar for it: carry on as the outer state from pos */
 	}
 }
+
+#else	/* VEDIT_SYNTAX: no highlighting; the render path paints the base color */
+
+static const Syntax *syn_for_ext(const char *ext) { (void)ext; return NULL; }
+static const Syntax *syn_for_path(const char *path) { (void)path; return NULL; }
+static const Syntax *syn_reg_find(const char *name) { (void)name; return NULL; }
+static const Jsf *jsf_by_gid(int gid) { (void)gid; return NULL; }
+static uint32_t syn_line(const Syntax *sy, uint32_t state_in, const char *bytes,
+    size_t n, uint16_t *out)
+{
+	(void)sy;
+	(void)bytes;
+	(void)n;
+	(void)out;
+	return state_in;
+}
+
+#endif	/* VEDIT_SYNTAX */
 
 #define VEDIT_VERSION "vedit 1.6.0"
 
@@ -10183,7 +10219,10 @@ rune_len_at(const char *s, size_t len, size_t cx)
  * Syntax highlighting
  ****************************************************************/
 
-/* The extension of a path (after the last '.'), or "" when there is none. */
+#if defined(VEDIT_SYNTAX) || defined(VEDIT_TABLE) || defined(VEDIT_ART)
+/* The extension of a path (after the last '.'), or "" when there is none. Used
+ * to pick a grammar, a table delimiter, or the art view, so it drops only when
+ * all three are compiled out. */
 static const char *
 file_ext(const char *path)
 {
@@ -10194,6 +10233,7 @@ file_ext(const char *path)
 		return "";
 	return dot + 1;
 }
+#endif
 
 /* Mark the highlighter's cached start-states stale from `line` onward: the
  * state entering `line` is unchanged, but everything after it may differ. */
@@ -11136,7 +11176,9 @@ static const Menuitem mi_search[] = {
 	{ "&Go to Line...",	"Ctrl+L",	"G",	MA_GOTO },
 };
 static const Menuitem mi_view[] = {
+#ifdef VEDIT_SYNTAX
 	{ "&Syntax Highlight",	"",	":syntax",	MA_SYNTAX },
+#endif
 	{ "&Color Scheme",	"",	"",	MA_SCHEME },
 	{ "Status Li&ne",	"",	":set sl=",	MA_STATUSLINE },
 	{ "&Line Numbers",	"",	":set nu",	MA_LINENO },
@@ -30160,8 +30202,10 @@ ed_reload_config(Editor *e)
 	}
 	g_cfg = nc;
 	themes_load_cfg(nc);		/* before ed_apply_config resolves scheme */
+#ifdef VEDIT_SYNTAX
 	syntax_reload_defaults();	/* built-in grammars (some read the config) */
 	syntax_load_cfg(&g_user, nc);	/* user grammars override them */
+#endif
 	ed_refresh_syntax(e);		/* re-point syn before ed_apply_config reads it */
 	if (e->term) {
 		e->term->box_mode = box_default();
@@ -30305,8 +30349,10 @@ vedit_set_config(struct vedit *v, const struct cfg *c)
 {
 	g_cfg = c;
 	themes_load_cfg(c);		/* before ed_apply_config resolves scheme */
+#ifdef VEDIT_SYNTAX
 	syntax_reload_defaults();	/* built-in grammars (some read the config) */
 	syntax_load_cfg(&g_user, c);	/* user grammars override them */
+#endif
 	if (v->e.term) {
 		v->e.term->box_mode = box_default();
 		v->e.term->colors = color_default();
