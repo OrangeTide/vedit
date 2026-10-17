@@ -19758,50 +19758,87 @@ tutorial_line(Editor *e, void *ctx, int idx)
 	return t->lines[idx];
 }
 
+/* A scrollable full-screen pager (help, tutorial) while it is a frame: the
+ * header, footer, line provider, total line count, and scroll offset. The
+ * offset is clamped at draw time, so a resize needs no special handling. */
+typedef struct pager_ctx {
+	char		hdr[128];
+	const char	*footer;
+	const char	*(*line)(Editor *, void *, int);
+	void		*line_ctx;
+	int		n;		/* total body lines */
+	int		top;		/* scroll offset */
+} PagerCtx;
+
+_Static_assert(sizeof(PagerCtx) <= sizeof(UiCtx),
+    "PagerCtx must fit inline in a UiFrame");
+
+static void
+pager_frame_draw(Editor *e, UiFrame *f)
+{
+	PagerCtx *pg = (PagerCtx *)&f->ctx;
+	int body = (e->rows > 0 ? e->rows : 24) - 2;
+	int maxtop = (pg->n > body) ? pg->n - body : 0;
+
+	if (pg->top > maxtop)
+		pg->top = maxtop;
+	if (pg->top < 0)
+		pg->top = 0;
+	ui_scroll_view(e, pg->hdr, pg->footer, pg->top, pg->line, pg->line_ctx);
+}
+
+/* Apply a scroll/jump key to a pager; returns 1 if it consumed the key. */
+static int
+pager_scroll_key(Editor *e, PagerCtx *pg, uint32_t key)
+{
+	int body = (e->rows > 0 ? e->rows : 24) - 2;
+	int maxtop = (pg->n > body) ? pg->n - body : 0;
+
+	switch (key) {
+	case TKBD_KEY_UP:	pg->top -= 1; return 1;
+	case TKBD_KEY_DOWN:	pg->top += 1; return 1;
+	case TKBD_KEY_PGUP:	pg->top -= body; return 1;
+	case TKBD_KEY_PGDN:	pg->top += body; return 1;
+	case TKBD_KEY_HOME:	pg->top = 0; return 1;
+	case TKBD_KEY_END:	pg->top = maxtop; return 1;
+	default:		return 0;
+	}
+}
+
+static int
+tutorial_frame_key(Editor *e, UiFrame *f, const Event *ev)
+{
+	PagerCtx *pg = (PagerCtx *)&f->ctx;
+
+	if (ev->type != EVENT_KEY || ev->key.type != TKBD_KEY)
+		return 0;
+	if (pager_scroll_key(e, pg, ev->key.key))
+		return 0;
+	if (ev->key.key == TKBD_KEY_ESC || ev->key.ch == 'q' || ev->key.ch == 'Q')
+		return 1;
+	return 0;
+}
+
 /* Show one tutorial in a scrollable view: Up/Down and PgUp/PgDn scroll,
  * Home/End jump, Esc or q returns. */
 static void
 dlg_tutorial_show(Editor *e, const Tutorial *t)
 {
-	char hdr[128];
-	int top = 0;
+	int base = e->ui_depth;
+	UiFrame *f;
+	PagerCtx *pg;
 
-	snprintf(hdr, sizeof(hdr), " vedit tutorial -- %s", t->title);
-	for (;;) {
-		int rows = e->rows > 0 ? e->rows : 24;
-		int body = rows - 2;		/* header and footer rows */
-		int maxtop = (t->n > body) ? t->n - body : 0;
-		Event ev;
-
-		if (top > maxtop)
-			top = maxtop;
-		if (top < 0)
-			top = 0;
-		ui_scroll_view(e, hdr,
-		    " Up/Down PgUp/PgDn Home/End scroll   Esc or q returns",
-		    top, tutorial_line, (void *)t);
-		if (scr_wait(e->d, &ev) == EVENT_EOF)
-			return;
-		if (ev.type == EVENT_RESIZE || ev.type == EVENT_RESUME) {
-			scr_size(e->d, &e->rows, &e->cols);
-			continue;
-		}
-		if (ev.type != EVENT_KEY || ev.key.type != TKBD_KEY)
-			continue;
-		switch (ev.key.key) {
-		case TKBD_KEY_UP:	top -= 1; break;
-		case TKBD_KEY_DOWN:	top += 1; break;
-		case TKBD_KEY_PGUP:	top -= body; break;
-		case TKBD_KEY_PGDN:	top += body; break;
-		case TKBD_KEY_HOME:	top = 0; break;
-		case TKBD_KEY_END:	top = maxtop; break;
-		case TKBD_KEY_ESC:	return;
-		default:
-			if (ev.key.ch == 'q' || ev.key.ch == 'Q')
-				return;
-			break;
-		}
-	}
+	f = ui_push(e, UI_PAGER, pager_frame_draw, tutorial_frame_key, NULL);
+	if (!f)
+		return;
+	pg = (PagerCtx *)&f->ctx;
+	snprintf(pg->hdr, sizeof(pg->hdr), " vedit tutorial -- %s", t->title);
+	pg->footer = " Up/Down PgUp/PgDn Home/End scroll   Esc or q returns";
+	pg->line = tutorial_line;
+	pg->line_ctx = (void *)t;
+	pg->n = t->n;
+	pg->top = 0;
+	ui_pump_modal(e, base);
 }
 
 static const char *
@@ -19858,58 +19895,54 @@ dlg_tutorial(Editor *e)
 		dlg_tutorial_show(e, &g_tutorials[chosen]);
 }
 
+static int
+help_frame_key(Editor *e, UiFrame *f, const Event *ev)
+{
+	PagerCtx *pg = (PagerCtx *)&f->ctx;
+	int body = (e->rows > 0 ? e->rows : 24) - 2;
+
+	if (ev->type != EVENT_KEY || ev->key.type != TKBD_KEY)
+		return 0;
+	if (pager_scroll_key(e, pg, ev->key.key))
+		return 0;
+	if (ev->key.key == TKBD_KEY_ESC || ev->key.key == TKBD_KEY_ENTER)
+		return 1;
+	if (ev->key.ch == 't' || ev->key.ch == 'T') {
+		dlg_tutorial(e);	/* a tutorial frame stacks over the help */
+		return 0;
+	}
+	if (ev->key.ch == ' ') {
+		pg->top += body;	/* Space pages down */
+		return 0;
+	}
+	if (ev->key.ch == 'q' || ev->key.ch == 'Q' ||
+	    ev->key.ch == '\r' || ev->key.ch == '\n')
+		return 1;
+	return 0;
+}
+
 /* Show the scrollable key-bindings screen. Up/Down and PgUp/PgDn (or Space)
  * scroll, Home/End jump, 't' opens the tutorial, and Esc, q, or Enter returns. */
 static void
 dlg_help(Editor *e)
 {
 	int vi = e->mode != MODE_MODELESS;
-	const char *hdr = vi ? " vedit -- vi key bindings"
-	    : " vedit -- key bindings";
-	int n = vi ? HELP_VI_COUNT : HELP_COUNT;
-	int top = 0;
+	int base = e->ui_depth;
+	UiFrame *f;
+	PagerCtx *pg;
 
-	for (;;) {
-		int rows = e->rows > 0 ? e->rows : 24;
-		int body = rows - 2;		/* header and footer rows */
-		int maxtop = (n > body) ? n - body : 0;
-		Event ev;
-
-		if (top > maxtop)
-			top = maxtop;
-		if (top < 0)
-			top = 0;
-		ui_scroll_view(e, hdr,
-		    " Up/Down PgUp/PgDn scroll   t tutorial   Esc returns",
-		    top, help_line, NULL);
-		if (scr_wait(e->d, &ev) == EVENT_EOF)
-			return;
-		if (ev.type == EVENT_RESIZE || ev.type == EVENT_RESUME) {
-			scr_size(e->d, &e->rows, &e->cols);
-			continue;
-		}
-		if (ev.type != EVENT_KEY || ev.key.type != TKBD_KEY)
-			continue;
-		switch (ev.key.key) {
-		case TKBD_KEY_UP:	top -= 1; break;
-		case TKBD_KEY_DOWN:	top += 1; break;
-		case TKBD_KEY_PGUP:	top -= body; break;
-		case TKBD_KEY_PGDN:	top += body; break;
-		case TKBD_KEY_HOME:	top = 0; break;
-		case TKBD_KEY_END:	top = maxtop; break;
-		case TKBD_KEY_ESC:
-		case TKBD_KEY_ENTER:	return;
-		default:
-			if (ev.key.ch == 't' || ev.key.ch == 'T')
-				dlg_tutorial(e);
-			else if (ev.key.ch == ' ')
-				top += body;		/* Space pages down */
-			else if (ev.key.ch == 'q' || ev.key.ch == 'Q' ||
-			    ev.key.ch == '\r' || ev.key.ch == '\n')
-				return;
-			break;
-		}
-	}
+	f = ui_push(e, UI_PAGER, pager_frame_draw, help_frame_key, NULL);
+	if (!f)
+		return;
+	pg = (PagerCtx *)&f->ctx;
+	snprintf(pg->hdr, sizeof(pg->hdr), "%s",
+	    vi ? " vedit -- vi key bindings" : " vedit -- key bindings");
+	pg->footer = " Up/Down PgUp/PgDn scroll   t tutorial   Esc returns";
+	pg->line = help_line;
+	pg->line_ctx = NULL;
+	pg->n = vi ? HELP_VI_COUNT : HELP_COUNT;
+	pg->top = 0;
+	ui_pump_modal(e, base);
 }
 
 /****************************************************************
@@ -25264,122 +25297,138 @@ tool_color(uint8_t idx)
 	return c;
 }
 
+/* The tool-output viewer while it is a frame: the header and the cursor/scroll
+ * lines. The output itself lives on the Editor (e->tool_*). */
+typedef struct toolout_ctx {
+	char	hdr[160];
+	int	cur, top;
+} ToolOutCtx;
+
+_Static_assert(sizeof(ToolOutCtx) <= sizeof(UiCtx),
+    "ToolOutCtx must fit inline in a UiFrame");
+
+static void
+toolout_frame_draw(Editor *e, UiFrame *f)
+{
+	ToolOutCtx *to = (ToolOutCtx *)&f->ctx;
+	const Pal *p = ed_chrome(e);
+	uint16_t barat = (p->reverse_bars ? ATTR_REVERSE : 0) | ATTR_BOLD;
+	Screen *d = e->d;
+	int rows = e->rows > 0 ? e->rows : 24;
+	int body = rows - 2;
+	int row;
+
+	if (to->cur < 0)
+		to->cur = 0;
+	if (to->cur >= e->tool_nlines)
+		to->cur = e->tool_nlines - 1;
+	if (to->cur < to->top)
+		to->top = to->cur;
+	if (body > 0 && to->cur >= to->top + body)
+		to->top = to->cur - body + 1;
+	if (to->top < 0)
+		to->top = 0;
+
+	scr_clear(d);
+	ui_field(d, 0, 0, e->cols, to->hdr, p->bar_fg, p->bar_bg, barat);
+	for (row = 1; row < rows - 1; row++) {
+		int idx = to->top + row - 1;
+		const char *s = (idx < e->tool_nlines) ?
+		    e->tool_lines[idx] : "";
+		Color fg = p->content_fg;
+		uint16_t at = 0;
+		int ei = (idx < e->tool_nlines) ?
+		    tool_err_at(e, idx) : -1;
+
+		if (ei >= 0) {
+			switch (e->tool_errs[ei].sev) {
+			case TSEV_ERROR: fg = tool_color(9); break;
+			case TSEV_WARN:  fg = tool_color(11); break;
+			default:	 fg = tool_color(14); break;
+			}
+		}
+		if (idx == to->cur)
+			at = ATTR_REVERSE;
+		ui_field(d, row, 0, e->cols, s, fg, p->content_bg, at);
+	}
+	ui_field(d, rows - 1, 0, e->cols,
+	    " Up/Down n/N move   Enter jump   Esc close",
+	    p->bar_fg, p->bar_bg, barat);
+	scr_present(d);
+}
+
+static int
+toolout_frame_key(Editor *e, UiFrame *f, const Event *ev)
+{
+	ToolOutCtx *to = (ToolOutCtx *)&f->ctx;
+	int body = (e->rows > 0 ? e->rows : 24) - 2;
+
+	if (ev->type != EVENT_KEY || ev->key.type != TKBD_KEY)
+		return 0;
+	switch (ev->key.key) {
+	case TKBD_KEY_UP:	to->cur -= 1; return 0;
+	case TKBD_KEY_DOWN:	to->cur += 1; return 0;
+	case TKBD_KEY_PGUP:	to->cur -= body; return 0;
+	case TKBD_KEY_PGDN:	to->cur += body; return 0;
+	case TKBD_KEY_HOME:	to->cur = 0; return 0;
+	case TKBD_KEY_END:	to->cur = e->tool_nlines - 1; return 0;
+	case TKBD_KEY_ENTER: {
+		int ei = tool_err_at(e, to->cur);
+
+		if (ei >= 0) {
+			tool_goto_err(e, ei);
+			return 1;
+		}
+		return 0;
+	}
+	case TKBD_KEY_ESC:
+		return 1;
+	default:
+		if (ev->key.ch == 'q' || ev->key.ch == 'Q')
+			return 1;
+		if ((ev->key.ch == 'n' || ev->key.ch == 'N') &&
+		    e->tool_nerr > 0) {
+			int step = (ev->key.ch == 'N') ? -1 : 1;
+			int ei = (e->tool_curerr < 0) ? 0 :
+			    e->tool_curerr + step;
+
+			if (ei < 0)
+				ei = 0;
+			if (ei >= e->tool_nerr)
+				ei = e->tool_nerr - 1;
+			e->tool_curerr = ei;
+			to->cur = e->tool_errs[ei].outline;
+		}
+		return 0;
+	}
+}
+
 /* The output pane: Up/Down (and PgUp/PgDn, Home/End) move the cursor line,
  * n / N step between diagnostics, Enter jumps to the one on the cursor line,
  * Esc or q closes. Diagnostic lines are drawn in red. */
 static void
 dlg_tool_output(Editor *e)
 {
-	const Pal *p = ed_chrome(e);
-	uint16_t barat = (p->reverse_bars ? ATTR_REVERSE : 0) | ATTR_BOLD;
-	char hdr[160];
-	int cur = 0, top = 0;
+	int base = e->ui_depth;
+	UiFrame *f;
+	ToolOutCtx *to;
+	int ne, nw;
 
 	if (e->tool_nlines == 0) {
 		set_status(e, "no output to show");
 		return;
 	}
-	if (e->tool_nerr > 0)
-		cur = e->tool_errs[0].outline;
-	{
-		int ne, nw;
-
-		tool_counts(e, &ne, &nw);
-		snprintf(hdr, sizeof(hdr),
-		    " Output: %s  (%d error%s, %d warning%s)", e->tool_title,
-		    ne, ne == 1 ? "" : "s", nw, nw == 1 ? "" : "s");
-	}
-
-	for (;;) {
-		Screen *d = e->d;
-		int rows = e->rows > 0 ? e->rows : 24;
-		int body = rows - 2;
-		int row;
-		Event ev;
-
-		if (cur < 0)
-			cur = 0;
-		if (cur >= e->tool_nlines)
-			cur = e->tool_nlines - 1;
-		if (cur < top)
-			top = cur;
-		if (body > 0 && cur >= top + body)
-			top = cur - body + 1;
-		if (top < 0)
-			top = 0;
-
-		scr_clear(d);
-		ui_field(d, 0, 0, e->cols, hdr, p->bar_fg, p->bar_bg, barat);
-		for (row = 1; row < rows - 1; row++) {
-			int idx = top + row - 1;
-			const char *s = (idx < e->tool_nlines) ?
-			    e->tool_lines[idx] : "";
-			Color fg = p->content_fg;
-			uint16_t at = 0;
-			int ei = (idx < e->tool_nlines) ?
-			    tool_err_at(e, idx) : -1;
-
-			if (ei >= 0) {
-				switch (e->tool_errs[ei].sev) {
-				case TSEV_ERROR: fg = tool_color(9); break;
-				case TSEV_WARN:  fg = tool_color(11); break;
-				default:	 fg = tool_color(14); break;
-				}
-			}
-			if (idx == cur)
-				at = ATTR_REVERSE;
-			ui_field(d, row, 0, e->cols, s, fg, p->content_bg, at);
-		}
-		ui_field(d, rows - 1, 0, e->cols,
-		    " Up/Down n/N move   Enter jump   Esc close",
-		    p->bar_fg, p->bar_bg, barat);
-		scr_present(d);
-
-		if (scr_wait(d, &ev) == EVENT_EOF)
-			return;
-		if (ev.type == EVENT_RESIZE || ev.type == EVENT_RESUME) {
-			scr_size(d, &e->rows, &e->cols);
-			continue;
-		}
-		if (ev.type != EVENT_KEY || ev.key.type != TKBD_KEY)
-			continue;
-		switch (ev.key.key) {
-		case TKBD_KEY_UP:	cur -= 1; break;
-		case TKBD_KEY_DOWN:	cur += 1; break;
-		case TKBD_KEY_PGUP:	cur -= body; break;
-		case TKBD_KEY_PGDN:	cur += body; break;
-		case TKBD_KEY_HOME:	cur = 0; break;
-		case TKBD_KEY_END:	cur = e->tool_nlines - 1; break;
-		case TKBD_KEY_ENTER: {
-			int ei = tool_err_at(e, cur);
-
-			if (ei >= 0) {
-				tool_goto_err(e, ei);
-				return;
-			}
-			break;
-		}
-		case TKBD_KEY_ESC:
-			return;
-		default:
-			if (ev.key.ch == 'q' || ev.key.ch == 'Q')
-				return;
-			if ((ev.key.ch == 'n' || ev.key.ch == 'N') &&
-			    e->tool_nerr > 0) {
-				int step = (ev.key.ch == 'N') ? -1 : 1;
-				int ei = (e->tool_curerr < 0) ? 0 :
-				    e->tool_curerr + step;
-
-				if (ei < 0)
-					ei = 0;
-				if (ei >= e->tool_nerr)
-					ei = e->tool_nerr - 1;
-				e->tool_curerr = ei;
-				cur = e->tool_errs[ei].outline;
-			}
-			break;
-		}
-	}
+	f = ui_push(e, UI_TOOLOUT, toolout_frame_draw, toolout_frame_key, NULL);
+	if (!f)
+		return;
+	to = (ToolOutCtx *)&f->ctx;
+	to->cur = (e->tool_nerr > 0) ? e->tool_errs[0].outline : 0;
+	to->top = 0;
+	tool_counts(e, &ne, &nw);
+	snprintf(to->hdr, sizeof(to->hdr),
+	    " Output: %s  (%d error%s, %d warning%s)", e->tool_title,
+	    ne, ne == 1 ? "" : "s", nw, nw == 1 ? "" : "s");
+	ui_pump_modal(e, base);
 }
 
 /* ---- running a command ---- */
