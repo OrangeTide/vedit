@@ -11100,11 +11100,13 @@ static const Menuitem mi_edit[] = {
 	{ "&Copy",	"Ctrl+C",	"yy",		MA_COPY },
 	{ "&Paste",	"Ctrl+V",	"p",		MA_PASTE },
 	{ "",		"",		"",		MA_SEP },
+#ifdef VEDIT_TABLE
 	{ "Insert Ro&w",	"",	":rowadd",	MA_TBL_ROWADD },
 	{ "&Delete Row",	"",	":rowdel",	MA_TBL_ROWDEL },
 	{ "Insert Colu&mn",	"",	":coladd",	MA_TBL_COLADD },
 	{ "De&lete Column",	"",	":coldel",	MA_TBL_COLDEL },
 	{ "Fit Column Widt&hs",	"",	":colwidth fit all",	MA_TBL_FIT },
+#endif
 	{ "S&ort Lines...",	"",	":sort",	MA_SORT },
 	{ "Reflow Para&graph",	"",	"gq",		MA_REFLOW },
 	{ "",		"",		"",		MA_SEP },
@@ -11149,7 +11151,9 @@ static const Menuitem mi_view[] = {
 #ifndef VEDIT_NO_HEX
 	{ "&Hex Dump",		"",	"",	MA_HEX },
 #endif
+#ifdef VEDIT_TABLE
 	{ "Ta&ble View",	"",	":table",	MA_TABLE },
+#endif
 	{ "Text Wi&dth...",	"",	":set tw=",	MA_TEXTWIDTH },
 	{ "Split &Pane",	"Ctrl-W s",	":split",	MA_SPLIT },
 	{ "Split Side b&y Side","Ctrl-W v",	":vsplit",	MA_VSPLIT },
@@ -20145,6 +20149,7 @@ static const char *const tut_term[] = {
 };
 #endif
 
+#ifdef VEDIT_TABLE
 static const char *const tut_table[] = {
 	"The table view shows a CSV or TSV file as a grid of cells. A file",
 	"named *.csv, *.tsv or *.tab opens in it; :table turns it on for",
@@ -20191,6 +20196,7 @@ static const char *const tut_table[] = {
 	"",
 	"Set table.view = off in the config to open these files as text.",
 };
+#endif	/* VEDIT_TABLE */
 
 #ifndef VEDIT_NO_SWAP
 static const char *const tut_recover[] = {
@@ -20250,7 +20256,9 @@ static const Tutorial g_tutorials[] = {
 #ifdef VEDIT_ART
 	{ "Art View (.ans)",	TUT(tut_art) },
 #endif
+#ifdef VEDIT_TABLE
 	{ "Table View (CSV)",	TUT(tut_table) },
+#endif
 #ifndef VEDIT_NO_SWAP
 	{ "Crash Recovery",	TUT(tut_recover) },
 #endif
@@ -20399,6 +20407,10 @@ dlg_tutorial(Editor *e)
 		.ctx = &chosen,
 	};
 
+	if (TUTORIAL_COUNT == 0) {
+		set_status(e, "no tutorials in this edition");
+		return;
+	}
 	if (TUTORIAL_COUNT == 1) {
 		dlg_tutorial_show(e, &g_tutorials[0]);
 		return;
