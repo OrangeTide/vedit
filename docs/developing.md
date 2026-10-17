@@ -29,6 +29,7 @@ make RELEASE=1          # optimized build
 make static             # static musl build
 make install            # install to ~/.local/bin and the man page (PREFIX overrides)
 make gvedit             # the SDL3 window build, linked as ./gvedit
+make veditmin           # a reduced build for embedding, linked as ./veditmin
 make guterm-sync GUTERM_DIR=../guterm   # refresh the vendored guterm.h
 make clean
 ```
@@ -48,9 +49,15 @@ Feature knobs are make variables that become `-D` defines:
 
 The other knobs are plain defines passed through `CFLAGS`:
 `-DVEDIT_NO_TOOLS` (build commands and the output pane), `-DVEDIT_NO_MAIL`,
-`-DVEDIT_NO_MOUSE`, and `-DVEDIT_NO_XDG` (use `~/.veditrc` instead of the
-XDG config path). Chapter 10 of the manual lists what each one removes from
-the user's point of view.
+`-DVEDIT_NO_MOUSE`, `-DVEDIT_NO_XDG` (use `~/.veditrc` instead of the
+XDG config path), and the feature gates `-DVEDIT_NO_HEX`,
+`-DVEDIT_NO_DRAW`, `-DVEDIT_NO_TABLE`, `-DVEDIT_NO_SYNTAX`,
+`-DVEDIT_NO_THEMES`, `-DVEDIT_NO_TAGS`, `-DVEDIT_NO_REFLOW`, and
+`-DVEDIT_NO_SWAP`. Chapter 10 of the manual lists what each one removes
+from the user's point of view.
+
+`make veditmin` sets all of these knobs at once for a reduced editor to
+embed in a host. Chapter 10 describes it.
 
 ## WebAssembly
 

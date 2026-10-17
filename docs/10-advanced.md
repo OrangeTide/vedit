@@ -237,5 +237,27 @@ flags stay).
 | `VEDIT_NO_MAIL` | the Mail menu and commands |
 | `VEDIT_NO_MOUSE` | mouse reporting and View > Mouse |
 | `VEDIT_NO_XDG` | the XDG config path; `~/.veditrc` is used instead |
+| `VEDIT_NO_HEX` | the hex view and its View menu entry |
+| `VEDIT_NO_DRAW` | the line-draw view. The glyph palette goes once both this and `NO_ART` are set |
+| `VEDIT_NO_TABLE` | the table view for CSV and TSV files and its row and column commands; Sort stays |
+| `VEDIT_NO_SYNTAX` | syntax highlighting, the built-in grammars, `:syntax`, and the per-language color settings |
+| `VEDIT_NO_THEMES` | the user `[theme]` color schemes in the config; the built-in schemes stay |
+| `VEDIT_NO_TAGS` | tag and header navigation: the symbol picker, the tag jump and stack, Open Header, `:tag`, `:pop`, `:symbol`, and their menu entries |
+| `VEDIT_NO_REFLOW` | paragraph reflow: `gq`, Edit > Reflow, `:set textwidth`, and insert-time auto-wrap |
+| `VEDIT_NO_SWAP` | the swap and backup files, crash recovery, and `:set swapfile` and `:set backup` |
 
 Open Header and the `cc.file` reader stay in a `NO_TOOLS` build.
+
+## The veditmin build
+
+`make veditmin` builds a reduced editor for embedding vedit in a host such
+as a MUD. It keeps the text editor, the vi keys, and find and replace, and
+sets every knob in the table above at once. So it drops the terminal
+buffers, the art and line-draw views, the build and mail tools, the hex and
+table views, syntax highlighting, tags, reflow, the color themes, and the
+swap and backup files. What stays is the full modeless and vi editing over
+the embedding vtable, at about half the size of the full binary.
+
+The binary lands at `_out/<triple>/bin/veditmin`, with a `veditmin` symlink
+at the top level. It is built from the same `vedit.c`, so the embedding
+interface in `vedit.h` is unchanged.
