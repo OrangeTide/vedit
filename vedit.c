@@ -7702,6 +7702,49 @@ typedef struct tagloc {
 	size_t	cy, cx;
 } Tagloc;
 
+/*
+ * Modal UI frames. A frame is one transient screen that owns input until it
+ * finishes: a dialog, a line prompt, the menu bar, a pager. Frames stack, so a
+ * confirm can sit over a menu. editor_loop owns the single input wait and hands
+ * each event to the top frame; when a frame's on_event reports done, the frame
+ * is popped and its on_done continuation runs (which may push further frames).
+ * A frame's state lives inline in the ctx union, so no frame keeps state on the
+ * C call stack across a wait. This is the spine of the event-driven rework; the
+ * blocking modal loops migrate onto it one family at a time.
+ */
+#define UI_STACK_MAX 6		/* deepest observed nesting is 3; 6 is headroom */
+#define UI_CTX_MAX 384		/* inline floor for a frame's state; see note */
+
+struct editor;
+
+typedef enum uikind {
+	UI_DIALOG,		/* generic centered dialog (dlg_run family) */
+	UI_PROMPT,		/* line input on the status row */
+	UI_YESNOKEY,		/* one-key y/n/a/q prompt */
+	UI_MENU,		/* menu bar / dropdown */
+	UI_PAGER,		/* scrollable help/tutorial viewer */
+	UI_TOOLOUT,		/* tool/build output viewer */
+	UI_INCSEARCH,		/* incremental search */
+	UI_PASTE,		/* bracketed-paste sink */
+	UI_PANEKEY,		/* Ctrl-W window prefix */
+	UI_TERM,		/* terminal passthrough */
+} UiKind;
+
+typedef union uictx {
+	void		*raw;
+	long double	align;		/* widen alignment for typed members */
+	unsigned char	bytes[UI_CTX_MAX];
+} UiCtx;
+
+typedef struct uiframe UiFrame;
+struct uiframe {
+	UiKind	kind;		/* which screen this frame is */
+	void		(*draw)(struct editor *, UiFrame *);
+	int		(*on_event)(struct editor *, UiFrame *, const Event *);
+	void		(*on_done)(struct editor *, UiFrame *);
+	UiCtx		ctx;		/* the frame's state, carried inline */
+};
+
 typedef struct editor {
 	Buf	*bufs;		/* open buffers; active mirrors into flat */
 	int		nbuf;		/* number of open buffers */
@@ -7900,6 +7943,8 @@ typedef struct editor {
 	int		tbl_on;		/* table.view: open .csv/.tsv files as a table */
 	int		tbl_header;	/* table.header: line 1 is a header row */
 	int		tbl_width;	/* table.width: default column width; 0 = built-in */
+	UiFrame		ui_stack[UI_STACK_MAX];	/* active modal frames; empty = editor focus */
+	int		ui_depth;	/* number of frames on ui_stack */
 } Editor;
 
 static void split_open(Editor *e, int kind, int idx);	/* two text panes */
@@ -14952,49 +14997,171 @@ typedef struct modal {
 	uint16_t	base;
 } Modal;
 
+/*
+ * The modal frame stack. editor_loop owns the one input wait; ui_render paints
+ * the top frame over the editor body, and the main loop hands each event to
+ * that frame's on_event. A frame reports done by returning nonzero; it is then
+ * popped and its on_done continuation runs. ui_pump_modal is the transition
+ * bridge: a synchronous caller pushes a frame and blocks here for its result,
+ * then reads it from ctx. The bridge goes away in the final pass, once every
+ * caller instead supplies an on_done and returns to the main loop.
+ */
+
+/* The frame on top of the modal stack, or NULL when the editor itself has
+ * focus. */
+static UiFrame *
+ui_top(Editor *e)
+{
+	return e->ui_depth > 0 ? &e->ui_stack[e->ui_depth - 1] : NULL;
+}
+
+/* Push a frame and return it for the caller to fill its ctx. Returns NULL when
+ * the stack is full (deeper than any real path nests). */
+static UiFrame *
+ui_push(Editor *e, UiKind kind,
+    void (*draw)(Editor *, UiFrame *),
+    int (*on_event)(Editor *, UiFrame *, const Event *),
+    void (*on_done)(Editor *, UiFrame *))
+{
+	UiFrame *f;
+
+	if (e->ui_depth >= UI_STACK_MAX)
+		return NULL;
+	f = &e->ui_stack[e->ui_depth++];
+	memset(f, 0, sizeof *f);
+	f->kind = kind;
+	f->draw = draw;
+	f->on_event = on_event;
+	f->on_done = on_done;
+	return f;
+}
+
+/* Discard the top frame without running its continuation. */
+static void
+ui_pop(Editor *e)
+{
+	if (e->ui_depth > 0)
+		e->ui_depth--;
+}
+
+/* Draw the active modal frame over the editor body. Each frame paints its own
+ * chrome (box, status row, bar) so a resize is just a repaint. */
+static void
+ui_render(Editor *e)
+{
+	UiFrame *f = ui_top(e);
+
+	if (f && !f->draw)
+		return;			/* a silent frame (paste) shows nothing */
+	render_body(e, e->d);
+	if (f)
+		f->draw(e, f);
+	scr_present(e->d);
+}
+
+/* Drive the frames pushed above base_depth to completion, blocking on input
+ * here. Transition bridge for callers that still read their result from ctx
+ * after the frame closes; see the note above. */
+static void
+ui_pump_modal(Editor *e, int base_depth)
+{
+	while (e->ui_depth > base_depth) {
+		Event ev;
+
+		ui_render(e);
+		switch (scr_wait(e->d, &ev)) {
+		case EVENT_EOF:
+			while (e->ui_depth > base_depth)
+				ui_pop(e);	/* abandon; main loop exits on EOF */
+			return;
+		case EVENT_RESIZE:
+		case EVENT_RESUME:
+			scr_size(e->d, &e->rows, &e->cols);
+			break;
+		case EVENT_KEY: {
+			UiFrame *f = ui_top(e);
+
+			if (f->on_event && f->on_event(e, f, &ev)) {
+				UiFrame done = *f;
+
+				ui_pop(e);
+				if (done.on_done)
+					done.on_done(e, &done);
+			}
+			break;
+		}
+		default:
+			break;
+		}
+	}
+}
+
+/* State of a generic centered dialog (the dlg_run family) while it is a frame:
+ * the requested size, the caller's draw/key callbacks, and its opaque ctx. The
+ * box geometry is recomputed from the current terminal size each draw, so a
+ * resize recenters the box with no special handling. */
+typedef struct dlg_frame_ctx {
+	int		want_w, want_h;	/* requested size before clamping */
+	Modal	m;		/* geometry + palette, recomputed each draw */
+	void		*uctx;		/* the caller's dialog ctx */
+	void		(*draw)(Editor *, const Modal *, void *);
+	int		(*on_key)(Editor *, const Modal *, const Event *, void *);
+} DlgFrameCtx;
+
+_Static_assert(sizeof(DlgFrameCtx) <= sizeof(UiCtx),
+    "DlgFrameCtx must fit inline in a UiFrame");
+
+static void
+dlg_frame_draw(Editor *e, UiFrame *f)
+{
+	DlgFrameCtx *fc = (DlgFrameCtx *)&f->ctx;
+
+	dlg_palette(e, &fc->m.fg, &fc->m.bg, &fc->m.base);
+	fc->m.w = fc->want_w > e->cols ? e->cols : fc->want_w;
+	fc->m.h = fc->want_h > e->rows ? e->rows : fc->want_h;
+	dlg_center(e, fc->m.w, fc->m.h, &fc->m.x, &fc->m.y);
+	scr_box(e->d, fc->m.x, fc->m.y, fc->m.w, fc->m.h,
+	    fc->m.fg, fc->m.bg, fc->m.base);
+	scr_cursor_vis(e->d, 0);		/* hidden unless the draw shows it */
+	fc->draw(e, &fc->m, fc->uctx);
+}
+
+static int
+dlg_frame_key(Editor *e, UiFrame *f, const Event *ev)
+{
+	DlgFrameCtx *fc = (DlgFrameCtx *)&f->ctx;
+
+	if (ev->type != EVENT_KEY)
+		return 0;
+	return fc->on_key(e, &fc->m, ev, fc->uctx);	/* nonzero closes */
+}
+
 /* Run a centered modal box of w by h until its key handler closes it. draw
  * paints the box interior each frame; on_key handles one input event and
  * returns nonzero to close. Both receive the box geometry and palette, plus
- * the caller's ctx. EOF and the editor frame behind the box are handled here.
- */
+ * the caller's ctx. The dialog runs as a frame on the modal stack; this call
+ * blocks through the bridge until it closes, so existing callers still read
+ * their result from ctx on return. */
 static void
 dlg_run(Editor *e, int w, int h, void *ctx,
     void (*draw)(Editor *, const Modal *, void *),
     int (*on_key)(Editor *, const Modal *,
         const Event *, void *))
 {
-	Modal m;
+	int base = e->ui_depth;
+	UiFrame *f;
+	DlgFrameCtx *fc;
 
-	dlg_palette(e, &m.fg, &m.bg, &m.base);
-	m.w = w > e->cols ? e->cols : w;
-	m.h = h > e->rows ? e->rows : h;
-	dlg_center(e, m.w, m.h, &m.x, &m.y);
-
-	for (;;) {
-		Event ev;
-
-		render_body(e, e->d);
-		scr_box(e->d, m.x, m.y, m.w, m.h, m.fg, m.bg, m.base);
-		scr_cursor_vis(e->d, 0);	/* hidden unless draw shows it */
-		draw(e, &m, ctx);
-		scr_present(e->d);
-
-		switch (scr_wait(e->d, &ev)) {
-		case EVENT_EOF:
-			return;
-		case EVENT_KEY:
-			if (on_key(e, &m, &ev, ctx))
-				return;
-			break;
-		case EVENT_RESIZE:
-		case EVENT_RESUME:
-			scr_size(e->d, &e->rows, &e->cols);
-			dlg_center(e, m.w, m.h, &m.x, &m.y);
-			break;
-		default:
-			break;
-		}
-	}
+	f = ui_push(e, UI_DIALOG, dlg_frame_draw, dlg_frame_key, NULL);
+	if (!f)
+		return;			/* stack full: no deeper path exists */
+	fc = (DlgFrameCtx *)&f->ctx;
+	fc->want_w = w;
+	fc->want_h = h;
+	fc->uctx = ctx;
+	fc->draw = draw;
+	fc->on_key = on_key;
+	ui_pump_modal(e, base);
 }
 
 /****************************************************************
@@ -28295,7 +28462,10 @@ editor_loop(Editor *e)
 		case EVENT_RESIZE:
 		case EVENT_RESUME:
 			scr_size(e->d, &e->rows, &e->cols);
-			ed_render(e, e->d);	/* resizes the terminals too */
+			if (ui_top(e))
+				ui_render(e);
+			else
+				ed_render(e, e->d);	/* resizes the terminals too */
 			continue;
 		case EVENT_KEY:
 			seq = ev.key;
@@ -28316,6 +28486,23 @@ editor_loop(Editor *e)
 #endif
 			continue;
 		default:
+			continue;
+		}
+
+		/* A modal frame, when present, takes the event before the
+		 * editor's own key handling. When it reports done, pop it and run
+		 * its continuation, which may push further frames. */
+		if (ui_top(e)) {
+			UiFrame *f = ui_top(e);
+
+			if (f->on_event && f->on_event(e, f, &ev)) {
+				UiFrame done = *f;
+
+				ui_pop(e);
+				if (done.on_done)
+					done.on_done(e, &done);
+			}
+			ui_render(e);
 			continue;
 		}
 
