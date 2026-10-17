@@ -10365,6 +10365,7 @@ static const Pal chrome_plain = {
 /* User color themes defined in the config file as [theme "name"] sections.
  * They extend the three built-in schemes: e->scheme holds SCHEME_COUNT + index
  * to select one. */
+#ifndef VEDIT_NO_THEMES
 #define USER_THEME_MAX 8
 
 typedef struct user_theme {
@@ -10513,15 +10514,24 @@ themes_load_cfg(const Cfg *c)
 	}
 }
 
+#else	/* VEDIT_NO_THEMES: only the built-in chrome schemes, no [theme] sections */
+
+static int theme_by_name(const char *name) { (void)name; return -1; }
+static void themes_load_cfg(const Cfg *c) { (void)c; }
+
+#endif	/* VEDIT_NO_THEMES */
+
 static const Pal *
 ed_chrome(const Editor *e)
 {
+#ifndef VEDIT_NO_THEMES
 	if (e->scheme >= SCHEME_COUNT) {
 		int i = e->scheme - SCHEME_COUNT;
 
 		if (i < g_user_theme_count)
 			return &g_user_themes[i].pal;
 	}
+#endif
 	switch (e->scheme) {
 	case SCHEME_BLACK:
 		return &chrome_black;
@@ -10540,12 +10550,14 @@ chrome_right(const Editor *e)
 {
 	if (e->scheme == SCHEME_BLACK)
 		return 0;
+#ifndef VEDIT_NO_THEMES
 	if (e->scheme >= SCHEME_COUNT) {
 		int i = e->scheme - SCHEME_COUNT;
 
 		if (i < g_user_theme_count && g_user_themes[i].borderless)
 			return 0;
 	}
+#endif
 	return CHROME_RIGHT;
 }
 
