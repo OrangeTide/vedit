@@ -16627,6 +16627,7 @@ ed_retab(Editor *e, int to_spaces)
 #define TEXTWIDTH_MAX	500
 #define GQ_WIDTH_MIN	20	/* a count this big before gq is a width */
 
+#ifndef VEDIT_NO_REFLOW
 /* The comment leaders a line of the buffer's language may carry after
  * its indent and quote marks, each followed by a blank or the end. */
 static const char *const *
@@ -16975,6 +16976,7 @@ reflow_range(Editor *e, size_t lo, size_t hi, int width)
 	e->sel_active = 0;
 	return (long)nl;
 }
+#endif	/* VEDIT_NO_REFLOW */
 
 /* The paragraph around line y as the vi text objects see it: the run of
  * non-empty lines holding y (or of empty ones, when y is empty). With
@@ -17004,6 +17006,7 @@ para_lines(const Editor *e, size_t y, int around, size_t *lo, size_t *hi)
 	*hi = b;
 }
 
+#ifndef VEDIT_NO_REFLOW
 /* Edit > Reflow Paragraph: the selected lines, else the paragraph under
  * the cursor, at textwidth. */
 static void
@@ -17082,6 +17085,14 @@ ed_auto_wrap(Editor *e)
 	e->cx = clen + (e->cx - w);
 	e->cy++;
 }
+
+#else	/* VEDIT_NO_REFLOW: no paragraph re-wrap in this edition */
+
+static void ed_reflow(Editor *e)
+{ set_status(e, "reflow is not built in this edition"); }
+static void ed_auto_wrap(Editor *e) { (void)e; }
+
+#endif	/* VEDIT_NO_REFLOW */
 
 
 /* A bracketed paste while it is a frame: the CR/LF-collapse flag and whether to
@@ -40741,6 +40752,7 @@ vi_shift_lines(Editor *e, size_t y1, size_t y2, int dir)
 
 /* gq over lines y1..y2 (either order): reflow at textwidth, or at the
  * width a count of GQ_WIDTH_MIN or more gave before the gq. */
+#ifndef VEDIT_NO_REFLOW
 static void
 vi_reflow_lines(Editor *e, size_t y1, size_t y2)
 {
@@ -40755,6 +40767,16 @@ vi_reflow_lines(Editor *e, size_t y1, size_t y2)
 		    n == 1 ? "" : "s", width);
 	vi_clamp(e);
 }
+#else
+static void
+vi_reflow_lines(Editor *e, size_t y1, size_t y2)
+{
+	(void)y1;
+	(void)y2;
+	e->vi_gq_width = 0;
+	set_status(e, "reflow is not built in this edition");
+}
+#endif	/* VEDIT_NO_REFLOW */
 
 /* gqq and gqgq: this line and count - 1 more below it. */
 static Req
