@@ -29270,6 +29270,64 @@ pane_key(Editor *e)
 	return pk->result;
 }
 
+/* edit_view_key result: let normal handling run, it was handled (re-render and
+ * loop), quit, or quit with an error code. */
+enum { VK_PASS, VK_DONE, VK_QUIT, VK_QUIT_ERR };
+
+/* The special views (hex, table, art) and the 2D draw mode get first crack at
+ * each key, before the normal text editor. The grid views take every key; the
+ * Insert key toggles draw mode, which then takes over. Centralising this is the
+ * one place a view's or draw mode's key handling lives, so compiling one out
+ * stays local. */
+static int
+edit_view_key(Editor *e, const struct tkbd_seq *seq)
+{
+#ifndef VEDIT_NO_HEX
+	/* The hex navigator shares the request handling, so Ctrl-S and Ctrl-Q
+	 * behave as usual. */
+	if (e->hex_view)
+		return run_req(e, hex_key(e, seq)) ? VK_QUIT : VK_DONE;
+#endif
+	if (e->tbl) {			/* the table view; its : prompt is vi's */
+		Req tr = tbl_key(e, seq);
+
+		switch (tr) {
+		case REQ_VI_COLON:
+			switch (vi_colon(e)) {
+			case REQ_FORCE_QUIT:
+				return VK_QUIT;
+			case REQ_QUIT_ERR:
+				return VK_QUIT_ERR;
+			default:
+				break;
+			}
+			break;
+		case REQ_VI_SEARCH:
+			vi_search(e);
+			break;
+		case REQ_FORCE_QUIT:
+			return VK_QUIT;
+		default:
+			if (run_req(e, tr))
+				return VK_QUIT;
+			break;
+		}
+		tbl_sync(e);
+		return VK_DONE;
+	}
+#ifdef VEDIT_ART
+	if (e->art)			/* the art view while a .ans is current */
+		return run_req(e, art_key(e, seq)) ? VK_QUIT : VK_DONE;
+#endif
+	if (seq->type == TKBD_KEY && seq->key == TKBD_KEY_INS &&
+	    !(seq->mod & TKBD_MOD_CTRL)) {
+		draw_toggle(e);
+		return VK_DONE;
+	}
+	if (e->draw_mode)
+		return run_req(e, draw_key(e, seq)) ? VK_QUIT : VK_DONE;
+	return VK_PASS;
+}
 
 static int
 editor_loop(Editor *e)
@@ -29398,72 +29456,17 @@ editor_loop(Editor *e)
 		}
 #endif
 
-		/* In the hex view, keys drive the hex navigator. It shares the
-		 * request handling, so Ctrl-S and Ctrl-Q behave as usual. */
-#ifndef VEDIT_NO_HEX
-		if (e->hex_view) {
-			if (run_req(e, hex_key(e, &seq)))
-				return 0;
+		/* The special views and draw mode get first crack at the key. */
+		switch (edit_view_key(e, &seq)) {
+		case VK_DONE:
 			ed_render(e, e->d);
 			continue;
-		}
-#endif
-
-		/* The table view takes every key; its : prompt is vi's. */
-		if (e->tbl) {
-			Req tr = tbl_key(e, &seq);
-
-			switch (tr) {
-			case REQ_VI_COLON:
-				switch (vi_colon(e)) {
-				case REQ_FORCE_QUIT:
-					return 0;
-				case REQ_QUIT_ERR:
-					return 1;
-				default:
-					break;
-				}
-				break;
-			case REQ_VI_SEARCH:
-				vi_search(e);
-				break;
-			case REQ_FORCE_QUIT:
-				return 0;
-			default:
-				if (run_req(e, tr))
-					return 0;
-				break;
-			}
-			tbl_sync(e);
-			ed_render(e, e->d);
-			continue;
-		}
-
-#ifdef VEDIT_ART
-		/* The art view takes every key while a .ans file is current. */
-		if (e->art) {
-			if (run_req(e, art_key(e, &seq)))
-				return 0;
-			ed_render(e, e->d);
-			continue;
-		}
-#endif
-
-		/* The Insert key toggles the 2D/block draw mode in either
-		 * personality. */
-		if (seq.type == TKBD_KEY && seq.key == TKBD_KEY_INS &&
-		    !(seq.mod & TKBD_MOD_CTRL)) {
-			draw_toggle(e);
-			ed_render(e, e->d);
-			continue;
-		}
-
-		/* Draw mode takes over input while it is on. */
-		if (e->draw_mode) {
-			if (run_req(e, draw_key(e, &seq)))
-				return 0;
-			ed_render(e, e->d);
-			continue;
+		case VK_QUIT:
+			return 0;
+		case VK_QUIT_ERR:
+			return 1;
+		default:
+			break;		/* not a view key: normal handling */
 		}
 
 		/* F2 toggles between the modeless and vi personalities, ignored
