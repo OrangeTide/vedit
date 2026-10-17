@@ -1271,6 +1271,12 @@ vf_mtime(const Vstat *st)
 #define VEDIT_DRAW 1
 #endif
 
+/* The CSV/TSV table grid view is built by default; -DVEDIT_NO_TABLE drops it.
+ * Its code is guarded by VEDIT_TABLE. */
+#if !defined(VEDIT_NO_TABLE) && !defined(VEDIT_TABLE)
+#define VEDIT_TABLE 1
+#endif
+
 /* The glyph palette (box-drawing and symbol picker) serves both the draw mode
  * and the art view, so it is built when either is. */
 #if (defined(VEDIT_DRAW) || defined(VEDIT_ART)) && !defined(VEDIT_GLYPHS)
@@ -7622,7 +7628,9 @@ widths_set(Widths *ws, int c, int w)
 	return 0;
 }
 
-/* Make room for n columns at c, or close up n columns there (n < 0). */
+#ifdef VEDIT_TABLE
+/* Make room for n columns at c, or close up n columns there (n < 0). Only the
+ * table view shifts column widths; tab stops never do. */
 static void
 widths_shift(Widths *ws, int c, int n)
 {
@@ -7645,6 +7653,7 @@ widths_shift(Widths *ws, int c, int n)
 			ws->w[i] = 0;
 	}
 }
+#endif	/* VEDIT_TABLE */
 
 /* Every column back to the default. */
 static void
@@ -11015,13 +11024,16 @@ static void draw_toggle(Editor *e);
 #ifdef VEDIT_GLYPHS
 static void dlg_glyphs(Editor *e);	/* the glyph palette dialog */
 #endif
+#ifdef VEDIT_TABLE
 static void tbl_sync_file(Editor *e);	/* .csv/.tsv files get the table view */
 static void tbl_detach(Editor *e);
 static void tbl_free(Tbl *tb);
 static void tbl_command(Editor *e, const char *arg);	/* :table */
 static void tbl_colwidth(Editor *e, const char *arg);	/* :colwidth */
 static void tbl_cell_goto(Editor *e, const char *arg);	/* :cell C7 */
+#endif
 static void toggle_vi(Editor *e);		/* F2: vi <-> modeless */
+#ifdef VEDIT_TABLE
 static int tbl_cell_off(const Editor *e, size_t row, int col, size_t *off,
     size_t *len);
 static void tbl_sync(Editor *e);		/* cell cursor from the text cursor */
@@ -11040,6 +11052,7 @@ static void tbl_col_add(Editor *e, int n, int after);
 static void tbl_col_del(Editor *e, int n);
 static void tbl_undo(Editor *e, int redo);
 static int tbl_count_arg(const char *arg);
+#endif
 static void vi_delete_lines(Editor *e, size_t y1, size_t y2);
 static int prompt_edit(Editor *e, const char *q, char *buf, size_t bufsz,
     int allow_empty, size_t pos, int allow_nl);
@@ -12956,12 +12969,18 @@ hex_render(Editor *e, Screen *d)
  * fixed per column; the labels count A, B .. Z, AA, AB like a spreadsheet.
  ****************************************************************/
 
+/* TBL_LABEL_MAX and TBL_CELL_MAX stay outside VEDIT_TABLE: the sort code reads
+ * them in branches that are never taken without a table but still compile. */
+#define TBL_LABEL_MAX		8
+#define TBL_CELL_MAX		4096	/* bytes a cell can hold in the prompt */
+
+#ifdef VEDIT_TABLE
+
 #define TBL_WIDTH_DEFAULT	10
 #define TBL_WIDTH_MIN		1
 #define TBL_WIDTH_MAX		200
 #define TBL_JOIN_MAX		64	/* lines one record may span */
 #define TBL_SNIFF_LINES		20
-#define TBL_LABEL_MAX		8
 
 /* One field of a record as a byte range of the line, quotes included. */
 typedef struct tbl_field {
@@ -13966,8 +13985,6 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 
 /* ---- editing cells ---- */
 
-#define TBL_CELL_MAX	4096		/* bytes a cell can hold in the prompt */
-
 /* The column whose field covers byte x of the row (a delimiter belongs to
  * the field before it); past the last field, the last column. */
 static int
@@ -14485,6 +14502,49 @@ tbl_colwidth(Editor *e, const char *arg)
 	set_status(e, "column %d is %d wide", e->tbl->cx + 1,
 	    tbl_width(e->tbl, e->tbl->cx));
 }
+
+#else	/* VEDIT_TABLE: the CSV/TSV grid view is not built */
+
+#define TBL_NOT_BUILT	"the table view is not built in this edition"
+
+static void tbl_sync_file(Editor *e) { (void)e; }
+static void tbl_detach(Editor *e) { (void)e; }
+static void tbl_free(Tbl *tb) { (void)tb; }
+static void tbl_sync(Editor *e) { (void)e; }
+static void tbl_render(Editor *e, Screen *d) { (void)e; (void)d; }
+static Req tbl_key(Editor *e, const struct tkbd_seq *seq)
+{ (void)e; (void)seq; return REQ_CONTINUE; }
+static void tbl_cell_status(const Editor *e, char *buf, size_t n)
+{ (void)e; if (n) buf[0] = '\0'; }
+static void tbl_cell_value(const Editor *e, size_t row, int col, char *buf,
+    size_t n)
+{ (void)e; (void)row; (void)col; if (n) buf[0] = '\0'; }
+static const char *tbl_label(int col, char *buf, size_t n)
+{ (void)col; if (n) buf[0] = '\0'; return buf; }
+static int tbl_label_col(const char *s) { (void)s; return -1; }
+static size_t tbl_first_row(const Editor *e) { (void)e; return 0; }
+static void tbl_copy_cell(Editor *e) { (void)e; }
+static void tbl_paste_cell(Editor *e) { (void)e; }
+static void tbl_undo(Editor *e, int redo) { (void)e; (void)redo; }
+static int tbl_count_arg(const char *arg) { (void)arg; return 1; }
+static void tbl_command(Editor *e, const char *arg)
+{ (void)arg; set_status(e, TBL_NOT_BUILT); }
+static void tbl_colwidth(Editor *e, const char *arg)
+{ (void)arg; set_status(e, TBL_NOT_BUILT); }
+static void tbl_cell_goto(Editor *e, const char *arg)
+{ (void)arg; set_status(e, TBL_NOT_BUILT); }
+static void tbl_row_add(Editor *e, int n, int below)
+{ (void)n; (void)below; set_status(e, TBL_NOT_BUILT); }
+static void tbl_row_del(Editor *e, int n)
+{ (void)n; set_status(e, TBL_NOT_BUILT); }
+static void tbl_col_add(Editor *e, int n, int after)
+{ (void)n; (void)after; set_status(e, TBL_NOT_BUILT); }
+static void tbl_col_del(Editor *e, int n)
+{ (void)n; set_status(e, TBL_NOT_BUILT); }
+
+#undef TBL_NOT_BUILT
+
+#endif	/* VEDIT_TABLE */
 
 /* Selection highlight bounds for one buffer line, as display columns [*hs,*he)
  * within the line, or -1/-1 when nothing on the line is selected. Shared by the
@@ -30004,6 +30064,7 @@ ed_apply_config(Editor *e)
 			e->art_cols = v;
 	}
 #endif
+#ifdef VEDIT_TABLE
 	e->tbl_on = cfg_bool(g_cfg, "table.view", e->tbl_on);
 	e->tbl_header = cfg_bool(g_cfg, "table.header", e->tbl_header);
 	s = cfg_get(g_cfg, "table.width");
@@ -30013,6 +30074,7 @@ ed_apply_config(Editor *e)
 		if (v >= 0 && v <= TBL_WIDTH_MAX)
 			e->tbl_width = v;
 	}
+#endif
 	s = cfg_get(g_cfg, "edit.shiftwidth");
 	if (s) {
 		int v = atoi(s);
