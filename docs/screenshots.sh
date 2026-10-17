@@ -34,6 +34,17 @@ done
 font='-misc-fixed-medium-r-normal--20-200-75-75-c-100-iso10646-1'
 geom=84x26
 
+# A fixed shell and prompt for the terminal/pane shots that start a shell, so
+# the captured prompt does not carry a host name or a login rc file's styling.
+export SHELL=/bin/sh
+export PS1='$ '
+export ENV=
+# This script is itself run from `make screenshots`, so a `make` typed in a
+# shot's terminal would inherit MAKELEVEL and print "Entering directory
+# <tmp>", leaking the random work path. Clear the sub-make markers so the
+# terminal shot's make is a clean top-level run.
+unset MAKEFLAGS MAKELEVEL MFLAGS
+
 # Pick a display number that is not already taken by an X server.
 dnum=99
 while [ -e "/tmp/.X${dnum}-lock" ] || [ -e "/tmp/.X11-unix/X${dnum}" ]; do
@@ -101,6 +112,44 @@ EOF
 	done
 	printf '\n'
 } > "$work/term.txt"
+
+# A tiny buildable program and a Makefile, so the terminal-buffer shot shows a
+# real shell session: `make run` compiles and runs it, and the editor's VT
+# emulator draws the command, the compile line, and the program output. The
+# program is warning-clean under -Wall -O2 and its output is fixed, so the shot
+# is the same on every run.
+cat > "$work/demo.c" <<'EOF'
+#include <stdio.h>
+
+/* Push 1..6 through a 4-slot ring buffer and print what survives. */
+int main(void)
+{
+	int buf[4], head = 0, len = 0, i;
+
+	for (i = 1; i <= 6; i++) {
+		buf[(head + len) % 4] = i;
+		if (len < 4)
+			len++;
+		else
+			head = (head + 1) % 4;
+	}
+	printf("ring: cap=4 head=%d len=%d\n", head, len);
+	for (i = 0; i < len; i++)
+		printf(" %d", buf[(head + i) % 4]);
+	printf("\nok\n");
+	return 0;
+}
+EOF
+cat > "$work/Makefile" <<'EOF'
+CC = cc
+CFLAGS = -Wall -O2
+
+run: demo
+	./demo
+
+demo: demo.c
+	$(CC) $(CFLAGS) -o demo demo.c
+EOF
 
 # A spreadsheet-ish CSV for the table view: a header row, quoted fields with
 # commas inside, and columns of different widths for :colwidth fit to size.
@@ -233,11 +282,13 @@ render "$here/shot-draw.png" pipeline.txt \
     ctrl+Home Insert \
     "Down Down Down Down Down Down Down Down Down Down"
 
-# A terminal buffer: F2 switches to vi keys, then the ex line :terminal runs
-# cat on the colored log. The built-in VT emulator parses the child's output
-# and the editor draws it in its own frame, with the OSC title as the label.
+# A terminal buffer: F2 switches to vi keys, :terminal starts a shell, and at
+# its prompt a real `make run` compiles demo.c and runs it. The built-in VT
+# emulator parses the shell and compiler output and the editor draws it in its
+# own frame.
 render "$here/shot-term.png" ring.c \
-    F2 "colon t e r m i n a l space c a t space t e r m period t x t Return"
+    F2 "colon t e r m i n a l Return" \
+    "m a k e space r u n Return"
 
 # The pane: the same build log runs under the text with :sterm cat term.txt.
 # A new pane leaves the focus in the file, so the cursor stays on line 1.
