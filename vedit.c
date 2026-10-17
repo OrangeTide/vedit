@@ -17504,6 +17504,125 @@ ui_prompt(Editor *e, const char *q, const char *buf)
 	ui_prompt_at(e, q, buf, buf ? strlen(buf) : 0);
 }
 
+/* A line-input prompt while it is a frame: the label, the caller-owned edit
+ * buffer, and the cursor/length carried across events. buf stays caller-owned
+ * (the synchronous bridge keeps it alive), so only the offsets live here. */
+typedef struct prompt_ctx {
+	const char	*q;		/* prompt label */
+	char		*buf;		/* caller's edit buffer (NUL-terminated) */
+	size_t		bufsz;		/* capacity of buf */
+	size_t		pos, len;	/* cursor byte offset and current length */
+	int		allow_empty;	/* accept an empty line */
+	int		allow_nl;	/* Alt+Enter inserts a newline */
+	int		result;		/* 1 accepted, 0 cancelled (set when done) */
+} PromptCtx;
+
+_Static_assert(sizeof(PromptCtx) <= sizeof(UiCtx),
+    "PromptCtx must fit inline in a UiFrame");
+
+static void
+prompt_frame_draw(Editor *e, UiFrame *f)
+{
+	PromptCtx *pc = (PromptCtx *)&f->ctx;
+
+	ui_prompt_at(e, pc->q, pc->buf, pc->pos);
+}
+
+/* One key of the line editor: returns 1 to close (accept or cancel, with the
+ * outcome in pc->result), 0 to keep editing. */
+static int
+prompt_frame_key(Editor *e, UiFrame *f, const Event *ev)
+{
+	PromptCtx *pc = (PromptCtx *)&f->ctx;
+	char *buf = pc->buf;
+	struct tkbd_seq seq;
+	size_t k;
+
+	(void)e;
+	if (ev->type != EVENT_KEY)
+		return 0;
+	seq = ev->key;
+	if (seq.type != TKBD_KEY)
+		return 0;
+	if ((seq.mod & TKBD_MOD_ALT) && pc->allow_nl &&
+	    (seq.key == TKBD_KEY_ENTER || seq.ch == '\r' || seq.ch == '\n')) {
+		if (pc->len + 1 < pc->bufsz) {
+			memmove(buf + pc->pos + 1, buf + pc->pos,
+			    pc->len - pc->pos + 1);
+			buf[pc->pos++] = '\n';
+			pc->len++;
+		}
+		return 0;
+	}
+	if (seq.key == TKBD_KEY_ENTER) {
+		pc->result = pc->allow_empty ? 1 : (pc->len > 0);
+		return 1;
+	}
+	if (seq.key == TKBD_KEY_ESC ||
+	    ((seq.mod & TKBD_MOD_CTRL) && seq.key == TKBD_KEY_C)) {
+		pc->result = 0;
+		return 1;
+	}
+	switch (seq.key) {
+	case TKBD_KEY_LEFT:
+		if (pc->pos > 0) {
+			pc->pos--;
+			while (pc->pos > 0 && ((unsigned char)buf[pc->pos] & 0xc0) == 0x80)
+				pc->pos--;
+		}
+		return 0;
+	case TKBD_KEY_RIGHT:
+		if (pc->pos < pc->len) {
+			pc->pos++;
+			while (pc->pos < pc->len && ((unsigned char)buf[pc->pos] & 0xc0) == 0x80)
+				pc->pos++;
+		}
+		return 0;
+	case TKBD_KEY_HOME:
+		pc->pos = 0;
+		return 0;
+	case TKBD_KEY_END:
+		pc->pos = pc->len;
+		return 0;
+	case TKBD_KEY_DEL:
+		if (pc->pos < pc->len) {
+			k = pc->pos + 1;
+			while (k < pc->len && ((unsigned char)buf[k] & 0xc0) == 0x80)
+				k++;
+			memmove(buf + pc->pos, buf + k, pc->len - k + 1);
+			pc->len -= k - pc->pos;
+		}
+		return 0;
+	case TKBD_KEY_BACKSPACE:
+	case TKBD_KEY_BACKSPACE2:
+		if (pc->pos > 0) {
+			k = pc->pos - 1;
+			while (k > 0 && ((unsigned char)buf[k] & 0xc0) == 0x80)
+				k--;
+			memmove(buf + k, buf + pc->pos, pc->len - pc->pos + 1);
+			pc->len -= pc->pos - k;
+			pc->pos = k;
+		}
+		return 0;
+	default:
+		break;
+	}
+	if (!(seq.mod & TKBD_MOD_CTRL) && seq.ch != TKBD_CH_NONE &&
+	    seq.ch >= 0x20 && seq.ch != 0x7f) {
+		unsigned char enc[8];
+		int el = utf8_encode(enc, seq.ch);
+
+		if (el > 0 && pc->len + (size_t)el < pc->bufsz) {
+			memmove(buf + pc->pos + (size_t)el, buf + pc->pos,
+			    pc->len - pc->pos + 1);
+			memcpy(buf + pc->pos, enc, (size_t)el);
+			pc->pos += (size_t)el;
+			pc->len += (size_t)el;
+		}
+	}
+	return 0;
+}
+
 /* Edit a line of text in the status row with a moving cursor: Left, Right,
  * Home and End move it, Backspace and Delete erase around it, typing inserts
  * at it, and Alt+Enter inserts a newline when allow_nl is set. buf is edited
@@ -17514,97 +17633,25 @@ static int
 prompt_edit(Editor *e, const char *q, char *buf, size_t bufsz,
     int allow_empty, size_t pos, int allow_nl)
 {
+	int base = e->ui_depth;
+	UiFrame *f;
+	PromptCtx *pc;
 	size_t len = strlen(buf);
 
-	if (pos > len)
-		pos = len;
-	for (;;) {
-		Event ev;
-		struct tkbd_seq seq;
-		size_t k;
-
-		ui_prompt_at(e, q, buf, pos);
-		if (scr_wait(e->d, &ev) == EVENT_EOF)
-			return 0;
-		if (ev.type != EVENT_KEY) {
-			scr_size(e->d, &e->rows, &e->cols);	/* resize/resume */
-			continue;			/* loop redraws the prompt */
-		}
-		seq = ev.key;
-		if (seq.type != TKBD_KEY)
-			continue;
-		if ((seq.mod & TKBD_MOD_ALT) && allow_nl &&
-		    (seq.key == TKBD_KEY_ENTER || seq.ch == '\r' || seq.ch == '\n')) {
-			if (len + 1 < bufsz) {
-				memmove(buf + pos + 1, buf + pos, len - pos + 1);
-				buf[pos++] = '\n';
-				len++;
-			}
-			continue;
-		}
-		if (seq.key == TKBD_KEY_ENTER)
-			return allow_empty ? 1 : (len > 0);
-		if (seq.key == TKBD_KEY_ESC ||
-		    ((seq.mod & TKBD_MOD_CTRL) && seq.key == TKBD_KEY_C))
-			return 0;
-		switch (seq.key) {
-		case TKBD_KEY_LEFT:
-			if (pos > 0) {
-				pos--;
-				while (pos > 0 && ((unsigned char)buf[pos] & 0xc0) == 0x80)
-					pos--;
-			}
-			continue;
-		case TKBD_KEY_RIGHT:
-			if (pos < len) {
-				pos++;
-				while (pos < len && ((unsigned char)buf[pos] & 0xc0) == 0x80)
-					pos++;
-			}
-			continue;
-		case TKBD_KEY_HOME:
-			pos = 0;
-			continue;
-		case TKBD_KEY_END:
-			pos = len;
-			continue;
-		case TKBD_KEY_DEL:
-			if (pos < len) {
-				k = pos + 1;
-				while (k < len && ((unsigned char)buf[k] & 0xc0) == 0x80)
-					k++;
-				memmove(buf + pos, buf + k, len - k + 1);
-				len -= k - pos;
-			}
-			continue;
-		case TKBD_KEY_BACKSPACE:
-		case TKBD_KEY_BACKSPACE2:
-			if (pos > 0) {
-				k = pos - 1;
-				while (k > 0 && ((unsigned char)buf[k] & 0xc0) == 0x80)
-					k--;
-				memmove(buf + k, buf + pos, len - pos + 1);
-				len -= pos - k;
-				pos = k;
-			}
-			continue;
-		default:
-			break;
-		}
-		if (!(seq.mod & TKBD_MOD_CTRL) && seq.ch != TKBD_CH_NONE &&
-		    seq.ch >= 0x20 && seq.ch != 0x7f) {
-			unsigned char enc[8];
-			int el = utf8_encode(enc, seq.ch);
-
-			if (el > 0 && len + (size_t)el < bufsz) {
-				memmove(buf + pos + (size_t)el, buf + pos,
-				    len - pos + 1);
-				memcpy(buf + pos, enc, (size_t)el);
-				pos += (size_t)el;
-				len += (size_t)el;
-			}
-		}
-	}
+	f = ui_push(e, UI_PROMPT, prompt_frame_draw, prompt_frame_key, NULL);
+	if (!f)
+		return 0;
+	pc = (PromptCtx *)&f->ctx;
+	pc->q = q;
+	pc->buf = buf;
+	pc->bufsz = bufsz;
+	pc->len = len;
+	pc->pos = pos > len ? len : pos;
+	pc->allow_empty = allow_empty;
+	pc->allow_nl = allow_nl;
+	pc->result = 0;			/* EOF closes the prompt as a cancel */
+	ui_pump_modal(e, base);
+	return pc->result;		/* frame slot stays valid after the pop */
 }
 
 /* Read a line of text with the cursor at its end; see prompt_edit. */
@@ -17620,33 +17667,69 @@ dlg_prompt_line(Editor *e, const char *q, char *buf, size_t bufsz)
 	return prompt_line(e, q, buf, bufsz, 0);
 }
 
+/* A one-key y/n/a/q prompt while it is a frame: just the label and the key
+ * that closed it. */
+typedef struct keyprompt_ctx {
+	const char	*q;		/* prompt label */
+	int		result;		/* lowercased char, '\n', or 0 (set when done) */
+} KeyPromptCtx;
+
+_Static_assert(sizeof(KeyPromptCtx) <= sizeof(UiCtx),
+    "KeyPromptCtx must fit inline in a UiFrame");
+
+static void
+keyprompt_frame_draw(Editor *e, UiFrame *f)
+{
+	KeyPromptCtx *kc = (KeyPromptCtx *)&f->ctx;
+
+	ui_prompt(e, kc->q, "");
+}
+
+static int
+keyprompt_frame_key(Editor *e, UiFrame *f, const Event *ev)
+{
+	KeyPromptCtx *kc = (KeyPromptCtx *)&f->ctx;
+	struct tkbd_seq seq;
+
+	(void)e;
+	if (ev->type != EVENT_KEY)
+		return 0;
+	seq = ev->key;
+	if (seq.type != TKBD_KEY)
+		return 0;
+	if (seq.key == TKBD_KEY_ESC ||
+	    ((seq.mod & TKBD_MOD_CTRL) && seq.key == TKBD_KEY_C)) {
+		kc->result = 0;
+		return 1;
+	}
+	if (seq.key == TKBD_KEY_ENTER) {
+		kc->result = '\n';
+		return 1;
+	}
+	if (seq.ch != TKBD_CH_NONE && seq.ch >= 0x20 && seq.ch < 0x7f) {
+		kc->result = tolower((unsigned char)seq.ch);
+		return 1;
+	}
+	return 0;			/* other keys: keep waiting */
+}
+
 /* Draw q on the status row and return the next character typed (lowercased),
  * or 0 on ESC, Ctrl-C or end of input. Used for a one-key y/n/a/q prompt. */
 static int
 dlg_prompt_key(Editor *e, const char *q)
 {
-	for (;;) {
-		Event ev;
-		struct tkbd_seq seq;
+	int base = e->ui_depth;
+	UiFrame *f;
+	KeyPromptCtx *kc;
 
-		ui_prompt(e, q, "");
-		if (scr_wait(e->d, &ev) == EVENT_EOF)
-			return 0;
-		if (ev.type != EVENT_KEY) {
-			scr_size(e->d, &e->rows, &e->cols);
-			continue;
-		}
-		seq = ev.key;
-		if (seq.type != TKBD_KEY)
-			continue;
-		if (seq.key == TKBD_KEY_ESC ||
-		    ((seq.mod & TKBD_MOD_CTRL) && seq.key == TKBD_KEY_C))
-			return 0;
-		if (seq.key == TKBD_KEY_ENTER)
-			return '\n';
-		if (seq.ch != TKBD_CH_NONE && seq.ch >= 0x20 && seq.ch < 0x7f)
-			return tolower((unsigned char)seq.ch);
-	}
+	f = ui_push(e, UI_YESNOKEY, keyprompt_frame_draw, keyprompt_frame_key, NULL);
+	if (!f)
+		return 0;
+	kc = (KeyPromptCtx *)&f->ctx;
+	kc->q = q;
+	kc->result = 0;			/* EOF closes as a cancel */
+	ui_pump_modal(e, base);
+	return kc->result;		/* frame slot stays valid after the pop */
 }
 
 /* ---- regex search adapters over the vendored rx engine -----------------
