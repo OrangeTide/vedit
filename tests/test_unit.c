@@ -2271,6 +2271,95 @@ t_keymap_cycle(Test *t)
 	unlink(path);
 }
 
+/* Build a key event for the keymap dispatch test. */
+static struct tkbd_seq
+kseq(uint16_t key, uint8_t mod, uint32_t ch)
+{
+	struct tkbd_seq s;
+
+	memset(&s, 0, sizeof(s));
+	s.type = TKBD_KEY;
+	s.key = key;
+	s.mod = mod;
+	s.ch = ch;
+	return s;
+}
+
+/* A [keys "name"] section binds keys for a custom keymap mode: single keys and
+ * two-key chords resolve to actions, an [include] merges the bindings from a
+ * second file, an unknown action is skipped, and an unbound printable key still
+ * self-inserts. */
+static void
+t_keymap_bind(Test *t)
+{
+	char incpath[256], mainpath[256], text[512];
+	const Cfg *old = g_cfg;
+	Cfg *inc, *c;
+	Editor e;
+	struct tkbd_seq s;
+
+	/* the bindings live in a separate file that the main config includes */
+	inc = load_cfg_text(
+	    "[keys \"ws\"]\n"
+	    "\tbind = ^D right\n"
+	    "\tbind = ^F word-right\n"
+	    "\tbind = ^Q S line-begin\n"
+	    "\tbind = ^G nonesuch\n"	/* unknown action: dropped */
+	    "\tbind = enter newline\n",
+	    incpath, sizeof(incpath));
+	TAP_ASSERT(t, inc != NULL);
+	vedit_cfg_free(inc);		/* only the file on disk is needed */
+
+	snprintf(text, sizeof(text),
+	    "[include]\n\tpath = %s\n[keys]\n\tmodes = ws\n", incpath);
+	c = load_cfg_text(text, mainpath, sizeof(mainpath));
+	TAP_ASSERT(t, c != NULL);
+	g_cfg = c;
+
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "hello world", 11);
+	ed_apply_config(&e);
+
+	/* the ws mode is active, modeless, with a bind table of four keys */
+	TAP_CHECK(t, e.kb_nmode == 1 && e.mode == MODE_MODELESS);
+	TAP_ASSERT(t, e.kb_map != NULL);
+	TAP_CHECKF(t, e.kb_map->n == 4, "bindings %d", e.kb_map->n);
+
+	/* ^D moves right */
+	e.cy = e.cx = 0;
+	s = kseq(TKBD_KEY_D, TKBD_MOD_CTRL, TKBD_CH_NONE);
+	kb_keymap_dispatch(&e, &s);
+	TAP_CHECKF(t, e.cx == 1, "after ^D cx=%zu", e.cx);
+
+	/* ^F jumps to the next word */
+	s = kseq(TKBD_KEY_F, TKBD_MOD_CTRL, TKBD_CH_NONE);
+	kb_keymap_dispatch(&e, &s);
+	TAP_CHECKF(t, e.cx == 6, "after ^F cx=%zu", e.cx);
+
+	/* ^Q then S is a chord to line-begin; the prefix sets kb_pending */
+	s = kseq(TKBD_KEY_Q, TKBD_MOD_CTRL, TKBD_CH_NONE);
+	kb_keymap_dispatch(&e, &s);
+	TAP_CHECK(t, e.kb_pending == 1);
+	s = kseq(TKBD_KEY_S, 0, 's');	/* second key matches without Ctrl */
+	kb_keymap_dispatch(&e, &s);
+	TAP_CHECK(t, e.kb_pending == 0 && e.cx == 0);
+
+	/* an unbound printable key self-inserts */
+	s = kseq(TKBD_KEY_Z, 0, 'z');
+	kb_keymap_dispatch(&e, &s);
+	TAP_CHECKF(t, text_line_len(e.t, 0) == 12 && e.cx == 1,
+	    "after z len=%zu cx=%zu", text_line_len(e.t, 0), e.cx);
+
+	text_free(e.t);
+	kb_free_maps(&e);
+	g_cfg = old;
+	vedit_cfg_free(c);
+	unlink(incpath);
+	unlink(mainpath);
+}
+
 /* Per-project keys may be overridden by VEDIT_<KEY> environment variables:
  * env wins over the config, an empty var is treated as unset, and the key's dots
  * map to underscores with the whole name uppercased. */
@@ -3998,6 +4087,7 @@ const Case tap_cases[] = {
 	{ "cfg_parse", t_cfg_parse },
 	{ "cfg_resolve", t_cfg_resolve },
 	{ "keymap_cycle", t_keymap_cycle },
+	{ "keymap_bind", t_keymap_bind },
 	{ "cfg_env", t_cfg_env },
 	{ "cfg_color", t_cfg_color },
 	{ "cfg_theme", t_cfg_theme },

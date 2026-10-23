@@ -3251,6 +3251,22 @@ cfg_get(const Cfg *c, const char *key)
 	return hit;
 }
 
+/* The i-th value set for key, in file order (0 is the first), or NULL once
+ * there are no more. Lets a caller walk a multivar such as a repeated "bind"
+ * line, where cfg_get would return only the last. */
+static const char *
+cfg_get_n(const Cfg *c, const char *key, int i)
+{
+	int j, seen = 0;
+
+	if (!c)
+		return NULL;
+	for (j = 0; j < c->count; j++)
+		if (strcmp(c->entries[j].key, key) == 0 && seen++ == i)
+			return c->entries[j].value;
+	return NULL;
+}
+
 /* Interpret a string as a boolean, returning def when it is not recognized. */
 static int
 str_bool(const char *v, int def)
@@ -7900,6 +7916,26 @@ typedef enum edit_mode {
 #define KB_MODE_MAX	8	/* most keymaps the F2 cycle can hold */
 #define KB_NAME_MAX	16	/* longest mode name kept, with the NUL */
 
+/* A custom keymap mode (one named by a [keys "name"] section) carries its own
+ * table of bindings instead of a built-in personality's hardcoded keys. Each
+ * binding is one key, or a two-key chord (a prefix like Ctrl-K then a second
+ * key), mapped to an action (ACT_*, defined with the engine). The mod field
+ * keeps only the Ctrl bit; the second key of a chord is matched ignoring Ctrl,
+ * so Ctrl-K Ctrl-B and Ctrl-K B are the same (WordStar behavior). */
+typedef struct kb_binding {
+	uint16_t	k1;	/* first key (TKBD_KEY_*) */
+	uint8_t		m1;	/* its Ctrl bit */
+	uint16_t	k2;	/* second key of a chord, else 0 */
+	uint8_t		two;	/* 1 when this is a two-key chord */
+	int		action;	/* ACT_* to run */
+	int		arg;	/* small integer argument, or -1 */
+} KbBinding;
+
+typedef struct kb_map {
+	KbBinding	*b;
+	int		n, cap;
+} KbMap;
+
 /* Marker stored in e->vi_visual for a Ctrl-V block selection (the control code
  * Ctrl-V itself), alongside 'v' charwise and 'V' linewise. */
 #define VI_VBLOCK 0x16
@@ -8107,6 +8143,11 @@ typedef struct editor {
 	int		kb_base[KB_MODE_MAX];	/* each mode's base personality */
 	int		kb_nmode;		/* modes in the cycle, 0 until configured */
 	int		kb_cur;			/* index of the active mode */
+	KbMap		kb_maps[KB_MODE_MAX];	/* a custom mode's bindings, else empty */
+	KbMap		*kb_map;		/* the active mode's map, or NULL for a built-in */
+	int		kb_pending;		/* a chord prefix key is awaiting its second key */
+	uint16_t	kb_pend_key;		/* the prefix key already pressed */
+	uint8_t		kb_pend_mod;		/* its Ctrl bit */
 
 	/* vi personality state */
 	Mode	mode;
@@ -25321,6 +25362,402 @@ ed_save_as(Editor *e)
 	(void)save_editor(e);
 }
 
+/****************************************************************
+ * Custom keymaps
+ *
+ * A mode named by a [keys "name"] config section binds keys itself instead of
+ * running a built-in personality. The base is modeless text entry: a printable
+ * key inserts, and every other key does only what a "bind" line gives it, so an
+ * empty keymap has no commands at all. Bindings reference actions by the names
+ * in kb_actions[]; a name the build does not know yet is skipped, so a config
+ * may list keys whose feature lands in a later patch.
+ ****************************************************************/
+
+/* Actions a binding can name. Each maps to an operation in kb_run_action. */
+enum kb_act {
+	ACT_NONE,
+	ACT_UP, ACT_DOWN, ACT_LEFT, ACT_RIGHT,
+	ACT_WORD_LEFT, ACT_WORD_RIGHT,
+	ACT_LINE_BEGIN, ACT_LINE_END,
+	ACT_FILE_TOP, ACT_FILE_BOTTOM,
+	ACT_PAGE_UP, ACT_PAGE_DOWN,
+	ACT_JUMP_BACK,
+	ACT_NEWLINE, ACT_TAB,
+	ACT_DELETE_LEFT, ACT_DELETE_RIGHT,
+	ACT_DELETE_WORD_RIGHT, ACT_DELETE_LINE,
+	ACT_DELETE_TO_EOL, ACT_DELETE_TO_BOL,
+	ACT_UNDO, ACT_REDO,
+	ACT_COPY, ACT_CUT, ACT_PASTE,
+	ACT_REFLOW,
+	ACT_FIND, ACT_FIND_NEXT, ACT_REPLACE, ACT_GOTO_LINE, ACT_SYMBOL,
+	ACT_FILE_INSERT, ACT_SAVE, ACT_SAVE_AS, ACT_SAVE_EXIT, ACT_QUIT,
+	ACT_HELP
+};
+
+/* Position helpers used by the word motions, defined with the vi code below. */
+static void vi_pos_word_fwd(Editor *e, size_t *py, size_t *px, int big);
+static void vi_pos_word_back(Editor *e, size_t *py, size_t *px, int big);
+
+static const struct { const char *name; int act; } kb_actions[] = {
+	{ "up", ACT_UP }, { "down", ACT_DOWN },
+	{ "left", ACT_LEFT }, { "right", ACT_RIGHT },
+	{ "word-left", ACT_WORD_LEFT }, { "word-right", ACT_WORD_RIGHT },
+	{ "line-begin", ACT_LINE_BEGIN }, { "line-end", ACT_LINE_END },
+	{ "file-top", ACT_FILE_TOP }, { "file-bottom", ACT_FILE_BOTTOM },
+	{ "page-up", ACT_PAGE_UP }, { "page-down", ACT_PAGE_DOWN },
+	{ "jump-back", ACT_JUMP_BACK },
+	{ "newline", ACT_NEWLINE }, { "tab", ACT_TAB },
+	{ "delete-left", ACT_DELETE_LEFT }, { "delete-right", ACT_DELETE_RIGHT },
+	{ "delete-word-right", ACT_DELETE_WORD_RIGHT },
+	{ "delete-line", ACT_DELETE_LINE },
+	{ "delete-to-eol", ACT_DELETE_TO_EOL },
+	{ "delete-to-bol", ACT_DELETE_TO_BOL },
+	{ "undo", ACT_UNDO }, { "redo", ACT_REDO },
+	{ "copy", ACT_COPY }, { "cut", ACT_CUT }, { "paste", ACT_PASTE },
+	{ "reflow", ACT_REFLOW },
+	{ "find", ACT_FIND }, { "find-next", ACT_FIND_NEXT },
+	{ "replace", ACT_REPLACE }, { "goto-line", ACT_GOTO_LINE },
+	{ "symbol", ACT_SYMBOL },
+	{ "file-insert", ACT_FILE_INSERT }, { "save", ACT_SAVE },
+	{ "save-as", ACT_SAVE_AS }, { "save-exit", ACT_SAVE_EXIT },
+	{ "quit", ACT_QUIT }, { "help", ACT_HELP },
+};
+
+#define KB_ACTION_COUNT ((int)(sizeof(kb_actions) / sizeof(kb_actions[0])))
+
+/* The action id for a name, or ACT_NONE when this build does not know it. */
+static int
+kb_action_id(const char *name)
+{
+	int i;
+
+	for (i = 0; i < KB_ACTION_COUNT; i++)
+		if (strcmp(kb_actions[i].name, name) == 0)
+			return kb_actions[i].act;
+	return ACT_NONE;
+}
+
+/* The function-key codes are not contiguous (F5 to F6 skips a value), so a
+ * small table maps f1..f12 to their TKBD_KEY_F* codes. */
+static const uint16_t kb_fkeys[12] = {
+	TKBD_KEY_F1, TKBD_KEY_F2, TKBD_KEY_F3, TKBD_KEY_F4,
+	TKBD_KEY_F5, TKBD_KEY_F6, TKBD_KEY_F7, TKBD_KEY_F8,
+	TKBD_KEY_F9, TKBD_KEY_F10, TKBD_KEY_F11, TKBD_KEY_F12,
+};
+
+/* A named key or a one-character key, into *key (mod is always 0 here; a Ctrl
+ * modifier comes from the "^" form handled in kb_parse_keyspec). Returns 1 on a
+ * recognized token, 0 otherwise. Case-insensitive for names and letters. */
+static int
+kb_key_named(const char *s, size_t len, uint16_t *key)
+{
+	static const struct { const char *name; uint16_t key; } named[] = {
+		{ "enter", TKBD_KEY_ENTER }, { "return", TKBD_KEY_ENTER },
+		{ "esc", TKBD_KEY_ESC }, { "tab", TKBD_KEY_TAB },
+		{ "bksp", TKBD_KEY_BACKSPACE }, { "backspace", TKBD_KEY_BACKSPACE },
+		{ "del", TKBD_KEY_DEL }, { "delete", TKBD_KEY_DEL },
+		{ "ins", TKBD_KEY_INS }, { "insert", TKBD_KEY_INS },
+		{ "space", TKBD_KEY_SPACE }, { "home", TKBD_KEY_HOME },
+		{ "end", TKBD_KEY_END }, { "pgup", TKBD_KEY_PGUP },
+		{ "pgdn", TKBD_KEY_PGDN }, { "up", TKBD_KEY_UP },
+		{ "down", TKBD_KEY_DOWN }, { "left", TKBD_KEY_LEFT },
+		{ "right", TKBD_KEY_RIGHT },
+	};
+	int i;
+
+	if (len == 1) {			/* a single character */
+		unsigned char c = (unsigned char)s[0];
+
+		if (c >= 'a' && c <= 'z')
+			c = (unsigned char)(c - 32);
+		*key = c;
+		return 1;
+	}
+	for (i = 0; i < (int)(sizeof(named) / sizeof(named[0])); i++)
+		if (strlen(named[i].name) == len &&
+		    strncasecmp(named[i].name, s, len) == 0) {
+			*key = named[i].key;
+			return 1;
+		}
+	if ((s[0] == 'f' || s[0] == 'F') && len >= 2 && len <= 3) {
+		int n = atoi(s + 1);
+
+		if (n >= 1 && n <= 12) {
+			*key = kb_fkeys[n - 1];
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* Parse one key token (e.g. "^S", "up", "del", "B") into a key and its Ctrl
+ * bit. "^X" is Ctrl plus that character; anything else is a named or one-char
+ * key with no modifier. Returns 1 on success. */
+static int
+kb_parse_onekey(const char *tok, uint16_t *key, uint8_t *mod)
+{
+	*mod = 0;
+	if (tok[0] == '^' && tok[1] && tok[2] == '\0') {
+		unsigned char c = (unsigned char)tok[1];
+
+		if (c >= 'a' && c <= 'z')
+			c = (unsigned char)(c - 32);
+		*key = c;
+		*mod = TKBD_MOD_CTRL;
+		return 1;
+	}
+	return kb_key_named(tok, strlen(tok), key);
+}
+
+/* Grow a map and append a binding. */
+static void
+kb_map_add(KbMap *m, const KbBinding *b)
+{
+	if (m->n >= m->cap) {
+		int na = m->cap ? m->cap * 2 : 16;
+		KbBinding *nb = realloc(m->b, (size_t)na * sizeof(*nb));
+
+		if (!nb)
+			return;
+		m->b = nb;
+		m->cap = na;
+	}
+	m->b[m->n++] = *b;
+}
+
+/* Build map m from the [keys "name"] bind lines. Each is one of:
+ *	bind = <key> <action> [arg]
+ *	bind = <key> <key2> <action> [arg]
+ * The second form is a chord (a prefix then a second key). The two are told
+ * apart by the second token: it is a chord's second key only when it parses as
+ * a key AND an action token still follows it, so "^D right" binds one key to
+ * the action "right" while "^Q S line-begin" is a chord. An unparsable key or
+ * an action this build does not know is skipped. */
+static void
+kb_build_map(KbMap *m, const char *name)
+{
+	char key[256];
+	const char *v;
+	int i;
+
+	snprintf(key, sizeof(key), "keys.%s.bind", name);
+	for (i = 0; (v = cfg_get_n(g_cfg, key, i)) != NULL; i++) {
+		char buf[256], *tok[4];
+		uint8_t m2;		/* the chord's second key matches mod-free */
+		int nt = 0, ai;
+		char *p;
+		KbBinding b;
+
+		snprintf(buf, sizeof(buf), "%s", v);
+		for (p = buf; *p && nt < 4; ) {
+			while (*p == ' ' || *p == '\t')
+				p++;
+			if (!*p)
+				break;
+			tok[nt++] = p;
+			while (*p && *p != ' ' && *p != '\t')
+				p++;
+			if (*p)
+				*p++ = '\0';
+		}
+		if (nt < 2)
+			continue;		/* need at least a key and an action */
+		memset(&b, 0, sizeof(b));
+		if (!kb_parse_onekey(tok[0], &b.k1, &b.m1))
+			continue;
+		if (nt >= 3 && kb_parse_onekey(tok[1], &b.k2, &m2)) {
+			b.two = 1;		/* <key> <key2> <action> [arg] */
+			ai = 2;
+		} else {
+			ai = 1;			/* <key> <action> [arg] */
+		}
+		b.action = kb_action_id(tok[ai]);
+		if (b.action == ACT_NONE)
+			continue;		/* a name this build lacks: skip */
+		b.arg = (nt > ai + 1) ? atoi(tok[ai + 1]) : -1;
+		kb_map_add(m, &b);
+	}
+}
+
+/* Free every mode's map and detach the active one. */
+static void
+kb_free_maps(Editor *e)
+{
+	int i;
+
+	for (i = 0; i < KB_MODE_MAX; i++) {
+		free(e->kb_maps[i].b);
+		e->kb_maps[i].b = NULL;
+		e->kb_maps[i].n = e->kb_maps[i].cap = 0;
+	}
+	e->kb_map = NULL;
+	e->kb_pending = 0;
+}
+
+/* The incoming key reduced to a code plus its Ctrl bit (Shift and the rest are
+ * dropped, so a letter matches whether or not Shift is held). */
+static void
+kb_norm(const struct tkbd_seq *seq, uint16_t *key, uint8_t *mod)
+{
+	*key = seq->key;
+	*mod = seq->mod & TKBD_MOD_CTRL;
+}
+
+/* Run one keymap action. Returns a Req for the main loop's run_req, like the
+ * modeless ed_dispatch does. */
+static Req
+kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
+{
+	size_t y, x, len;
+
+	(void)arg;
+	switch (act) {
+	case ACT_UP:		return ed_dispatch(e, CMD_UP, seq);
+	case ACT_DOWN:		return ed_dispatch(e, CMD_DOWN, seq);
+	case ACT_LEFT:		return ed_dispatch(e, CMD_LEFT, seq);
+	case ACT_RIGHT:		return ed_dispatch(e, CMD_RIGHT, seq);
+	case ACT_LINE_BEGIN:	return ed_dispatch(e, CMD_HOME, seq);
+	case ACT_LINE_END:	return ed_dispatch(e, CMD_END, seq);
+	case ACT_FILE_TOP:	return ed_dispatch(e, CMD_TOP, seq);
+	case ACT_FILE_BOTTOM:	return ed_dispatch(e, CMD_BOTTOM, seq);
+	case ACT_PAGE_UP:	return ed_dispatch(e, CMD_PGUP, seq);
+	case ACT_PAGE_DOWN:	return ed_dispatch(e, CMD_PGDN, seq);
+	case ACT_NEWLINE:	return ed_dispatch(e, CMD_NEWLINE, seq);
+	case ACT_TAB:		return ed_dispatch(e, CMD_TAB, seq);
+	case ACT_DELETE_LEFT:	return ed_dispatch(e, CMD_BACKSPACE, seq);
+	case ACT_DELETE_RIGHT:	return ed_dispatch(e, CMD_DELETE, seq);
+	case ACT_UNDO:		return ed_dispatch(e, CMD_UNDO, seq);
+	case ACT_REDO:		return ed_dispatch(e, CMD_REDO, seq);
+	case ACT_COPY:		return ed_dispatch(e, CMD_COPY, seq);
+	case ACT_CUT:		return ed_dispatch(e, CMD_CUT, seq);
+	case ACT_PASTE:		return ed_dispatch(e, CMD_PASTE, seq);
+	case ACT_FIND:		return ed_dispatch(e, CMD_FIND, seq);
+	case ACT_REPLACE:	return ed_dispatch(e, CMD_REPLACE, seq);
+	case ACT_GOTO_LINE:	return ed_dispatch(e, CMD_GOTO, seq);
+	case ACT_SYMBOL:	return ed_dispatch(e, CMD_SYMBOL, seq);
+	case ACT_SAVE:		return ed_dispatch(e, CMD_SAVE, seq);
+	case ACT_QUIT:		return ed_dispatch(e, CMD_QUIT, seq);
+	case ACT_HELP:		return ed_dispatch(e, CMD_HELP, seq);
+	case ACT_WORD_LEFT:
+		y = e->cy; x = e->cx;
+		vi_pos_word_back(e, &y, &x, 0);
+		e->cy = y; e->cx = x;
+		vi_clamp(e);
+		return REQ_CONTINUE;
+	case ACT_WORD_RIGHT:
+		y = e->cy; x = e->cx;
+		vi_pos_word_fwd(e, &y, &x, 0);
+		e->cy = y; e->cx = x;
+		vi_clamp(e);
+		return REQ_CONTINUE;
+	case ACT_JUMP_BACK:
+		jump_back(e);
+		return REQ_CONTINUE;
+	case ACT_DELETE_WORD_RIGHT:
+		y = e->cy; x = e->cx;
+		vi_pos_word_fwd(e, &y, &x, 0);
+		len = text_line_len(e->t, e->cy);
+		text_undo_group_begin(e->t);
+		if (y == e->cy && x > e->cx)
+			text_delete(e->t, e->cy, e->cx, x - e->cx);
+		else if (e->cx < len)
+			text_delete(e->t, e->cy, e->cx, len - e->cx);
+		text_undo_group_end(e->t);
+		e->hl_valid = 0;
+		vi_clamp(e);
+		return REQ_CONTINUE;
+	case ACT_DELETE_TO_EOL:
+		len = text_line_len(e->t, e->cy);
+		if (e->cx < len) {
+			text_undo_group_begin(e->t);
+			text_delete(e->t, e->cy, e->cx, len - e->cx);
+			text_undo_group_end(e->t);
+			e->hl_valid = 0;
+		}
+		return REQ_CONTINUE;
+	case ACT_DELETE_TO_BOL:
+		if (e->cx > 0) {
+			text_undo_group_begin(e->t);
+			text_delete(e->t, e->cy, 0, e->cx);
+			text_undo_group_end(e->t);
+			e->cx = 0;
+			e->hl_valid = 0;
+		}
+		return REQ_CONTINUE;
+	case ACT_DELETE_LINE:
+		text_undo_group_begin(e->t);
+		vi_delete_lines(e, e->cy, e->cy);
+		text_undo_group_end(e->t);
+		e->cx = 0;
+		e->hl_valid = 0;
+		vi_clamp(e);
+		return REQ_CONTINUE;
+	case ACT_REFLOW:
+		ed_reflow(e);
+		return REQ_CONTINUE;
+	case ACT_FIND_NEXT:
+		if (e->last_find[0])
+			ed_find(e, e->last_find);
+		else
+			set_status(e, "no previous search");
+		return REQ_CONTINUE;
+	case ACT_FILE_INSERT:
+		ed_insert_file(e);
+		return REQ_CONTINUE;
+	case ACT_SAVE_AS:
+		ed_save_as(e);
+		return REQ_CONTINUE;
+	case ACT_SAVE_EXIT:
+		(void)save_editor(e);
+		return REQ_QUIT;	/* run_req prompts for any other dirty buffer */
+	default:
+		return REQ_CONTINUE;
+	}
+}
+
+/* Route a key through the active custom keymap. Tracks a one-key prefix for
+ * chords; an unbound printable key self-inserts; any other unbound key is
+ * ignored. Returns a Req. */
+static Req
+kb_keymap_dispatch(Editor *e, const struct tkbd_seq *seq)
+{
+	KbMap *m = e->kb_map;
+	uint16_t key;
+	uint8_t mod;
+	int i;
+
+	if (seq->type != TKBD_KEY)
+		return REQ_CONTINUE;
+	kb_norm(seq, &key, &mod);
+
+	if (e->kb_pending) {		/* the second key of a chord */
+		e->kb_pending = 0;
+		for (i = 0; i < m->n; i++)
+			if (m->b[i].two && m->b[i].k1 == e->kb_pend_key &&
+			    m->b[i].m1 == e->kb_pend_mod && m->b[i].k2 == key)
+				return kb_run_action(e, m->b[i].action,
+				    m->b[i].arg, seq);
+		return REQ_CONTINUE;	/* no such chord: drop it quietly */
+	}
+
+	for (i = 0; i < m->n; i++)	/* a single-key binding wins */
+		if (!m->b[i].two && m->b[i].k1 == key && m->b[i].m1 == mod)
+			return kb_run_action(e, m->b[i].action, m->b[i].arg,
+			    seq);
+	for (i = 0; i < m->n; i++)	/* else a prefix: wait for the second key */
+		if (m->b[i].two && m->b[i].k1 == key && m->b[i].m1 == mod) {
+			e->kb_pending = 1;
+			e->kb_pend_key = key;
+			e->kb_pend_mod = mod;
+			return REQ_CONTINUE;
+		}
+
+	if (!(mod & TKBD_MOD_CTRL) && seq->ch != TKBD_CH_NONE &&
+	    seq->ch >= 0x20 && seq->ch != 0x7f)
+		return ed_dispatch(e, CMD_INSERT, seq);
+	return REQ_CONTINUE;
+}
+
 /* Switch the editor to keymap index i: apply that mode's base personality and
  * post a status line naming the mode F2 moves to next. */
 static void
@@ -25333,7 +25770,12 @@ kb_apply(Editor *e, int i)
 	e->kb_cur = i;
 	e->vi_visual = 0;
 	e->sel_active = 0;
+	e->kb_pending = 0;
 	vi_reset_pending(e);
+	/* A modeless mode with its own bind table drives that table; msedit and
+	 * the vi modes have none. */
+	e->kb_map = (e->kb_base[i] == MODE_MODELESS && e->kb_maps[i].n)
+	    ? &e->kb_maps[i] : NULL;
 	next = e->kb_modes[(i + 1) % e->kb_nmode];
 	if (e->kb_base[i] == MODE_MODELESS) {
 		e->mode = MODE_MODELESS;
@@ -25377,6 +25819,7 @@ kb_config(Editor *e)
 	const char *p;
 	int n = 0, want, i;
 
+	kb_free_maps(e);		/* drop any maps from a previous config */
 	if (!spec || !*spec)
 		spec = "msedit vi";
 	for (p = spec; *p && n < KB_MODE_MAX; ) {
@@ -25404,6 +25847,8 @@ kb_config(Editor *e)
 		n = 1;
 	}
 	e->kb_nmode = n;
+	for (i = 0; i < n; i++)		/* each custom mode's bind table */
+		kb_build_map(&e->kb_maps[i], e->kb_modes[i]);
 	want = (e->mode == MODE_MODELESS) ? MODE_MODELESS : MODE_NORMAL;
 	e->kb_cur = 0;
 	for (i = 0; i < n; i++)
@@ -25411,6 +25856,8 @@ kb_config(Editor *e)
 			e->kb_cur = i;
 			break;
 		}
+	e->kb_map = (e->kb_base[e->kb_cur] == MODE_MODELESS &&
+	    e->kb_maps[e->kb_cur].n) ? &e->kb_maps[e->kb_cur] : NULL;
 }
 
 /* The About box content, one centered line per row plus a button. */
@@ -29986,8 +30433,12 @@ editor_loop(Editor *e)
 			continue;
 		}
 
-		if (run_req(e, ed_dispatch(e, key_to_cmd(&seq), &seq)))
+		if (e->kb_map) {	/* a custom keymap owns this mode's keys */
+			if (run_req(e, kb_keymap_dispatch(e, &seq)))
+				return 0;
+		} else if (run_req(e, ed_dispatch(e, key_to_cmd(&seq), &seq))) {
 			return 0;
+		}
 		ed_render(e, e->d);
 	}
 }
@@ -30005,6 +30456,7 @@ editor_teardown(Editor *e)
 		e->d = NULL;
 		e->term = NULL;
 	}
+	kb_free_maps(e);		/* custom keymap bind tables */
 	swap_remove(e);			/* a clean exit leaves no swap behind */
 	if (e->nbuf > 0) {
 		buf_save(e, &e->bufs[e->cur]);
@@ -30374,8 +30826,15 @@ static const char g_config_template[] =
 	"#	header = on          # line 1 is a frozen header row\n"
 	"#	width = 10           # default column width\n"
 	"\n"
+	"#[include]\n"
+	"#	path = /path/to/other.conf   # merge another config file in here\n"
+	"\n"
 	"[keys]\n"
 	"#	modes = msedit vi    # single-word keymaps F2 cycles through\n"
+	"# A mode named by a [keys \"name\"] section binds its own keys, e.g. the\n"
+	"# shipped examples/wordstar.conf. Each line is: bind = <keys> <action>\n"
+	"#[keys \"wordstar\"]\n"
+	"#	bind = ^E up         # one key, or a chord like: bind = ^K B block-begin\n"
 	"\n"
 	"[edit]\n"
 	"#	mode = msedit        # starting keymap: vi | msedit\n"

@@ -120,6 +120,53 @@ names are `msedit` (the EDIT keys) and `vi` (the vi keys); the default list
 gives the plain `F2` toggle between them. `edit.mode` names which of these the
 editor starts in.
 
+#### Custom keymaps
+
+A mode name that is not built in takes its keys from a `[keys "name"]` section.
+Such a mode is modeless: a printable key inserts text, and nothing else is a
+command until a `bind` line gives it one, so the mode starts empty. Each line
+is:
+
+```ini
+[keys "wordstar"]
+    bind = ^E up              # one key -> an action
+    bind = ^K B block-begin   # a chord: a prefix key, then a second key
+    bind = ^K 0 marker-set 0  # an action may take a number
+```
+
+A key is `^X` for Ctrl plus a character, a single character, or a named key:
+`enter`, `esc`, `tab`, `bksp`, `del`, `space`, `home`, `end`, `pgup`, `pgdn`,
+`up`, `down`, `left`, `right`, `f1` to `f12`. In a chord the second key is
+matched whether or not Ctrl is held. An action the build does not provide is
+skipped, so a keymap may list keys for features that are not present yet.
+
+The actions are: `up`, `down`, `left`, `right`, `word-left`, `word-right`,
+`line-begin`, `line-end`, `file-top`, `file-bottom`, `page-up`, `page-down`,
+`jump-back`, `newline`, `tab`, `delete-left`, `delete-right`,
+`delete-word-right`, `delete-line`, `delete-to-eol`, `delete-to-bol`, `undo`,
+`redo`, `copy`, `cut`, `paste`, `reflow`, `find`, `find-next`, `replace`,
+`goto-line`, `symbol`, `file-insert`, `save`, `save-as`, `save-exit`, `quit`,
+and `help`.
+
+A complete WordStar keymap ships in `examples/wordstar.conf`. Pull it in with an
+`[include]`, then add its name to the cycle:
+
+```ini
+[include]
+    path = /path/to/examples/wordstar.conf
+[keys]
+    modes = msedit wordstar
+```
+
+### `[include]`: merge another file
+
+| Key | Default | Meaning |
+|---|---|---|
+| `path` | | read another config file in at this point |
+
+A relative `path` resolves against the including file's directory. The line
+takes effect where it appears, so later settings in the including file win.
+
 ### `[edit]`: editing
 
 | Key | Default | Meaning |
