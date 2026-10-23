@@ -2213,6 +2213,64 @@ t_cfg_resolve(Test *t)
 	unlink(path);
 }
 
+/* F2 steps the keymap cycle. With no config the built-in default is "msedit
+ * vi", so F2 toggles the two personalities and wraps, exactly as before. A
+ * [keys] modes list sets a longer cycle; an unknown name drives the modeless
+ * personality for now. edit.mode points kb_cur at the matching built-in. */
+static void
+t_keymap_cycle(Test *t)
+{
+	static const char *text =
+	    "[keys]\n"
+	    "modes = msedit vi draw\n"
+	    "[edit]\n"
+	    "mode = vi\n";
+	char path[256];
+	const Cfg *old = g_cfg;
+	Editor e;
+	Cfg *c;
+
+	/* the built-in default, with no config at all */
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();		/* vi_clamp needs a buffer; vedit_new's job */
+	TAP_ASSERT(t, e.t != NULL);
+	TAP_CHECK(t, e.kb_nmode == 2 && e.kb_cur == 0);
+	TAP_CHECK(t, strcmp(e.kb_modes[0], "msedit") == 0 &&
+	    strcmp(e.kb_modes[1], "vi") == 0);
+	TAP_CHECK(t, e.mode == MODE_MODELESS);
+	kb_cycle(&e);
+	TAP_CHECK(t, e.kb_cur == 1 && e.mode == MODE_NORMAL);
+	kb_cycle(&e);			/* wraps back to msedit */
+	TAP_CHECK(t, e.kb_cur == 0 && e.mode == MODE_MODELESS);
+	e.mode = MODE_INSERT;		/* ignored mid-insert, so typing is safe */
+	kb_cycle(&e);
+	TAP_CHECK(t, e.kb_cur == 0 && e.mode == MODE_INSERT);
+	text_free(e.t);
+
+	/* a config list sets a longer cycle; edit.mode = vi starts there */
+	c = load_cfg_text(text, path, sizeof(path));
+	TAP_ASSERT(t, c != NULL);
+	g_cfg = c;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	ed_apply_config(&e);
+	TAP_CHECK(t, e.kb_nmode == 3);
+	TAP_CHECK(t, strcmp(e.kb_modes[2], "draw") == 0 &&
+	    e.kb_base[2] == MODE_MODELESS);	/* unknown name: modeless for now */
+	TAP_CHECK(t, e.kb_cur == 1 && e.mode == MODE_NORMAL);	/* edit.mode = vi */
+	kb_cycle(&e);
+	TAP_CHECK(t, e.kb_cur == 2 && e.mode == MODE_MODELESS);	/* draw */
+	kb_cycle(&e);			/* wraps across three modes */
+	TAP_CHECK(t, e.kb_cur == 0 && e.mode == MODE_MODELESS);	/* msedit */
+	text_free(e.t);
+
+	g_cfg = old;
+	vedit_cfg_free(c);
+	unlink(path);
+}
+
 /* Per-project keys may be overridden by VEDIT_<KEY> environment variables:
  * env wins over the config, an empty var is treated as unset, and the key's dots
  * map to underscores with the whole name uppercased. */
@@ -3939,6 +3997,7 @@ const Case tap_cases[] = {
 	{ "filepick_start_dir", t_filepick_start_dir },
 	{ "cfg_parse", t_cfg_parse },
 	{ "cfg_resolve", t_cfg_resolve },
+	{ "keymap_cycle", t_keymap_cycle },
 	{ "cfg_env", t_cfg_env },
 	{ "cfg_color", t_cfg_color },
 	{ "cfg_theme", t_cfg_theme },

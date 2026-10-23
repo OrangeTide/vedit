@@ -54,7 +54,7 @@ and `#` or `;` comments.
     wrap = on            # word wrap
 
 [edit]
-    mode = vi            # vi | modeless (the EDIT keys)
+    mode = vi            # the keymap at startup: vi | msedit (the EDIT keys)
     ignorecase = on      # searches ignore case
 
 [indent]
@@ -109,11 +109,22 @@ environment variables say; it starts with `ui.clipboard = on`.
 | `paneheight` | `0` | rows for the pane under the text, 0 to 500; 0 is a third (chapter 7; builds with terminals) |
 | `mouse` | `on` | mouse reporting (chapter 2) |
 
+### `[keys]`: keybinding modes
+
+| Key | Default | Meaning |
+|---|---|---|
+| `modes` | `msedit vi` | the single-word keymaps **F2** steps through, in order |
+
+`F2` cycles through the modes named here, wrapping at the end. The two built-in
+names are `msedit` (the EDIT keys) and `vi` (the vi keys); the default list
+gives the plain `F2` toggle between them. `edit.mode` names which of these the
+editor starts in.
+
 ### `[edit]`: editing
 
 | Key | Default | Meaning |
 |---|---|---|
-| `mode` | `modeless` | `vi` or `modeless` |
+| `mode` | `msedit` | the keymap at startup: `vi` or `msedit` |
 | `autoindent` | `on` | new lines copy the previous indent |
 | `ignorecase` | `off` | searches ignore case |
 | `shiftwidth` | `0` | columns for vi `>>` and `<<`, 0 to 32; 0 is one tab stop |

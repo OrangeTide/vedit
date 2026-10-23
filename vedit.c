@@ -7843,6 +7843,13 @@ typedef enum edit_mode {
 	MODE_INSERT,		/* vi insert mode */
 } Mode;
 
+/* The F2 keymap cycle. [keys] modes names the single-word modes F2 steps
+ * through; the default "msedit vi" reproduces the two built-in personalities.
+ * Each name maps to a base personality (msedit = modeless, vi = normal) until
+ * custom keymaps arrive. */
+#define KB_MODE_MAX	8	/* most keymaps the F2 cycle can hold */
+#define KB_NAME_MAX	16	/* longest mode name kept, with the NUL */
+
 /* Marker stored in e->vi_visual for a Ctrl-V block selection (the control code
  * Ctrl-V itself), alongside 'v' charwise and 'V' linewise. */
 #define VI_VBLOCK 0x16
@@ -8044,6 +8051,12 @@ typedef struct editor {
 	size_t		hl_valid;	/* line_state[0..hl_valid) are current */
 	uint16_t	*hl_buf;	/* scratch styles for one rendered line */
 	size_t		hl_buf_cap;
+
+	/* F2 keymap cycle (see [keys] modes) */
+	char		kb_modes[KB_MODE_MAX][KB_NAME_MAX];
+	int		kb_base[KB_MODE_MAX];	/* each mode's base personality */
+	int		kb_nmode;		/* modes in the cycle, 0 until configured */
+	int		kb_cur;			/* index of the active mode */
 
 	/* vi personality state */
 	Mode	mode;
@@ -11072,7 +11085,7 @@ static void tbl_command(Editor *e, const char *arg);	/* :table */
 static void tbl_colwidth(Editor *e, const char *arg);	/* :colwidth */
 static void tbl_cell_goto(Editor *e, const char *arg);	/* :cell C7 */
 #endif
-static void toggle_vi(Editor *e);		/* F2: vi <-> modeless */
+static void kb_cycle(Editor *e);		/* F2: step the keymap cycle */
 #ifdef VEDIT_TABLE
 static int tbl_cell_off(const Editor *e, size_t row, int col, size_t *off,
     size_t *len);
@@ -13912,7 +13925,7 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 	case TKBD_KEY_F1:
 		return REQ_HELP;
 	case TKBD_KEY_F2:
-		toggle_vi(e);
+		kb_cycle(e);
 		return REQ_CONTINUE;
 	case TKBD_KEY_F3:
 		tbl_find_again(e, shift ? -1 : 1);
@@ -25258,25 +25271,96 @@ ed_save_as(Editor *e)
 	(void)save_editor(e);
 }
 
-/* Switch between the modeless and vi personalities (also on F2). */
+/* Switch the editor to keymap index i: apply that mode's base personality and
+ * post a status line naming the mode F2 moves to next. */
 static void
-toggle_vi(Editor *e)
+kb_apply(Editor *e, int i)
 {
+	const char *next;
+
+	if (i < 0 || i >= e->kb_nmode)
+		return;
+	e->kb_cur = i;
 	e->vi_visual = 0;
-	if (e->mode == MODE_MODELESS) {
-		e->mode = MODE_NORMAL;
-		e->sel_active = 0;
-		vi_reset_pending(e);
-		vi_clamp(e);
-		set_status(e,
-		    "-- NORMAL -- (F2 returns to modeless)");
-	} else {
+	e->sel_active = 0;
+	vi_reset_pending(e);
+	next = e->kb_modes[(i + 1) % e->kb_nmode];
+	if (e->kb_base[i] == MODE_MODELESS) {
 		e->mode = MODE_MODELESS;
-		e->sel_active = 0;
-		vi_reset_pending(e);
-		set_status(e,
-		    "modeless mode (F2 for vi keys)");
+		set_status(e, "%s keys (F2: %s keys)", e->kb_modes[i], next);
+	} else {
+		e->mode = MODE_NORMAL;
+		vi_clamp(e);
+		set_status(e, "-- NORMAL -- (F2: %s keys)", next);
 	}
+}
+
+/* Step to the next keymap in the F2 cycle. A no-op while a vi insert is in
+ * progress so it does not interrupt typing, or before the cycle is configured. */
+static void
+kb_cycle(Editor *e)
+{
+	if (e->mode == MODE_INSERT || e->kb_nmode <= 0)
+		return;
+	kb_apply(e, (e->kb_cur + 1) % e->kb_nmode);
+}
+
+/* The base personality a keymap name drives. "vi" is the modal personality;
+ * "msedit" (and its "modeless" alias) and any not-yet-known name fall back to
+ * the modeless personality until custom keymaps arrive. */
+static int
+kb_base_for(const char *name)
+{
+	if (strcmp(name, "vi") == 0)
+		return MODE_NORMAL;
+	return MODE_MODELESS;
+}
+
+/* Build the F2 keymap cycle from [keys] modes (a space-separated list of
+ * single-word names; default "msedit vi"), then point kb_cur at the mode whose
+ * base matches the current personality. Called from ed_apply_config, so it also
+ * runs on :reload. */
+static void
+kb_config(Editor *e)
+{
+	const char *spec = cfg_get(g_cfg, "keys.modes");
+	const char *p;
+	int n = 0, want, i;
+
+	if (!spec || !*spec)
+		spec = "msedit vi";
+	for (p = spec; *p && n < KB_MODE_MAX; ) {
+		const char *start;
+		size_t len;
+
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (!*p)
+			break;
+		start = p;
+		while (*p && *p != ' ' && *p != '\t')
+			p++;
+		len = (size_t)(p - start);
+		if (len >= KB_NAME_MAX)
+			len = KB_NAME_MAX - 1;
+		memcpy(e->kb_modes[n], start, len);
+		e->kb_modes[n][len] = '\0';
+		e->kb_base[n] = kb_base_for(e->kb_modes[n]);
+		n++;
+	}
+	if (n == 0) {			/* the spec was only whitespace */
+		memcpy(e->kb_modes[0], "msedit", sizeof("msedit"));
+		e->kb_base[0] = MODE_MODELESS;
+		n = 1;
+	}
+	e->kb_nmode = n;
+	want = (e->mode == MODE_MODELESS) ? MODE_MODELESS : MODE_NORMAL;
+	e->kb_cur = 0;
+	for (i = 0; i < n; i++)
+		if (e->kb_base[i] == want) {
+			e->kb_cur = i;
+			break;
+		}
 }
 
 /* The About box content, one centered line per row plus a button. */
@@ -27822,7 +27906,7 @@ run_menu_act(Editor *e, Menuact act)
 		break;
 	}
 	case MA_VI_MODE:
-		toggle_vi(e);
+		kb_cycle(e);
 		break;
 #ifdef VEDIT_GLYPHS
 	case MA_GLYPHS:
@@ -29050,6 +29134,7 @@ editor_init(Editor *e)
 	e->art_on = 1;		/* .ans files open in the art view */
 	e->tbl_on = 1;		/* .csv/.tsv files open in the table view */
 	e->tbl_header = 1;
+	kb_config(e);		/* the built-in F2 cycle; config may replace it */
 }
 
 /* Run the event loop until the editor exits. Returns a process-style code:
@@ -29748,23 +29833,11 @@ editor_loop(Editor *e)
 			break;		/* not a view key: normal handling */
 		}
 
-		/* F2 toggles between the modeless and vi personalities, ignored
-		 * while inserting so it does not interrupt typing. */
+		/* F2 steps the keymap cycle (see [keys] modes), ignored while
+		 * inserting so it does not interrupt typing. */
 		if (seq.type == TKBD_KEY && seq.key == TKBD_KEY_F2 &&
 		    !(seq.mod & TKBD_MOD_CTRL) && e->mode != MODE_INSERT) {
-			if (e->mode == MODE_MODELESS) {
-				e->mode = MODE_NORMAL;
-				e->sel_active = 0;
-				vi_reset_pending(e);
-				vi_clamp(e);
-				set_status(e,
-				    "-- NORMAL -- (F2 returns to modeless)");
-			} else {
-				e->mode = MODE_MODELESS;
-				vi_reset_pending(e);
-				set_status(e,
-				    "modeless mode (F2 for vi keys)");
-			}
+			kb_cycle(e);
 			ed_render(e, e->d);
 			continue;
 		}
@@ -30151,9 +30224,10 @@ ed_apply_config(Editor *e)
 	if (s) {
 		if (strcmp(s, "vi") == 0)
 			e->mode = MODE_NORMAL;
-		else if (strcmp(s, "modeless") == 0)
+		else if (strcmp(s, "msedit") == 0 || strcmp(s, "modeless") == 0)
 			e->mode = MODE_MODELESS;
 	}
+	kb_config(e);
 }
 
 /* Reloading the grammars rebuilds the Syntax registries, so every buffer's cached
@@ -30250,8 +30324,11 @@ static const char g_config_template[] =
 	"#	header = on          # line 1 is a frozen header row\n"
 	"#	width = 10           # default column width\n"
 	"\n"
+	"[keys]\n"
+	"#	modes = msedit vi    # single-word keymaps F2 cycles through\n"
+	"\n"
 	"[edit]\n"
-	"#	mode = modeless      # vi | modeless\n"
+	"#	mode = msedit        # starting keymap: vi | msedit\n"
 	"#	autoindent = on      # new lines copy the previous indent\n"
 	"#	ignorecase = off     # on = searches match regardless of case\n"
 	"#	shiftwidth = 0       # >> / << indent width; 0 = one tab stop\n"
