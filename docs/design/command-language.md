@@ -180,6 +180,131 @@ endpoints anchored to marks that track insertions and deletions rather than raw
 coordinates. A `Pos` can therefore be a raw coordinate or a mark handle. This is
 noted in the type design and is not built first.
 
+## Worked examples
+
+Before any code, a set of real commands was written in the subset above, using
+only verbs that exist today, to see where the currency makes a composition clean
+and where it fights back. The verbs today are nullary and cursor-implicit: each
+reads and writes the one cursor or the live selection and takes no target.
+`{ a ; b }` is a sequence in one undo group.
+
+Easy, linear macros over the cursor:
+
+- Clear the current line but keep it: `{ line-end ; delete-to-bol }`. Go to the
+  end, delete back to column 0. Clean, because the second verb starts where the
+  first left the cursor.
+- Open a blank line below and land on it: `{ line-end ; newline }`.
+- Duplicate the current line: `{ copy ; line-begin ; paste }`. Works, but leans
+  on two implicit conveniences: `copy` with no selection grabs the whole line
+  and its newline, and `paste` lands at the cursor that `line-begin` placed.
+
+These need nothing past the first subset. The easy majority of keymap
+customization lives here.
+
+Where the API starts to resist:
+
+- Delete the word under the cursor, roughly: `{ word-left ; delete-word-right }`.
+  Expressible but fuzzy. Two motions only approximate "the word I am on" and get
+  boundaries wrong mid-word. It wants a region, not two motions.
+- Faithful emacs kill-line, where the killed text is kept so it can be yanked
+  back: this cannot be written today. `copy` acts on the selection or the whole
+  line; there is no "copy from the cursor to end of line", and no verb builds a
+  selection inside a program. So "clear the line" is easy and "kill the line" is
+  not, and the only difference is whether a span can be named for both the copy
+  and the delete.
+
+Where the Region currency is required, not more macros:
+
+- Delete lines 10 through 20: `delete [region line 10 20]` in the target syntax.
+  Today no verb takes a range, and there is no loop, so it is eleven blind
+  `delete-line` calls. A region argument collapses it to one.
+- Swap two blocks: impossible today at any length. There is one persistent block
+  slot and one clipboard slot, and no way to name a second. Swap and concat are
+  exactly what the single-slot API cannot express, and are the motivation for
+  named handles over buffers.
+- Comment a column, insert a prefix down the left of several rows: needs the
+  reserved `rect` kind and a column-insert verb. Impossible today.
+- Accumulate several lines into the clip, then place once: impossible today,
+  because `copy` overwrites the single slot. This is the case the capture suffix
+  below is for.
+
+### What the examples settled
+
+1. The nullary cursor verbs compose well for linear macros and for nothing else.
+   Every easy case is "do, then do", each verb consuming the cursor the last one
+   left. That is the real value of the first subset.
+2. The wall is always the same wall: a span or a second container cannot be
+   named. Text objects, copy-a-range, line ranges, swap, rect, and accumulation
+   all fail for that one reason. This is concrete validation of the Region over
+   buffer currency. It is the line between a macro recorder and the commands
+   actually worth writing.
+3. `put` acting at the implicit cursor is the recurring friction. The gymnastics
+   in the duplicate-line, swap, and accumulate cases are all "navigate the cursor
+   to where paste will land". A `put <content> at <pos|region>` form removes it.
+
+A hazard to audit before the region-form verbs land: the removing verbs are
+inconsistent about whether they feed the clipboard. `delete-to-eol` does not; the
+line-delete path goes through vi's yank. Clip-based composition stays fragile
+until that is made uniform, which the capture suffix below also forces us to
+settle.
+
+## The verb convention
+
+### Two forms, one operation
+
+Every buffer verb has two shapes that name the same operation.
+
+- Region form: the verb takes an explicit `Region` or `Pos` and acts on it:
+  `delete $r`, `copy $r`, `put $clip at $p`, `reflow $r`.
+- Cursor form: the verb with no region argument acts on an implicit region built
+  from editor state, the live selection if there is one, otherwise a
+  verb-specific default around the cursor (a point, the current line, or the span
+  from the cursor to a motion target).
+
+The cursor form is defined as the region form applied to that implicit region.
+`delete-to-eol` is `delete [region char from cursor to line-end]`; `delete-line`
+is `delete [region line at cursor]`. One operator per operation, with the nullary
+verbs as the sugar rather than a parallel set. A macro author uses the cursor
+forms and never meets a `Region`; a program that computes a span uses the region
+form; both reach the same C.
+
+The motion-carrying names (`delete-to-eol`, `delete-word-right`) are kept as
+cursor-form shortcuts, not deprecated. They are ergonomic and already bound, and
+each is equivalent to the general `delete <region>` once regions exist.
+
+This is why the phasing works. The existing named actions are the cursor forms.
+Phase 1 can ship cursor forms only, the vocabulary that exists, and add region
+forms when the value model lands, renaming nothing.
+
+### The capture suffix
+
+A trailing `.` on a removing verb is a variation that also pushes the removed
+text onto a capture store. `delete-to-eol` discards; `delete-to-eol.` deletes and
+captures. It is one modifier in place of a parallel family of `cut-*` verbs, and
+it answers the split the examples found: clear versus kill is the dot.
+
+From the parser's view the dotted name is simply another command name; from the
+user's view it is the same command with a capture variation. `.` is not added to
+the reserved metacharacter set. It is special only as the last character of a
+command-position word, so it stays literal inside arguments (file names, `3.14`)
+and in the middle of a word.
+
+Recommended mechanics, open to change:
+
+- The capture store is a distinct kill stack, separate from the CUA clipboard, so
+  `.` never clobbers an explicit copy. Under the reserved registers-as-buffers
+  model it is just one more named buffer, so it adds no new concept later; today
+  it is a single hidden buffer used as a stack.
+- `.` pushes, newest on top, so repeated captures accumulate. That is the
+  mechanism the accumulate example wanted, and it matches an emacs kill ring.
+  Reading back is a paste from the stack, peeking the top for now, with yank-pop
+  and named-buffer access arriving with the register model.
+- The verbs that accept `.` are the removing ones: `delete-left`,
+  `delete-right`, `delete-word-right`, `delete-line`, `delete-to-eol`,
+  `delete-to-bol`, and the region-form `delete`. `cut` already captures by
+  definition, so `cut` is `delete.` over the selection. `cut` keeps its own name
+  for familiarity, with the equivalence noted.
+
 ## Scope boundary
 
 The language covers the synchronous buffer-and-cursor core: motion, edit,
@@ -230,6 +355,9 @@ Phase 1, mini-program bindings:
 - represent the program as the picol-subset grammar above; compile to an
   internal form if a compact representation is wanted, but keep the source
   readable words, not single-character opcodes.
+- ship the cursor forms of the verbs first (they are the existing actions), then
+  add the region forms with the value model. The capture suffix can arrive with
+  the cursor forms, since it needs only a kill stack, not the `Region` type.
 
 ## Decisions settled
 
@@ -250,3 +378,13 @@ Phase 1, mini-program bindings:
   across a prompt, reuses the existing frame stack, and is the model that lets
   more commands move onto the language over time. It is the larger piece of
   work, chosen for that reach.
+- two-form verbs. Each operation has a region form that takes an explicit handle
+  and a cursor form with no argument that is the region form over an implicit
+  cursor or selection region. The existing named actions are the cursor forms,
+  so one operator serves both the macro author and the program.
+- capture suffix. A trailing `.` on a removing verb also pushes the removed text
+  onto a kill stack (`delete-to-eol.` kills, `delete-to-eol` clears). It is a
+  distinct command name to the parser and a variation to the user, replaces a
+  family of `cut-*` verbs, and makes `cut` equal to `delete.` over the selection.
+  Open: whether the store is a separate stack (recommended) or the clip, and
+  whether `.` pushes (recommended) or replaces.
