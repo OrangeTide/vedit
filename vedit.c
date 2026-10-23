@@ -7934,6 +7934,8 @@ typedef struct kb_binding {
 typedef struct kb_map {
 	KbBinding	*b;
 	int		n, cap;
+	char		**help;		/* [keys "name"] help lines, for F1 */
+	int		nhelp, help_cap;
 } KbMap;
 
 /* Marker stored in e->vi_visual for a Ctrl-V block selection (the control code
@@ -20165,6 +20167,9 @@ ui_scroll_view(Editor *e, const char *header, const char *footer,
 
 /* Line provider for the help view: one formatted "keys  description" row from
  * the active personality's table. */
+static const char *kb_help_line(Editor *e, void *ctx, int idx);
+static int kb_help_count(const Editor *e);
+
 static const char *
 help_line(Editor *e, void *ctx, int idx)
 {
@@ -20672,13 +20677,20 @@ dlg_help(Editor *e)
 	if (!f)
 		return;
 	pg = (PagerCtx *)&f->ctx;
-	snprintf(pg->hdr, sizeof(pg->hdr), "%s",
-	    vi ? " vedit -- vi key bindings" : " vedit -- key bindings");
 	pg->footer = " Up/Down PgUp/PgDn scroll   t tutorial   Esc returns";
-	pg->line = help_line;
-	pg->line_ctx = NULL;
-	pg->n = vi ? HELP_VI_COUNT : HELP_COUNT;
 	pg->top = 0;
+	if (e->kb_map) {		/* a custom keymap shows its own help */
+		snprintf(pg->hdr, sizeof(pg->hdr), " vedit -- %s key bindings",
+		    e->kb_modes[e->kb_cur]);
+		pg->line = kb_help_line;
+		pg->n = kb_help_count(e);
+	} else {
+		snprintf(pg->hdr, sizeof(pg->hdr), "%s",
+		    vi ? " vedit -- vi key bindings" : " vedit -- key bindings");
+		pg->line = help_line;
+		pg->n = vi ? HELP_VI_COUNT : HELP_COUNT;
+	}
+	pg->line_ctx = NULL;
 	ui_pump_modal(e, base);
 }
 
@@ -25666,21 +25678,135 @@ kb_build_map(KbMap *m, const char *name)
 		b.arg = (nt > ai + 1) ? atoi(tok[ai + 1]) : -1;
 		kb_map_add(m, &b);
 	}
+
+	/* Help lines, shown on F1 for this keymap, in config order. */
+	snprintf(key, sizeof(key), "keys.%s.help", name);
+	for (i = 0; (v = cfg_get_n(g_cfg, key, i)) != NULL; i++) {
+		char *dup;
+
+		if (m->nhelp >= m->help_cap) {
+			int na = m->help_cap ? m->help_cap * 2 : 16;
+			char **nh = realloc(m->help, (size_t)na * sizeof(*nh));
+
+			if (!nh)
+				break;
+			m->help = nh;
+			m->help_cap = na;
+		}
+		dup = cfg_dup(v);
+		if (!dup)
+			break;
+		m->help[m->nhelp++] = dup;
+	}
 }
 
 /* Free every mode's map and detach the active one. */
 static void
 kb_free_maps(Editor *e)
 {
-	int i;
+	int i, j;
 
 	for (i = 0; i < KB_MODE_MAX; i++) {
 		free(e->kb_maps[i].b);
 		e->kb_maps[i].b = NULL;
 		e->kb_maps[i].n = e->kb_maps[i].cap = 0;
+		for (j = 0; j < e->kb_maps[i].nhelp; j++)
+			free(e->kb_maps[i].help[j]);
+		free(e->kb_maps[i].help);
+		e->kb_maps[i].help = NULL;
+		e->kb_maps[i].nhelp = e->kb_maps[i].help_cap = 0;
 	}
 	e->kb_map = NULL;
 	e->kb_pending = 0;
+}
+
+/* The action name for an id (reverse of kb_action_id), or "?". */
+static const char *
+kb_action_name(int act)
+{
+	int i;
+
+	for (i = 0; i < KB_ACTION_COUNT; i++)
+		if (kb_actions[i].act == act)
+			return kb_actions[i].name;
+	return "?";
+}
+
+/* A readable label for a bound key, the reverse of kb_parse_onekey. */
+static void
+kb_key_name(uint16_t key, uint8_t mod, char *buf, size_t sz)
+{
+	const char *name = NULL;
+
+	switch (key) {
+	case TKBD_KEY_ENTER:	name = "enter"; break;
+	case TKBD_KEY_ESC:	name = "esc"; break;
+	case TKBD_KEY_TAB:	name = "tab"; break;
+	case TKBD_KEY_BACKSPACE:name = "bksp"; break;
+	case TKBD_KEY_DEL:	name = "del"; break;
+	case TKBD_KEY_INS:	name = "ins"; break;
+	case TKBD_KEY_SPACE:	name = "space"; break;
+	case TKBD_KEY_HOME:	name = "home"; break;
+	case TKBD_KEY_END:	name = "end"; break;
+	case TKBD_KEY_PGUP:	name = "pgup"; break;
+	case TKBD_KEY_PGDN:	name = "pgdn"; break;
+	case TKBD_KEY_UP:	name = "up"; break;
+	case TKBD_KEY_DOWN:	name = "down"; break;
+	case TKBD_KEY_LEFT:	name = "left"; break;
+	case TKBD_KEY_RIGHT:	name = "right"; break;
+	default:		break;
+	}
+	if (name) {
+		snprintf(buf, sz, "%s", name);
+	} else if (key >= TKBD_KEY_F1 && key <= TKBD_KEY_F12) {
+		int n;
+
+		for (n = 0; n < 12; n++)
+			if (kb_fkeys[n] == key)
+				break;
+		snprintf(buf, sz, "F%d", n + 1);
+	} else if (mod & TKBD_MOD_CTRL) {
+		snprintf(buf, sz, "^%c", (char)key);
+	} else {
+		snprintf(buf, sz, "%c", (char)key);
+	}
+}
+
+/* How many help rows the custom keymap shows: its own help lines, or one per
+ * binding when it supplies none. */
+static int
+kb_help_count(const Editor *e)
+{
+	if (!e->kb_map)
+		return 0;
+	return e->kb_map->nhelp ? e->kb_map->nhelp : e->kb_map->n;
+}
+
+/* Help row idx for the active custom keymap: a config help line, or, when the
+ * keymap supplies none, an auto-generated "keys  action" from its bindings. */
+static const char *
+kb_help_line(Editor *e, void *ctx, int idx)
+{
+	static char line[128];
+	KbMap *m = e->kb_map;
+	const KbBinding *b;
+	char k1[16], k2[16], keys[40];
+
+	(void)ctx;
+	if (!m || idx < 0 || idx >= kb_help_count(e))
+		return NULL;
+	if (m->nhelp)
+		return m->help[idx];
+	b = &m->b[idx];
+	kb_key_name(b->k1, b->m1, k1, sizeof(k1));
+	if (b->two) {
+		kb_key_name(b->k2, 0, k2, sizeof(k2));
+		snprintf(keys, sizeof(keys), "%s %s", k1, k2);
+	} else {
+		snprintf(keys, sizeof(keys), "%s", k1);
+	}
+	snprintf(line, sizeof(line), "  %-16s %s", keys, kb_action_name(b->action));
+	return line;
 }
 
 /* The incoming key reduced to a code plus its Ctrl bit (Shift and the rest are

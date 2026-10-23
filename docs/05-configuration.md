@@ -138,7 +138,20 @@ A key is `^X` for Ctrl plus a character, a single character, or a named key:
 `enter`, `esc`, `tab`, `bksp`, `del`, `space`, `home`, `end`, `pgup`, `pgdn`,
 `up`, `down`, `left`, `right`, `f1` to `f12`. In a chord the second key is
 matched whether or not Ctrl is held. An action the build does not provide is
-skipped, so a keymap may list keys for features that are not present yet.
+skipped, so a keymap may list keys for features that are not present yet. Note
+that a terminal reports Ctrl-J, Ctrl-M, and Ctrl-I as Enter, Enter, and Tab, so
+bind those three by their key names, not as `^J`, `^M`, or `^I`.
+
+A `help` line adds a row to the F1 key-bindings screen shown while the keymap is
+active, so the file documents its own keys:
+
+```ini
+[keys "wordstar"]
+    help = "WordStar keys"
+    help = "  ^E up   ^X down   ^S left   ^D right"
+```
+
+With no `help` lines, F1 lists the bindings and their actions automatically.
 
 The actions are:
 

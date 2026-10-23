@@ -2477,6 +2477,72 @@ t_keymap_format(Test *t)
 	g_cfg = old;
 }
 
+/* A custom keymap carries its own F1 help: the config's help lines when it has
+ * them, otherwise an auto-generated key-to-action list from its bindings. */
+static void
+t_keymap_help(Test *t)
+{
+	char path[256];
+	const Cfg *old = g_cfg;
+	const char *ln;
+	Cfg *c;
+	Editor e;
+
+	/* help lines from the config are shown verbatim */
+	c = load_cfg_text(
+	    "[keys]\n\tmodes = ws\n"
+	    "[keys \"ws\"]\n"
+	    "\tbind = ^D right\n"
+	    "\thelp = first line\n"
+	    "\thelp = second line\n",
+	    path, sizeof(path));
+	TAP_ASSERT(t, c != NULL);
+	g_cfg = c;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	ed_apply_config(&e);
+	TAP_ASSERT(t, e.kb_map != NULL);
+	TAP_CHECKF(t, kb_help_count(&e) == 2, "help count %d", kb_help_count(&e));
+	ln = kb_help_line(&e, NULL, 0);
+	TAP_CHECKF(t, ln && strcmp(ln, "first line") == 0, "help0 [%s]",
+	    ln ? ln : "(nil)");
+	ln = kb_help_line(&e, NULL, 1);
+	TAP_CHECK(t, ln && strcmp(ln, "second line") == 0);
+	TAP_CHECK(t, kb_help_line(&e, NULL, 2) == NULL);
+	text_free(e.t);
+	kb_free_maps(&e);
+	vedit_cfg_free(c);
+	unlink(path);
+
+	/* with no help lines, the list is generated from the bindings */
+	c = load_cfg_text(
+	    "[keys]\n\tmodes = ws2\n"
+	    "[keys \"ws2\"]\n"
+	    "\tbind = ^D right\n"
+	    "\tbind = ^K B block-begin\n",
+	    path, sizeof(path));
+	TAP_ASSERT(t, c != NULL);
+	g_cfg = c;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	ed_apply_config(&e);
+	TAP_ASSERT(t, e.kb_map != NULL);
+	TAP_CHECKF(t, kb_help_count(&e) == 2, "gen count %d", kb_help_count(&e));
+	ln = kb_help_line(&e, NULL, 0);		/* a static buffer: check now */
+	TAP_CHECKF(t, ln && strstr(ln, "^D") && strstr(ln, "right"),
+	    "gen0 [%s]", ln ? ln : "(nil)");
+	ln = kb_help_line(&e, NULL, 1);
+	TAP_CHECKF(t, ln && strstr(ln, "^K B") && strstr(ln, "block-begin"),
+	    "gen1 [%s]", ln ? ln : "(nil)");
+	text_free(e.t);
+	kb_free_maps(&e);
+	g_cfg = old;
+	vedit_cfg_free(c);
+	unlink(path);
+}
+
 /* Per-project keys may be overridden by VEDIT_<KEY> environment variables:
  * env wins over the config, an empty var is treated as unset, and the key's dots
  * map to underscores with the whole name uppercased. */
@@ -4207,6 +4273,7 @@ const Case tap_cases[] = {
 	{ "keymap_bind", t_keymap_bind },
 	{ "keymap_block", t_keymap_block },
 	{ "keymap_format", t_keymap_format },
+	{ "keymap_help", t_keymap_help },
 	{ "cfg_env", t_cfg_env },
 	{ "cfg_color", t_cfg_color },
 	{ "cfg_theme", t_cfg_theme },
