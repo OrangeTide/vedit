@@ -9838,9 +9838,10 @@ text_redo(Text *t, size_t *line, size_t *col)
 
 
 
-#ifndef VEDIT_NO_HEX
 /* Whether an implied newline follows line i (a separator before the next line,
- * or the trailing newline after the last line when the file carried one). */
+ * or the trailing newline after the last line when the file carried one). These
+ * byte-stream helpers are generic over struct text; the hex view uses them, and
+ * so do the custom-keymap block actions, so they stay outside VEDIT_NO_HEX. */
 static int
 line_has_newline(const Text *t, size_t i, size_t nlines)
 {
@@ -9901,6 +9902,7 @@ hex_pos_at(const Text *t, size_t off, size_t *cy, size_t *cx)
 	*cx = text_line_len(t, *cy);
 }
 
+#ifndef VEDIT_NO_HEX
 /* Copy up to "count" bytes of the reconstructed stream starting at byte offset
  * "start" into buf. Returns how many were copied (fewer than count only near
  * the end of the buffer). */
