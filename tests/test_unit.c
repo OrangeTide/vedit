@@ -2360,6 +2360,73 @@ t_keymap_bind(Test *t)
 	unlink(mainpath);
 }
 
+/* The WordStar-style keymap actions: overtype replaces the rune under the
+ * cursor, numbered markers remember and restore a position, and the persistent
+ * block (begin/end) copies, deletes, and moves its region whatever the cursor
+ * does. Actions are invoked directly, so no config is needed. */
+static void
+t_keymap_block(Test *t)
+{
+	const Cfg *old = g_cfg;
+	struct tkbd_seq s;
+	const char *ln;
+	size_t len;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "hello world", 11);
+
+	/* overtype: typing X over the first rune keeps the length */
+	e.cy = e.cx = 0;
+	kb_run_action(&e, ACT_OVERTYPE_TOGGLE, -1, &s);
+	TAP_CHECK(t, e.overtype == 1);
+	s = kseq(TKBD_KEY_X, 0, 'X');
+	ed_dispatch(&e, CMD_INSERT, &s);
+	ln = text_line(e.t, 0, &len);
+	TAP_CHECKF(t, len == 11 && ln[0] == 'X', "overtype len=%zu c=%c",
+	    len, ln ? ln[0] : '?');
+	e.overtype = 0;
+
+	/* a numbered marker remembers and restores a column */
+	e.cy = 0; e.cx = 5;
+	kb_run_action(&e, ACT_MARKER_SET, 3, &s);
+	e.cx = 0;
+	kb_run_action(&e, ACT_MARKER_GOTO, 3, &s);
+	TAP_CHECKF(t, e.cx == 5, "marker cx=%zu", e.cx);
+
+	/* the block from column 0 to 5 is "Xello"; deleting it leaves " world" */
+	e.cx = 0;
+	kb_run_action(&e, ACT_BLOCK_BEGIN, -1, &s);
+	e.cx = 5;
+	kb_run_action(&e, ACT_BLOCK_END, -1, &s);
+	kb_run_action(&e, ACT_BLOCK_DELETE, -1, &s);
+	ln = text_line(e.t, 0, &len);
+	TAP_CHECKF(t, len == 6 && ln[0] == ' ', "after delete len=%zu", len);
+
+	/* block move: "ABC" from the front to after the cursor at the end */
+	text_free(e.t);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "ABCDEFGH", 8);
+	e.blk_bset = e.blk_eset = 0;
+	e.cy = e.cx = 0;
+	kb_run_action(&e, ACT_BLOCK_BEGIN, -1, &s);
+	e.cx = 3;
+	kb_run_action(&e, ACT_BLOCK_END, -1, &s);
+	e.cx = 8;
+	kb_run_action(&e, ACT_BLOCK_MOVE, -1, &s);
+	ln = text_line(e.t, 0, &len);
+	TAP_CHECKF(t, len == 8 && memcmp(ln, "DEFGHABC", 8) == 0,
+	    "after move [%.*s]", (int)len, ln);
+
+	text_free(e.t);
+	kb_free_maps(&e);
+	g_cfg = old;
+}
+
 /* Per-project keys may be overridden by VEDIT_<KEY> environment variables:
  * env wins over the config, an empty var is treated as unset, and the key's dots
  * map to underscores with the whole name uppercased. */
@@ -4088,6 +4155,7 @@ const Case tap_cases[] = {
 	{ "cfg_resolve", t_cfg_resolve },
 	{ "keymap_cycle", t_keymap_cycle },
 	{ "keymap_bind", t_keymap_bind },
+	{ "keymap_block", t_keymap_block },
 	{ "cfg_env", t_cfg_env },
 	{ "cfg_color", t_cfg_color },
 	{ "cfg_theme", t_cfg_theme },

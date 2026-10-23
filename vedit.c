@@ -8149,6 +8149,17 @@ typedef struct editor {
 	uint16_t	kb_pend_key;		/* the prefix key already pressed */
 	uint8_t		kb_pend_mod;		/* its Ctrl bit */
 
+	/* WordStar-style state driven by custom keymap actions */
+	int		overtype;		/* typing overwrites instead of inserting */
+	size_t		num_mark_y[10];		/* numbered position markers 0-9 */
+	size_t		num_mark_x[10];
+	uint16_t	num_mark_set;		/* bit i: numbered marker i is set */
+	size_t		blk_by, blk_bx;		/* block begin, when blk_bset */
+	size_t		blk_ey, blk_ex;		/* block end, when blk_eset */
+	int		blk_bset, blk_eset;	/* which ends of the block are marked */
+	int		blk_hidden;		/* the block highlight is hidden */
+	int		blk_column;		/* the block is a column (rectangle) */
+
 	/* vi personality state */
 	Mode	mode;
 	char		vi_visual;	/* 0, 'v' charwise, or 'V' linewise */
@@ -17840,6 +17851,16 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 	case CMD_INSERT:
 		n = utf8_encode(buf, seq->ch);
 		if (n > 0) {
+			/* Overtype (a custom keymap toggle) replaces the rune
+			 * under the cursor instead of pushing it right. */
+			if (e->overtype) {
+				size_t ll = 0;
+				const char *s = text_line(e->t, e->cy, &ll);
+
+				if (e->cx < ll)
+					text_delete(e->t, e->cy, e->cx,
+					    rune_len_at(s, ll, e->cx));
+			}
 			ed_insert(e, (char *)buf, (size_t)n);
 			if (seq->ch != ' ')
 				ed_auto_wrap(e);
@@ -25393,7 +25414,13 @@ enum kb_act {
 	ACT_REFLOW,
 	ACT_FIND, ACT_FIND_NEXT, ACT_REPLACE, ACT_GOTO_LINE, ACT_SYMBOL,
 	ACT_FILE_INSERT, ACT_SAVE, ACT_SAVE_AS, ACT_SAVE_EXIT, ACT_QUIT,
-	ACT_HELP
+	ACT_HELP,
+	ACT_SCROLL_UP, ACT_SCROLL_DOWN, ACT_SCREEN_TOP, ACT_SCREEN_BOTTOM,
+	ACT_SPLIT_LINE, ACT_OVERTYPE_TOGGLE, ACT_WRAP_TOGGLE,
+	ACT_MARKER_SET, ACT_MARKER_GOTO,
+	ACT_BLOCK_BEGIN, ACT_BLOCK_END, ACT_BLOCK_GOTO_BEGIN, ACT_BLOCK_GOTO_END,
+	ACT_BLOCK_COPY, ACT_BLOCK_MOVE, ACT_BLOCK_DELETE, ACT_BLOCK_WRITE,
+	ACT_BLOCK_HIDE, ACT_BLOCK_COLUMN_TOGGLE
 };
 
 /* Position helpers used by the word motions, defined with the vi code below. */
@@ -25423,6 +25450,19 @@ static const struct { const char *name; int act; } kb_actions[] = {
 	{ "file-insert", ACT_FILE_INSERT }, { "save", ACT_SAVE },
 	{ "save-as", ACT_SAVE_AS }, { "save-exit", ACT_SAVE_EXIT },
 	{ "quit", ACT_QUIT }, { "help", ACT_HELP },
+	{ "scroll-up", ACT_SCROLL_UP }, { "scroll-down", ACT_SCROLL_DOWN },
+	{ "screen-top", ACT_SCREEN_TOP }, { "screen-bottom", ACT_SCREEN_BOTTOM },
+	{ "split-line", ACT_SPLIT_LINE },
+	{ "overtype-toggle", ACT_OVERTYPE_TOGGLE },
+	{ "wrap-toggle", ACT_WRAP_TOGGLE },
+	{ "marker-set", ACT_MARKER_SET }, { "marker-goto", ACT_MARKER_GOTO },
+	{ "block-begin", ACT_BLOCK_BEGIN }, { "block-end", ACT_BLOCK_END },
+	{ "block-goto-begin", ACT_BLOCK_GOTO_BEGIN },
+	{ "block-goto-end", ACT_BLOCK_GOTO_END },
+	{ "block-copy", ACT_BLOCK_COPY }, { "block-move", ACT_BLOCK_MOVE },
+	{ "block-delete", ACT_BLOCK_DELETE }, { "block-write", ACT_BLOCK_WRITE },
+	{ "block-hide", ACT_BLOCK_HIDE },
+	{ "block-column-toggle", ACT_BLOCK_COLUMN_TOGGLE },
 };
 
 #define KB_ACTION_COUNT ((int)(sizeof(kb_actions) / sizeof(kb_actions[0])))
@@ -25605,14 +25645,51 @@ kb_norm(const struct tkbd_seq *seq, uint16_t *key, uint8_t *mod)
 	*mod = seq->mod & TKBD_MOD_CTRL;
 }
 
+/* The marked block as an ordered region. Returns 1 with the bounds filled when
+ * both ends are set and begin is not past end, else 0. */
+static int
+kb_block_bounds(const Editor *e, size_t *y1, size_t *x1, size_t *y2, size_t *x2)
+{
+	if (!e->blk_bset || !e->blk_eset)
+		return 0;
+	if (e->blk_by < e->blk_ey ||
+	    (e->blk_by == e->blk_ey && e->blk_bx <= e->blk_ex)) {
+		*y1 = e->blk_by; *x1 = e->blk_bx;
+		*y2 = e->blk_ey; *x2 = e->blk_ex;
+	} else {
+		*y1 = e->blk_ey; *x1 = e->blk_ex;
+		*y2 = e->blk_by; *x2 = e->blk_bx;
+	}
+	return 1;
+}
+
+/* Copy the marked block's text, or report why it cannot. Returns the malloc'd
+ * text (caller frees) and its length and byte span, or NULL. */
+static char *
+kb_block_grab(Editor *e, size_t *len, size_t *span)
+{
+	size_t y1, x1, y2, x2;
+	char *text;
+
+	if (!kb_block_bounds(e, &y1, &x1, &y2, &x2)) {
+		set_status(e, "mark a block first (begin and end)");
+		return NULL;
+	}
+	text = region_text(e, y1, x1, y2, x2, len);
+	if (!text)
+		return NULL;
+	*span = hex_offset_of(e->t, y2, x2) - hex_offset_of(e->t, y1, x1);
+	return text;
+}
+
 /* Run one keymap action. Returns a Req for the main loop's run_req, like the
  * modeless ed_dispatch does. */
 static Req
 kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
 {
 	size_t y, x, len;
+	int th = text_height(e);
 
-	(void)arg;
 	switch (act) {
 	case ACT_UP:		return ed_dispatch(e, CMD_UP, seq);
 	case ACT_DOWN:		return ed_dispatch(e, CMD_DOWN, seq);
@@ -25712,6 +25789,190 @@ kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
 	case ACT_SAVE_EXIT:
 		(void)save_editor(e);
 		return REQ_QUIT;	/* run_req prompts for any other dirty buffer */
+	case ACT_SCROLL_UP:		/* view up a line; keep the cursor in it */
+		if (e->top > 0) {
+			e->top--;
+			if (th > 0 && e->cy > e->top + (size_t)th - 1)
+				e->cy = e->top + (size_t)th - 1;
+			clamp_col(e);
+		}
+		return REQ_CONTINUE;
+	case ACT_SCROLL_DOWN:
+		if (e->top + 1 < text_lines(e->t)) {
+			e->top++;
+			if (e->cy < e->top)
+				e->cy = e->top;
+			clamp_col(e);
+		}
+		return REQ_CONTINUE;
+	case ACT_SCREEN_TOP:
+		e->cy = e->top;
+		e->cx = 0;
+		vi_clamp(e);
+		return REQ_CONTINUE;
+	case ACT_SCREEN_BOTTOM:
+		y = e->top + (size_t)(th > 0 ? th - 1 : 0);
+		if (y >= text_lines(e->t))
+			y = text_lines(e->t) - 1;
+		e->cy = y;
+		e->cx = 0;
+		vi_clamp(e);
+		return REQ_CONTINUE;
+	case ACT_SPLIT_LINE:		/* break the line, cursor stays put */
+		text_undo_group_begin(e->t);
+		text_split(e->t, e->cy, e->cx);
+		text_undo_group_end(e->t);
+		e->hl_valid = 0;
+		return REQ_CONTINUE;
+	case ACT_OVERTYPE_TOGGLE:
+		e->overtype = !e->overtype;
+		set_status(e, "%s", e->overtype ? "overtype" : "insert");
+		return REQ_CONTINUE;
+	case ACT_WRAP_TOGGLE:
+		e->wrap = !e->wrap;
+		set_status(e, "word wrap %s", e->wrap ? "on" : "off");
+		return REQ_CONTINUE;
+	case ACT_MARKER_SET:
+		if (arg >= 0 && arg < 10) {
+			e->num_mark_y[arg] = e->cy;
+			e->num_mark_x[arg] = e->cx;
+			e->num_mark_set |= (uint16_t)(1u << arg);
+			set_status(e, "marker %d set", arg);
+		}
+		return REQ_CONTINUE;
+	case ACT_MARKER_GOTO:
+		if (arg >= 0 && arg < 10 &&
+		    (e->num_mark_set & (1u << arg))) {
+			e->cy = e->num_mark_y[arg];
+			e->cx = e->num_mark_x[arg];
+			vi_clamp(e);
+		} else {
+			set_status(e, "marker %d not set", arg);
+		}
+		return REQ_CONTINUE;
+	case ACT_BLOCK_BEGIN:
+		e->blk_by = e->cy; e->blk_bx = e->cx; e->blk_bset = 1;
+		e->blk_hidden = 0;
+		set_status(e, "block begin");
+		return REQ_CONTINUE;
+	case ACT_BLOCK_END:
+		e->blk_ey = e->cy; e->blk_ex = e->cx; e->blk_eset = 1;
+		e->blk_hidden = 0;
+		set_status(e, "block end");
+		return REQ_CONTINUE;
+	case ACT_BLOCK_GOTO_BEGIN:
+		if (e->blk_bset) {
+			e->cy = e->blk_by; e->cx = e->blk_bx;
+			vi_clamp(e);
+		} else {
+			set_status(e, "no block begin");
+		}
+		return REQ_CONTINUE;
+	case ACT_BLOCK_GOTO_END:
+		if (e->blk_eset) {
+			e->cy = e->blk_ey; e->cx = e->blk_ex;
+			vi_clamp(e);
+		} else {
+			set_status(e, "no block end");
+		}
+		return REQ_CONTINUE;
+	case ACT_BLOCK_COPY: {
+		size_t span;
+		char *text = kb_block_grab(e, &len, &span);
+
+		if (text) {
+			text_undo_group_begin(e->t);
+			insert_bytes(e, text, len);
+			text_undo_group_end(e->t);
+			free(text);
+			e->hl_valid = 0;
+			set_status(e, "block copied (%zu bytes)", len);
+		}
+		return REQ_CONTINUE;
+	}
+	case ACT_BLOCK_DELETE: {
+		size_t y1, x1, y2, x2;
+
+		if (!kb_block_bounds(e, &y1, &x1, &y2, &x2)) {
+			set_status(e, "mark a block first (begin and end)");
+			return REQ_CONTINUE;
+		}
+		text_undo_group_begin(e->t);
+		delete_region(e, y1, x1, y2, x2);
+		text_undo_group_end(e->t);
+		e->blk_bset = e->blk_eset = 0;
+		e->hl_valid = 0;
+		vi_clamp(e);
+		set_status(e, "block deleted");
+		return REQ_CONTINUE;
+	}
+	case ACT_BLOCK_MOVE: {
+		size_t y1, x1, y2, x2, span, co, bo, eo, at;
+		char *text;
+
+		if (!kb_block_bounds(e, &y1, &x1, &y2, &x2)) {
+			set_status(e, "mark a block first (begin and end)");
+			return REQ_CONTINUE;
+		}
+		bo = hex_offset_of(e->t, y1, x1);
+		eo = hex_offset_of(e->t, y2, x2);
+		co = hex_offset_of(e->t, e->cy, e->cx);
+		if (co >= bo && co <= eo) {
+			set_status(e, "cursor is inside the block");
+			return REQ_CONTINUE;
+		}
+		text = region_text(e, y1, x1, y2, x2, &len);
+		if (!text)
+			return REQ_CONTINUE;
+		span = eo - bo;
+		text_undo_group_begin(e->t);
+		delete_region(e, y1, x1, y2, x2);
+		at = (co > eo) ? co - span : co;	/* the block was before the cursor */
+		hex_pos_at(e->t, at, &e->cy, &e->cx);
+		insert_bytes(e, text, len);
+		text_undo_group_end(e->t);
+		free(text);
+		e->blk_bset = e->blk_eset = 0;
+		e->hl_valid = 0;
+		vi_clamp(e);
+		set_status(e, "block moved");
+		return REQ_CONTINUE;
+	}
+	case ACT_BLOCK_WRITE: {
+		size_t span;
+		char path[PATH_MAX];
+		char *text;
+		Vfile *f;
+
+		text = kb_block_grab(e, &len, &span);
+		if (!text)
+			return REQ_CONTINUE;
+		path[0] = '\0';
+		if (!dlg_save_file_confirm(e, path, sizeof(path))) {
+			free(text);
+			return REQ_CONTINUE;
+		}
+		f = g_vfs->open(path, VF_WRITE | VF_CREATE | VF_TRUNC, 0644);
+		if (!f || vf_write_all(f, text, len) != 0) {
+			if (f)
+				g_vfs->close(f);
+			free(text);
+			set_status(e, "write failed: %.80s", path);
+			return REQ_CONTINUE;
+		}
+		g_vfs->close(f);
+		free(text);
+		set_status(e, "wrote block to %.80s (%zu bytes)", path, len);
+		return REQ_CONTINUE;
+	}
+	case ACT_BLOCK_HIDE:
+		e->blk_hidden = !e->blk_hidden;
+		set_status(e, "block %s", e->blk_hidden ? "hidden" : "shown");
+		return REQ_CONTINUE;
+	case ACT_BLOCK_COLUMN_TOGGLE:
+		e->blk_column = !e->blk_column;
+		set_status(e, "block is %s", e->blk_column ? "a column" : "a stream");
+		return REQ_CONTINUE;
 	default:
 		return REQ_CONTINUE;
 	}

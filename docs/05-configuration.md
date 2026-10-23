@@ -140,13 +140,22 @@ A key is `^X` for Ctrl plus a character, a single character, or a named key:
 matched whether or not Ctrl is held. An action the build does not provide is
 skipped, so a keymap may list keys for features that are not present yet.
 
-The actions are: `up`, `down`, `left`, `right`, `word-left`, `word-right`,
-`line-begin`, `line-end`, `file-top`, `file-bottom`, `page-up`, `page-down`,
-`jump-back`, `newline`, `tab`, `delete-left`, `delete-right`,
-`delete-word-right`, `delete-line`, `delete-to-eol`, `delete-to-bol`, `undo`,
-`redo`, `copy`, `cut`, `paste`, `reflow`, `find`, `find-next`, `replace`,
-`goto-line`, `symbol`, `file-insert`, `save`, `save-as`, `save-exit`, `quit`,
-and `help`.
+The actions are:
+
+- Motion: `up`, `down`, `left`, `right`, `word-left`, `word-right`,
+  `line-begin`, `line-end`, `file-top`, `file-bottom`, `page-up`, `page-down`,
+  `screen-top`, `screen-bottom`, `scroll-up`, `scroll-down`, `jump-back`.
+- Editing: `newline`, `split-line`, `tab`, `delete-left`, `delete-right`,
+  `delete-word-right`, `delete-line`, `delete-to-eol`, `delete-to-bol`,
+  `overtype-toggle`, `reflow`, `wrap-toggle`, `undo`, `redo`, `copy`, `cut`,
+  `paste`.
+- Markers: `marker-set N`, `marker-goto N` (N is 0 to 9).
+- Blocks: `block-begin`, `block-end`, `block-goto-begin`, `block-goto-end`,
+  `block-copy`, `block-move`, `block-delete`, `block-write`, `block-hide`,
+  `block-column-toggle`. A block is two marks set independently of the cursor;
+  copy and move act on it at the cursor, and write saves it to a file.
+- Files and search: `find`, `find-next`, `replace`, `goto-line`, `symbol`,
+  `file-insert`, `save`, `save-as`, `save-exit`, `quit`, `help`.
 
 A complete WordStar keymap ships in `examples/wordstar.conf`. Pull it in with an
 `[include]`, then add its name to the cycle:
