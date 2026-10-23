@@ -199,6 +199,10 @@ A complete WordStar keymap ships in `examples/wordstar.conf`. Pull it in with an
     modes = msedit wordstar
 ```
 
+A smaller `examples/emacs.conf` ships the same way, a simple subset of the
+GNU Emacs keys. Meta (Alt) bindings are left out, since vedit has none and Alt
+plus a letter opens the menu bar.
+
 ### `[include]`: merge another file
 
 | Key | Default | Meaning |

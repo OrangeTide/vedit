@@ -65,7 +65,8 @@ example:
 
 F2 now steps msedit then wordstar, and in the WordStar mode vedit edits with
 the cursor diamond, the Ctrl-K / Ctrl-Q / Ctrl-O prefixes, blocks, and
-markers. F1 shows that mode's own keys, carried in the same file. The
+markers. F1 shows that mode's own keys, carried in the same file. A simple
+Emacs layout ships the same way in `examples/emacs.conf`. The
 [configuration chapter](docs/05-configuration.md) has the binding syntax.
 
 ## Manual
