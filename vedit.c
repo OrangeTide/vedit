@@ -25464,7 +25464,8 @@ enum kb_act {
 	ACT_MARKER_SET, ACT_MARKER_GOTO,
 	ACT_BLOCK_BEGIN, ACT_BLOCK_END, ACT_BLOCK_GOTO_BEGIN, ACT_BLOCK_GOTO_END,
 	ACT_BLOCK_COPY, ACT_BLOCK_MOVE, ACT_BLOCK_DELETE, ACT_BLOCK_WRITE,
-	ACT_BLOCK_HIDE, ACT_BLOCK_COLUMN_TOGGLE
+	ACT_BLOCK_HIDE, ACT_BLOCK_COLUMN_TOGGLE,
+	ACT_CENTER_LINE, ACT_LEFT_MARGIN, ACT_RIGHT_MARGIN
 };
 
 /* Position helpers used by the word motions, defined with the vi code below. */
@@ -25507,6 +25508,8 @@ static const struct { const char *name; int act; } kb_actions[] = {
 	{ "block-delete", ACT_BLOCK_DELETE }, { "block-write", ACT_BLOCK_WRITE },
 	{ "block-hide", ACT_BLOCK_HIDE },
 	{ "block-column-toggle", ACT_BLOCK_COLUMN_TOGGLE },
+	{ "center-line", ACT_CENTER_LINE },
+	{ "left-margin", ACT_LEFT_MARGIN }, { "right-margin", ACT_RIGHT_MARGIN },
 };
 
 #define KB_ACTION_COUNT ((int)(sizeof(kb_actions) / sizeof(kb_actions[0])))
@@ -25724,6 +25727,53 @@ kb_block_grab(Editor *e, size_t *len, size_t *span)
 		return NULL;
 	*span = hex_offset_of(e->t, y2, x2) - hex_offset_of(e->t, y1, x1);
 	return text;
+}
+
+/* Center the current line's text between the left margin and the right margin
+ * (textwidth, or the window when it is 0) by resetting its leading space. */
+static void
+ed_center_line(Editor *e)
+{
+	size_t len = 0;
+	const char *s = text_line(e->t, e->cy, &len);
+	size_t a = 0, b = len;
+	int right = e->textwidth > 0 ? e->textwidth : text_width(e);
+	int left = e->leftmargin, tw, pad;
+	char *content, *buf;
+	size_t clen;
+
+	if (!s)
+		return;
+	while (a < len && (s[a] == ' ' || s[a] == '\t'))
+		a++;
+	while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t'))
+		b--;
+	if (b <= a)			/* a blank line: nothing to center */
+		return;
+	clen = b - a;
+	content = malloc(clen);
+	if (!content)
+		return;
+	memcpy(content, s + a, clen);		/* s is freed by the delete below */
+	tw = disp_cols(content, clen);
+	pad = left + (right - left - tw) / 2;
+	if (pad < left)
+		pad = left;
+	buf = malloc((size_t)pad + clen);
+	if (!buf) {
+		free(content);
+		return;
+	}
+	memset(buf, ' ', (size_t)pad);
+	memcpy(buf + pad, content, clen);
+	text_undo_group_begin(e->t);
+	text_delete(e->t, e->cy, 0, len);
+	text_insert(e->t, e->cy, 0, buf, (size_t)pad + clen);
+	text_undo_group_end(e->t);
+	e->cx = (size_t)pad;
+	e->hl_valid = 0;
+	free(buf);
+	free(content);
 }
 
 /* Run one keymap action. Returns a Req for the main loop's run_req, like the
@@ -26016,6 +26066,19 @@ kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
 	case ACT_BLOCK_COLUMN_TOGGLE:
 		e->blk_column = !e->blk_column;
 		set_status(e, "block is %s", e->blk_column ? "a column" : "a stream");
+		return REQ_CONTINUE;
+	case ACT_CENTER_LINE:
+		ed_center_line(e);
+		return REQ_CONTINUE;
+	case ACT_LEFT_MARGIN:
+		e->leftmargin = cursor_dispcol(e);
+		set_status(e, "left margin at column %d", e->leftmargin + 1);
+		return REQ_CONTINUE;
+	case ACT_RIGHT_MARGIN:
+		e->textwidth = cursor_dispcol(e);
+		if (e->textwidth < 1)
+			e->textwidth = 1;
+		set_status(e, "right margin at column %d", e->textwidth);
 		return REQ_CONTINUE;
 	default:
 		return REQ_CONTINUE;

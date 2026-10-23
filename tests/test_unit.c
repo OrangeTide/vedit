@@ -2427,6 +2427,56 @@ t_keymap_block(Test *t)
 	g_cfg = old;
 }
 
+/* Centering sets a line's leading space so it sits between the margins, the
+ * margin actions read the cursor's display column, and reflow indents its
+ * output to the left margin. */
+static void
+t_keymap_format(Test *t)
+{
+	const Cfg *old = g_cfg;
+	struct tkbd_seq s;
+	const char *ln;
+	size_t len;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+
+	/* center "hello" in a width of 20: pad = (20 - 5) / 2 = 7 */
+	text_insert(e.t, 0, 0, "hello", 5);
+	e.cy = e.cx = 0;
+	e.textwidth = 20;
+	e.leftmargin = 0;
+	kb_run_action(&e, ACT_CENTER_LINE, -1, &s);
+	ln = text_line(e.t, 0, &len);
+	TAP_CHECKF(t, len == 12 && e.cx == 7 && memcmp(ln + 7, "hello", 5) == 0,
+	    "center [%.*s]", (int)len, ln);
+
+	/* the margin actions take the cursor's display column */
+	kb_run_action(&e, ACT_LEFT_MARGIN, -1, &s);	/* cursor at column 7 */
+	TAP_CHECKF(t, e.leftmargin == 7, "left margin %d", e.leftmargin);
+	kb_run_action(&e, ACT_RIGHT_MARGIN, -1, &s);
+	TAP_CHECKF(t, e.textwidth == 7, "right margin %d", e.textwidth);
+
+	/* reflow indents every output line to the left margin */
+	text_free(e.t);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "one two three four five", 23);
+	e.cy = e.cx = 0;
+	e.leftmargin = 2;
+	reflow_range(&e, 0, 0, 12);
+	ln = text_line(e.t, 0, &len);
+	TAP_CHECKF(t, len >= 3 && ln[0] == ' ' && ln[1] == ' ' && ln[2] != ' ',
+	    "reflow indent [%.*s]", (int)len, ln);
+
+	text_free(e.t);
+	kb_free_maps(&e);
+	g_cfg = old;
+}
+
 /* Per-project keys may be overridden by VEDIT_<KEY> environment variables:
  * env wins over the config, an empty var is treated as unset, and the key's dots
  * map to underscores with the whole name uppercased. */
@@ -4156,6 +4206,7 @@ const Case tap_cases[] = {
 	{ "keymap_cycle", t_keymap_cycle },
 	{ "keymap_bind", t_keymap_bind },
 	{ "keymap_block", t_keymap_block },
+	{ "keymap_format", t_keymap_format },
 	{ "cfg_env", t_cfg_env },
 	{ "cfg_color", t_cfg_color },
 	{ "cfg_theme", t_cfg_theme },

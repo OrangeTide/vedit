@@ -149,6 +149,9 @@ The actions are:
   `delete-word-right`, `delete-line`, `delete-to-eol`, `delete-to-bol`,
   `overtype-toggle`, `reflow`, `wrap-toggle`, `undo`, `redo`, `copy`, `cut`,
   `paste`.
+- Format: `center-line`, `left-margin`, `right-margin`. The margins take the
+  cursor's column; reflow and centering sit between them, and the right margin
+  is also the type-time wrap width (`textwidth`).
 - Markers: `marker-set N`, `marker-goto N` (N is 0 to 9).
 - Blocks: `block-begin`, `block-end`, `block-goto-begin`, `block-goto-end`,
   `block-copy`, `block-move`, `block-delete`, `block-write`, `block-hide`,
