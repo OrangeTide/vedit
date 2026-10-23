@@ -14709,6 +14709,9 @@ static void tbl_col_del(Editor *e, int n)
 
 #endif	/* VEDIT_TABLE */
 
+static int kb_block_bounds(const Editor *e, size_t *y1, size_t *x1,
+    size_t *y2, size_t *x2);	/* the marked block as an ordered region */
+
 /* Selection highlight bounds for one buffer line, as display columns [*hs,*he)
  * within the line, or -1/-1 when nothing on the line is selected. Shared by the
  * plain and soft-wrap renderers. */
@@ -14716,8 +14719,31 @@ static void
 sel_cols(const Editor *e, size_t idx, const char *s, size_t llen,
     int *hs, int *he)
 {
+	size_t by1, bx1, by2, bx2;
+
 	*hs = -1;
 	*he = -1;
+	/* A marked WordStar block (a custom keymap) highlights its region even
+	 * when the cursor has moved away; a live selection takes priority. */
+	if (!e->sel_active && e->kb_map && !e->blk_hidden &&
+	    kb_block_bounds(e, &by1, &bx1, &by2, &bx2)) {
+		if (e->blk_column) {
+			size_t lo = bx1 < bx2 ? bx1 : bx2;
+			size_t hi = bx1 > bx2 ? bx1 : bx2;
+
+			if (idx >= by1 && idx <= by2) {
+				*hs = disp_cols(s, lo);
+				*he = disp_cols(s, hi);
+			}
+		} else if (idx >= by1 && idx <= by2) {
+			size_t a = (idx == by1) ? bx1 : 0;
+			size_t b = (idx == by2) ? bx2 : llen;
+
+			*hs = disp_cols(s, a);
+			*he = disp_cols(s, b);
+		}
+		return;
+	}
 	if (e->sel_active && e->sel_block) {
 		size_t ry1 = e->ay < e->cy ? e->ay : e->cy;
 		size_t ry2 = e->ay > e->cy ? e->ay : e->cy;
