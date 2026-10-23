@@ -11,6 +11,28 @@ PROG = vedit
 SRC  = vedit.c
 HDR  = vedit.h
 
+# The version: the release number from version.mk, refined by git when the tree
+# is a checkout. A release checkout describes as the tag; an untagged checkout
+# adds a -dev-g<sha> suffix; a tarball with no git falls back to the bare
+# number. Matching v$(VEDIT_VERSION) rather than v* keeps a vendored copy from
+# describing itself against a host project's tags.
+include version.mk
+GIT_DESC := $(shell git describe --tags --dirty --match 'v$(VEDIT_VERSION)' 2>/dev/null)
+ifeq ($(GIT_DESC),)
+GIT_SUFFIX := $(shell git describe --always --dirty 2>/dev/null | sed 's/^/-dev-g/')
+else
+GIT_SUFFIX := $(patsubst v$(VEDIT_VERSION)%,%,$(GIT_DESC))
+endif
+VERSION := $(VEDIT_VERSION)$(GIT_SUFFIX)
+
+# The version reaches vedit.c through a generated header, force-included on the
+# shipped builds. FORCE reruns the recipe every build so the stamp tracks the
+# current git state; the cmp guard keeps an unchanged version from touching the
+# header's mtime and cascading into a rebuild. vedit.c has a fallback #define,
+# so a plain `cc vedit.c` and the test builds still compile without it.
+VERSION_H = $(OUT)/version.h
+VERSION_INC = -include $(VERSION_H)
+
 # Every build lands in its own directory under OUT, keyed by the target
 # triple, so a native, a static musl, and a cross build never overwrite each
 # other and each stays up to date on its own. TARGET defaults to what the
@@ -101,15 +123,25 @@ TORTURE_ROUNDS ?= 20000
 SANCFLAGS = -std=gnu11 -Wall -Wextra -g -O1 -fno-omit-frame-pointer
 
 .PHONY: all link clean install uninstall test torture asan ubsan cov cov-term \
-    screenshots static gvedit veditmin wasm web guterm-sync
+    screenshots static gvedit veditmin wasm web guterm-sync release-check FORCE
 
 all: $(BIN) link
 
-$(BIN): $(SRC) $(HDR) | $(OUTBIN)
-	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
+$(BIN): $(SRC) $(HDR) $(VERSION_H) | $(OUTBIN)
+	$(CC) $(CFLAGS) $(VERSION_INC) -o $@ $(SRC) $(LDFLAGS)
 
 $(OUTBIN):
 	mkdir -p $@
+
+$(OUT):
+	mkdir -p $@
+
+$(VERSION_H): FORCE | $(OUT)
+	@printf '#define VEDIT_VERSION "vedit %s"\n' '$(VERSION)' > $@.tmp
+	@cmp -s $@.tmp $@ || mv $@.tmp $@
+	@rm -f $@.tmp
+
+FORCE:
 
 # veditmin: a reduced native build for embedding vedit in a host (such as a
 # MUD) that does not need the full feature set. It keeps the text editor, the
@@ -124,8 +156,8 @@ MINBIN = $(OUTBIN)/veditmin$(EXE)
 veditmin: $(MINBIN)
 	$(if $(EXE),,ln -sfn $(MINBIN) veditmin)
 
-$(MINBIN): $(SRC) $(HDR) | $(OUTBIN)
-	$(CC) $(CFLAGS) $(VEDITMIN_DEFS) -o $@ $(SRC) $(LDFLAGS)
+$(MINBIN): $(SRC) $(HDR) $(VERSION_H) | $(OUTBIN)
+	$(CC) $(CFLAGS) $(VERSION_INC) $(VEDITMIN_DEFS) -o $@ $(SRC) $(LDFLAGS)
 
 # Point the top-level symlink at this target's binary. Always rerun, so
 # `make static` and a plain `make` each leave ./vedit on the build just made.
@@ -137,8 +169,9 @@ static: all
 gvedit: $(GBIN)
 	$(if $(EXE),,ln -sfn $(GBIN) $(GPROG))
 
-$(GBIN): $(SRC) $(HDR) guterm.h | $(OUTBIN)
-	$(CC) $(CFLAGS) -DVEDIT_GUI $(if $(EXE),,-pthread) $(SDL_CFLAGS) -o $@ \
+$(GBIN): $(SRC) $(HDR) guterm.h $(VERSION_H) | $(OUTBIN)
+	$(CC) $(CFLAGS) $(VERSION_INC) -DVEDIT_GUI $(if $(EXE),,-pthread) \
+	    $(SDL_CFLAGS) -o $@ \
 	    $(SRC) $(SDL_LIBS) -lm \
 	    $(LDFLAGS)
 
@@ -172,9 +205,9 @@ WASI_LIBS    = -lc -lwasi-emulated-mman -lwasi-emulated-signal \
 
 wasm: $(WASI_BIN)
 
-$(WASI_BIN): $(SRC) $(HDR) | $(OUT)/wasm32-wasi/bin
+$(WASI_BIN): $(SRC) $(HDR) $(VERSION_H) | $(OUT)/wasm32-wasi/bin
 	$(WASI_CC) --target=wasm32-wasi $(WASI_INC) -std=gnu11 -Wall -Wextra \
-	    -O2 $(WASI_DEFS) -nodefaultlibs -L$(WASI_LIBDIR) \
+	    -O2 $(VERSION_INC) $(WASI_DEFS) -nodefaultlibs -L$(WASI_LIBDIR) \
 	    $(SRC) $(WASI_LIBS) -o $@
 
 $(OUT)/wasm32-wasi/bin:
@@ -196,8 +229,8 @@ WEB_EMFLAGS  = -sASYNCIFY -sINVOKE_RUN=0 -sEXIT_RUNTIME=1 \
 
 web: web/vedit.js
 
-web/vedit.js: $(SRC) $(HDR) web/index.html $(WEB_SAMPLE)
-	$(EMCC) -std=gnu11 -O2 $(WEB_DEFS) $(WEB_EMFLAGS) \
+web/vedit.js: $(SRC) $(HDR) web/index.html $(WEB_SAMPLE) $(VERSION_H)
+	$(EMCC) -std=gnu11 -O2 $(VERSION_INC) $(WEB_DEFS) $(WEB_EMFLAGS) \
 	    --embed-file $(WEB_SAMPLE)@/note.txt \
 	    $(SRC) -o $@
 
@@ -337,3 +370,18 @@ install: $(BIN)
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(PROG)
 	rm -f $(DESTDIR)$(MANDIR)/man1/vedit.1
+
+# Verify version.mk and the git tag agree before cutting a release: the tag
+# v$(VEDIT_VERSION) exists, sits at HEAD, and the tree is clean.
+release-check:
+	@v=$(VEDIT_VERSION); \
+	if ! git rev-parse --verify --quiet "refs/tags/v$$v" >/dev/null; then \
+	    echo "release-check: no tag v$$v (version.mk says $$v)" >&2; exit 1; \
+	fi; \
+	if [ "$$(git rev-parse "v$$v^{commit}")" != "$$(git rev-parse HEAD)" ]; then \
+	    echo "release-check: tag v$$v is not at HEAD" >&2; exit 1; \
+	fi; \
+	if [ -n "$$(git status --porcelain)" ]; then \
+	    echo "release-check: working tree is dirty" >&2; exit 1; \
+	fi; \
+	echo "release-check: v$$v ok"
