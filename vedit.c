@@ -3306,10 +3306,45 @@ cfg_make_key(char *out, size_t outsz, const char *section,
 		snprintf(out, outsz, "%s.%s", section, name);
 }
 
+int vedit_cfg_load(Cfg *c, const char *path);	/* file loader, defined below */
+
+/* The directory of the config file currently loading, so an [include] path
+ * resolves relative to it, and a depth guard against include cycles. Both are
+ * saved and restored around each nested load. */
+static char g_cfg_dir[PATH_MAX];
+static int g_cfg_inc_depth;
+
+/* Load the file named by an [include] path line, resolving a relative path
+ * against the including file's directory. A no-op past a small depth so a
+ * cycle cannot recurse forever. */
+static void
+cfg_include(Cfg *c, const char *relpath)
+{
+	char full[PATH_MAX];
+
+	if (g_cfg_inc_depth >= 8 || !relpath[0])
+		return;
+	if (relpath[0] == '/' || g_cfg_dir[0] == '\0') {
+		snprintf(full, sizeof(full), "%s", relpath);
+	} else {
+		size_t dl = strlen(g_cfg_dir), rl = strlen(relpath);
+
+		if (dl + 1 + rl >= sizeof(full))
+			return;			/* the joined path will not fit */
+		memcpy(full, g_cfg_dir, dl);
+		full[dl] = '/';
+		memcpy(full + dl + 1, relpath, rl + 1);
+	}
+	g_cfg_inc_depth++;
+	(void)vedit_cfg_load(c, full);	/* sets and restores g_cfg_dir itself */
+	g_cfg_inc_depth--;
+}
+
 /* Parse config text (modified in place) into c, merging over anything already
  * there. Lines are split on '\n'; a blank or whitespace-only line is skipped.
- * Returns 0 on success, -1 on a syntax error. Shared by the file loader and the
- * built-in default grammars. */
+ * An [include] path = FILE line loads FILE in place. Returns 0 on success, -1
+ * on a syntax error. Shared by the file loader and the built-in default
+ * grammars. */
 static int
 cfg_load_mem(Cfg *c, char *text)
 {
@@ -3402,7 +3437,11 @@ cfg_load_mem(Cfg *c, char *text)
 				value[vlen - 1] = '\0';
 				value++;
 			}
-			if (section[0] == '\0' && strchr(name, '.') != NULL) {
+			if (strcmp(section, "include") == 0 &&
+			    strcmp(name, "path") == 0) {
+				cfg_include(c, value);	/* load it in place */
+			} else if (section[0] == '\0' &&
+			    strchr(name, '.') != NULL) {
 				/* shorthand: a trimmed name with a dot is already
 				 * a full dotted key */
 				cfg_set(c, name, value);
@@ -3423,7 +3462,8 @@ cfg_load_mem(Cfg *c, char *text)
 int
 vedit_cfg_load(Cfg *c, const char *path)
 {
-	char *buf;
+	char saved_dir[PATH_MAX], *buf;
+	const char *slash;
 	size_t len;
 	int rc;
 
@@ -3431,7 +3471,17 @@ vedit_cfg_load(Cfg *c, const char *path)
 		return -1;
 	if (vf_read_file(path, &buf, &len) != 0)
 		return -1;
+	/* Remember this file's directory so an [include] inside it resolves a
+	 * relative path against it; restore the caller's on the way out. */
+	memcpy(saved_dir, g_cfg_dir, sizeof(saved_dir));
+	slash = strrchr(path, '/');
+	if (slash && (size_t)(slash - path) < sizeof(g_cfg_dir))
+		snprintf(g_cfg_dir, sizeof(g_cfg_dir), "%.*s",
+		    (int)(slash - path), path);
+	else
+		g_cfg_dir[0] = '\0';
 	rc = cfg_load_mem(c, buf);
+	memcpy(g_cfg_dir, saved_dir, sizeof(g_cfg_dir));
 	free(buf);
 	return rc;
 }
