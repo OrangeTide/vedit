@@ -8095,6 +8095,7 @@ typedef struct editor {
 	int		expand_tabs;	/* Tab and auto-indent use spaces (per buffer) */
 	int		shiftwidth;	/* >> / << shift size in columns; 0 = a tab stop */
 	int		textwidth;	/* gq and the insert wrap pack to this; 0 = the window */
+	int		leftmargin;	/* reflow and center indent to this column (0 = none) */
 	int		statusline;	/* STATUS_PLAIN or STATUS_POWERLINE (ui.statusline) */
 	uint32_t	sep[2];		/* powerline separators, left and right side; 0 = none,
 					 * SEP_DEFAULT = chosen by the box style */
@@ -17043,10 +17044,22 @@ typedef struct para {
 	int	open;
 } Para;
 
-/* Pack a paragraph's words into lines of at most width columns (one
- * word always fits) and append them to out, each ending in '\n'. */
+/* Append n spaces to out. */
 static int
-para_flush(Para *p, int width, Rbuf *out)
+rbuf_pad(Rbuf *out, int n)
+{
+	while (n-- > 0)
+		if (rbuf_add(out, " ", 1) < 0)
+			return -1;
+	return 0;
+}
+
+/* Pack a paragraph's words into lines of at most width columns (one
+ * word always fits) and append them to out, each ending in '\n'. Lines are
+ * indented to at least `left` columns, so a configured left margin applies
+ * on top of the paragraph's own prefix. */
+static int
+para_flush(Para *p, int width, int left, Rbuf *out)
 {
 	size_t i = 0;
 	int col = 0, have = 0;
@@ -17058,6 +17071,8 @@ para_flush(Para *p, int width, Rbuf *out)
 	if (rbuf_add(out, pfx->s, pfx->len) < 0)
 		return -1;
 	col = disp_cols(pfx->s, pfx->len);
+	if (col < left && rbuf_pad(out, left - col) == 0)
+		col = left;
 	while (i < p->words.len) {
 		const char *w = p->words.s + i;
 		size_t n = strlen(w);
@@ -17068,6 +17083,8 @@ para_flush(Para *p, int width, Rbuf *out)
 			    rbuf_add(out, p->cont.s, p->cont.len) < 0)
 				return -1;
 			col = disp_cols(p->cont.s, p->cont.len);
+			if (col < left && rbuf_pad(out, left - col) == 0)
+				col = left;
 			have = 0;
 		}
 		if (have) {
@@ -17159,6 +17176,7 @@ static int
 reflow_build(Editor *e, size_t lo, size_t hi, int width, Rbuf *out)
 {
 	const char *const *leaders = reflow_leaders(e);
+	int left = e->leftmargin;
 	Para p;
 	size_t y;
 	int rc = 0;
@@ -17173,7 +17191,7 @@ reflow_build(Editor *e, size_t lo, size_t hi, int width, Rbuf *out)
 			break;
 		reflow_scan(s, len, leaders, &lp);
 		if (lp.text >= len) {		/* blank: a separator, kept */
-			rc = para_flush(&p, width, out);
+			rc = para_flush(&p, width, left, out);
 			if (rc == 0)
 				rc = rbuf_add(out, s, len);
 			if (rc == 0)
@@ -17181,7 +17199,7 @@ reflow_build(Editor *e, size_t lo, size_t hi, int width, Rbuf *out)
 			continue;
 		}
 		if (!para_continues(&p, s, len, &lp)) {
-			rc = para_flush(&p, width, out);
+			rc = para_flush(&p, width, left, out);
 			if (rc == 0)
 				rc = para_start(&p, s, &lp);
 		}
@@ -17189,7 +17207,7 @@ reflow_build(Editor *e, size_t lo, size_t hi, int width, Rbuf *out)
 			rc = para_words(&p, s, lp.text, len);
 	}
 	if (rc == 0)
-		rc = para_flush(&p, width, out);
+		rc = para_flush(&p, width, left, out);
 	free(p.first.s);
 	free(p.cont.s);
 	free(p.words.s);
