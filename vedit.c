@@ -25720,93 +25720,32 @@ kb_free_maps(Editor *e)
 	e->kb_pending = 0;
 }
 
-/* The action name for an id (reverse of kb_action_id), or "?". */
-static const char *
-kb_action_name(int act)
-{
-	int i;
+/* The help shown on F1 is whatever the keymap's config supplies. A keymap with
+ * no help lines gets a single notice; writing good help is the config author's
+ * job. */
+#define KB_NO_HELP "  (this keymap defines no help; add help = lines to its config)"
 
-	for (i = 0; i < KB_ACTION_COUNT; i++)
-		if (kb_actions[i].act == act)
-			return kb_actions[i].name;
-	return "?";
-}
-
-/* A readable label for a bound key, the reverse of kb_parse_onekey. */
-static void
-kb_key_name(uint16_t key, uint8_t mod, char *buf, size_t sz)
-{
-	const char *name = NULL;
-
-	switch (key) {
-	case TKBD_KEY_ENTER:	name = "enter"; break;
-	case TKBD_KEY_ESC:	name = "esc"; break;
-	case TKBD_KEY_TAB:	name = "tab"; break;
-	case TKBD_KEY_BACKSPACE:name = "bksp"; break;
-	case TKBD_KEY_DEL:	name = "del"; break;
-	case TKBD_KEY_INS:	name = "ins"; break;
-	case TKBD_KEY_SPACE:	name = "space"; break;
-	case TKBD_KEY_HOME:	name = "home"; break;
-	case TKBD_KEY_END:	name = "end"; break;
-	case TKBD_KEY_PGUP:	name = "pgup"; break;
-	case TKBD_KEY_PGDN:	name = "pgdn"; break;
-	case TKBD_KEY_UP:	name = "up"; break;
-	case TKBD_KEY_DOWN:	name = "down"; break;
-	case TKBD_KEY_LEFT:	name = "left"; break;
-	case TKBD_KEY_RIGHT:	name = "right"; break;
-	default:		break;
-	}
-	if (name) {
-		snprintf(buf, sz, "%s", name);
-	} else if (key >= TKBD_KEY_F1 && key <= TKBD_KEY_F12) {
-		int n;
-
-		for (n = 0; n < 12; n++)
-			if (kb_fkeys[n] == key)
-				break;
-		snprintf(buf, sz, "F%d", n + 1);
-	} else if (mod & TKBD_MOD_CTRL) {
-		snprintf(buf, sz, "^%c", (char)key);
-	} else {
-		snprintf(buf, sz, "%c", (char)key);
-	}
-}
-
-/* How many help rows the custom keymap shows: its own help lines, or one per
- * binding when it supplies none. */
+/* How many help rows the custom keymap shows: its own help lines, or one
+ * notice line when it supplies none. */
 static int
 kb_help_count(const Editor *e)
 {
 	if (!e->kb_map)
 		return 0;
-	return e->kb_map->nhelp ? e->kb_map->nhelp : e->kb_map->n;
+	return e->kb_map->nhelp ? e->kb_map->nhelp : 1;
 }
 
-/* Help row idx for the active custom keymap: a config help line, or, when the
- * keymap supplies none, an auto-generated "keys  action" from its bindings. */
+/* Help row idx for the active custom keymap: a config help line, or the notice
+ * when the keymap carries no help. */
 static const char *
 kb_help_line(Editor *e, void *ctx, int idx)
 {
-	static char line[128];
 	KbMap *m = e->kb_map;
-	const KbBinding *b;
-	char k1[16], k2[16], keys[40];
 
 	(void)ctx;
 	if (!m || idx < 0 || idx >= kb_help_count(e))
 		return NULL;
-	if (m->nhelp)
-		return m->help[idx];
-	b = &m->b[idx];
-	kb_key_name(b->k1, b->m1, k1, sizeof(k1));
-	if (b->two) {
-		kb_key_name(b->k2, 0, k2, sizeof(k2));
-		snprintf(keys, sizeof(keys), "%s %s", k1, k2);
-	} else {
-		snprintf(keys, sizeof(keys), "%s", k1);
-	}
-	snprintf(line, sizeof(line), "  %-16s %s", keys, kb_action_name(b->action));
-	return line;
+	return m->nhelp ? m->help[idx] : KB_NO_HELP;
 }
 
 /* The incoming key reduced to a code plus its Ctrl bit (Shift and the rest are

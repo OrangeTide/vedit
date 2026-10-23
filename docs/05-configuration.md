@@ -158,7 +158,8 @@ active, so the file documents its own keys:
     help = "  ^E up   ^X down   ^S left   ^D right"
 ```
 
-With no `help` lines, F1 lists the bindings and their actions automatically.
+A keymap with no `help` lines shows only a short notice on F1, so writing good
+help is the keymap author's job.
 
 A few editor-wide keys stay fixed in every mode, so a keymap does not bind them:
 F2 (cycle modes), F6 (other pane), F8 and Shift-F8 (next and previous buffer),

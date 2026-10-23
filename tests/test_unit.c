@@ -2515,7 +2515,7 @@ t_keymap_help(Test *t)
 	vedit_cfg_free(c);
 	unlink(path);
 
-	/* with no help lines, the list is generated from the bindings */
+	/* with no help lines, F1 shows a single notice, not the bindings */
 	c = load_cfg_text(
 	    "[keys]\n\tmodes = ws2\n"
 	    "[keys \"ws2\"]\n"
@@ -2529,13 +2529,12 @@ t_keymap_help(Test *t)
 	TAP_ASSERT(t, e.t != NULL);
 	ed_apply_config(&e);
 	TAP_ASSERT(t, e.kb_map != NULL);
-	TAP_CHECKF(t, kb_help_count(&e) == 2, "gen count %d", kb_help_count(&e));
-	ln = kb_help_line(&e, NULL, 0);		/* a static buffer: check now */
-	TAP_CHECKF(t, ln && strstr(ln, "^D") && strstr(ln, "right"),
-	    "gen0 [%s]", ln ? ln : "(nil)");
-	ln = kb_help_line(&e, NULL, 1);
-	TAP_CHECKF(t, ln && strstr(ln, "^K B") && strstr(ln, "block-begin"),
-	    "gen1 [%s]", ln ? ln : "(nil)");
+	TAP_CHECKF(t, kb_help_count(&e) == 1, "notice count %d",
+	    kb_help_count(&e));
+	ln = kb_help_line(&e, NULL, 0);
+	TAP_CHECKF(t, ln && strstr(ln, "no help"), "notice [%s]",
+	    ln ? ln : "(nil)");
+	TAP_CHECK(t, kb_help_line(&e, NULL, 1) == NULL);
 	text_free(e.t);
 	kb_free_maps(&e);
 	g_cfg = old;
