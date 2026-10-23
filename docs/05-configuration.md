@@ -123,6 +123,13 @@ editor starts in.
 #### Custom keymaps
 
 A mode name that is not built in takes its keys from a `[keys "name"]` section.
+Such a mode is a first-class editing mode: it joins the `F2` cycle beside
+`msedit` and `vi`, `edit.mode` can start the editor in it, and `F1` shows its
+own key list. A config file with its bindings and `help` lines is a complete
+mode, installable on its own. The shipped `examples/wordstar.conf` turns vedit
+into a WordStar editor this way; pull it in with an `[include]` and add its
+name to `modes`.
+
 Such a mode is modeless: a printable key inserts text, and nothing else is a
 command until a `bind` line gives it one, so the mode starts empty. Each line
 is:
@@ -152,6 +159,14 @@ active, so the file documents its own keys:
 ```
 
 With no `help` lines, F1 lists the bindings and their actions automatically.
+
+A few editor-wide keys stay fixed in every mode, so a keymap does not bind them:
+F2 (cycle modes), F6 (other pane), F8 and Shift-F8 (next and previous buffer),
+Ctrl-W (the pane prefix), Ctrl-] (jump to the tag under the cursor), the build
+keys (chapter 7), F10 and Alt+letter (the menu bar), and the mouse. Everything
+else is the mode's to claim. The built-in
+`msedit` and `vi` keys are still compiled in rather than written as config, so
+they are the one thing a keymap cannot yet redefine.
 
 The actions are:
 

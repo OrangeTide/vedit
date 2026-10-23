@@ -49,6 +49,25 @@ Hold Shift while moving to select.
 | F1 | show the keys |
 | F2 | switch between the EDIT keys and the vi keys |
 
+## Key modes
+
+The EDIT keys and the vi keys are the two built-in modes, and F2 cycles
+between them. A config file can add its own modes by binding keys, and they
+join the same F2 cycle as equals. A complete WordStar layout ships as an
+example:
+
+```ini
+[include]
+    path = /usr/share/vedit/examples/wordstar.conf
+[keys]
+    modes = msedit wordstar
+```
+
+F2 now steps msedit then wordstar, and in the WordStar mode vedit edits with
+the cursor diamond, the Ctrl-K / Ctrl-Q / Ctrl-O prefixes, blocks, and
+markers. F1 shows that mode's own keys, carried in the same file. The
+[configuration chapter](docs/05-configuration.md) has the binding syntax.
+
 ## Manual
 
 The manual is in `docs/`, in reading order:
