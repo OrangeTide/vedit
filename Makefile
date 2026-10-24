@@ -12,14 +12,18 @@ SRC  = vedit.c
 HDR  = vedit.h
 
 # The version: the release number from version.mk, refined by git when the tree
-# is a checkout. A release checkout describes as the tag; an untagged checkout
-# adds a -dev-g<sha> suffix; a tarball with no git falls back to the bare
+# is a checkout. The release commit is tagged v$(VEDIT_VERSION) and describes as
+# that tag. Between releases version.mk is already a step ahead of the last tag,
+# so there is nothing to count from and the suffix is a plain -dev-g<sha> (with
+# -dirty for uncommitted tracked changes). A tarball with no git keeps the bare
 # number. Matching v$(VEDIT_VERSION) rather than v* keeps a vendored copy from
 # describing itself against a host project's tags.
 include version.mk
 GIT_DESC := $(shell git describe --tags --dirty --match 'v$(VEDIT_VERSION)' 2>/dev/null)
 ifeq ($(GIT_DESC),)
-GIT_SUFFIX := $(shell git describe --always --dirty 2>/dev/null | sed 's/^/-dev-g/')
+GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null)
+GIT_DIRTY := $(shell git diff-index --quiet HEAD -- 2>/dev/null || echo -dirty)
+GIT_SUFFIX := $(if $(GIT_SHA),-dev-g$(GIT_SHA)$(GIT_DIRTY))
 else
 GIT_SUFFIX := $(patsubst v$(VEDIT_VERSION)%,%,$(GIT_DESC))
 endif

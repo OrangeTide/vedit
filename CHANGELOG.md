@@ -1,12 +1,13 @@
 # Changelog
 
 All notable changes to vedit are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
-[semantic versioning](https://semver.org/).
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-The release number lives in `version.mk`. A release build stamps the git
-description onto it, so `vedit --version` on an untagged checkout reads like
-`1.6.0-27-gfce3eef`. Each tagged release also carries full notes in its
+The release number lives in `version.mk` and is bumped on every commit: the
+patch level at least, or the minor level for a big change or one that breaks
+the config file format. A release build stamps the git description onto the
+number, so `vedit --version` on an untagged checkout reads like
+`1.6.1-dev-gfce3eef`. Each tagged release also carries full notes in its
 annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
 
 ## [Unreleased]

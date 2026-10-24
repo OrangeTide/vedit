@@ -6031,10 +6031,11 @@ static uint32_t syn_line(const Syntax *sy, uint32_t state_in, const char *bytes,
 /* The build normally defines VEDIT_VERSION on the command line from
  * version.mk (see the Makefile), stamping the git description onto the release
  * number. This fallback keeps a plain `cc vedit.c`, the tests, and any build
- * without that header compiling with a sensible version. Bump it in step with
- * version.mk. */
+ * without that header compiling with a sensible version. version.mk is the one
+ * authoritative number; a shipped build always overrides this define, so this
+ * may lag it between releases. */
 #ifndef VEDIT_VERSION
-#define VEDIT_VERSION "vedit 1.6.0"
+#define VEDIT_VERSION "vedit 1.6.1"
 #endif
 
 /****************************************************************

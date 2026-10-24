@@ -2,8 +2,8 @@ name: Release
 
 # Pushing a version tag (v1.4.0) builds the release binaries and publishes
 # them on the GitHub release for that tag, created here when it does not
-# exist yet. The tag must match VEDIT_VERSION in vedit.c, so a stale version
-# string fails the run before anything is built.
+# exist yet. The tag must match VEDIT_VERSION in version.mk, so a stale
+# version string fails the run before anything is built.
 
 on:
   push:
@@ -29,10 +29,10 @@ jobs:
         id: version
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          src=$(sed -n 's/^#define VEDIT_VERSION "vedit \(.*\)"$/\1/p' vedit.c)
+          src=$(sed -n 's/^VEDIT_VERSION := \(.*\)$/\1/p' version.mk)
           echo "tag: $tag, source: $src"
           if [ "$tag" != "$src" ]; then
-            echo "the tag does not match VEDIT_VERSION in vedit.c"
+            echo "the tag does not match VEDIT_VERSION in version.mk"
             exit 1
           fi
           echo "version=$tag" >> "$GITHUB_OUTPUT"

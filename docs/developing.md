@@ -165,12 +165,21 @@ The script starts a throwaway X server (Xvfb), runs one xterm per shot,
 drives the editor with xdotool, and grabs the window with ImageMagick's
 `import`. Those four tools must be on PATH.
 
+## Versioning
+
+The version lives in `version.mk` as `VEDIT_VERSION`, and it is the one
+authoritative number. Every commit bumps it: the patch level at least, or
+the minor level (with the patch reset to 0) for a big change or one that
+breaks the config file format. A build stamps the git description onto the
+number, so `vedit --version` on an untagged checkout reads like
+`1.6.1-dev-g1a2b3c4`.
+
 ## Releases
 
 Pushing a tag of the form `v1.4.0` runs `.github/workflows/release.yml`,
 which:
 
-1. checks that the tag matches `VEDIT_VERSION` in `vedit.c` and stops if
+1. checks that the tag matches `VEDIT_VERSION` in `version.mk` and stops if
    not, before anything is built
 2. builds static Linux binaries for x86_64 and aarch64, each packaged with
    the man page and the manual. The x86_64 tarball also gets gvedit,
@@ -184,7 +193,8 @@ which:
 4. publishes the archives and a `SHA256SUMS` file on the GitHub release for
    the tag, creating the release when it does not exist
 
-So a release is: bump `VEDIT_VERSION`, commit, tag, push the tag.
+So a release is: make sure `VEDIT_VERSION` names the release number, commit,
+tag the commit `v$(VEDIT_VERSION)`, and push the tag.
 
 The SDL3 version both actions fetch is the one line in
 `.github/sdl3-version`; CI builds gvedit the same two ways on every
