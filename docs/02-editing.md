@@ -116,8 +116,10 @@ Dragging from the press selects the text in between; a drag above or below
 the pane scrolls it so the selection can reach offscreen lines. The wheel
 scrolls three lines, and the cursor is pulled along when it would leave the
 window. On the scrollbar, the arrows scroll a line, the track pages toward
-the click, and dragging the block scrolls the view. In a split, a click in
-either pane moves the focus there and places the cursor.
+the click, and dragging the block scrolls the view. In a split, or with a
+file shown in the pane under another (chapter 7), a click in either view
+moves the focus there and places the cursor, and the wheel over the one
+without focus scrolls it in place.
 
 A click on the menu bar opens that menu, and clicks work in the menus, the
 pickers (the file browser, the symbol list, the buffer, mark, and jump
@@ -126,8 +128,8 @@ the second, and buttons, check boxes, and calendar days answer the mouse.
 
 In the art view a left click moves the cursor to the cell, a left drag
 marks a rectangle for the block commands, and the wheel scrolls. The right
-and middle buttons are ignored, as is the mouse in the hex and table views,
-in terminal buffers, and in the text pane under the split; only the menu
+and middle buttons are ignored, as is the mouse in the hex and table views
+and in terminal buffers, a terminal in the pane among them; only the menu
 bar answers there.
 
 With the mouse on, the terminal's own text selection usually needs Shift
