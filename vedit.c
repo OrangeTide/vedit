@@ -8379,6 +8379,7 @@ void ed_backspace(Editor *e);
 void ed_find(Editor *e, const char *q);
 void ed_find_dir(Editor *e, const char *q, int dir);
 void ed_find_next(Editor *e);
+void ed_set_wrap(Editor *e, int on);
 
 /* Multi-buffer management (edit.c). The active buffer's per-file state lives
  * in the flat struct editor; these swap it with the saved buffers. */
@@ -19810,6 +19811,17 @@ ed_find_next(Editor *e)
 		set_status(e, "no previous search");
 }
 
+/* Set word wrap on or off. Turning it on clears the horizontal scroll, since
+ * a wrapped view never scrolls sideways. Every path that changes wrap goes
+ * through here so the side effect stays uniform. */
+void
+ed_set_wrap(Editor *e, int on)
+{
+	e->wrap = on ? 1 : 0;
+	if (e->wrap)
+		e->left = 0;
+}
+
 /* Direction-aware incremental scan for the regex q. Forward finds the first
  * match at or after (oy, ox), wrapping once back to the origin; backward finds
  * the nearest match before the origin, wrapping once to the end of the buffer.
@@ -26168,7 +26180,7 @@ kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
 		set_status(e, "%s", e->overtype ? "overtype" : "insert");
 		return REQ_CONTINUE;
 	case ACT_WRAP_TOGGLE:
-		e->wrap = !e->wrap;
+		ed_set_wrap(e, !e->wrap);
 		set_status(e, "word wrap %s", e->wrap ? "on" : "off");
 		return REQ_CONTINUE;
 	case ACT_MARKER_SET:
@@ -28938,9 +28950,7 @@ run_menu_act(Editor *e, Menuact act)
 		    e->show_lineno ? "on" : "off");
 		break;
 	case MA_WRAP:
-		e->wrap = !e->wrap;
-		if (e->wrap)
-			e->left = 0;
+		ed_set_wrap(e, !e->wrap);
 		set_status(e, "word wrap %s",
 		    e->wrap ? "on" : "off");
 		break;
@@ -45192,11 +45202,11 @@ ex_set(Editor *e, const char *arg)
 	    strcmp(arg, "invnumber") == 0)
 		e->show_lineno = !e->show_lineno;
 	else if (strcmp(arg, "wrap") == 0)
-		e->wrap = 1;
+		ed_set_wrap(e, 1);
 	else if (strcmp(arg, "nowrap") == 0)
-		e->wrap = 0;
+		ed_set_wrap(e, 0);
 	else if (strcmp(arg, "wrap!") == 0 || strcmp(arg, "invwrap") == 0)
-		e->wrap = !e->wrap;
+		ed_set_wrap(e, !e->wrap);
 	else if (strcmp(arg, "list") == 0 || strcmp(arg, "nolist") == 0 ||
 	    strcmp(arg, "list!") == 0 || strcmp(arg, "invlist") == 0) {
 		if (arg[0] == 'n')
