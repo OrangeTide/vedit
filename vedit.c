@@ -8380,6 +8380,9 @@ void ed_find(Editor *e, const char *q);
 void ed_find_dir(Editor *e, const char *q, int dir);
 void ed_find_next(Editor *e);
 void ed_set_wrap(Editor *e, int on);
+void ed_copy(Editor *e);
+void ed_cut(Editor *e);
+void ed_paste(Editor *e);
 
 /* Multi-buffer management (edit.c). The active buffer's per-file state lives
  * in the flat struct editor; these swap it with the saved buffers. */
@@ -17919,6 +17922,81 @@ osc_copy_file(Editor *e)
 }
 
 /* Carry out one command, returning what the main loop must do next. */
+/* Copy the selection, or the current line and its newline when nothing is
+ * selected, into the clipboard. Read-only, so no undo group. */
+void
+ed_copy(Editor *e)
+{
+	size_t rl = 0;
+	char *r;
+
+	if (e->sel_active) {
+		r = current_selection_text(e, &rl);
+		if (r) {
+			clip_set(e, r, rl);
+			set_status(e, "copied %zu bytes", rl);
+		}
+		return;
+	}
+	{
+		size_t ll = 0;
+		const char *s = text_line(e->t, e->cy, &ll);
+
+		r = malloc(ll + 1);	/* the line plus its newline */
+		if (r) {
+			if (ll && s)
+				memcpy(r, s, ll);
+			r[ll] = '\n';
+			clip_set(e, r, ll + 1);
+			set_status(e, "copied line");
+		}
+	}
+}
+
+/* Copy the selection to the clipboard and delete it, in one undo step. Does
+ * nothing without a selection. */
+void
+ed_cut(Editor *e)
+{
+	size_t y1, x1, y2, x2, rl = 0;
+	char *r;
+
+	if (!e->sel_active) {
+		set_status(e, "select text first (Shift+arrows)");
+		return;
+	}
+	text_undo_group_begin(e->t);
+	r = current_selection_text(e, &rl);
+	if (r)
+		clip_set(e, r, rl);
+	sel_bounds(e, &y1, &x1, &y2, &x2);
+	delete_region(e, y1, x1, y2, x2);
+	e->sel_active = 0;
+	text_undo_group_end(e->t);
+	set_status(e, "cut %zu bytes", rl);
+}
+
+/* Insert the clipboard at the cursor, replacing the selection if there is one,
+ * in one undo step. */
+void
+ed_paste(Editor *e)
+{
+	if (!e->clip || e->clip_len == 0) {
+		set_status(e, "clipboard is empty");
+		return;
+	}
+	text_undo_group_begin(e->t);
+	if (e->sel_active) {		/* paste replaces the selection */
+		size_t y1, x1, y2, x2;
+
+		sel_bounds(e, &y1, &x1, &y2, &x2);
+		delete_region(e, y1, x1, y2, x2);
+		e->sel_active = 0;
+	}
+	insert_clip(e);
+	text_undo_group_end(e->t);
+}
+
 static Req
 ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 {
@@ -17992,69 +18070,14 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 			clamp_col(e);
 		}
 		break;
-	case CMD_COPY: {
-		size_t rl = 0;
-		char *r;
-
-		if (e->sel_active) {
-			r = current_selection_text(e, &rl);
-			if (r) {
-				clip_set(e, r, rl);
-				set_status(e,
-				    "copied %zu bytes", rl);
-			}
-		} else {
-			size_t ll = 0;
-			const char *s = text_line(e->t, e->cy, &ll);
-
-			r = malloc(ll + 1);	/* the line plus its newline */
-			if (r) {
-				if (ll && s)
-					memcpy(r, s, ll);
-				r[ll] = '\n';
-				clip_set(e, r, ll + 1);
-				set_status(e,
-				    "copied line");
-			}
-		}
+	case CMD_COPY:
+		ed_copy(e);
 		break;
-	}
-	case CMD_CUT: {
-		size_t y1, x1, y2, x2, rl = 0;
-		char *r;
-
-		if (!e->sel_active) {
-			set_status(e,
-			    "select text first (Shift+arrows)");
-			break;
-		}
-		text_undo_group_begin(e->t);
-		grouped = 1;
-		r = current_selection_text(e, &rl);
-		if (r)
-			clip_set(e, r, rl);
-		sel_bounds(e, &y1, &x1, &y2, &x2);
-		delete_region(e, y1, x1, y2, x2);
-		e->sel_active = 0;
-		set_status(e, "cut %zu bytes", rl);
+	case CMD_CUT:
+		ed_cut(e);
 		break;
-	}
 	case CMD_PASTE:
-		if (!e->clip || e->clip_len == 0) {
-			set_status(e,
-			    "clipboard is empty");
-			break;
-		}
-		text_undo_group_begin(e->t);
-		grouped = 1;
-		if (e->sel_active) {		/* paste replaces the selection */
-			size_t y1, x1, y2, x2;
-
-			sel_bounds(e, &y1, &x1, &y2, &x2);
-			delete_region(e, y1, x1, y2, x2);
-			e->sel_active = 0;
-		}
-		insert_clip(e);
+		ed_paste(e);
 		break;
 	case CMD_FIND:
 		return REQ_FIND;
