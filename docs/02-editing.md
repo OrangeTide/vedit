@@ -123,9 +123,12 @@ A click on the menu bar opens that menu, and clicks work in the menus, the
 pickers (the file browser, the symbol list, the buffer, mark, and jump
 lists), and the dialogs: a list row selects on the first click and opens on
 the second, and buttons, check boxes, and calendar days answer the mouse.
-The right and middle buttons are ignored, as is the mouse in the hex,
-table, and art views, in terminal buffers, and in the text pane under the
-split; only the menu bar answers there.
+
+In the art view a left click moves the cursor to the cell, a left drag
+marks a rectangle for the block commands, and the wheel scrolls. The right
+and middle buttons are ignored, as is the mouse in the hex and table views,
+in terminal buffers, and in the text pane under the split; only the menu
+bar answers there.
 
 With the mouse on, the terminal's own text selection usually needs Shift
 held. View > Mouse turns reporting off for the session. `ui.mouse` in the

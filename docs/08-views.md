@@ -62,6 +62,7 @@ The keys are draw mode's, applied to cells:
 | Backspace, Delete | erase the cell to the left, or under the cursor |
 | Shift+arrows, Ctrl-C, Ctrl-X, Ctrl-V, Ctrl-B | rectangles, as in draw mode, but Ctrl-B draws the box with line-drawing glyphs in the pen. Cells keep their colors |
 | Ctrl-Z, Ctrl-Y | undo, redo |
+| mouse | a click moves the cursor, a left drag marks a rectangle, the wheel scrolls |
 | Ctrl-S, Ctrl-Q, F1, F8 | as usual |
 
 The **pen** is the color new glyphs get. A swatch of it, `Ab`, sits on the
