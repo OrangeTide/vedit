@@ -111,13 +111,21 @@ end goes to the last line.
 
 ## The mouse
 
-A left click in the text puts the cursor there. The wheel scrolls three
-lines, and the cursor is pulled along when it would leave the window. A
-click on the menu bar opens that menu, and clicks work in the menus and in
-the Yes/No/Cancel dialogs. A click drops the selection. Dragging and the
-right and middle buttons are ignored, and so is the mouse in the hex,
-table, and art views, in terminal buffers, and in the pane under the
-text; only the menu bar answers there.
+A left click in the text puts the cursor there and drops any selection.
+Dragging from the press selects the text in between; a drag above or below
+the pane scrolls it so the selection can reach offscreen lines. The wheel
+scrolls three lines, and the cursor is pulled along when it would leave the
+window. On the scrollbar, the arrows scroll a line, the track pages toward
+the click, and dragging the block scrolls the view. In a split, a click in
+either pane moves the focus there and places the cursor.
+
+A click on the menu bar opens that menu, and clicks work in the menus, the
+pickers (the file browser, the symbol list, the buffer, mark, and jump
+lists), and the dialogs: a list row selects on the first click and opens on
+the second, and buttons, check boxes, and calendar days answer the mouse.
+The right and middle buttons are ignored, as is the mouse in the hex,
+table, and art views, in terminal buffers, and in the text pane under the
+split; only the menu bar answers there.
 
 With the mouse on, the terminal's own text selection usually needs Shift
 held. View > Mouse turns reporting off for the session. `ui.mouse` in the
