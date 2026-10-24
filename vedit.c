@@ -16368,10 +16368,47 @@ pick_key(Editor *e, const Modal *m, const Event *ev, void *ctx)
 
 	(void)e;
 	(void)m;
-	if (ev->key.type != TKBD_KEY)
-		return 0;		/* ignore mouse and the like */
 	k = &ev->key;
 	n = src->count(src->ctx);
+
+	if (k->type == TKBD_MOUSE) {
+		int press = k->key == TKBD_MOUSE_LEFT &&
+		    !(k->mod & TKBD_MOD_MOTION);
+		int row;
+
+		if (k->key == TKBD_MOUSE_WHEEL_UP) {
+			if (pk->top > 0)
+				pk->top--;
+			return 0;
+		}
+		if (k->key == TKBD_MOUSE_WHEEL_DOWN) {
+			if (pk->top + pk->vis < n)
+				pk->top++;
+			return 0;
+		}
+		if (!press)
+			return 0;
+		if (src->entry_label && k->y == m->y + 1) {
+			pk->focus = 1;		/* click the entry line */
+			return 0;
+		}
+		if (k->y < pk->listy || k->y >= pk->listy + pk->vis ||
+		    k->x <= m->x || k->x >= m->x + m->w - 1)
+			return 0;
+		row = pk->top + (k->y - pk->listy);
+		if (row >= n)
+			return 0;
+		pk->focus = 0;
+		if (row == pk->sel) {		/* a second click activates */
+			act = src->choose(src->ctx, row);
+			goto resolve;
+		}
+		pk->sel = row;			/* first click selects */
+		pick_clamp(pk, n);
+		return 0;
+	}
+	if (k->type != TKBD_KEY)
+		return 0;
 
 	if (k->key == TKBD_KEY_ESC) {
 		pk->result = 0;
@@ -16437,6 +16474,7 @@ pick_key(Editor *e, const Modal *m, const Event *ev, void *ctx)
 		}
 	}
 
+resolve:
 	if (act == PICK_DONE) {
 		pk->result = 1;
 		return 1;

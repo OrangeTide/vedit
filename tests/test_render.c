@@ -2982,6 +2982,34 @@ t_pick_symbol_cancel(Test *t)
 	rmdir(dir);
 }
 
+/* The picker takes the mouse: a click selects a row, and a second click on the
+ * already selected row activates it. The symbol list is alpha/bravo/charlie at
+ * lines 0/3/6; the box centers so bravo's row is screen row 10 (seq y 11). */
+static void
+t_pick_mouse(Test *t)
+{
+	char dir[PATH_MAX], src[PATH_MAX];
+	const char keys[] = "\x14\033[<0;24;11M\033[<0;24;11m"
+	    "\033[<0;24;11M\033[<0;24;11m";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	v = open_syms(&m, &io, dir, sizeof(dir), src, sizeof(src));
+	TAP_ASSERT(t, v != NULL);
+
+	vedit_run(v);
+
+	TAP_CHECKF(t, v->e.cy == 3, "clicked bravo -> line %zu", v->e.cy);
+
+	vedit_free(v);
+	memio_free(&m);
+	g_cfg = NULL;
+	unlink(src);
+	rmdir(dir);
+}
+
 /* The file picker's entry line, reached through the menu: Alt-F opens the File
  * menu, 'o' picks Open, Tab moves focus to the entry field, a typed absolute
  * path is submitted with Enter, and the editor opens that file. Exercises the
@@ -5043,6 +5071,7 @@ const Case tap_cases[] = {
 	{ "vblock_yank_put", t_vblock_yank_put },
 	{ "pick_symbol_choose", t_pick_symbol_choose },
 	{ "pick_symbol_cancel", t_pick_symbol_cancel },
+	{ "pick_mouse", t_pick_mouse },
 	{ "pick_open_entry", t_pick_open_entry },
 	{ "menu_item_enabled", t_menu_item_enabled },
 	{ "menu_checked_toggles", t_menu_checked_toggles },
