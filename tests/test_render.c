@@ -3010,6 +3010,74 @@ t_pick_mouse(Test *t)
 	rmdir(dir);
 }
 
+/* A picker with pl_frame set draws its title as a powerline tab: a left
+ * arrow cap (U+E0B2), the title with the dialog's fg/bg swapped to a filled
+ * bar, and a right arrow cap (U+E0B0). Off under ASCII box drawing or the
+ * plain status style, where the title is a plain centered label. */
+static const char *plt_title(void *c) { (void)c; return "History"; }
+static int plt_count(void *c) { (void)c; return 2; }
+static const char *plt_label(void *c, int i) { (void)c; return i ? "b" : "a"; }
+
+static void
+t_pick_pl_title(Test *t)
+{
+	static const Picksrc s = {
+		.title = plt_title, .count = plt_count, .label = plt_label,
+		.pl_frame = 1,
+	};
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Scrbuf *sb;
+	Cell *row;
+	Modal md = { .x = 0, .y = 0, .w = 40, .h = 10,
+	    .fg = { .type = COLOR_INDEXED, { .index = 0 } },
+	    .bg = { .type = COLOR_INDEXED, { .index = 7 } }, .base = 0 };
+	Picker pk;
+	int i, cap = -1, cap2 = -1;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	v->e.statusline = STATUS_POWERLINE;
+	v->e.d->t->box_mode = VEDIT_BOX_UTF8;
+	memset(&pk, 0, sizeof(pk));
+	pk.src = &s;
+
+	pick_draw(&v->e, &md, &pk);
+	sb = v->e.d->t;
+	row = &sb->cur[0];
+	for (i = 0; i < 40; i++) {
+		if (row[i].codepoint == 0xe0b2)
+			cap = i;
+		else if (row[i].codepoint == 0xe0b0)
+			cap2 = i;
+	}
+	TAP_CHECKF(t, cap >= 0 && cap2 > cap, "caps at %d, %d", cap, cap2);
+	/* left cap in the dialog colours; the fill has them swapped */
+	TAP_CHECK(t, row[cap].fg.index == 0 && row[cap].bg.index == 7);
+	TAP_CHECKF(t, row[cap + 2].codepoint == 'H' &&
+	    row[cap + 2].fg.index == 7 && row[cap + 2].bg.index == 0,
+	    "title U+%04x fg%d bg%d", row[cap + 2].codepoint,
+	    row[cap + 2].fg.index, row[cap + 2].bg.index);
+	TAP_CHECK(t, row[cap2].fg.index == 0 && row[cap2].bg.index == 7);
+
+	/* ASCII box drawing: a plain title, no caps (clear the stale row first,
+	 * since a direct pick_draw does not redraw the box border) */
+	for (i = 0; i < 40; i++)
+		row[i].codepoint = ' ';
+	v->e.d->t->box_mode = VEDIT_BOX_ASCII;
+	pick_draw(&v->e, &md, &pk);
+	for (i = 0, cap = -1; i < 40; i++)
+		if (row[i].codepoint == 0xe0b2 || row[i].codepoint == 0xe0b0)
+			cap = i;
+	TAP_CHECK(t, cap < 0);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* The file picker's entry line, reached through the menu: Alt-F opens the File
  * menu, 'o' picks Open, Tab moves focus to the entry field, a typed absolute
  * path is submitted with Enter, and the editor opens that file. Exercises the
@@ -5161,6 +5229,7 @@ const Case tap_cases[] = {
 	{ "pick_symbol_choose", t_pick_symbol_choose },
 	{ "pick_symbol_cancel", t_pick_symbol_cancel },
 	{ "pick_mouse", t_pick_mouse },
+	{ "pick_pl_title", t_pick_pl_title },
 	{ "pick_open_entry", t_pick_open_entry },
 	{ "menu_item_enabled", t_menu_item_enabled },
 	{ "menu_checked_toggles", t_menu_checked_toggles },

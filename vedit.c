@@ -16224,6 +16224,9 @@ struct picksrc {
 	int		 (*key)(void *ctx, int i, uint32_t ch);
 	/* Optional hint for the bottom border, such as the keys. */
 	const char	*(*footer)(void *ctx);
+	/* Draw the title as a powerline tab (arrow end-caps) when the terminal
+	 * has the glyphs and the powerline status style is on. */
+	int		 pl_frame;
 };
 
 typedef struct picker {
@@ -16355,13 +16358,26 @@ pick_draw(Editor *e, const Modal *m, void *ctx)
 	/* title centered in the top border */
 	if (title && title[0]) {
 		int tw = pick_fit(buf, sizeof(buf), title, m->w - 4);
+		int pl = src->pl_frame && e->statusline == STATUS_POWERLINE &&
+		    d->t->box_mode == VEDIT_BOX_UTF8 && tw + 4 <= m->w - 2;
+		int span = pl ? tw + 4 : tw + 2;
+		int tx = m->x + (m->w - span) / 2;
 
-		scr_cell(d, m->y, m->x + (m->w - tw - 2) / 2, ' ',
-		    m->fg, m->bg, m->base);
-		scr_text(d, m->y, m->x + (m->w - tw - 2) / 2 + 1, buf,
-		    m->fg, m->bg, m->base);
-		scr_cell(d, m->y, m->x + (m->w - tw - 2) / 2 + 1 + tw, ' ',
-		    m->fg, m->bg, m->base);
+		if (pl) {
+			/* a powerline tab: the title filled (fg/bg swapped) with a
+			 * triangular arrow cap each side, the same glyphs as the
+			 * status bar, carrying the fill colour into the border */
+			scr_cell(d, m->y, tx, 0xe0b2, m->fg, m->bg, m->base);
+			scr_cell(d, m->y, tx + 1, ' ', m->bg, m->fg, m->base);
+			scr_text(d, m->y, tx + 2, buf, m->bg, m->fg, m->base);
+			scr_cell(d, m->y, tx + 2 + tw, ' ', m->bg, m->fg, m->base);
+			scr_cell(d, m->y, tx + 3 + tw, 0xe0b0, m->fg, m->bg,
+			    m->base);
+		} else {
+			scr_cell(d, m->y, tx, ' ', m->fg, m->bg, m->base);
+			scr_text(d, m->y, tx + 1, buf, m->fg, m->bg, m->base);
+			scr_cell(d, m->y, tx + 1 + tw, ' ', m->fg, m->bg, m->base);
+		}
 	}
 
 	row = m->y + 1;
@@ -28481,6 +28497,7 @@ vcs_history(Editor *e)
 		.title = vcslog_title, .count = vcslog_count,
 		.label = vcslog_label, .choose = vcslog_choose,
 		.key = vcslog_key, .footer = vcslog_footer,
+		.pl_frame = 1,
 	};
 	Vcslog l;
 	struct fmtbuf b;
