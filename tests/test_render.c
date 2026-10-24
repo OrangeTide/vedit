@@ -203,13 +203,13 @@ t_mouse_click_wheel(Test *t)
 	v->e.mouse = 1;
 	scr_mouse(v->e.d, 1);
 	vedit_run(v);
-	TAP_CHECK(t, strstr(m.out, "\033[?1000h\033[?1006h") != NULL);
+	TAP_CHECK(t, strstr(m.out, "\033[?1002h\033[?1006h") != NULL);
 	/* the click put the cursor on line 2 column 4; two wheel steps then
 	 * scrolled the view to line 6 and pulled the cursor to that edge */
 	TAP_CHECKF(t, v->e.top == 6 && v->e.cy == 6 && v->e.cx == 4,
 	    "top=%zu cy=%zu cx=%zu", v->e.top, v->e.cy, v->e.cx);
 	vedit_free(v);
-	TAP_CHECK(t, strstr(m.out, "\033[?1006l\033[?1000l") != NULL);	/* off at teardown */
+	TAP_CHECK(t, strstr(m.out, "\033[?1006l\033[?1002l") != NULL);	/* off at teardown */
 	memio_free(&m);
 
 	/* ui.mouse = off: no request, and the click is ignored */
@@ -222,7 +222,7 @@ t_mouse_click_wheel(Test *t)
 	vedit_set_config(v, cfg);
 	fill_lines(v->e.t, L, 30);
 	vedit_run(v);
-	TAP_CHECK(t, strstr(m.out, "\033[?1000h") == NULL);
+	TAP_CHECK(t, strstr(m.out, "\033[?1002h") == NULL);
 	TAP_CHECK(t, v->e.cy == 0 && v->e.cx == 0);
 	vedit_free(v);
 	memio_free(&m);
@@ -417,6 +417,125 @@ t_mouse_click_wrap(Test *t)
 	vedit_run(v);
 	TAP_CHECKF(t, v->e.cy == 1 && v->e.cx == 5, "below click cy=%zu cx=%zu",
 	    v->e.cy, v->e.cx);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+static const char *const MOUSE_LINES[] = {
+	"line 0", "line 1", "line 2 is longer", "line 3", "line 4",
+	"line 5", "line 6", "line 7", "line 8", "line 9", "line 10",
+	"line 11", "line 12", "line 13", "line 14", "line 15",
+	"line 16", "line 17", "line 18", "line 19", "line 20",
+	"line 21", "line 22", "line 23", "line 24", "line 25",
+	"line 26", "line 27", "line 28", "line 29"
+};
+
+/* A left press then a drag builds a selection anchored at the press, and a
+ * drag below the pane scrolls it to reach offscreen text. A press with no
+ * drag is a plain click and leaves no selection. (24x80, no gutter: the text
+ * area is screen rows 2..21, columns from 1.) */
+static void
+t_mouse_drag(Test *t)
+{
+	/* press at line 2 col 4, drag to line 5 col 3, release */
+	const char drag[] = "\033[<0;6;5M\033[<32;5;8M\033[<0;5;8m";
+	/* press and release in place: a click, no selection */
+	const char click[] = "\033[<0;6;5M\033[<0;6;5m";
+	/* press at line 2, then drag past the bottom text row three times */
+	const char below[] = "\033[<0;6;5M\033[<32;9;24M\033[<32;9;24M"
+	    "\033[<32;9;24M";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, drag, sizeof(drag) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, MOUSE_LINES, 30);
+	v->e.mouse = 1;
+	scr_mouse(v->e.d, 1);
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.sel_active && v->e.ay == 2 && v->e.ax == 4 &&
+	    v->e.cy == 5 && v->e.cx == 3 && v->e.mouse_drag == MDRAG_NONE,
+	    "sel=%d ay=%zu ax=%zu cy=%zu cx=%zu drag=%d", v->e.sel_active,
+	    v->e.ay, v->e.ax, v->e.cy, v->e.cx, v->e.mouse_drag);
+	vedit_free(v);
+	memio_free(&m);
+
+	memio_init(&m, click, sizeof(click) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, MOUSE_LINES, 30);
+	v->e.mouse = 1;
+	scr_mouse(v->e.d, 1);
+	vedit_run(v);
+	TAP_CHECKF(t, !v->e.sel_active && v->e.cy == 2 && v->e.cx == 4,
+	    "click sel=%d cy=%zu cx=%zu", v->e.sel_active, v->e.cy, v->e.cx);
+	vedit_free(v);
+	memio_free(&m);
+
+	memio_init(&m, below, sizeof(below) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, MOUSE_LINES, 30);
+	v->e.mouse = 1;
+	scr_mouse(v->e.d, 1);
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.sel_active && v->e.ay == 2 && v->e.top == 3,
+	    "below sel=%d ay=%zu top=%zu", v->e.sel_active, v->e.ay, v->e.top);
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* The vertical scrollbar (column 79, rows 2..21 at 24x80) steps on its arrows,
+ * pages on its track, and scrolls absolutely while its thumb is dragged. */
+static void
+t_mouse_scrollbar(Test *t)
+{
+	const char downarrow[] = "\033[<0;80;22M";		/* bottom arrow */
+	const char trackdown[] = "\033[<0;80;11M";		/* track below thumb */
+	const char thumbdrag[] = "\033[<0;80;4M\033[<32;80;22M\033[<0;80;22m";
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, downarrow, sizeof(downarrow) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, MOUSE_LINES, 30);
+	v->e.mouse = 1;
+	scr_mouse(v->e.d, 1);
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.top == 1, "down arrow top=%zu", v->e.top);
+	vedit_free(v);
+	memio_free(&m);
+
+	memio_init(&m, trackdown, sizeof(trackdown) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, MOUSE_LINES, 30);
+	v->e.mouse = 1;
+	scr_mouse(v->e.d, 1);
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.top == 18, "track page top=%zu", v->e.top);
+	vedit_free(v);
+	memio_free(&m);
+
+	memio_init(&m, thumbdrag, sizeof(thumbdrag) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	fill_lines(v->e.t, MOUSE_LINES, 30);
+	v->e.mouse = 1;
+	scr_mouse(v->e.d, 1);
+	vedit_run(v);
+	TAP_CHECKF(t, v->e.top == 10 && v->e.mouse_drag == MDRAG_NONE,
+	    "thumb drag top=%zu drag=%d", v->e.top, v->e.mouse_drag);
 	vedit_free(v);
 	memio_free(&m);
 }
@@ -4879,6 +4998,8 @@ const Case tap_cases[] = {
 #ifndef VEDIT_NO_MOUSE
 	{ "mouse_click_wheel", t_mouse_click_wheel },
 	{ "mouse_click_wrap", t_mouse_click_wrap },
+	{ "mouse_drag", t_mouse_drag },
+	{ "mouse_scrollbar", t_mouse_scrollbar },
 #endif
 	{ "insert_date_file", t_insert_date_file },
 	{ "insert_dateformat", t_insert_dateformat },

@@ -6199,7 +6199,7 @@ typedef struct draw_term {
 	int		cursor_vis;
 
 	int		begun;
-	int		mouse;		/* report the mouse (?1000 + ?1006) while begun */
+	int		mouse;		/* report the mouse (?1002 + ?1006) while begun */
 	int		want_resize;	/* a resize is pending for scr_wait */
 	int		box_mode;	/* enum vedit_box_mode for the glyphs */
 	int		colors;		/* 256 or 16 (downgrade palette) */
@@ -6968,7 +6968,7 @@ scr_begin(Screen *d)
 	scr_str(t, "\033[?1049h");	/* alt screen, if supported */
 	scr_str(t, "\033[?2004h");	/* bracketed paste */
 	if (t->mouse)
-		scr_str(t, "\033[?1000h\033[?1006h");	/* mouse, SGR reports */
+		scr_str(t, "\033[?1002h\033[?1006h");	/* mouse+drag, SGR reports */
 	scr_str(t, "\033[2J");		/* clear */
 	scr_str(t, "\033[H");
 	for (i = 0; i < t->rows; i++)
@@ -6991,7 +6991,7 @@ scr_end(Screen *d)
 	scr_str(t, "\033[?2004l");
 	scr_str(t, "\033[?25h");
 	if (t->mouse)
-		scr_str(t, "\033[?1006l\033[?1000l");
+		scr_str(t, "\033[?1006l\033[?1002l");
 	/* Drop the cursor to the bottom and scroll up one line, so on a client
 	 * without the alternate screen the shell prompt lands on a fresh line
 	 * below the editor instead of in the middle of the chrome. A client that
@@ -7019,7 +7019,7 @@ scr_mouse(Screen *d, int on)
 	t->mouse = on;
 	if (!t->begun)
 		return;
-	scr_str(t, on ? "\033[?1000h\033[?1006h" : "\033[?1006l\033[?1000l");
+	scr_str(t, on ? "\033[?1002h\033[?1006h" : "\033[?1006l\033[?1002l");
 	scr_flush(t);
 }
 
@@ -7989,6 +7989,15 @@ typedef struct pview {
 
 enum { SPLIT_NONE, SPLIT_H, SPLIT_V };
 
+/* What the held left mouse button is currently dragging. */
+enum {
+	MDRAG_NONE,	/* button up */
+	MDRAG_PEND,	/* pressed in the text, no motion yet (a plain click) */
+	MDRAG_TEXT,	/* extending a text selection */
+	MDRAG_VBAR,	/* dragging a vertical scrollbar thumb */
+	MDRAG_HBAR	/* dragging the horizontal scrollbar thumb */
+};
+
 /* One saved location on the tag stack: where a tag jump started, so a pop can
  * return there. Only named buffers are recorded (a pop reopens by path). */
 typedef struct tagloc {
@@ -8100,6 +8109,10 @@ typedef struct editor {
 	int		wrap;		/* soft-wrap long lines to the window width */
 	int		show_tabs;	/* draw a guide glyph at each hard tab */
 	int		mouse;		/* act on mouse reports (and ask for them) */
+	int		mouse_drag;	/* MDRAG_*: what the held button drags */
+	int		msb_r0;		/* dragged scrollbar: first track cell (row/col) */
+	int		msb_span;	/* dragged scrollbar: cell count incl. arrows */
+	int		msb_other;	/* dragged scrollbar controls the other split pane */
 	int		auto_indent;	/* a new line copies the previous indent */
 	int		expand_tabs;	/* Tab and auto-indent use spaces (per buffer) */
 	int		shiftwidth;	/* >> / << shift size in columns; 0 = a tab stop */
@@ -30117,10 +30130,26 @@ mouse_scroll(Editor *e, long delta, int text_h)
 		vi_clamp(e);
 }
 
-/* Put the cursor on the text under screen row `row` (0 = the first text
- * row) and column offset xoff into the text area, honoring soft wrap. */
+/* Scroll the view so `top` is the first visible line, keeping the cursor
+ * inside it at the same display column (an absolute version of mouse_scroll
+ * used by the scrollbar). */
 static void
-mouse_click(Editor *e, int row, int xoff, int text_w)
+mouse_scroll_to(Editor *e, size_t top, int text_h)
+{
+	size_t n = text_lines(e->t);
+
+	if (n == 0)
+		return;
+	if (top >= n)
+		top = n - 1;
+	mouse_scroll(e, (long)top - (long)e->top, text_h);
+}
+
+/* Put the cursor on the text under screen row `row` (0 = the first text
+ * row) and column offset xoff into the text area, honoring soft wrap. Unlike
+ * mouse_click it leaves the selection untouched, so a drag can extend it. */
+static void
+mouse_place(Editor *e, int row, int xoff, int text_w)
 {
 	size_t n = text_lines(e->t), idx = e->top, llen = 0;
 	const char *s;
@@ -30171,23 +30200,314 @@ mouse_click(Editor *e, int row, int xoff, int text_w)
 	e->cy = idx;
 	e->cx = vi_col_to_byte(e, idx, col);
 placed:
-	e->sel_active = 0;
 	e->vi_vert_run = 0;
 	if (e->mode != MODE_MODELESS)
 		vi_clamp(e);
 }
 
+/* Extend the drag selection to the pointer at screen (x,y). The first motion
+ * after a press promotes the pending click to a live selection, anchored where
+ * the press landed. Dragging above or below the focused pane scrolls it one
+ * line so the selection can reach offscreen text; drift sideways or into other
+ * chrome is clamped back into the pane. */
+static void
+mouse_drag_extend(Editor *e, int x, int y)
+{
+	int text_h = text_height(e), gutter = gutter_width(e);
+	int row0 = view_row0(e), col0 = view_col0(e) + gutter;
+	int text_w = text_width(e) - gutter, row;
+
+	if (text_w < 1)
+		text_w = 1;
+	if (e->mouse_drag == MDRAG_PEND) {
+		e->sel_active = 1;
+		e->sel_block = 0;
+		if (e->mode != MODE_MODELESS)
+			e->vi_visual = 'v';
+		e->mouse_drag = MDRAG_TEXT;
+	}
+	if (y < row0) {
+		mouse_scroll(e, -1, text_h);
+		row = 0;
+	} else if (y >= row0 + text_h) {
+		mouse_scroll(e, 1, text_h);
+		row = text_h - 1;
+	} else {
+		row = y - row0;
+	}
+	if (row < 0)
+		row = 0;
+	mouse_place(e, row, x - col0, text_w);
+	e->sel_active = 1;
+}
+
+/* Scroll horizontally so column `left` is first, keeping the cursor in view at
+ * its row (the horizontal scrollbar reflects only the current line). */
+static void
+mouse_hscroll_to(Editor *e, int left, int text_w)
+{
+	int col;
+
+	if (left < 0)
+		left = 0;
+	e->left = (size_t)left;
+	col = cursor_dispcol(e);
+	if (col < left)
+		e->cx = vi_col_to_byte(e, e->cy, left);
+	else if (text_w > 0 && col >= left + text_w)
+		e->cx = vi_col_to_byte(e, e->cy, left + text_w - 1);
+	if (e->mode != MODE_MODELESS)
+		vi_clamp(e);
+}
+
+/* If (x,y) lands on a scrollbar, return 1 and describe its track: *orient 0 for
+ * a vertical bar, 1 for the horizontal one; *r0 the first track cell (row for
+ * vertical, column for horizontal); *span the cell count including the two
+ * arrows; *other set when a vertical bar drives the non-focused split pane.
+ * Mirrors the draw layout in ui_frame and split_chrome. */
+static int
+scrollbar_hit(Editor *e, int x, int y, int *orient, int *r0, int *span,
+    int *other)
+{
+	int cr = chrome_right(e), sb = e->cols - cr;
+
+	*other = 0;
+	if (split_shown(e)) {
+		Rect r0r, r1r;
+
+		split_rect(e, 0, &r0r);
+		split_rect(e, 1, &r1r);
+		if (e->split == SPLIT_V) {
+			int dc = r0r.col0 + r0r.cols;	/* pane 0 bar / divider */
+
+			if (x == dc && y >= r0r.row0 &&
+			    y < r0r.row0 + r0r.rows && r0r.rows >= 3) {
+				*orient = 0; *r0 = r0r.row0; *span = r0r.rows;
+				*other = e->split_focus != 0;
+				return 1;
+			}
+			if (cr > 0 && x == sb && y >= r1r.row0 &&
+			    y < r1r.row0 + r1r.rows && r1r.rows >= 3) {
+				*orient = 0; *r0 = r1r.row0; *span = r1r.rows;
+				*other = e->split_focus != 1;
+				return 1;
+			}
+		} else if (cr > 0 && x == sb) {
+			if (y >= r0r.row0 && y < r0r.row0 + r0r.rows &&
+			    r0r.rows >= 3) {
+				*orient = 0; *r0 = r0r.row0; *span = r0r.rows;
+				*other = e->split_focus != 0;
+				return 1;
+			}
+			if (y >= r1r.row0 && y < r1r.row0 + r1r.rows &&
+			    r1r.rows >= 3) {
+				*orient = 0; *r0 = r1r.row0; *span = r1r.rows;
+				*other = e->split_focus != 1;
+				return 1;
+			}
+		}
+	} else if (cr > 0 && x == sb) {
+		int th = text_height(e);
+
+		if (y >= CHROME_TOP && y < CHROME_TOP + th && th >= 3) {
+			*orient = 0; *r0 = CHROME_TOP; *span = th;
+			return 1;
+		}
+	}
+	/* the horizontal bar sits in the bottom border row in every layout */
+	if (y == e->rows - CHROME_BOTTOM && e->cols >= 6) {
+		int hspan = frame_cols(e);
+
+		if (x >= CHROME_LEFT && x < CHROME_LEFT + hspan) {
+			*orient = 1; *r0 = CHROME_LEFT; *span = hspan;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* Line count and current top of the view a vertical bar controls. */
+static void
+sbar_view_v(Editor *e, int other, size_t *nlines, size_t *top)
+{
+	if (other) {
+		int o = !e->split_focus;
+		const Text *t = e->pv[o].buf >= 0 && e->pv[o].buf < e->nbuf ?
+		    buf_text_at(e, e->pv[o].buf) : NULL;
+
+		*nlines = t ? text_lines(t) : 0;
+		*top = e->pv[o].top;
+	} else {
+		*nlines = text_lines(e->t);
+		*top = e->top;
+	}
+}
+
+/* Invert thumb_index: the scroll offset for interior track cell i. */
+static size_t
+sbar_off_from_index(int i, size_t max_off, int span)
+{
+	int inner = span - 2;
+
+	if (inner <= 1 || max_off == 0)
+		return 0;
+	if (i < 1)
+		i = 1;
+	if (i > span - 2)
+		i = span - 2;
+	return (size_t)(i - 1) * max_off / (size_t)(inner - 1);
+}
+
+/* Scroll the vertical bar's view by delta lines (focused or the other pane). */
+static void
+sbar_scroll_v(Editor *e, int other, long delta)
+{
+	if (other)
+		split_scroll_other(e, delta);
+	else
+		mouse_scroll(e, delta, text_height(e));
+}
+
+/* Move the vertical bar's view so line `top` is first. */
+static void
+sbar_goto_v(Editor *e, int other, size_t top)
+{
+	if (other)
+		split_scroll_other(e, (long)top - (long)e->pv[!e->split_focus].top);
+	else
+		mouse_scroll_to(e, top, text_height(e));
+}
+
+/* Continue a scrollbar thumb drag to the pointer at (x,y). */
+static void
+mouse_sbar_drag(Editor *e, int x, int y)
+{
+	int span = e->msb_span, other = e->msb_other, i;
+	size_t nlines, top, max_off;
+
+	if (span < 3)
+		return;
+	if (e->mouse_drag == MDRAG_VBAR) {
+		sbar_view_v(e, other, &nlines, &top);
+		max_off = nlines > (size_t)span ? nlines - (size_t)span : 0;
+		i = y - e->msb_r0;
+		sbar_goto_v(e, other, sbar_off_from_index(i, max_off, span));
+	} else {
+		int tw = text_width(e), twc = tw - gutter_width(e);
+		size_t llen;
+		const char *s = text_line(e->t, e->cy, &llen);
+		int curw = s ? (int)disp_cols(s, llen) : 0;
+		size_t max_left = curw > tw ? (size_t)(curw - tw) : 0;
+
+		i = x - e->msb_r0;
+		mouse_hscroll_to(e, (int)sbar_off_from_index(i, max_left, span), twc);
+	}
+}
+
+/* Handle a fresh press or wheel on a scrollbar: the arrows step one line, the
+ * track pages toward the click, and grabbing the thumb starts a drag. Returns
+ * 1 when the event fell on a bar and was consumed. */
+static int
+mouse_sbar(Editor *e, const struct tkbd_seq *m)
+{
+	int orient, r0, span, other, i, page;
+	size_t nlines, top, max_off;
+
+	if (!scrollbar_hit(e, m->x, m->y, &orient, &r0, &span, &other))
+		return 0;
+	if (orient == 0) {
+		sbar_view_v(e, other, &nlines, &top);
+		max_off = nlines > (size_t)span ? nlines - (size_t)span : 0;
+		page = span - 2 > 1 ? span - 2 : 1;
+		if (m->key == TKBD_MOUSE_WHEEL_UP)
+			sbar_scroll_v(e, other, -3);
+		else if (m->key == TKBD_MOUSE_WHEEL_DOWN)
+			sbar_scroll_v(e, other, 3);
+		else if ((i = m->y - r0) <= 0)
+			sbar_scroll_v(e, other, -1);
+		else if (i >= span - 1)
+			sbar_scroll_v(e, other, 1);
+		else {
+			int th = thumb_index(top, max_off, span);
+
+			if (i < th)
+				sbar_scroll_v(e, other, -page);
+			else if (i > th)
+				sbar_scroll_v(e, other, page);
+			else {
+				e->mouse_drag = MDRAG_VBAR;
+				e->msb_r0 = r0;
+				e->msb_span = span;
+				e->msb_other = other;
+			}
+		}
+		return 1;
+	}
+	/* horizontal bar: the focused view's e->left */
+	{
+		int tw = text_width(e), twc = tw - gutter_width(e);
+		size_t llen;
+		const char *s = text_line(e->t, e->cy, &llen);
+		int curw = s ? (int)disp_cols(s, llen) : 0;
+
+		max_off = curw > tw ? (size_t)(curw - tw) : 0;
+		page = twc > 1 ? twc : 1;
+		if (m->key == TKBD_MOUSE_WHEEL_UP)
+			mouse_hscroll_to(e, (int)e->left - 3, twc);
+		else if (m->key == TKBD_MOUSE_WHEEL_DOWN)
+			mouse_hscroll_to(e, (int)e->left + 3, twc);
+		else if ((i = m->x - r0) <= 0)
+			mouse_hscroll_to(e, (int)e->left - 1, twc);
+		else if (i >= span - 1)
+			mouse_hscroll_to(e, (int)e->left + 1, twc);
+		else {
+			int th = thumb_index(e->left, max_off, span);
+
+			if (i < th)
+				mouse_hscroll_to(e, (int)e->left - page, twc);
+			else if (i > th)
+				mouse_hscroll_to(e, (int)e->left + page, twc);
+			else {
+				e->mouse_drag = MDRAG_HBAR;
+				e->msb_r0 = r0;
+				e->msb_span = span;
+				e->msb_other = 0;
+			}
+		}
+	}
+	return 1;
+}
+
 /* Act on a mouse report. A click on the menu bar opens that menu and returns
- * the action chosen there; in the text area a left click places the cursor
- * and the wheel scrolls three lines. Terminal buffers, the pane, and the
- * hex, table and art views take nothing from the mouse yet. */
+ * the action chosen there; in the text area a left click places the cursor,
+ * a drag extends a selection, and the wheel scrolls three lines. Terminal
+ * buffers, the pane, and the hex, table and art views take nothing yet. */
 static Menuact
 ed_mouse_event(Editor *e, const struct tkbd_seq *m)
 {
-	int text_h = text_height(e), gutter = gutter_width(e);
-	int row0, col0, text_w = text_width(e) - gutter;
+	int text_h, gutter, row0, col0, text_w;
 	int press = m->key == TKBD_MOUSE_LEFT && !(m->mod & TKBD_MOD_MOTION);
+	int motion = m->key == TKBD_MOUSE_LEFT && (m->mod & TKBD_MOD_MOTION);
 
+	/* The button came up: finish whatever was dragging. A press that never
+	 * moved was a plain click, so it leaves no selection behind. */
+	if (m->key == TKBD_MOUSE_RELEASE) {
+		if (e->mouse_drag == MDRAG_PEND)
+			e->sel_active = 0;
+		e->mouse_drag = MDRAG_NONE;
+		return MA_NONE;
+	}
+	/* A drag already in progress owns the event wherever the pointer went. */
+	if (motion) {
+		if (e->mouse_drag == MDRAG_VBAR || e->mouse_drag == MDRAG_HBAR)
+			mouse_sbar_drag(e, m->x, m->y);
+		else if (e->mouse_drag == MDRAG_TEXT || e->mouse_drag == MDRAG_PEND)
+			mouse_drag_extend(e, m->x, m->y);
+		return MA_NONE;
+	}
+	text_h = text_height(e);
+	gutter = gutter_width(e);
+	text_w = text_width(e) - gutter;
 	if (text_w < 1)
 		text_w = 1;
 	if (press && m->y == 0) {
@@ -30195,6 +30515,9 @@ ed_mouse_event(Editor *e, const struct tkbd_seq *m)
 
 		return mi >= 0 ? menu_bar_run(e, mi, 1) : MA_NONE;
 	}
+	if ((press || m->key == TKBD_MOUSE_WHEEL_UP ||
+	    m->key == TKBD_MOUSE_WHEEL_DOWN) && mouse_sbar(e, m))
+		return MA_NONE;
 	if (e->hex_view || e->tbl)
 		return MA_NONE;
 #ifdef VEDIT_TERM
@@ -30236,8 +30559,13 @@ ed_mouse_event(Editor *e, const struct tkbd_seq *m)
 		mouse_scroll(e, -3, text_h);
 	else if (m->key == TKBD_MOUSE_WHEEL_DOWN)
 		mouse_scroll(e, 3, text_h);
-	else if (press)
-		mouse_click(e, m->y - row0, m->x - col0, text_w);
+	else if (press) {
+		mouse_place(e, m->y - row0, m->x - col0, text_w);
+		e->ay = e->cy;
+		e->ax = e->cx;
+		e->sel_active = 0;
+		e->mouse_drag = MDRAG_PEND;
+	}
 	return MA_NONE;
 }
 #endif /* VEDIT_NO_MOUSE */
@@ -31582,7 +31910,7 @@ static void
 tty_on_fatal(int sig)
 {
 	static const char restore[] =
-	    "\033[0m\033[?1006l\033[?1000l\033[?2004l\033[?25h\033[?1049l";
+	    "\033[0m\033[?1006l\033[?1002l\033[?1000l\033[?2004l\033[?25h\033[?1049l";
 	ssize_t wr;
 
 	signal(sig, SIG_DFL);
@@ -31825,7 +32153,7 @@ static void
 tty_restore(Ttyio *t)
 {
 	static const char restore[] =
-	    "\033[0m\033[?1006l\033[?1000l\033[?2004l\033[?25h\033[?1049l";
+	    "\033[0m\033[?1006l\033[?1002l\033[?1000l\033[?2004l\033[?25h\033[?1049l";
 	DWORD w;
 
 	if (!t->raw)
