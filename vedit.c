@@ -15966,6 +15966,33 @@ dlg_sort_key(Editor *e, const Modal *m, const Event *ev, void *ctx)
 
 	(void)e;
 	(void)m;
+	if (k->type == TKBD_MOUSE) {
+		int x = m->x + 2, y = m->y + 1;
+
+		if (k->key != TKBD_MOUSE_LEFT || (k->mod & TKBD_MOD_MOTION))
+			return 0;
+		if (k->y == y && k->x >= x + 12 && k->x < x + 20)
+			c->focus = 0;
+		else if (k->y == y + 1 && k->x >= x + 12 && k->x < x + 36) {
+			c->focus = 1;
+			c->numeric = k->x >= x + 24;
+		} else if (k->y == y + 2 && k->x >= x && k->x < x + 18) {
+			c->focus = 2;
+			c->reverse = !c->reverse;
+		} else if (k->y == y + 3 && k->x >= x && k->x < x + 16) {
+			c->focus = 3;
+			c->icase = !c->icase;
+		} else if (k->y == y + 5 && k->x >= x + 10 && k->x < x + 16) {
+			c->focus = 4;
+			c->ok = 1;
+			return 1;
+		} else if (k->y == y + 5 && k->x >= x + 20 && k->x < x + 30) {
+			c->focus = 5;
+			c->ok = 0;
+			return 1;		/* Cancel */
+		}
+		return 0;
+	}
 	if (k->type != TKBD_KEY)
 		return 0;
 	switch (k->key) {
@@ -26589,6 +26616,40 @@ dlg_date_key(Editor *e, const Modal *m, const Event *ev, void *ctx)
 
 	(void)e;
 	(void)m;
+	if (k->type == TKBD_MOUSE) {
+		int gx = m->x + (m->w - 20) / 2;
+		int ci, ri, cell, first, ndays, i;
+		struct tm t;
+
+		if (k->key != TKBD_MOUSE_LEFT || (k->mod & TKBD_MOD_MOTION))
+			return 0;
+		ri = k->y - (m->y + 3);
+		if (ri < 0 || k->x < gx || (k->x - gx) % 3 > 1)
+			return 0;		/* above the grid or in a gap */
+		ci = (k->x - gx) / 3;
+		if (ci > 6)
+			return 0;
+		t = c->tm;			/* weekday of the first of the month */
+		t.tm_mday = 1;
+		date_norm(&t);
+		first = (t.tm_wday + 6) % 7;
+		t = c->tm;			/* last day of the month */
+		t.tm_mon++;
+		t.tm_mday = 0;
+		date_norm(&t);
+		ndays = t.tm_mday;
+		cell = ri * 7 + ci;
+		i = cell - first + 1;
+		if (i < 1 || i > ndays)
+			return 0;
+		if (i == c->tm.tm_mday) {	/* a second click inserts */
+			c->pick = 1;
+			return 1;
+		}
+		c->tm.tm_mday = i;		/* a first click selects the day */
+		date_norm(&c->tm);
+		return 0;
+	}
 	if (k->type != TKBD_KEY)
 		return 0;
 	switch (k->key) {

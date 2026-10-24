@@ -5006,10 +5006,83 @@ t_sort(Test *t)
 	ev.key.ch = TKBD_CH_NONE;
 	TAP_CHECK(t, dlg_sort_key(&v->e, &md, &ev, &c) == 0 && strcmp(c.col, "B") == 0);
 
+	/* the mouse: md is zeroed, so the dialog origin is x=2, y=1. Click the
+	 * check boxes, the Decimal radio, then the Cancel and OK buttons. */
+	memset(&c, 0, sizeof(c));
+	c.table = 1;
+	ev.key.type = TKBD_MOUSE;
+	ev.key.key = TKBD_MOUSE_LEFT;
+	ev.key.mod = 0;
+	ev.key.ch = TKBD_CH_NONE;
+	ev.key.y = 3; ev.key.x = 4;		/* Reverse order */
+	TAP_CHECK(t, dlg_sort_key(&v->e, &md, &ev, &c) == 0 && c.focus == 2 &&
+	    c.reverse);
+	ev.key.y = 4; ev.key.x = 4;		/* Ignore case */
+	TAP_CHECK(t, dlg_sort_key(&v->e, &md, &ev, &c) == 0 && c.focus == 3 &&
+	    c.icase);
+	ev.key.y = 2; ev.key.x = 28;		/* kind: the Decimal half */
+	TAP_CHECK(t, dlg_sort_key(&v->e, &md, &ev, &c) == 0 && c.focus == 1 &&
+	    c.numeric);
+	c.ok = 1;
+	ev.key.y = 6; ev.key.x = 23;		/* Cancel */
+	TAP_CHECK(t, dlg_sort_key(&v->e, &md, &ev, &c) == 1 && c.focus == 5 &&
+	    !c.ok);
+	ev.key.y = 6; ev.key.x = 13;		/* OK */
+	TAP_CHECK(t, dlg_sort_key(&v->e, &md, &ev, &c) == 1 && c.focus == 4 &&
+	    c.ok);
+
 	vedit_free(v);
 	memio_free(&m);
 	unlink(path);
 	rmdir(dir);
+}
+
+/* The calendar takes the mouse: a click on a day selects it, a second click on
+ * the selected day inserts. The target cell is located from the month layout,
+ * so it does not depend on today's date. */
+static void
+t_date_mouse(Test *t)
+{
+	Datectx c;
+	Modal md;
+	Event ev;
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	struct tm t1;
+	int first, cell, row, col, target = 10;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	memset(&md, 0, sizeof(md));
+	md.w = DATE_W;
+	memset(&c, 0, sizeof(c));
+	c.tm.tm_year = 126;		/* March 2026 */
+	c.tm.tm_mon = 2;
+	c.tm.tm_mday = 20;
+	date_norm(&c.tm);
+	t1 = c.tm;			/* weekday of the first, Monday-based */
+	t1.tm_mday = 1;
+	date_norm(&t1);
+	first = (t1.tm_wday + 6) % 7;
+	cell = first + target - 1;
+	row = md.y + 3 + cell / 7;
+	col = md.x + (md.w - 20) / 2 + (cell % 7) * 3;
+
+	memset(&ev, 0, sizeof(ev));
+	ev.type = EVENT_KEY;
+	ev.key.type = TKBD_MOUSE;
+	ev.key.key = TKBD_MOUSE_LEFT;
+	ev.key.y = row;
+	ev.key.x = col;
+	TAP_CHECKF(t, dlg_date_key(&v->e, &md, &ev, &c) == 0 &&
+	    c.tm.tm_mday == target && !c.pick, "select day mday=%d pick=%d",
+	    c.tm.tm_mday, c.pick);
+	TAP_CHECK(t, dlg_date_key(&v->e, &md, &ev, &c) == 1 && c.pick);
+	vedit_free(v);
+	memio_free(&m);
 }
 
 const Case tap_cases[] = {
@@ -5108,6 +5181,7 @@ const Case tap_cases[] = {
 	{ "tbl_loop", t_tbl_loop },
 	{ "tbl_rows", t_tbl_rows },
 	{ "sort", t_sort },
+	{ "date_mouse", t_date_mouse },
 #endif
 	{ NULL, NULL },
 };
