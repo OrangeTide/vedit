@@ -8378,6 +8378,7 @@ void ed_delete(Editor *e);
 void ed_backspace(Editor *e);
 void ed_find(Editor *e, const char *q);
 void ed_find_dir(Editor *e, const char *q, int dir);
+void ed_find_next(Editor *e);
 
 /* Multi-buffer management (edit.c). The active buffer's per-file state lives
  * in the flat struct editor; these swap it with the saved buffers. */
@@ -19798,6 +19799,17 @@ ed_find(Editor *e, const char *q)
 	ed_find_dir(e, q, 1);
 }
 
+/* Repeat the last search, or report that there is none. The modeless keys,
+ * the config actions, and the menu all run the same step. */
+void
+ed_find_next(Editor *e)
+{
+	if (e->last_find[0])
+		ed_find(e, e->last_find);
+	else
+		set_status(e, "no previous search");
+}
+
 /* Direction-aware incremental scan for the regex q. Forward finds the first
  * match at or after (oy, ox), wrapping once back to the origin; backward finds
  * the nearest match before the origin, wrapping once to the end of the buffer.
@@ -26105,10 +26117,7 @@ kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
 		ed_reflow(e);
 		return REQ_CONTINUE;
 	case ACT_FIND_NEXT:
-		if (e->last_find[0])
-			ed_find(e, e->last_find);
-		else
-			set_status(e, "no previous search");
+		ed_find_next(e);
 		return REQ_CONTINUE;
 	case ACT_FILE_INSERT:
 		ed_insert_file(e);
@@ -28886,11 +28895,7 @@ run_menu_act(Editor *e, Menuact act)
 		find_prompt(e);
 		break;
 	case MA_FIND_NEXT:
-		if (e->last_find[0])
-			ed_find(e, e->last_find);
-		else
-			set_status(e,
-			    "no previous search");
+		ed_find_next(e);
 		break;
 	case MA_REPLACE:
 		replace_prompt(e);
