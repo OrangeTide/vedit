@@ -8053,6 +8053,8 @@ struct uiframe {
 	UiCtx		ctx;		/* the frame's state, carried inline */
 };
 
+#define KILL_STACK_MAX 32	/* depth of the capture-suffix kill stack */
+
 typedef struct editor {
 	Buf	*bufs;		/* open buffers; active mirrors into flat */
 	int		nbuf;		/* number of open buffers */
@@ -8081,6 +8083,10 @@ typedef struct editor {
 	int		clip_linewise;	/* clip holds whole lines (vi p/P) */
 	int		clip_block;	/* clip holds a rectangle (draw mode) */
 	int		clip_osc52;	/* mirror every copy/yank through OSC 52 */
+	/* The kill stack fed by the capture suffix '.' on a removing verb, kept
+	 * separate from the clipboard above. Newest entry on top. */
+	struct { char *bytes; size_t len; } kill[KILL_STACK_MAX];
+	int		kill_n;
 #ifndef VEDIT_NO_TOOLS
 	const struct vedit_tool_api *tools;	/* borrowed; NULL = no building */
 	char	**tool_lines;		/* captured output, one line per entry */
@@ -8394,6 +8400,8 @@ void ed_set_wrap(Editor *e, int on);
 void ed_copy(Editor *e);
 void ed_cut(Editor *e);
 void ed_paste(Editor *e);
+void ed_kill_push(Editor *e, const char *bytes, size_t len);
+void ed_kill_free(Editor *e);
 
 /* Multi-buffer management (edit.c). The active buffer's per-file state lives
  * in the flat struct editor; these swap it with the saved buffers. */
@@ -17922,6 +17930,56 @@ clip_set(Editor *e, char *bytes, size_t len)
 		scr_set_clipboard(e->d, bytes, len);
 }
 
+/* Push bytes onto the kill stack, newest on top. The stack is capped; when
+ * full the oldest entry is dropped. This is the store the capture suffix '.'
+ * feeds, kept separate from the CUA clipboard. Empty input is ignored. */
+void
+ed_kill_push(Editor *e, const char *bytes, size_t len)
+{
+	char *dup;
+
+	if (len == 0)
+		return;
+	dup = malloc(len);
+	if (!dup)
+		return;
+	memcpy(dup, bytes, len);
+	if (e->kill_n == KILL_STACK_MAX) {
+		free(e->kill[0].bytes);
+		memmove(&e->kill[0], &e->kill[1],
+		    (KILL_STACK_MAX - 1) * sizeof(e->kill[0]));
+		e->kill_n--;
+	}
+	e->kill[e->kill_n].bytes = dup;
+	e->kill[e->kill_n].len = len;
+	e->kill_n++;
+}
+
+/* Capture the byte run [x0,x1) of line y onto the kill stack, for the span
+ * removing verbs. Columns past the line end are clamped. */
+static void
+ed_kill_line_span(Editor *e, size_t y, size_t x0, size_t x1)
+{
+	size_t len = 0;
+	const char *s = text_line(e->t, y, &len);
+
+	if (x1 > len)
+		x1 = len;
+	if (s && x0 < x1)
+		ed_kill_push(e, s + x0, x1 - x0);
+}
+
+/* Free the kill stack. */
+void
+ed_kill_free(Editor *e)
+{
+	int i;
+
+	for (i = 0; i < e->kill_n; i++)
+		free(e->kill[i].bytes);
+	e->kill_n = 0;
+}
+
 /* Allocated text of the active selection, with its byte length in *len. The
  * caller owns the buffer. Returns NULL when nothing is selected or on an
  * allocation failure. */
@@ -26039,6 +26097,10 @@ enum kb_act {
 	ACT_DELETE_LEFT, ACT_DELETE_RIGHT,
 	ACT_DELETE_WORD_RIGHT, ACT_DELETE_LINE,
 	ACT_DELETE_TO_EOL, ACT_DELETE_TO_BOL,
+	ACT_DELETE_LEFT_CAP, ACT_DELETE_RIGHT_CAP,
+	ACT_DELETE_WORD_RIGHT_CAP, ACT_DELETE_LINE_CAP,
+	ACT_DELETE_TO_EOL_CAP, ACT_DELETE_TO_BOL_CAP,
+	ACT_KILL_PASTE,
 	ACT_UNDO, ACT_REDO,
 	ACT_COPY, ACT_CUT, ACT_PASTE,
 	ACT_REFLOW,
@@ -26072,6 +26134,13 @@ static const struct { const char *name; int act; } kb_actions[] = {
 	{ "delete-line", ACT_DELETE_LINE },
 	{ "delete-to-eol", ACT_DELETE_TO_EOL },
 	{ "delete-to-bol", ACT_DELETE_TO_BOL },
+	{ "delete-left.", ACT_DELETE_LEFT_CAP },
+	{ "delete-right.", ACT_DELETE_RIGHT_CAP },
+	{ "delete-word-right.", ACT_DELETE_WORD_RIGHT_CAP },
+	{ "delete-line.", ACT_DELETE_LINE_CAP },
+	{ "delete-to-eol.", ACT_DELETE_TO_EOL_CAP },
+	{ "delete-to-bol.", ACT_DELETE_TO_BOL_CAP },
+	{ "kill-paste", ACT_KILL_PASTE },
 	{ "undo", ACT_UNDO }, { "redo", ACT_REDO },
 	{ "copy", ACT_COPY }, { "cut", ACT_CUT }, { "paste", ACT_PASTE },
 	{ "reflow", ACT_REFLOW },
@@ -26499,6 +26568,50 @@ kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
 	case ACT_TAB:		return ed_dispatch(e, CMD_TAB, seq);
 	case ACT_DELETE_LEFT:	return ed_dispatch(e, CMD_BACKSPACE, seq);
 	case ACT_DELETE_RIGHT:	return ed_dispatch(e, CMD_DELETE, seq);
+	case ACT_DELETE_LEFT_CAP: {	/* backspace, keeping the removed text */
+		size_t ll = 0, rl = 0;
+		const char *s;
+
+		if (e->sel_active) {
+			char *r = current_selection_text(e, &rl);
+
+			if (r) {
+				ed_kill_push(e, r, rl);
+				free(r);
+			}
+		} else if (e->cx > 0) {
+			s = text_line(e->t, e->cy, &ll);
+			if (s) {
+				size_t pr = prev_rune_len(s, e->cx);
+
+				ed_kill_push(e, s + e->cx - pr, pr);
+			}
+		} else if (e->cy > 0) {
+			ed_kill_push(e, "\n", 1);
+		}
+		return ed_dispatch(e, CMD_BACKSPACE, NULL);
+	}
+	case ACT_DELETE_RIGHT_CAP: {	/* forward delete, keeping the text */
+		size_t ll = 0, rl = 0;
+		const char *s;
+
+		if (e->sel_active) {
+			char *r = current_selection_text(e, &rl);
+
+			if (r) {
+				ed_kill_push(e, r, rl);
+				free(r);
+			}
+		} else {
+			s = text_line(e->t, e->cy, &ll);
+			if (e->cx < ll && s)
+				ed_kill_push(e, s + e->cx,
+				    rune_len_at(s, ll, e->cx));
+			else if (e->cx >= ll && e->cy + 1 < text_lines(e->t))
+				ed_kill_push(e, "\n", 1);
+		}
+		return ed_dispatch(e, CMD_DELETE, NULL);
+	}
 	case ACT_UNDO:		return ed_dispatch(e, CMD_UNDO, seq);
 	case ACT_REDO:		return ed_dispatch(e, CMD_REDO, seq);
 	case ACT_COPY:		return ed_dispatch(e, CMD_COPY, seq);
@@ -26527,29 +26640,50 @@ kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
 		jump_back(e);
 		return REQ_CONTINUE;
 	case ACT_DELETE_WORD_RIGHT:
+	case ACT_DELETE_WORD_RIGHT_CAP: {
+		int cap = (act == ACT_DELETE_WORD_RIGHT_CAP);
+		size_t to;
+
 		y = e->cy; x = e->cx;
 		vi_pos_word_fwd(e, &y, &x, 0);
 		len = text_line_len(e->t, e->cy);
-		text_undo_group_begin(e->t);
 		if (y == e->cy && x > e->cx)
-			text_delete(e->t, e->cy, e->cx, x - e->cx);
-		else if (e->cx < len)
-			text_delete(e->t, e->cy, e->cx, len - e->cx);
-		text_undo_group_end(e->t);
-		e->hl_valid = 0;
+			to = x;
+		else
+			to = (e->cx < len) ? len : e->cx;
+		if (to > e->cx) {
+			if (cap)
+				ed_kill_line_span(e, e->cy, e->cx, to);
+			text_undo_group_begin(e->t);
+			text_delete(e->t, e->cy, e->cx, to - e->cx);
+			text_undo_group_end(e->t);
+			e->hl_valid = 0;
+		}
 		vi_clamp(e);
 		return REQ_CONTINUE;
+	}
 	case ACT_DELETE_TO_EOL:
+	case ACT_DELETE_TO_EOL_CAP: {
+		int cap = (act == ACT_DELETE_TO_EOL_CAP);
+
 		len = text_line_len(e->t, e->cy);
 		if (e->cx < len) {
+			if (cap)
+				ed_kill_line_span(e, e->cy, e->cx, len);
 			text_undo_group_begin(e->t);
 			text_delete(e->t, e->cy, e->cx, len - e->cx);
 			text_undo_group_end(e->t);
 			e->hl_valid = 0;
 		}
 		return REQ_CONTINUE;
+	}
 	case ACT_DELETE_TO_BOL:
+	case ACT_DELETE_TO_BOL_CAP: {
+		int cap = (act == ACT_DELETE_TO_BOL_CAP);
+
 		if (e->cx > 0) {
+			if (cap)
+				ed_kill_line_span(e, e->cy, 0, e->cx);
 			text_undo_group_begin(e->t);
 			text_delete(e->t, e->cy, 0, e->cx);
 			text_undo_group_end(e->t);
@@ -26557,13 +26691,42 @@ kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
 			e->hl_valid = 0;
 		}
 		return REQ_CONTINUE;
+	}
 	case ACT_DELETE_LINE:
+	case ACT_DELETE_LINE_CAP: {
+		int cap = (act == ACT_DELETE_LINE_CAP);
+
+		if (cap) {		/* the line and its newline, as one entry */
+			size_t ll = 0;
+			const char *s = text_line(e->t, e->cy, &ll);
+			char *tmp = malloc(ll + 1);
+
+			if (tmp) {
+				if (ll && s)
+					memcpy(tmp, s, ll);
+				tmp[ll] = '\n';
+				ed_kill_push(e, tmp, ll + 1);
+				free(tmp);
+			}
+		}
 		text_undo_group_begin(e->t);
 		vi_delete_lines(e, e->cy, e->cy);
 		text_undo_group_end(e->t);
 		e->cx = 0;
 		e->hl_valid = 0;
 		vi_clamp(e);
+		return REQ_CONTINUE;
+	}
+	case ACT_KILL_PASTE:
+		if (e->kill_n > 0) {
+			text_undo_group_begin(e->t);
+			insert_bytes(e, e->kill[e->kill_n - 1].bytes,
+			    e->kill[e->kill_n - 1].len);
+			text_undo_group_end(e->t);
+			e->hl_valid = 0;
+		} else {
+			set_status(e, "kill stack is empty");
+		}
 		return REQ_CONTINUE;
 	case ACT_REFLOW:
 		ed_reflow(e);
@@ -32190,6 +32353,7 @@ editor_teardown(Editor *e)
 	}
 	free(e->bufs);
 	free(e->clip);
+	ed_kill_free(e);
 	free(e->art_clip);
 	for (i = 0; i < 26; i++)
 		free(e->vi_regs[i].bytes);

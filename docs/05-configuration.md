@@ -198,7 +198,13 @@ The actions are:
 - Editing: `newline`, `split-line`, `tab`, `delete-left`, `delete-right`,
   `delete-word-right`, `delete-line`, `delete-to-eol`, `delete-to-bol`,
   `overtype-toggle`, `reflow`, `wrap-toggle`, `undo`, `redo`, `copy`, `cut`,
-  `paste`.
+  `paste`, `kill-paste`.
+- Capture: each removing verb has a twin whose name ends in a dot, such as
+  `delete-to-eol.` or `delete-line.`, that removes the same text and also pushes
+  it onto the kill stack. The plain verb discards; the dotted verb keeps. The
+  kill stack is separate from the clipboard, so a capture never disturbs a
+  `copy`, and repeated captures stack up with the newest on top. `kill-paste`
+  inserts the top entry at the cursor.
 - Format: `center-line`, `left-margin`, `right-margin`. The margins take the
   cursor's column; reflow and centering sit between them, and the right margin
   is also the type-time wrap width (`textwidth`).

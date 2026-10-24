@@ -4399,9 +4399,61 @@ t_keymap_prog(Test *t)
 	unlink(mainpath);
 }
 
+/* The capture suffix: a plain removing verb discards, its dotted twin also
+ * pushes the removed text onto the kill stack, and kill-paste inserts the top
+ * entry. The kill stack is separate from the clipboard and accumulates. */
+static void
+t_cl_capture(Test *t)
+{
+	const Cfg *old = g_cfg;
+	const char *s;
+	size_t len;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "hello world", 11);
+
+	/* the plain verb discards: nothing reaches the kill stack */
+	e.cy = 0; e.cx = 6;
+	kb_run_action(&e, ACT_DELETE_TO_EOL, -1, NULL);
+	TAP_CHECKF(t, e.kill_n == 0, "plain kill_n=%d", e.kill_n);
+	TAP_CHECK(t, text_line_len(e.t, 0) == 6);		/* "hello " */
+
+	/* the dotted verb captures the removed span */
+	e.cx = 0;
+	kb_run_action(&e, ACT_DELETE_TO_EOL_CAP, -1, NULL);
+	TAP_CHECKF(t, e.kill_n == 1, "cap kill_n=%d", e.kill_n);
+	TAP_CHECK(t, e.kill[0].len == 6 &&
+	    memcmp(e.kill[0].bytes, "hello ", 6) == 0);
+	TAP_CHECK(t, text_line_len(e.t, 0) == 0);		/* line cleared */
+
+	/* kill-paste inserts the top entry at the cursor */
+	kb_run_action(&e, ACT_KILL_PASTE, -1, NULL);
+	s = text_line(e.t, 0, &len);
+	TAP_CHECKF(t, len == 6 && memcmp(s, "hello ", 6) == 0,
+	    "after paste len=%zu", len);
+
+	/* a second capture accumulates, newest on top */
+	text_insert(e.t, 0, 6, "world", 5);			/* "hello world" */
+	e.cx = 0;
+	kb_run_action(&e, ACT_DELETE_LINE_CAP, -1, NULL);
+	TAP_CHECKF(t, e.kill_n == 2, "accum kill_n=%d", e.kill_n);
+	TAP_CHECK(t, e.kill[1].len == 12 &&
+	    memcmp(e.kill[1].bytes, "hello world\n", 12) == 0);
+
+	ed_kill_free(&e);
+	TAP_CHECK(t, e.kill_n == 0);
+	text_free(e.t);
+	g_cfg = old;
+}
+
 const Case tap_cases[] = {
 	{ "ed_pos", t_ed_pos },
 	{ "cl_parse", t_cl_parse },
+	{ "cl_capture", t_cl_capture },
 	{ "keymap_prog", t_keymap_prog },
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },
