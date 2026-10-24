@@ -8548,6 +8548,12 @@ struct text {
 	size_t		map_len;
 	Vstat		map_st;
 	int		map_torn;
+	/* On Windows a mapping pins its file, so a file about to be removed or
+	 * replaced under the map is renamed aside to a private name kept here;
+	 * text_unmap deletes it. Empty when the map backs a file owned by
+	 * someone else (the loaded file or a live swap base). Unused on POSIX,
+	 * where a removed base lives on as an unlinked inode under the map. */
+	char		map_tmp[PATH_MAX];
 };
 
 /****************************************************************
@@ -8906,7 +8912,9 @@ map_unregister(Text *t)
 			g_maps[i].t = NULL;
 }
 
-/* Drop the map. The caller has made sure no line borrows from it. */
+/* Drop the map. The caller has made sure no line borrows from it. A private
+ * file renamed aside to keep the map alive (Windows) is deleted now that the
+ * view is gone. */
 static void
 text_unmap(Text *t)
 {
@@ -8917,6 +8925,10 @@ text_unmap(Text *t)
 	t->map = NULL;
 	t->map_len = 0;
 	t->map_torn = 0;
+	if (t->map_tmp[0]) {
+		g_vfs->remove(t->map_tmp);
+		t->map_tmp[0] = '\0';
+	}
 }
 
 /* Copy every borrowed line to the heap and drop the map. OK, or ERR
@@ -8979,18 +8991,53 @@ text_maps_file(const Text *t, const char *path)
 	    st.dev == t->map_st.dev && st.ino == t->map_st.ino;
 }
 
-/* Before path is truncated in place, or (on Windows, where a mapping
- * pins the file) replaced or removed: give up the map if it is that
- * file. Returns OK, or ERR when the lines could not be copied. */
-static int
-text_release_file(const Text *t, const char *path, int in_place)
-{
 #ifdef _WIN32
-	in_place = 1;
+/* Rename the file t maps to a fresh sibling name and remember it, so the
+ * view stays valid while the caller removes or replaces the original name.
+ * The renamed file is deleted in text_unmap. OK, or ERR with the map
+ * unchanged (the caller then falls back to a heap copy). */
+static int
+text_rename_aside(Text *t, const char *path)
+{
+	char aside[PATH_MAX];
+	int i;
+
+	for (i = 0; i < 1000; i++) {
+		if (snprintf(aside, sizeof(aside), "%s.swpb%d", path, i) >=
+		    (int)sizeof(aside))
+			return ERR;
+		if (g_vfs->access(aside, VF_R) != 0)	/* a free name */
+			break;
+	}
+	if (i >= 1000 || g_vfs->replace(path, aside) != 0)
+		return ERR;
+	snprintf(t->map_tmp, sizeof(t->map_tmp), "%s", aside);
+	return OK;
+}
 #endif
+
+/* Before path is truncated in place, or (on Windows, where a mapping
+ * pins the file) replaced or removed: give up the map if it is that file.
+ * On Windows the file is renamed aside and the view kept, so a big mapped
+ * file is not copied into the heap on every save; only a failed rename
+ * falls back to that copy. Returns OK, or ERR when neither worked. */
+static int
+text_release_file(const Text *ct, const char *path, int in_place)
+{
+	Text *t = (Text *)ct;		/* map_tmp bookkeeping only */
+
+#ifdef _WIN32
+	(void)in_place;
+	if (!text_maps_file(t, path))
+		return OK;
+	if (text_rename_aside(t, path) == OK)
+		return OK;
+	return text_materialize(t);
+#else
 	if (!in_place || !text_maps_file(t, path))
 		return OK;
 	return text_materialize(t);
+#endif
 }
 
 /****************************************************************

@@ -1628,6 +1628,14 @@ t_map_remap(Test *t)
 	TAP_CHECK(t, ed_save_file(&e) == OK);
 	TAP_CHECK(t, access(base, F_OK) != 0);
 	TAP_CHECK(t, dump_is(e.t, "keep\nme!"));	/* unlinked base still mapped */
+
+	/* the file on disk holds the buffer, written through the still-mapped
+	 * base (on Windows the base is renamed aside, not copied to the heap) */
+	rd = text_new();
+	TAP_ASSERT(t, rd && text_load(rd, path) == OK);
+	TAP_CHECK(t, dump_is(rd, "keep\nme!"));
+	text_free(rd);
+
 	swap_detach(e.t, e.swapj);
 	text_free(e.t);
 	unlink(path);
