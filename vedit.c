@@ -11989,14 +11989,13 @@ ui_frame(Editor *e, const Pal *p)
 	int th = split ? frame_rows(e) : text_height(e);
 	int i;
 	size_t nlines = text_lines(e->t);
-	size_t max_top = nlines > (size_t)th ? nlines - (size_t)th : 0;
 	size_t curlen = 0;
 	const char *cur = text_line(e->t, e->cy, &curlen);
 	int curw = cur ? disp_cols(cur, curlen) : 0;
 	int tw = text_width(e);
-	size_t max_left = curw > tw ? (size_t)(curw - tw) : 0;
-	int vthumb = thumb_index(e->top, max_top, th);
-	int hthumb;
+	size_t vtop = e->top, hleft = e->left;
+	size_t max_top, max_left;
+	int vthumb, hthumb;
 #ifdef VEDIT_TERM
 	const char *name = (e->kind == BUF_TERM) ? term_label(e)
 	    : (e->has_name ? e->path : "Untitled");
@@ -12011,6 +12010,18 @@ ui_frame(Editor *e, const Pal *p)
 #endif
 	char title[80];
 	int tlen, tstart;
+
+#ifdef VEDIT_ART
+	if (e->art) {		/* the bars track the grid, not the text buffer */
+		nlines = (size_t)e->art->rows;
+		curw = e->art->cols;
+		vtop = (size_t)e->art->top;
+		hleft = (size_t)e->art->left;
+	}
+#endif
+	max_top = nlines > (size_t)th ? nlines - (size_t)th : 0;
+	max_left = curw > tw ? (size_t)(curw - tw) : 0;
+	vthumb = thumb_index(vtop, max_top, th);
 
 	if (bot < top)
 		bot = top;
@@ -12059,7 +12070,7 @@ ui_frame(Editor *e, const Pal *p)
 	if (e->cols >= 6) {
 		int hspan = e->cols - CHROME_LEFT - chrome_right(e); /* corners off */
 
-		hthumb = thumb_index(e->left, max_left, hspan);
+		hthumb = thumb_index(hleft, max_left, hspan);
 		for (i = 0; i < hspan; i++)
 			scrollbar_cell(d, bot, 1 + i, i, hspan, hthumb,
 			    GL_LEFT, GL_RIGHT, fg, bg);
@@ -30426,10 +30437,61 @@ scrollbar_hit(Editor *e, int x, int y, int *orient, int *r0, int *span,
 	return 0;
 }
 
+#ifdef VEDIT_ART
+/* Scroll the art view so grid row `top` is first, pulling the cursor into
+ * view so art_scroll does not snap the top back on the next paint. */
+static void
+art_scroll_to(Art *a, size_t top, int h)
+{
+	int max = a->rows > h ? a->rows - h : 0;
+
+	if ((long)top > max)
+		top = (size_t)max;
+	a->top = (int)top;
+	if (a->cy < a->top)
+		a->cy = a->top;
+	else if (h > 0 && a->cy >= a->top + h)
+		a->cy = a->top + h - 1;
+}
+
+/* Scroll the art view by delta rows (negative up). */
+static void
+art_scroll_lines(Art *a, long delta, int h)
+{
+	long top = (long)a->top + delta;
+
+	art_scroll_to(a, top < 0 ? 0 : (size_t)top, h);
+}
+
+/* Scroll the art view so grid column `left` is first, pulling the cursor in. */
+static void
+art_hscroll_to(Art *a, long left, int w)
+{
+	int max = a->cols > w ? a->cols - w : 0;
+
+	if (left < 0)
+		left = 0;
+	if (left > max)
+		left = max;
+	a->left = (int)left;
+	if (a->cx < a->left)
+		a->cx = a->left;
+	else if (w > 0 && a->cx >= a->left + w)
+		a->cx = a->left + w - 1;
+}
+#endif /* VEDIT_ART */
+
 /* Line count and current top of the view a vertical bar controls. */
 static void
 sbar_view_v(Editor *e, int other, size_t *nlines, size_t *top)
 {
+#ifdef VEDIT_ART
+	if (e->art) {
+		*nlines = (size_t)e->art->rows;
+		*top = (size_t)e->art->top;
+		return;
+	}
+#endif
 	if (other) {
 		int o = !e->split_focus;
 		const Text *t = e->pv[o].buf >= 0 && e->pv[o].buf < e->nbuf ?
@@ -30462,6 +30524,12 @@ sbar_off_from_index(int i, size_t max_off, int span)
 static void
 sbar_scroll_v(Editor *e, int other, long delta)
 {
+#ifdef VEDIT_ART
+	if (e->art) {
+		art_scroll_lines(e->art, delta, text_height(e));
+		return;
+	}
+#endif
 	if (other)
 		split_scroll_other(e, delta);
 	else
@@ -30472,6 +30540,12 @@ sbar_scroll_v(Editor *e, int other, long delta)
 static void
 sbar_goto_v(Editor *e, int other, size_t top)
 {
+#ifdef VEDIT_ART
+	if (e->art) {
+		art_scroll_to(e->art, top, text_height(e));
+		return;
+	}
+#endif
 	if (other)
 		split_scroll_other(e, (long)top - (long)e->pv[!e->split_focus].top);
 	else
@@ -30495,10 +30569,24 @@ mouse_sbar_drag(Editor *e, int x, int y)
 	} else {
 		int tw = text_width(e), twc = tw - gutter_width(e);
 		size_t llen;
-		const char *s = text_line(e->t, e->cy, &llen);
-		int curw = s ? (int)disp_cols(s, llen) : 0;
-		size_t max_left = curw > tw ? (size_t)(curw - tw) : 0;
+		const char *s;
+		int curw;
+		size_t max_left;
 
+#ifdef VEDIT_ART
+		if (e->art) {
+			Art *a = e->art;
+
+			max_left = a->cols > tw ? (size_t)(a->cols - tw) : 0;
+			i = x - e->msb_r0;
+			art_hscroll_to(a,
+			    (long)sbar_off_from_index(i, max_left, span), tw);
+			return;
+		}
+#endif
+		s = text_line(e->t, e->cy, &llen);
+		curw = s ? (int)disp_cols(s, llen) : 0;
+		max_left = curw > tw ? (size_t)(curw - tw) : 0;
 		i = x - e->msb_r0;
 		mouse_hscroll_to(e, (int)sbar_off_from_index(i, max_left, span), twc);
 	}
@@ -30547,8 +30635,44 @@ mouse_sbar(Editor *e, const struct tkbd_seq *m)
 	{
 		int tw = text_width(e), twc = tw - gutter_width(e);
 		size_t llen;
-		const char *s = text_line(e->t, e->cy, &llen);
-		int curw = s ? (int)disp_cols(s, llen) : 0;
+		const char *s;
+		int curw;
+
+#ifdef VEDIT_ART
+		if (e->art) {
+			Art *a = e->art;
+			int left = a->left;
+
+			twc = tw;
+			max_off = a->cols > twc ? (size_t)(a->cols - twc) : 0;
+			page = twc > 1 ? twc : 1;
+			if (m->key == TKBD_MOUSE_WHEEL_UP)
+				art_hscroll_to(a, left - 3, twc);
+			else if (m->key == TKBD_MOUSE_WHEEL_DOWN)
+				art_hscroll_to(a, left + 3, twc);
+			else if ((i = m->x - r0) <= 0)
+				art_hscroll_to(a, left - 1, twc);
+			else if (i >= span - 1)
+				art_hscroll_to(a, left + 1, twc);
+			else {
+				int th = thumb_index((size_t)left, max_off, span);
+
+				if (i < th)
+					art_hscroll_to(a, left - page, twc);
+				else if (i > th)
+					art_hscroll_to(a, left + page, twc);
+				else {
+					e->mouse_drag = MDRAG_HBAR;
+					e->msb_r0 = r0;
+					e->msb_span = span;
+					e->msb_other = 0;
+				}
+			}
+			return 1;
+		}
+#endif
+		s = text_line(e->t, e->cy, &llen);
+		curw = s ? (int)disp_cols(s, llen) : 0;
 
 		max_off = curw > tw ? (size_t)(curw - tw) : 0;
 		page = twc > 1 ? twc : 1;

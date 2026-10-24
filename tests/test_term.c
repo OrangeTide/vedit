@@ -1399,6 +1399,68 @@ t_art_mouse(Test *t)
 	rmdir(dir);
 }
 
+/* The vertical scrollbar drives the art grid, not the hidden text buffer.
+ * A grid taller than the view has a live bar: the down arrow steps the top,
+ * and grabbing the thumb and dragging it to the bottom scrolls to the end. */
+static void
+t_art_scrollbar(Test *t)
+{
+	char dir[] = "/tmp/vedit-artsb-XXXXXX";
+	char path[PATH_MAX];
+	char content[40 * 6 + 1];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Art *a;
+	int sb, r0, span, max_off, i, n = 0;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	for (i = 0; i < 40; i++)
+		n += snprintf(content + n, sizeof(content) - n, "r%02d\r\n", i);
+	write_file(dir, "tall.ans", content);
+	snprintf(path, sizeof(path), "%s/tall.ans", dir);
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	TAP_ASSERT(t, v->e.art != NULL);
+	a = v->e.art;
+	TAP_CHECKF(t, a->rows >= 40, "grid rows %d", a->rows);
+
+	sb = v->e.cols - chrome_right(&v->e);
+	r0 = CHROME_TOP;
+	span = text_height(&v->e);
+	max_off = a->rows - span;
+	TAP_ASSERT(t, max_off > 0);
+
+	/* the down arrow at the foot of the bar steps the top down a row */
+	a->top = 0;
+	a->cy = 0;
+	art_mouse(&v->e, TKBD_MOUSE_LEFT, sb, r0 + span - 1, 0);
+	art_mouse(&v->e, TKBD_MOUSE_RELEASE, sb, r0 + span - 1, 0);
+	TAP_CHECKF(t, a->top == 1, "down arrow top=%d", a->top);
+
+	/* grab the thumb (one cell below the top arrow when top is 0) and
+	 * drag it to the last interior cell: the view jumps to the bottom */
+	a->top = 0;
+	a->cy = 0;
+	art_mouse(&v->e, TKBD_MOUSE_LEFT, sb, r0 + 1, 0);
+	TAP_CHECKF(t, v->e.mouse_drag == MDRAG_VBAR, "thumb drag=%d",
+	    v->e.mouse_drag);
+	art_mouse(&v->e, TKBD_MOUSE_LEFT, sb, r0 + span - 2, TKBD_MOD_MOTION);
+	TAP_CHECKF(t, a->top == max_off, "thumb drag top=%d want %d", a->top,
+	    max_off);
+	art_mouse(&v->e, TKBD_MOUSE_RELEASE, sb, r0 + span - 2, 0);
+	TAP_CHECK(t, v->e.mouse_drag == MDRAG_NONE);
+
+	vedit_free(v);
+	memio_free(&m);
+	unlink(path);
+	rmdir(dir);
+}
+
 /* A .ans file opens as a grid, renders through the emulator's cells, and
  * saves back as SGR-coloured UTF-8 with blank rows and cells dropped. */
 static void
@@ -1832,6 +1894,7 @@ const Case tap_cases[] = {
 	{ "art_roundtrip", t_art_roundtrip },
 	{ "art_edit", t_art_edit },
 	{ "art_mouse", t_art_mouse },
+	{ "art_scrollbar", t_art_scrollbar },
 	{ "palettes", t_palettes },
 	{ "term_repost", t_term_repost },
 	{ NULL, NULL },
