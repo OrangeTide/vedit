@@ -3796,6 +3796,22 @@ t_statusline_pl(Test *t)
 	TAP_CHECKF(t, row[x].codepoint == 0xe0b2, "right glyph U+%04x", row[x].codepoint);
 	TAP_CHECK(t, row[x].fg.index == 240 && row[x].bg.index == 7);
 
+	/* the VCS branch shows with the powerline branch glyph (U+E0A0), the
+	 * backend name dropped; under ASCII box drawing it keeps "git:" */
+	snprintf(v->e.vcs, sizeof(v->e.vcs), "git:main*");
+	ed_render(&v->e, v->e.d);
+	for (x = -1, i = 0; i < 80; i++)
+		if (row[i].codepoint == 0xe0a0) { x = i; break; }
+	TAP_CHECKF(t, x >= 0, "no branch glyph in bar");
+	BAR();
+	TAP_CHECK(t, strstr(bar, "main*") != NULL && strstr(bar, "git:") == NULL);
+	v->e.d->t->box_mode = VEDIT_BOX_ASCII;
+	ed_render(&v->e, v->e.d);
+	BAR();
+	TAP_CHECK(t, strstr(bar, "git:main*") != NULL);
+	v->e.d->t->box_mode = VEDIT_BOX_UTF8;
+	v->e.vcs[0] = '\0';
+
 	/* a message takes the mode segment; the right side stays */
 	set_status(&v->e, "hello");
 	ed_render(&v->e, v->e.d);

@@ -12200,6 +12200,7 @@ ui_statusbar_pl(Editor *e, const Pal *p, int cur_col, size_t ly)
 	Color mode_bg = p->st_edit;
 	const char *mode = "EDIT";
 	char cell[160], pos[48], flags[24], msg[sizeof(e->status)];
+	char vcsbuf[sizeof(e->vcs) + 8];
 	int rev = p->reverse_bars &&
 	    p->st_a_bg.type == COLOR_DEFAULT && p->st_b_bg.type == COLOR_DEFAULT;
 
@@ -12249,7 +12250,16 @@ ui_statusbar_pl(Editor *e, const Pal *p, int cur_col, size_t ly)
 		left[nl].at = 0;
 		nl++;
 		if (e->vcs[0]) {
-			left[nl].text = e->vcs;
+			/* Show the branch with the powerline branch glyph (U+E0A0)
+			 * in place of the "name:" prefix, when the font has it. */
+			if (e->d->t->box_mode == VEDIT_BOX_UTF8) {
+				const char *br = strchr(e->vcs, ':');
+
+				snprintf(vcsbuf, sizeof(vcsbuf), "\xee\x82\xa0 %s",
+				    br ? br + 1 : e->vcs);
+			} else
+				snprintf(vcsbuf, sizeof(vcsbuf), "%s", e->vcs);
+			left[nl].text = vcsbuf;
 			left[nl].fg = p->st_b_fg;
 			left[nl].bg = p->st_b_bg;
 			left[nl].at = rev ? ATTR_REVERSE : 0;
