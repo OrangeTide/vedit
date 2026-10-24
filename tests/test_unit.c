@@ -4282,8 +4282,127 @@ t_ed_pos(Test *t)
 	text_free(e.t);
 }
 
+/* The command-language parser: a program is commands separated by ';' or a
+ * newline; a command is words; a word is bare text or a brace-quoted literal.
+ * Braces group and nest, backslash escapes a reserved character, '#' at a
+ * command start is a comment, and the unimplemented metacharacters are
+ * errors. */
+static void
+t_cl_parse(Test *t)
+{
+	char err[64];
+	ClProg *p;
+
+	/* two commands, one word each */
+	p = cl_parse("line-end ; newline", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	TAP_CHECKF(t, p->ncmds == 2, "ncmds=%d", p->ncmds);
+	TAP_CHECK(t, p->cmds[0].nwords == 1 &&
+	    strcmp(p->cmds[0].words[0].text, "line-end") == 0);
+	TAP_CHECK(t, p->cmds[1].nwords == 1 &&
+	    strcmp(p->cmds[1].words[0].text, "newline") == 0);
+	cl_prog_free(p);
+
+	/* a brace-quoted word groups spaces into one argument */
+	p = cl_parse("{a b} c", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	TAP_CHECK(t, p->ncmds == 1 && p->cmds[0].nwords == 2);
+	TAP_CHECK(t, strcmp(p->cmds[0].words[0].text, "a b") == 0);
+	TAP_CHECK(t, strcmp(p->cmds[0].words[1].text, "c") == 0);
+	cl_prog_free(p);
+
+	/* a newline separates commands; a numeric argument is its own word */
+	p = cl_parse("marker-goto 3\nnewline", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	TAP_CHECK(t, p->ncmds == 2 && p->cmds[0].nwords == 2);
+	TAP_CHECK(t, strcmp(p->cmds[0].words[1].text, "3") == 0);
+	cl_prog_free(p);
+
+	/* nested braces balance and stay literal */
+	p = cl_parse("{a{b}c}", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	TAP_CHECK(t, p->ncmds == 1 && p->cmds[0].nwords == 1 &&
+	    strcmp(p->cmds[0].words[0].text, "a{b}c") == 0);
+	cl_prog_free(p);
+
+	/* a backslash escapes a reserved character into the word */
+	p = cl_parse("a\\;b", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	TAP_CHECK(t, p->ncmds == 1 && p->cmds[0].nwords == 1 &&
+	    strcmp(p->cmds[0].words[0].text, "a;b") == 0);
+	cl_prog_free(p);
+
+	/* a '#' at a command start is a comment to end of line */
+	p = cl_parse("# a comment\nnewline", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	TAP_CHECK(t, p->ncmds == 1 &&
+	    strcmp(p->cmds[0].words[0].text, "newline") == 0);
+	cl_prog_free(p);
+
+	/* an empty or all-comment source is a valid empty program */
+	p = cl_parse("   \n # nothing \n", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	TAP_CHECK(t, p->ncmds == 0);
+	cl_prog_free(p);
+
+	/* errors: unterminated brace, a reserved metacharacter, a bad escape */
+	TAP_CHECK(t, cl_parse("{unterminated", err, sizeof(err)) == NULL);
+	TAP_CHECK(t, cl_parse("a$b", err, sizeof(err)) == NULL);
+	TAP_CHECK(t, cl_parse("a\\x", err, sizeof(err)) == NULL);
+	TAP_CHECK(t, cl_parse("a\"b", err, sizeof(err)) == NULL);
+}
+
+/* A key bound to a {program} runs its commands in order. ^D here runs
+ * line-end then newline, which opens a blank line below "hello" and lands on
+ * it. */
+static void
+t_keymap_prog(Test *t)
+{
+	const Cfg *old = g_cfg, *c, *inc;
+	char incpath[PATH_MAX], mainpath[PATH_MAX], text[512];
+	struct tkbd_seq s;
+	Editor e;
+
+	inc = load_cfg_text(
+	    "[keys \"pg\"]\n"
+	    "\tbind = \"^D { line-end ; newline }\"\n",
+	    incpath, sizeof(incpath));
+	TAP_ASSERT(t, inc != NULL);
+	vedit_cfg_free(inc);
+
+	snprintf(text, sizeof(text),
+	    "[include]\n\tpath = %s\n[keys]\n\tmodes = pg\n", incpath);
+	c = load_cfg_text(text, mainpath, sizeof(mainpath));
+	TAP_ASSERT(t, c != NULL);
+	g_cfg = c;
+
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "hello", 5);
+	ed_apply_config(&e);
+
+	TAP_ASSERT(t, e.kb_map != NULL && e.kb_map->n == 1);
+	TAP_ASSERT(t, e.kb_map->b[0].prog != NULL);
+
+	e.cy = e.cx = 0;
+	s = kseq(TKBD_KEY_D, TKBD_MOD_CTRL, TKBD_CH_NONE);
+	kb_keymap_dispatch(&e, &s);
+	TAP_CHECKF(t, text_lines(e.t) == 2, "lines=%zu", text_lines(e.t));
+	TAP_CHECKF(t, e.cy == 1 && e.cx == 0, "cursor y=%zu x=%zu", e.cy, e.cx);
+
+	text_free(e.t);
+	kb_free_maps(&e);
+	g_cfg = old;
+	vedit_cfg_free(c);
+	unlink(incpath);
+	unlink(mainpath);
+}
+
 const Case tap_cases[] = {
 	{ "ed_pos", t_ed_pos },
+	{ "cl_parse", t_cl_parse },
+	{ "keymap_prog", t_keymap_prog },
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },
 	{ "disp_cols", t_disp_cols },

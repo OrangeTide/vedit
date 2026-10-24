@@ -289,7 +289,7 @@ the reserved metacharacter set. It is special only as the last character of a
 command-position word, so it stays literal inside arguments (file names, `3.14`)
 and in the middle of a word.
 
-Recommended mechanics, open to change:
+Mechanics (settled by the user, 2026-10-24):
 
 - The capture store is a distinct kill stack, separate from the CUA clipboard, so
   `.` never clobbers an explicit copy. Under the reserved registers-as-buffers
@@ -387,4 +387,5 @@ Phase 1, mini-program bindings:
   distinct command name to the parser and a variation to the user, replaces a
   family of `cut-*` verbs, and makes `cut` equal to `delete.` over the selection.
   Open: whether the store is a separate stack (recommended) or the clip, and
-  whether `.` pushes (recommended) or replaces.
+  whether `.` pushes (recommended) or replaces. Settled 2026-10-24: a
+  separate kill stack, and `.` pushes (accumulates).

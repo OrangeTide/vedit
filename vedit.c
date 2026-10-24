@@ -7930,13 +7930,16 @@ typedef enum edit_mode {
  * key), mapped to an action (ACT_*, defined with the engine). The mod field
  * keeps only the Ctrl bit; the second key of a chord is matched ignoring Ctrl,
  * so Ctrl-K Ctrl-B and Ctrl-K B are the same (WordStar behavior). */
+struct cl_prog;			/* a command-language program, defined below */
+
 typedef struct kb_binding {
 	uint16_t	k1;	/* first key (TKBD_KEY_*) */
 	uint8_t		m1;	/* its Ctrl bit */
 	uint16_t	k2;	/* second key of a chord, else 0 */
 	uint8_t		two;	/* 1 when this is a two-key chord */
-	int		action;	/* ACT_* to run */
+	int		action;	/* ACT_* to run, or ACT_NONE for a program */
 	int		arg;	/* small integer argument, or -1 */
+	struct cl_prog	*prog;	/* a {program} to run, else NULL for an action */
 } KbBinding;
 
 typedef struct kb_map {
@@ -25734,6 +25737,285 @@ ed_save_as(Editor *e)
 }
 
 /****************************************************************
+ * Command language
+ *
+ * A small Tcl-shaped language, taking its grammar from antirez's picol, so a
+ * key binding's target can be a short program rather than a single action. A
+ * program is a sequence of commands; a command is a word and its arguments. A
+ * word is bare text or a brace-quoted {block}.
+ *
+ * The full metacharacter set is reserved from day one even though only a
+ * subset is live, so adding a construct later as real syntax cannot change the
+ * meaning of a program written today. Reserved characters:
+ *
+ *	{ }	group a block; its contents are literal, with no substitution
+ *	;	and a newline separate commands
+ *	#	a comment, only where a command begins (the picol rule)
+ *	\	escape the next character so it is literal
+ *	[ ] $ "	command substitution, variables, and quoted strings; parsed as
+ *		errors for now, so giving them meaning later is additive
+ *
+ * To put a reserved character in a word, brace the word or escape the
+ * character. A backslash may escape only a reserved character or whitespace;
+ * other backslash sequences are errors, reserved for future escapes.
+ *
+ * This layer only parses source into a program. Running one is the evaluator,
+ * added separately.
+ ****************************************************************/
+
+typedef struct cl_word {
+	char *text;		/* NUL-terminated literal argument */
+} ClWord;
+
+typedef struct cl_cmd {
+	ClWord	*words;
+	int	nwords;
+	int	cap;
+} ClCmd;
+
+typedef struct cl_prog {
+	ClCmd	*cmds;
+	int	ncmds;
+	int	cap;
+} ClProg;
+
+/* A growable byte buffer for one word under construction. */
+typedef struct cl_buf {
+	char	*s;
+	size_t	len;
+	size_t	cap;
+} ClBuf;
+
+static int
+cl_buf_put(ClBuf *b, char c)
+{
+	if (b->len + 1 >= b->cap) {
+		size_t na = b->cap ? b->cap * 2 : 32;
+		char *ns = realloc(b->s, na);
+
+		if (!ns)
+			return -1;
+		b->s = ns;
+		b->cap = na;
+	}
+	b->s[b->len++] = c;
+	return 0;
+}
+
+static void
+cl_cmd_free(ClCmd *c)
+{
+	int i;
+
+	for (i = 0; i < c->nwords; i++)
+		free(c->words[i].text);
+	free(c->words);
+	c->words = NULL;
+	c->nwords = c->cap = 0;
+}
+
+static void
+cl_prog_free(ClProg *p)
+{
+	int i;
+
+	if (!p)
+		return;
+	for (i = 0; i < p->ncmds; i++)
+		cl_cmd_free(&p->cmds[i]);
+	free(p->cmds);
+	free(p);
+}
+
+/* Append a word (taking ownership of text) to a command. */
+static int
+cl_cmd_add(ClCmd *c, char *text)
+{
+	if (c->nwords >= c->cap) {
+		int na = c->cap ? c->cap * 2 : 4;
+		ClWord *nw = realloc(c->words, (size_t)na * sizeof(*nw));
+
+		if (!nw)
+			return -1;
+		c->words = nw;
+		c->cap = na;
+	}
+	c->words[c->nwords++].text = text;
+	return 0;
+}
+
+/* Append a command (by value) to a program. */
+static int
+cl_prog_add(ClProg *p, const ClCmd *c)
+{
+	if (p->ncmds >= p->cap) {
+		int na = p->cap ? p->cap * 2 : 8;
+		ClCmd *nc = realloc(p->cmds, (size_t)na * sizeof(*nc));
+
+		if (!nc)
+			return -1;
+		p->cmds = nc;
+		p->cap = na;
+	}
+	p->cmds[p->ncmds++] = *c;
+	return 0;
+}
+
+static int
+cl_is_sep(int c)
+{
+	return c == ' ' || c == '\t' || c == '\r';
+}
+
+static int
+cl_is_eoc(int c)		/* ends a command */
+{
+	return c == '\0' || c == ';' || c == '\n';
+}
+
+/* A reserved character that may escape, as itself, after a backslash. */
+static int
+cl_escapable(int c)
+{
+	return strchr("{}[]$\";#\\ \t\r\n", c) != NULL;
+}
+
+/* A reserved character that cannot appear bare in a word. */
+static int
+cl_reserved_bare(int c)
+{
+	return c == '[' || c == ']' || c == '$' || c == '"';
+}
+
+#define CL_ERR(msg) do { \
+		snprintf(err, errlen, "%s", (msg)); \
+		goto fail; \
+	} while (0)
+
+/* Parse source into a program. On a syntax error returns NULL and writes a
+ * short message to err. An empty or all-comment source is a valid empty
+ * program. */
+static ClProg *
+cl_parse(const char *src, char *err, size_t errlen)
+{
+	ClProg *prog = calloc(1, sizeof(*prog));
+	const char *p = src;
+	ClBuf buf = { 0 };
+	ClCmd cmd = { 0 };
+
+	if (err && errlen)
+		err[0] = '\0';
+	if (!prog) {
+		if (err)
+			snprintf(err, errlen, "out of memory");
+		return NULL;
+	}
+	for (;;) {
+		/* between commands: skip blanks, separators, and comments */
+		while (cl_is_sep((unsigned char)*p) || *p == ';' || *p == '\n')
+			p++;
+		if (*p == '\0')
+			break;
+		if (*p == '#') {		/* comment to end of line */
+			while (*p && *p != '\n')
+				p++;
+			continue;
+		}
+		/* collect the words of one command */
+		cmd.words = NULL;
+		cmd.nwords = cmd.cap = 0;
+		while (!cl_is_eoc((unsigned char)*p)) {
+			char *word;
+
+			if (cl_is_sep((unsigned char)*p)) {
+				p++;
+				continue;
+			}
+			buf.len = 0;
+			if (*p == '{') {	/* brace-quoted literal block */
+				int depth = 1;
+
+				p++;
+				while (depth > 0) {
+					if (*p == '\0')
+						CL_ERR("unterminated {");
+					if (*p == '\\') {
+						if (p[1] == '\0')
+							CL_ERR("trailing backslash");
+						if (cl_buf_put(&buf, p[1]) < 0)
+							CL_ERR("out of memory");
+						p += 2;
+						continue;
+					}
+					if (*p == '{') {
+						depth++;
+					} else if (*p == '}') {
+						if (--depth == 0) {
+							p++;
+							break;
+						}
+					}
+					if (cl_buf_put(&buf, *p) < 0)
+						CL_ERR("out of memory");
+					p++;
+				}
+				if (!cl_is_eoc((unsigned char)*p) &&
+				    !cl_is_sep((unsigned char)*p))
+					CL_ERR("text after }");
+			} else {		/* a bare word */
+				if (*p == '}')
+					CL_ERR("unexpected }");
+				if (cl_reserved_bare((unsigned char)*p))
+					CL_ERR("reserved character");
+				while (!cl_is_eoc((unsigned char)*p) &&
+				    !cl_is_sep((unsigned char)*p)) {
+					if (*p == '\\') {
+						if (!cl_escapable((unsigned char)p[1]))
+							CL_ERR("bad escape");
+						if (cl_buf_put(&buf, p[1]) < 0)
+							CL_ERR("out of memory");
+						p += 2;
+						continue;
+					}
+					if (*p == '{' || *p == '}')
+						CL_ERR("brace in word");
+					if (cl_reserved_bare((unsigned char)*p))
+						CL_ERR("reserved character");
+					if (cl_buf_put(&buf, *p) < 0)
+						CL_ERR("out of memory");
+					p++;
+				}
+			}
+			word = malloc(buf.len + 1);
+			if (!word)
+				CL_ERR("out of memory");
+			if (buf.len)
+				memcpy(word, buf.s, buf.len);
+			word[buf.len] = '\0';
+			if (cl_cmd_add(&cmd, word) < 0) {
+				free(word);
+				CL_ERR("out of memory");
+			}
+		}
+		if (cmd.nwords > 0) {
+			if (cl_prog_add(prog, &cmd) < 0)
+				CL_ERR("out of memory");
+			cmd.words = NULL;	/* ownership moved into prog */
+			cmd.nwords = cmd.cap = 0;
+		}
+	}
+	free(buf.s);
+	return prog;
+fail:
+	free(buf.s);
+	cl_cmd_free(&cmd);
+	cl_prog_free(prog);
+	return NULL;
+}
+
+#undef CL_ERR
+
+/****************************************************************
  * Custom keymaps
  *
  * A mode named by a [keys "name"] config section binds keys itself instead of
@@ -25935,13 +26217,22 @@ kb_build_map(KbMap *m, const char *name)
 
 	snprintf(key, sizeof(key), "keys.%s.bind", name);
 	for (i = 0; (v = cfg_get_n(g_cfg, key, i)) != NULL; i++) {
+		const char *brace = strchr(v, '{');
 		char buf[256], *tok[4];
 		uint8_t m2;		/* the chord's second key matches mod-free */
 		int nt = 0, ai;
 		char *p;
+		size_t klen;
 		KbBinding b;
 
-		snprintf(buf, sizeof(buf), "%s", v);
+		memset(&b, 0, sizeof(b));
+		/* The key spec is the text before a '{' (the program form) or the
+		 * whole value (the action form). Tokenize just that part. */
+		klen = brace ? (size_t)(brace - v) : strlen(v);
+		if (klen >= sizeof(buf))
+			klen = sizeof(buf) - 1;
+		memcpy(buf, v, klen);
+		buf[klen] = '\0';
 		for (p = buf; *p && nt < 4; ) {
 			while (*p == ' ' || *p == '\t')
 				p++;
@@ -25953,9 +26244,59 @@ kb_build_map(KbMap *m, const char *name)
 			if (*p)
 				*p++ = '\0';
 		}
+
+		if (brace) {			/* <key> [key2] {program} */
+			char emsg[64], *body;
+			const char *q, *end = NULL;
+			ClProg *prog;
+			int depth = 1;
+
+			if (nt < 1 || nt > 2)
+				continue;	/* one key, or a chord's two */
+			if (!kb_parse_onekey(tok[0], &b.k1, &b.m1))
+				continue;
+			if (nt == 2) {
+				if (!kb_parse_onekey(tok[1], &b.k2, &m2))
+					continue;
+				b.two = 1;
+			}
+			/* The program is the text between the outer braces. */
+			for (q = brace + 1; *q; q++) {
+				if (*q == '\\' && q[1]) {
+					q++;
+					continue;
+				}
+				if (*q == '{') {
+					depth++;
+				} else if (*q == '}' && --depth == 0) {
+					end = q;
+					break;
+				}
+			}
+			if (!end)
+				continue;	/* unbalanced braces: skip */
+			for (q = end + 1; *q == ' ' || *q == '\t'; q++)
+				;
+			if (*q)
+				continue;	/* text after the program: skip */
+			body = malloc((size_t)(end - brace));	/* inner + NUL */
+			if (!body)
+				continue;
+			memcpy(body, brace + 1, (size_t)(end - brace - 1));
+			body[end - brace - 1] = '\0';
+			prog = cl_parse(body, emsg, sizeof(emsg));
+			free(body);
+			if (!prog)
+				continue;	/* a malformed program: skip */
+			b.action = ACT_NONE;
+			b.prog = prog;
+			kb_map_add(m, &b);
+			continue;
+		}
+
+		/* <key> <action> [arg] or <key> <key2> <action> [arg] */
 		if (nt < 2)
 			continue;		/* need at least a key and an action */
-		memset(&b, 0, sizeof(b));
 		if (!kb_parse_onekey(tok[0], &b.k1, &b.m1))
 			continue;
 		if (nt >= 3 && kb_parse_onekey(tok[1], &b.k2, &m2)) {
@@ -25999,6 +26340,8 @@ kb_free_maps(Editor *e)
 	int i, j;
 
 	for (i = 0; i < KB_MODE_MAX; i++) {
+		for (j = 0; j < e->kb_maps[i].n; j++)
+			cl_prog_free(e->kb_maps[i].b[j].prog);
 		free(e->kb_maps[i].b);
 		e->kb_maps[i].b = NULL;
 		e->kb_maps[i].n = e->kb_maps[i].cap = 0;
@@ -26439,6 +26782,40 @@ kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
 	}
 }
 
+/* Run a parsed program: each command is a verb name and its literal arguments,
+ * looked up in kb_actions[] and run through kb_run_action, in order, as the
+ * cursor forms of those verbs. The commands run with no originating key, so a
+ * motion in a program never extends a selection from the trigger key's Shift.
+ * The program stops at the first host request (any Req other than
+ * REQ_CONTINUE), handing control back to the main loop so a command that opens
+ * a prompt or quits ends the run; the commands after it do not execute. An
+ * unknown verb is reported and stops the program. */
+static Req
+cl_run(Editor *e, const struct cl_prog *p)
+{
+	int i;
+
+	for (i = 0; i < p->ncmds; i++) {
+		const ClCmd *c = &p->cmds[i];
+		int act, arg;
+		Req r;
+
+		if (c->nwords == 0)
+			continue;
+		act = kb_action_id(c->words[0].text);
+		if (act == ACT_NONE) {
+			set_status(e, "unknown command: %.40s",
+			    c->words[0].text);
+			return REQ_CONTINUE;
+		}
+		arg = (c->nwords > 1) ? atoi(c->words[1].text) : -1;
+		r = kb_run_action(e, act, arg, NULL);
+		if (r != REQ_CONTINUE)
+			return r;
+	}
+	return REQ_CONTINUE;
+}
+
 /* Route a key through the active custom keymap. Tracks a one-key prefix for
  * chords; an unbound printable key self-inserts; any other unbound key is
  * ignored. Returns a Req. */
@@ -26458,16 +26835,22 @@ kb_keymap_dispatch(Editor *e, const struct tkbd_seq *seq)
 		e->kb_pending = 0;
 		for (i = 0; i < m->n; i++)
 			if (m->b[i].two && m->b[i].k1 == e->kb_pend_key &&
-			    m->b[i].m1 == e->kb_pend_mod && m->b[i].k2 == key)
+			    m->b[i].m1 == e->kb_pend_mod && m->b[i].k2 == key) {
+				if (m->b[i].prog)
+					return cl_run(e, m->b[i].prog);
 				return kb_run_action(e, m->b[i].action,
 				    m->b[i].arg, seq);
+			}
 		return REQ_CONTINUE;	/* no such chord: drop it quietly */
 	}
 
 	for (i = 0; i < m->n; i++)	/* a single-key binding wins */
-		if (!m->b[i].two && m->b[i].k1 == key && m->b[i].m1 == mod)
+		if (!m->b[i].two && m->b[i].k1 == key && m->b[i].m1 == mod) {
+			if (m->b[i].prog)
+				return cl_run(e, m->b[i].prog);
 			return kb_run_action(e, m->b[i].action, m->b[i].arg,
 			    seq);
+		}
 	for (i = 0; i < m->n; i++)	/* else a prefix: wait for the second key */
 		if (m->b[i].two && m->b[i].k1 == key && m->b[i].m1 == mod) {
 			e->kb_pending = 1;

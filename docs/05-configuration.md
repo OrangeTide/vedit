@@ -149,6 +149,27 @@ skipped, so a keymap may list keys for features that are not present yet. Note
 that a terminal reports Ctrl-J, Ctrl-M, and Ctrl-I as Enter, Enter, and Tab, so
 bind those three by their key names, not as `^J`, `^M`, or `^I`.
 
+A binding can also run a short program instead of a single action, so one key
+performs several steps. Wrap the program in braces as the bind target; its
+commands are the same action names, separated by `;` or a newline, and run in
+order:
+
+```ini
+[keys "wordstar"]
+    bind = "^Y { line-end ; delete-to-bol }"   # clear the line's text
+    bind = "^N { line-end ; newline }"         # open a blank line below
+```
+
+Quote the whole value. The config file treats `;` and `#` as the start of a
+comment, so a program that uses them must sit inside double quotes, which the
+parser strips before reading the program. Inside the program, braces group an
+argument that holds spaces and a backslash escapes the next character. The
+characters `[ ] $ "` are reserved for later use and are errors for now, so
+brace or escape one to use it as text. A program stops at the first command
+that opens a prompt or quits (`find`, `save`, `quit`, and the like), so put
+such a command last. An unknown command name is reported and stops the
+program.
+
 A `help` line adds a row to the F1 key-bindings screen shown while the keymap is
 active, so the file documents its own keys:
 
