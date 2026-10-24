@@ -8371,6 +8371,14 @@ size_t prev_rune_len(const char *s, size_t cx);
 void clamp_col(Editor *e);
 void move_left(Editor *e);
 void move_right(Editor *e);
+void ed_pos_left(Editor *e, size_t *py, size_t *px);
+void ed_pos_right(Editor *e, size_t *py, size_t *px);
+void ed_pos_up(Editor *e, size_t *py, size_t *px);
+void ed_pos_down(Editor *e, size_t *py, size_t *px);
+void ed_pos_line_begin(Editor *e, size_t *py, size_t *px);
+void ed_pos_line_end(Editor *e, size_t *py, size_t *px);
+void ed_pos_buf_begin(Editor *e, size_t *py, size_t *px);
+void ed_pos_buf_end(Editor *e, size_t *py, size_t *px);
 void hl_touch(Editor *e, size_t line);
 void ed_insert(Editor *e, const char *bytes, size_t n);
 void ed_newline(Editor *e);
@@ -16672,32 +16680,106 @@ dlg_pick(Editor *e, const Picksrc *src)
  * Editing operations
  ****************************************************************/
 
+/* The non-vi motion layer. Each function maps a position to the position a
+ * modeless motion lands on, touching no editor state, so the CUA keys, the
+ * config actions, and a future command program share one set of moves. The
+ * cursor forms (move_left, move_right, the ed_dispatch movement cases) are
+ * these applied to the live cursor. The vi keys keep their own vi_pos_*
+ * family. Up and down clamp the column to the target line, matching the
+ * modeless behaviour of no sticky goal column. */
+void
+ed_pos_left(Editor *e, size_t *py, size_t *px)
+{
+	size_t len = 0;
+	const char *line = text_line(e->t, *py, &len);
+
+	if (*px > 0) {
+		*px -= prev_rune_len(line, *px);
+	} else if (*py > 0) {
+		(*py)--;
+		*px = text_line_len(e->t, *py);
+	}
+}
+
+void
+ed_pos_right(Editor *e, size_t *py, size_t *px)
+{
+	size_t len = 0;
+	const char *line = text_line(e->t, *py, &len);
+
+	if (*px < len) {
+		*px += rune_len_at(line, len, *px);
+	} else if (*py + 1 < text_lines(e->t)) {
+		(*py)++;
+		*px = 0;
+	}
+}
+
+void
+ed_pos_up(Editor *e, size_t *py, size_t *px)
+{
+	size_t len;
+
+	if (*py == 0)
+		return;
+	(*py)--;
+	len = text_line_len(e->t, *py);
+	if (*px > len)
+		*px = len;
+}
+
+void
+ed_pos_down(Editor *e, size_t *py, size_t *px)
+{
+	size_t len;
+
+	if (*py + 1 >= text_lines(e->t))
+		return;
+	(*py)++;
+	len = text_line_len(e->t, *py);
+	if (*px > len)
+		*px = len;
+}
+
+void
+ed_pos_line_begin(Editor *e, size_t *py, size_t *px)
+{
+	(void)e;
+	(void)py;
+	*px = 0;
+}
+
+void
+ed_pos_line_end(Editor *e, size_t *py, size_t *px)
+{
+	*px = text_line_len(e->t, *py);
+}
+
+void
+ed_pos_buf_begin(Editor *e, size_t *py, size_t *px)
+{
+	(void)e;
+	*py = 0;
+	*px = 0;
+}
+
+void
+ed_pos_buf_end(Editor *e, size_t *py, size_t *px)
+{
+	*py = text_lines(e->t) ? text_lines(e->t) - 1 : 0;
+	*px = text_line_len(e->t, *py);
+}
+
 void
 move_left(Editor *e)
 {
-	size_t len = 0;
-	const char *line = text_line(e->t, e->cy, &len);
-
-	if (e->cx > 0) {
-		e->cx -= prev_rune_len(line, e->cx);
-	} else if (e->cy > 0) {
-		e->cy--;
-		e->cx = text_line_len(e->t, e->cy);
-	}
+	ed_pos_left(e, &e->cy, &e->cx);
 }
 
 void
 move_right(Editor *e)
 {
-	size_t len = 0;
-	const char *line = text_line(e->t, e->cy, &len);
-
-	if (e->cx < len) {
-		e->cx += rune_len_at(line, len, e->cx);
-	} else if (e->cy + 1 < text_lines(e->t)) {
-		e->cy++;
-		e->cx = 0;
-	}
+	ed_pos_right(e, &e->cy, &e->cx);
 }
 
 /* Clamp the cursor to a valid line and column. */
@@ -18127,30 +18209,22 @@ ed_dispatch(Editor *e, Cmd cmd, const struct tkbd_seq *seq)
 		move_right(e);
 		break;
 	case CMD_UP:
-		if (e->cy > 0) {
-			e->cy--;
-			clamp_col(e);
-		}
+		ed_pos_up(e, &e->cy, &e->cx);
 		break;
 	case CMD_DOWN:
-		if (e->cy + 1 < text_lines(e->t)) {
-			e->cy++;
-			clamp_col(e);
-		}
+		ed_pos_down(e, &e->cy, &e->cx);
 		break;
 	case CMD_HOME:
-		e->cx = 0;
+		ed_pos_line_begin(e, &e->cy, &e->cx);
 		break;
 	case CMD_END:
-		e->cx = text_line_len(e->t, e->cy);
+		ed_pos_line_end(e, &e->cy, &e->cx);
 		break;
 	case CMD_TOP:
-		e->cy = 0;
-		e->cx = 0;
+		ed_pos_buf_begin(e, &e->cy, &e->cx);
 		break;
 	case CMD_BOTTOM:
-		e->cy = text_lines(e->t) ? text_lines(e->t) - 1 : 0;
-		e->cx = text_line_len(e->t, e->cy);
+		ed_pos_buf_end(e, &e->cy, &e->cx);
 		break;
 	case CMD_PGUP:
 		e->cy = e->cy > (size_t)page ? e->cy - (size_t)page : 0;

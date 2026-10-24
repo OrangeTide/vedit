@@ -4219,7 +4219,71 @@ t_tbl_join(Test *t)
 	text_free(tx);
 }
 
+/* The non-vi motion layer maps a position to where a modeless motion lands,
+ * without touching the editor cursor. Left and right step by rune and wrap
+ * across line ends; up and down clamp the column to the target line; the
+ * line and buffer ends land where expected. */
+static void
+t_ed_pos(Test *t)
+{
+	size_t y, x;
+	Editor e;
+
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "hello", 5);
+	text_split(e.t, 0, 5);
+	text_insert(e.t, 1, 0, "hi", 2);		/* line 1 = "hi" */
+
+	/* right at the end of line 0 wraps to the head of line 1 */
+	y = 0; x = 5;
+	ed_pos_right(&e, &y, &x);
+	TAP_CHECKF(t, y == 1 && x == 0, "right wrap y=%zu x=%zu", y, x);
+
+	/* left at the head of line 1 wraps back to the tail of line 0 */
+	y = 1; x = 0;
+	ed_pos_left(&e, &y, &x);
+	TAP_CHECKF(t, y == 0 && x == 5, "left wrap y=%zu x=%zu", y, x);
+
+	/* down from past the short line clamps the column */
+	y = 0; x = 5;
+	ed_pos_down(&e, &y, &x);
+	TAP_CHECKF(t, y == 1 && x == 2, "down clamp y=%zu x=%zu", y, x);
+
+	/* up stays put at the top line */
+	y = 0; x = 3;
+	ed_pos_up(&e, &y, &x);
+	TAP_CHECKF(t, y == 0 && x == 3, "up at top y=%zu x=%zu", y, x);
+
+	/* line begin and end */
+	y = 1; x = 1;
+	ed_pos_line_begin(&e, &y, &x);
+	TAP_CHECK(t, x == 0);
+	ed_pos_line_end(&e, &y, &x);
+	TAP_CHECKF(t, x == 2, "line end x=%zu", x);
+
+	/* buffer begin and end */
+	y = 1; x = 1;
+	ed_pos_buf_begin(&e, &y, &x);
+	TAP_CHECK(t, y == 0 && x == 0);
+	ed_pos_buf_end(&e, &y, &x);
+	TAP_CHECKF(t, y == 1 && x == 2, "buf end y=%zu x=%zu", y, x);
+
+	/* the cursor forms run the same transform over the live cursor */
+	e.cy = 0; e.cx = 5;
+	move_right(&e);
+	TAP_CHECKF(t, e.cy == 1 && e.cx == 0, "move_right y=%zu x=%zu",
+	    e.cy, e.cx);
+	move_left(&e);
+	TAP_CHECKF(t, e.cy == 0 && e.cx == 5, "move_left y=%zu x=%zu",
+	    e.cy, e.cx);
+
+	text_free(e.t);
+}
+
 const Case tap_cases[] = {
+	{ "ed_pos", t_ed_pos },
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },
 	{ "disp_cols", t_disp_cols },
