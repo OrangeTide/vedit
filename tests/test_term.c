@@ -1461,6 +1461,69 @@ t_art_scrollbar(Test *t)
 	rmdir(dir);
 }
 
+/* A text buffer parked in the bottom pane makes two stacked text views. A
+ * click in the unfocused half moves the focus there and places the cursor,
+ * and the wheel over it scrolls that half in place. (art_mouse feeds a raw
+ * mouse report through ed_mouse_event; its name is incidental here.) */
+static void
+t_pane_mouse(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int full, ph, th0, botrow0, i;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	memio_enable_fds(&io);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, buf_slot(&v->e) == 0);
+	buf_save(&v->e, &v->e.bufs[0]);
+	for (i = 0; i < 30; i++) {		/* 30 lines in buffer 0 */
+		char lbl[8];
+		int ln = snprintf(lbl, sizeof(lbl), "L%02d", i);
+
+		text_insert(v->e.t, (size_t)i, 0, lbl, (size_t)ln);
+		text_split(v->e.t, (size_t)i, (size_t)ln);
+	}
+	TAP_ASSERT(t, buf_open(&v->e, NULL) == 1);
+	text_insert(v->e.t, 0, 0, "pane line", 9);	/* buffer 1 */
+
+	pane_buffer(&v->e);			/* buffer 1 below, buffer 0 above */
+	TAP_ASSERT(t, v->e.in_pane && pane_shown(&v->e) && v->e.cur == 1);
+	full = text_height_full(&v->e);
+	ph = pane_height(&v->e);
+	th0 = text_height(&v->e);
+	botrow0 = CHROME_TOP + th0 + 1;
+	TAP_CHECKF(t, th0 == full - ph - 1, "th0 %d full %d ph %d", th0, full, ph);
+
+	/* focus is below (buffer 1); a click in the top half (parked buffer 0)
+	 * moves the focus up and lands the cursor there */
+	art_mouse(&v->e, TKBD_MOUSE_LEFT, CHROME_LEFT + 2, CHROME_TOP, 0);
+	TAP_CHECKF(t, v->e.cur == 0 && !v->e.in_pane && v->e.cy == 0,
+	    "click top: cur %d in_pane %d cy %zu", v->e.cur, v->e.in_pane,
+	    v->e.cy);
+	art_mouse(&v->e, TKBD_MOUSE_RELEASE, CHROME_LEFT + 2, CHROME_TOP, 0);
+
+	/* focus is now above (buffer 0); a click in the bottom half returns it */
+	art_mouse(&v->e, TKBD_MOUSE_LEFT, CHROME_LEFT + 2, botrow0, 0);
+	TAP_CHECKF(t, v->e.cur == 1 && v->e.in_pane && v->e.cy == 0,
+	    "click bottom: cur %d in_pane %d cy %zu", v->e.cur, v->e.in_pane,
+	    v->e.cy);
+	art_mouse(&v->e, TKBD_MOUSE_RELEASE, CHROME_LEFT + 2, botrow0, 0);
+
+	/* the wheel over the top half scrolls the parked buffer 0 in place,
+	 * leaving the focus and the focused cursor where they are */
+	TAP_ASSERT(t, v->e.bufs[0].top == 0);
+	art_mouse(&v->e, TKBD_MOUSE_WHEEL_DOWN, CHROME_LEFT + 2, CHROME_TOP, 0);
+	TAP_CHECKF(t, v->e.bufs[0].top == 3 && v->e.cur == 1 && v->e.in_pane,
+	    "wheel parked: top %zu cur %d", v->e.bufs[0].top, v->e.cur);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* A .ans file opens as a grid, renders through the emulator's cells, and
  * saves back as SGR-coloured UTF-8 with blank rows and cells dropped. */
 static void
@@ -1879,6 +1942,7 @@ const Case tap_cases[] = {
 	{ "term_loop_colon", t_term_loop_colon },
 	{ "pane_split", t_pane_split },
 	{ "pane_text", t_pane_text },
+	{ "pane_mouse", t_pane_mouse },
 	{ "term_poll_fallback", t_term_poll_fallback },
 	{ "term_discard", t_term_discard },
 	{ "term_open_nomux", t_term_open_nomux },

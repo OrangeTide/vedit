@@ -30316,6 +30316,48 @@ placed:
 		vi_clamp(e);
 }
 
+/* First screen row and visible height of the focused text view. This matches
+ * view_row0 and text_height except when the current buffer is the one parked
+ * in the bottom pane: it is drawn below the separator, not at the top. */
+static void
+focus_view_rect(const Editor *e, int *row0, int *rows)
+{
+	*row0 = view_row0(e);
+	*rows = text_height(e);
+#ifdef VEDIT_TERM
+	if (e->in_pane && pane_shown(e)) {
+		*row0 = CHROME_TOP + text_height(e) + 1;
+		*rows = pane_height(e);
+	}
+#endif
+}
+
+#ifdef VEDIT_TERM
+/* Scroll a text buffer parked in the bottom pane (shown but not focused) in
+ * place by delta lines, mirroring split_scroll_other for that pane. */
+static void
+pane_scroll_parked(Editor *e, int idx, long delta, int rows)
+{
+	const Text *t = idx >= 0 && idx < e->nbuf ? buf_text_at(e, idx) : NULL;
+	size_t n = t ? text_lines(t) : 0, top;
+
+	if (n == 0)
+		return;
+	top = e->bufs[idx].top;
+	if (delta < 0)
+		top = (size_t)(-delta) > top ? 0 : top - (size_t)(-delta);
+	else
+		top = top + (size_t)delta >= n ? n - 1 : top + (size_t)delta;
+	e->bufs[idx].top = top;
+	if (e->bufs[idx].cy < top)
+		e->bufs[idx].cy = top;
+	else if (rows > 0 && e->bufs[idx].cy >= top + (size_t)rows)
+		e->bufs[idx].cy = top + (size_t)rows - 1;
+	if (e->bufs[idx].cy >= n)
+		e->bufs[idx].cy = n - 1;
+}
+#endif /* VEDIT_TERM */
+
 /* Extend the drag selection to the pointer at screen (x,y). The first motion
  * after a press promotes the pending click to a live selection, anchored where
  * the press landed. Dragging above or below the focused pane scrolls it one
@@ -30324,10 +30366,11 @@ placed:
 static void
 mouse_drag_extend(Editor *e, int x, int y)
 {
-	int text_h = text_height(e), gutter = gutter_width(e);
-	int row0 = view_row0(e), col0 = view_col0(e) + gutter;
+	int text_h, gutter = gutter_width(e);
+	int row0, col0 = view_col0(e) + gutter;
 	int text_w = text_width(e) - gutter, row;
 
+	focus_view_rect(e, &row0, &text_h);
 	if (text_w < 1)
 		text_w = 1;
 	if (e->mouse_drag == MDRAG_PEND) {
@@ -30772,11 +30815,6 @@ ed_mouse_event(Editor *e, const struct tkbd_seq *m)
 			mouse_drag_extend(e, m->x, m->y);
 		return MA_NONE;
 	}
-	text_h = text_height(e);
-	gutter = gutter_width(e);
-	text_w = text_width(e) - gutter;
-	if (text_w < 1)
-		text_w = 1;
 	if (press && m->y == 0) {
 		int mi = menu_hit(e, m->x);
 
@@ -30818,6 +30856,40 @@ ed_mouse_event(Editor *e, const struct tkbd_seq *m)
 		return MA_NONE;
 	}
 #endif
+#ifdef VEDIT_TERM
+	/* A text buffer parked in the bottom pane makes two stacked text views,
+	 * like a horizontal split. A click in the unfocused one moves the focus
+	 * there, the wheel scrolls it in place, and the cursor then lands as in
+	 * any view (the generic tail below, now aimed at the focused region). */
+	if (pane_shown(e) && !pane_term(e, NULL)) {
+		int th0 = text_height(e), ph = pane_height(e);
+		int botrow0 = CHROME_TOP + th0 + 1;
+		int in_bot = m->y >= botrow0 && m->y < botrow0 + ph;
+		int in_top = m->y >= CHROME_TOP && m->y < CHROME_TOP + th0;
+		int below = e->in_pane;		/* the focused view is the lower one */
+		int on_focused = below ? in_bot : in_top;
+
+		if ((!in_top && !in_bot) ||
+		    m->x < view_col0(e) || m->x >= view_col0(e) + text_width(e))
+			return MA_NONE;
+		if (!on_focused) {		/* the parked half */
+			int pidx = below ? pane_top_idx(e) : pane_text_idx(e);
+			int prows = below ? th0 : ph;
+
+			if (m->key == TKBD_MOUSE_WHEEL_UP) {
+				pane_scroll_parked(e, pidx, -3, prows);
+				return MA_NONE;
+			}
+			if (m->key == TKBD_MOUSE_WHEEL_DOWN) {
+				pane_scroll_parked(e, pidx, 3, prows);
+				return MA_NONE;
+			}
+			if (!press)
+				return MA_NONE;
+			pane_focus_text(e, !below);	/* focus the clicked half */
+		}
+	} else
+#endif
 	if (split_shown(e)) {
 		Rect o;
 
@@ -30833,14 +30905,13 @@ ed_mouse_event(Editor *e, const struct tkbd_seq *m)
 			if (!press)
 				return MA_NONE;
 			split_focus_set(e, !e->split_focus);
-			text_h = text_height(e);
-			gutter = gutter_width(e);
-			text_w = text_width(e) - gutter;
-			if (text_w < 1)
-				text_w = 1;
 		}
 	}
-	row0 = view_row0(e);
+	focus_view_rect(e, &row0, &text_h);
+	gutter = gutter_width(e);
+	text_w = text_width(e) - gutter;
+	if (text_w < 1)
+		text_w = 1;
 	col0 = view_col0(e) + gutter;
 	if (m->y < row0 || m->y >= row0 + text_h ||
 	    m->x < view_col0(e) || m->x >= view_col0(e) + text_width(e))
