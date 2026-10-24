@@ -1327,6 +1327,78 @@ art_type(Editor *e, const char *s)
 		    (uint32_t)(unsigned char)*s, 0);
 }
 
+static void
+art_mouse(Editor *e, uint16_t key, int x, int y, int mod)
+{
+	struct tkbd_seq seq;
+
+	memset(&seq, 0, sizeof(seq));
+	seq.type = TKBD_MOUSE;
+	seq.key = key;
+	seq.ch = TKBD_CH_NONE;
+	seq.x = x;
+	seq.y = y;
+	seq.mod = mod;
+	ed_mouse_event(e, &seq);
+}
+
+/* The mouse in the art view: a left click moves the cursor (dropping any
+ * selection), a left drag marks a rectangle (anchor at the press), and the
+ * wheel scrolls by moving the cursor. Screen (row,col) maps to the grid as
+ * (CHROME_TOP + y - top, CHROME_LEFT + x - left). */
+static void
+t_art_mouse(Test *t)
+{
+	char dir[] = "/tmp/vedit-artm-XXXXXX";
+	char path[PATH_MAX];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	Art *a;
+	int y1, y2, x1, x2;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	write_file(dir, "m.ans",
+	    "aaaa\r\nbbbb\r\ncccc\r\ndddd\r\neeee\r\nffff\r\n");
+	snprintf(path, sizeof(path), "%s/m.ans", dir);
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	TAP_ASSERT(t, v->e.art != NULL);
+	a = v->e.art;
+
+	/* press at grid (1,2): screen (y=3, x=3) */
+	art_mouse(&v->e, TKBD_MOUSE_LEFT, 3, 3, 0);
+	TAP_CHECKF(t, a->cy == 1 && a->cx == 2 && !v->e.sel_active &&
+	    v->e.mouse_drag == MDRAG_ART && v->e.ay == 1 && v->e.ax == 2,
+	    "press cy=%d cx=%d sel=%d drag=%d", a->cy, a->cx, v->e.sel_active,
+	    v->e.mouse_drag);
+	/* drag to grid (3,5): screen (y=5, x=6) */
+	art_mouse(&v->e, TKBD_MOUSE_LEFT, 6, 5, TKBD_MOD_MOTION);
+	TAP_CHECKF(t, a->cy == 3 && a->cx == 5 && v->e.sel_active &&
+	    v->e.sel_block, "drag cy=%d cx=%d sel=%d block=%d", a->cy, a->cx,
+	    v->e.sel_active, v->e.sel_block);
+	art_mouse(&v->e, TKBD_MOUSE_RELEASE, 6, 5, 0);
+	TAP_CHECK(t, v->e.mouse_drag == MDRAG_NONE && v->e.sel_active);
+	art_sel_rect(&v->e, &y1, &y2, &x1, &x2);
+	TAP_CHECKF(t, y1 == 1 && y2 == 3 && x1 == 2 && x2 == 5,
+	    "rect y%d..%d x%d..%d", y1, y2, x1, x2);
+
+	/* the wheel scrolls by moving the cursor three rows */
+	a->cy = 0;
+	a->top = 0;
+	art_mouse(&v->e, TKBD_MOUSE_WHEEL_DOWN, 5, 5, 0);
+	TAP_CHECKF(t, a->cy == 3, "wheel cy=%d", a->cy);
+
+	vedit_free(v);
+	memio_free(&m);
+	unlink(path);
+	rmdir(dir);
+}
+
 /* A .ans file opens as a grid, renders through the emulator's cells, and
  * saves back as SGR-coloured UTF-8 with blank rows and cells dropped. */
 static void
@@ -1759,6 +1831,7 @@ const Case tap_cases[] = {
 	{ "term_resize_skips", t_term_resize_skips },
 	{ "art_roundtrip", t_art_roundtrip },
 	{ "art_edit", t_art_edit },
+	{ "art_mouse", t_art_mouse },
 	{ "palettes", t_palettes },
 	{ "term_repost", t_term_repost },
 	{ NULL, NULL },

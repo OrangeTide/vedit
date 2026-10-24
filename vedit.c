@@ -7994,6 +7994,7 @@ enum {
 	MDRAG_NONE,	/* button up */
 	MDRAG_PEND,	/* pressed in the text, no motion yet (a plain click) */
 	MDRAG_TEXT,	/* extending a text selection */
+	MDRAG_ART,	/* extending an art rectangle selection */
 	MDRAG_VBAR,	/* dragging a vertical scrollbar thumb */
 	MDRAG_HBAR	/* dragging the horizontal scrollbar thumb */
 };
@@ -30577,10 +30578,49 @@ mouse_sbar(Editor *e, const struct tkbd_seq *m)
 	return 1;
 }
 
+#ifdef VEDIT_ART
+/* Screen (x,y) to an art grid cell, clamped to the grid. The art mapping is
+ * the identity through the scroll offset: no gutter, no stolen columns. */
+static void
+art_mouse_cell(Editor *e, int x, int y, int *gy, int *gx)
+{
+	Art *a = e->art;
+	int ry = a->top + (y - CHROME_TOP);
+	int rx = a->left + (x - CHROME_LEFT);
+
+	if (ry < 0)
+		ry = 0;
+	else if (a->rows > 0 && ry > a->rows - 1)
+		ry = a->rows - 1;
+	if (rx < 0)
+		rx = 0;
+	else if (a->cols > 0 && rx > a->cols - 1)
+		rx = a->cols - 1;
+	*gy = ry;
+	*gx = rx;
+}
+
+/* Extend the art rectangle selection to the pointer. The anchor stays where
+ * the press landed; a drag past an edge lands offscreen and art_scroll brings
+ * it back into view on the next paint, so the view follows the drag. */
+static void
+art_drag_extend(Editor *e, int x, int y)
+{
+	Art *a = e->art;
+	int gy, gx;
+
+	art_mouse_cell(e, x, y, &gy, &gx);
+	a->cy = gy;
+	a->cx = gx;
+	e->sel_active = 1;
+	e->sel_block = 1;
+}
+#endif /* VEDIT_ART */
+
 /* Act on a mouse report. A click on the menu bar opens that menu and returns
  * the action chosen there; in the text area a left click places the cursor,
- * a drag extends a selection, and the wheel scrolls three lines. Terminal
- * buffers, the pane, and the hex, table and art views take nothing yet. */
+ * a drag extends a selection, and the wheel scrolls three lines. In art mode
+ * a click moves the cursor and a drag marks a rectangle. */
 static Menuact
 ed_mouse_event(Editor *e, const struct tkbd_seq *m)
 {
@@ -30600,6 +30640,10 @@ ed_mouse_event(Editor *e, const struct tkbd_seq *m)
 	if (motion) {
 		if (e->mouse_drag == MDRAG_VBAR || e->mouse_drag == MDRAG_HBAR)
 			mouse_sbar_drag(e, m->x, m->y);
+#ifdef VEDIT_ART
+		else if (e->mouse_drag == MDRAG_ART)
+			art_drag_extend(e, m->x, m->y);
+#endif
 		else if (e->mouse_drag == MDRAG_TEXT || e->mouse_drag == MDRAG_PEND)
 			mouse_drag_extend(e, m->x, m->y);
 		return MA_NONE;
@@ -30624,8 +30668,31 @@ ed_mouse_event(Editor *e, const struct tkbd_seq *m)
 		return MA_NONE;
 #endif
 #ifdef VEDIT_ART
-	if (e->art)
+	if (e->art) {
+		Art *a = e->art;
+		int gy, gx;
+
+		if (m->key == TKBD_MOUSE_WHEEL_UP) {
+			art_move(a, -3, 0);
+			return MA_NONE;
+		}
+		if (m->key == TKBD_MOUSE_WHEEL_DOWN) {
+			art_move(a, 3, 0);
+			return MA_NONE;
+		}
+		if (!press || m->y < CHROME_TOP ||
+		    m->y >= CHROME_TOP + text_height(e) || m->x < CHROME_LEFT ||
+		    m->x >= CHROME_LEFT + text_width(e))
+			return MA_NONE;
+		art_mouse_cell(e, m->x, m->y, &gy, &gx);
+		a->cy = gy;
+		a->cx = gx;
+		e->ay = (size_t)gy;	/* anchor; a drag turns this into a rect */
+		e->ax = (size_t)gx;
+		e->sel_active = 0;	/* a plain click leaves no selection */
+		e->mouse_drag = MDRAG_ART;
 		return MA_NONE;
+	}
 #endif
 	if (split_shown(e)) {
 		Rect o;
