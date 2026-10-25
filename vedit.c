@@ -3290,6 +3290,22 @@ cfg_bool(const Cfg *c, const char *key, int def)
 	return str_bool(cfg_get(c, key), def);
 }
 
+/* Read an integer setting, keeping def unless the value parses and lands
+ * within [lo, hi] inclusive. */
+static int
+cfg_int_range(const Cfg *c, const char *key, int def, int lo, int hi)
+{
+	const char *s = cfg_get(c, key);
+
+	if (s) {
+		int v = atoi(s);
+
+		if (v >= lo && v <= hi)
+			return v;
+	}
+	return def;
+}
+
 static char *
 cfg_skip_ws(char *s)
 {
@@ -17118,9 +17134,7 @@ tabs_config(Editor *e)
 	int dflt = TAB_WIDTH;
 
 	tabs_detach(e);
-	s = cfg_get(g_cfg, "edit.tabstop");
-	if (s && atoi(s) >= 1 && atoi(s) <= TAB_STOP_MAX)
-		dflt = atoi(s);
+	dflt = cfg_int_range(g_cfg, "edit.tabstop", dflt, 1, TAB_STOP_MAX);
 	s = cfg_get(g_cfg, "edit.tabstops");
 	if (s && *s) {
 		Widths *ws = tabs_parse(s, dflt, err, sizeof(err));
@@ -34387,13 +34401,7 @@ ed_apply_config(Editor *e)
 	e->search_icase = cfg_bool(g_cfg, "edit.ignorecase", e->search_icase);
 	date_set_format(cfg_get(g_cfg, "insert.dateformat"));
 #ifdef VEDIT_TERM
-	s = cfg_get(g_cfg, "ui.paneheight");
-	if (s) {
-		int v = atoi(s);
-
-		if (v >= 0 && v <= 500)
-			e->pane_rows = v;
-	}
+	e->pane_rows = cfg_int_range(g_cfg, "ui.paneheight", e->pane_rows, 0, 500);
 	e->art_on = cfg_bool(g_cfg, "art.view", e->art_on);
 	s = cfg_get(g_cfg, "art.width");
 	if (s) {
@@ -34406,28 +34414,10 @@ ed_apply_config(Editor *e)
 #ifdef VEDIT_TABLE
 	e->tbl_on = cfg_bool(g_cfg, "table.view", e->tbl_on);
 	e->tbl_header = cfg_bool(g_cfg, "table.header", e->tbl_header);
-	s = cfg_get(g_cfg, "table.width");
-	if (s) {
-		int v = atoi(s);
-
-		if (v >= 0 && v <= TBL_WIDTH_MAX)
-			e->tbl_width = v;
-	}
+	e->tbl_width = cfg_int_range(g_cfg, "table.width", e->tbl_width, 0, TBL_WIDTH_MAX);
 #endif
-	s = cfg_get(g_cfg, "edit.shiftwidth");
-	if (s) {
-		int v = atoi(s);
-
-		if (v >= 0 && v <= 32)
-			e->shiftwidth = v;
-	}
-	s = cfg_get(g_cfg, "edit.textwidth");
-	if (s) {
-		int v = atoi(s);
-
-		if (v >= 0 && v <= TEXTWIDTH_MAX)
-			e->textwidth = v;
-	}
+	e->shiftwidth = cfg_int_range(g_cfg, "edit.shiftwidth", e->shiftwidth, 0, 32);
+	e->textwidth = cfg_int_range(g_cfg, "edit.textwidth", e->textwidth, 0, TEXTWIDTH_MAX);
 	e->expand_tabs = indent_expand_default(e->syn ? e->syn->name : NULL);
 	tabs_config(e);
 	e->hl_on = cfg_bool(g_cfg, "syntax.enable", e->hl_on);
