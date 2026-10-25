@@ -28176,6 +28176,20 @@ bi_reg(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return 0;
 }
 
+/* Validate an argument as a region over a buffer (the current file or a named
+ * file) and resolve it into *out. Rejects a non-region or a register/clip
+ * region, naming the verb in the error. */
+static int
+cl_arg_buffer_region(ClEval *ev, const ClVal *v, const char *verb, ClRegion *out)
+{
+	if (v->type != CLV_REGION ||
+	    (v->reg.buffer != CLB_CUR && v->reg.buffer != CLB_FILE)) {
+		cle_err(ev, "%s needs a buffer region", verb);
+		return -1;
+	}
+	return cl_region_resolve(ev, &v->reg, out);
+}
+
 /* delete [REGION]: with a region, the region form; with none, the cursor form
  * (the selection, else the character under the cursor). The dotted twin also
  * pushes the removed text onto the kill stack. */
@@ -28191,15 +28205,7 @@ cl_do_delete(ClEval *ev, int argc, ClVal *argv, int cap)
 		    -1, NULL);
 		return 0;
 	}
-	if (argv[0].type != CLV_REGION) {
-		cle_err(ev, "delete needs a region");
-		return -1;
-	}
-	if (argv[0].reg.buffer != CLB_CUR && argv[0].reg.buffer != CLB_FILE) {
-		cle_err(ev, "delete needs a buffer region");
-		return -1;
-	}
-	if (cl_region_resolve(ev, &argv[0].reg, &resolved) < 0)
+	if (cl_arg_buffer_region(ev, &argv[0], "delete", &resolved) < 0)
 		return -1;
 	r = &resolved;
 	if (cap) {			/* read the span before the scope edits it */
@@ -28260,12 +28266,7 @@ bi_copy(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		ed_copy(e);
 		return 0;
 	}
-	if (argv[0].type != CLV_REGION || (argv[0].reg.buffer != CLB_CUR &&
-	    argv[0].reg.buffer != CLB_FILE)) {
-		cle_err(ev, "copy needs a buffer region");
-		return -1;
-	}
-	if (cl_region_resolve(ev, &argv[0].reg, &resolved) < 0)
+	if (cl_arg_buffer_region(ev, &argv[0], "copy", &resolved) < 0)
 		return -1;
 	r = &resolved;
 	b = cl_region_bytes(e, r, &l);		/* reads another file in place */
@@ -28409,15 +28410,11 @@ bi_replace(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	int fidx;
 
 	(void)result;
-	if (argc != 1 || argv[0].type != CLV_REGION) {
+	if (argc != 1) {
 		cle_err(ev, "replace needs a region");
 		return -1;
 	}
-	if (argv[0].reg.buffer != CLB_CUR && argv[0].reg.buffer != CLB_FILE) {
-		cle_err(ev, "replace needs a buffer region");
-		return -1;
-	}
-	if (cl_region_resolve(ev, &argv[0].reg, &resolved) < 0)
+	if (cl_arg_buffer_region(ev, &argv[0], "replace", &resolved) < 0)
 		return -1;
 	r = &resolved;
 	fidx = (r->buffer == CLB_FILE) ? r->file : e->cur;
