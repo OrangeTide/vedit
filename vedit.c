@@ -21570,6 +21570,43 @@ buf_same_file(const char *a, const char *b)
 	return 0;
 }
 
+/* Load path into a fresh Text and return it, or NULL with *err set: 1 = out
+ * of memory, 2 = load failed (errno holds why). An empty path gives an empty
+ * buffer, and a missing file is tolerated as empty when allow_missing is set.
+ * The caller words its own message from *err. */
+static Text *
+text_open_file(const char *path, int allow_missing, int *err)
+{
+	Text *nt = text_new();
+
+	if (!nt) {
+		*err = 1;
+		return NULL;
+	}
+	if (path && path[0] &&
+	    text_load(nt, path) < 0 && !(allow_missing && errno == ENOENT)) {
+		*err = 2;
+		text_free(nt);
+		return NULL;
+	}
+	*err = 0;
+	return nt;
+}
+
+/* Run swap recovery for path against the freshly loaded nt, reporting the file
+ * mtime in *mtime (0 when unknown) for a later swap_adopt. Returns the swap
+ * action; the caller handles SWAP_ABORT, since the unwinding differs. */
+static int
+ed_offer_swap_recover(Editor *e, const char *path, Text *nt, time_t *mtime)
+{
+	Vstat st;
+	time_t mt = (g_vfs->stat(path, &st) == 0) ? vf_mtime(&st) : 0;
+
+	if (mtime)
+		*mtime = mt;
+	return swap_recover(e, path, nt, mt);
+}
+
 int
 buf_open(Editor *e, const char *path)
 {
@@ -21590,23 +21627,20 @@ buf_open(Editor *e, const char *path)
 			}
 		}
 	}
-	nt = text_new();
-	if (!nt) {
-		set_status(e, "out of memory");
-		return -1;
-	}
-	if (path && path[0] && text_load(nt, path) < 0 && errno != ENOENT) {
-		set_status(e, "open failed: %s",
-		    strerror(errno));
-		text_free(nt);
-		return -1;
+	{
+		int err;
+
+		nt = text_open_file(path, 1, &err);
+		if (!nt) {
+			if (err == 1)
+				set_status(e, "out of memory");
+			else
+				set_status(e, "open failed: %s", strerror(errno));
+			return -1;
+		}
 	}
 	if (path && path[0]) {			/* offer swap recovery */
-		Vstat st;
-		time_t mt = (g_vfs->stat(path, &st) == 0) ? vf_mtime(&st) : 0;
-
-		swap_action = swap_recover(e, path, nt, mt);
-		swap_mtime = mt;
+		swap_action = ed_offer_swap_recover(e, path, nt, &swap_mtime);
 		if (swap_action == SWAP_ABORT) {
 			text_free(nt);
 			return -1;
@@ -25898,21 +25932,21 @@ ed_open(Editor *e)
 	path[0] = '\0';
 	if (!dlg_open_file(e, path, sizeof(path)))
 		return;
-	nt = text_new();
-	if (!nt) {
-		set_status(e, "out of memory");
-		return;
-	}
-	if (text_load(nt, path) < 0 && errno != ENOENT) {
-		set_status(e, "open failed: %s",
-		    strerror(errno));
-		text_free(nt);
-		return;
+	{
+		int err;
+
+		nt = text_open_file(path, 1, &err);
+		if (!nt) {
+			if (err == 1)
+				set_status(e, "out of memory");
+			else
+				set_status(e, "open failed: %s", strerror(errno));
+			return;
+		}
 	}
 	{
-		Vstat st;
-		time_t mt = (g_vfs->stat(path, &st) == 0) ? vf_mtime(&st) : 0;
-		int action = swap_recover(e, path, nt, mt);
+		time_t mt;
+		int action = ed_offer_swap_recover(e, path, nt, &mt);
 
 		if (action == SWAP_ABORT) {	/* keep the current buffer */
 			text_free(nt);
@@ -47555,20 +47589,18 @@ vi_ex_read_file(Editor *e, size_t at, const char *fn)
 	Text *nt;
 	char *bytes;
 	size_t nlines, i, total, off;
+	int err;
 
 	if (*fn == '\0') {
 		set_status(e, "E32: no file name");
 		return REQ_CONTINUE;
 	}
-	nt = text_new();
+	nt = text_open_file(fn, 0, &err);
 	if (!nt) {
-		set_status(e, "out of memory");
-		return REQ_CONTINUE;
-	}
-	if (text_load(nt, fn) < 0) {
-		set_status(e,
-		    "E484: cannot open %.80s", fn);
-		text_free(nt);
+		if (err == 1)
+			set_status(e, "out of memory");
+		else
+			set_status(e, "E484: cannot open %.80s", fn);
 		return REQ_CONTINUE;
 	}
 
