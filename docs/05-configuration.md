@@ -188,7 +188,12 @@ in the status bar. A region names a span:
 - `region rect P1 P2` is the column box with those two corners: columns P1's
   through P2's across their rows.
 
-`$clip` is the clipboard as a region.
+`$clip` is the clipboard as a region. `reg NAME` is a named register as a
+region, a holder that persists between keypresses: a single letter `a`-`z` is
+vi's register of that letter, so a program and vi share them, and any other
+name is a register of its own. `mark NAME` is a vi mark as a position, and
+`mark NAME POS` sets it; these are vi's own marks, shared, and a letter mark is
+settable while the special marks are read-only.
 
 The editing verbs take two forms. With no argument a verb acts on the selection
 or a default around the cursor, exactly as the plain action names do. Given a
@@ -196,12 +201,16 @@ region it acts on that span:
 
 - `delete REGION` removes the span, and `delete.` also pushes it onto the kill
   stack. Deleting a rect removes the columns and closes up each row.
-- `copy REGION` grabs the span into the clipboard; a rect is grabbed as a
-  blank-padded block.
-- `put VALUE at POS` inserts a string or a region at a position; the word `at`
-  is optional. A rect, or the clipboard when it holds a block, goes in as
-  columns, shifting existing text right and padding short rows.
+- `copy SRC [DST]` grabs the span into the clipboard, or into the register DST
+  names; a rect is grabbed as a blank-padded block.
+- `put VALUE at POS` inserts a string or a region (the clip or a register) at a
+  position; the word `at` is optional. A rect, or a register or clip holding a
+  block, goes in as columns, shifting existing text right and padding short
+  rows.
 - `replace REGION` removes the span and puts the clipboard where it began.
+- `run SRC` evaluates a string or a register's text as a command-language
+  program, sharing the current run's variables. A program stored in a register
+  is a reusable macro.
 
 For example, a key that copies the first three lines and places them at the
 top of the file:
@@ -209,6 +218,14 @@ top of the file:
 ```ini
 [keys "demo"]
     bind = "^D { copy [region line 1 3] ; put $clip at [pos 1 1] }"
+```
+
+Registers persist, so one key can stash a region and another place it:
+
+```ini
+[keys "demo"]
+    bind = ^Y { copy [region line 1 1] [reg a] }
+    bind = ^P { put [reg a] at [cursor] }
 ```
 
 A `help` line adds a row to the F1 key-bindings screen shown while the keymap is

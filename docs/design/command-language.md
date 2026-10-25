@@ -4,14 +4,16 @@ Status: landing in phases. Phase 0 (consolidation), Phase 1 (mini-program
 bindings with the cursor-form verbs and the capture suffix), the value model
 (typed values, $variables, [substitution], and the region-form verbs over the
 char, line, and rect kinds), the rect kind (which also makes the WordStar
-column block do real rectangular edits), and the resumable evaluator are
-implemented. The resumable evaluator is synchronous: the prompt helpers block
-on the modal frame stack, so a top-level program services a prompt request
-through run_req and resumes with the next command when the frame closes; a quit
-ends the program. A prompt inside a [substitution] stays an error, since a
-substitution must yield a value at once. Still reserved and not built: arbitrary
-and register buffers, and art mode's colored Cell-grid rectangle. This note
-records the decisions behind the design. It is an
+column block do real rectangular edits), named registers (reg, shared with vi's
+a-z; run to evaluate a register as a macro; a mark bridge for vi's marks), and
+the resumable evaluator are implemented. The resumable evaluator is synchronous:
+the prompt helpers block on the modal frame stack, so a top-level program
+services a prompt request through run_req and resumes with the next command when
+the frame closes; a quit ends the program. A prompt inside a [substitution]
+stays an error, since a substitution must yield a value at once. Still reserved
+and not built: open files as buffers (cross-file editing), and art mode's
+colored Cell-grid rectangle. This note records the decisions behind the design.
+It is an
 engineering document, not user manual text; the user-facing chapters stay in
 `docs/01` through `docs/11`.
 
@@ -190,20 +192,39 @@ region model would need regions over a polymorphic Cell-payload buffer. That is
 a larger project than the value model and is deliberately left out; `rect` over
 the Text buffer does not depend on it.
 
+### Named registers
+
+Registers as buffers is built. A `reg NAME` region names a session-persistent
+byte holder, and a single `a`-`z` letter is the matching entry of vi's
+`vi_regs[26]`, so a program and vi share them: a program that copies into `a` is
+pasteable with vi's `"ap`, and a macro recorded with `qa` is readable by the
+language. Any other name lives in a small added store on the editor; the store
+is reached through one accessor (`reg_slot`) that returns the vi slot for a
+letter and an added slot otherwise, so vi's own register code is untouched. A
+register gained a block flag, so a rect survives into a named register. `copy`
+takes an optional register destination, `put` and `run` take a register source,
+and `run` evaluates a register's bytes as a program, which makes a register a
+reusable macro (distinct from vi's keystroke macros, which stay vi's).
+
+Marks fold in as a bridge, not a merge: `mark NAME` reads a vi mark as a `Pos`
+and `mark NAME POS` sets a letter mark, sharing vi's own mark slots. A mark is a
+position, not bytes, so it is exposed as the existing `Pos` value rather than
+packed into the byte-register store.
+
 ### Reserved, not built
 
-- arbitrary buffers beyond current and scratch (multi-buffer editing).
-- registers as buffers. vi's 26 registers and the clipboard are, under this
-  model, named scratch buffers, and a register reference is a buffer name. This
-  is what eventually collapses `vi_regs[26]` and `clip` into one concept.
+- arbitrary open files as buffers (copy and put across two open files). The
+  register store covers data buffers; cross-file editing over the `e->bufs`
+  array is a separate, larger step.
 
 ### A known refinement
 
 A region is a coordinate snapshot into a buffer, so a persistent selection, or
-anything that must survive edits (now possibly across buffers), needs its
-endpoints anchored to marks that track insertions and deletions rather than raw
-coordinates. A `Pos` can therefore be a raw coordinate or a mark handle. This is
-noted in the type design and is not built first.
+anything that must survive edits, needs its endpoints anchored to marks that
+track insertions and deletions rather than raw coordinates. vi's marks are raw
+coordinates today and go stale on edits above them; the `mark` bridge exposes
+them as they are. A `Pos` that tracks edits (a mark handle) is still a refinement
+noted in the type design and not built.
 
 ## Worked examples
 
