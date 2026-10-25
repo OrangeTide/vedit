@@ -28188,6 +28188,29 @@ bi_mark(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return -1;
 }
 
+/* go POS: move the cursor to a position in the current file. The old spot is
+ * pushed onto the jump list first, so jump-back returns to it, matching vi's
+ * `<mark> jump. A mark or an explicit pos both read as a Pos, so "go [mark a]"
+ * and "go [pos 5 1]" are the jump-to-register and go-to-line forms. */
+static int
+bi_go(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	Editor *e = ev->e;
+	ClPos p;
+
+	(void)result;
+	if (argc != 1 || argv[0].type != CLV_POS) {
+		cle_err(ev, "go needs a position");
+		return -1;
+	}
+	p = cl_clamp_pos(e, argv[0].pos);
+	jump_record(e);			/* remember where we left, for jump-back */
+	e->cy = p.row;
+	e->cx = p.col;
+	vi_clamp(e);
+	return 0;
+}
+
 /* go-file N: make the Nth open file (1-based) the active one. Unlike a region's
  * "file N", which edits another file in place, this changes which file has
  * focus, as F8 does. */
@@ -28224,6 +28247,7 @@ static const ClBuiltin cl_builtins[] = {
 	{ "replace", bi_replace },
 	{ "run", bi_run },
 	{ "mark", bi_mark },
+	{ "go", bi_go },
 	{ "go-file", bi_go_file },
 };
 

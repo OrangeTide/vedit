@@ -4835,6 +4835,32 @@ t_cl_mark(Test *t)
 	cl_prog_free(p);
 	TAP_CHECK(t, text_line_len(e.t, 1) == 6);	/* unchanged */
 
+	/* go moves the cursor to a position; a mark is the jump-to-register form */
+	e.cy = 0; e.cx = 0;
+	p = cl_parse("go [mark a]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.cy == 1 && e.cx == 2, "go mark cy=%zu cx=%zu",
+	    e.cy, e.cx);
+	TAP_CHECK(t, e.jump_n > 0);		/* the old spot was recorded */
+
+	/* go [pos R C] is the go-to-line form, 1-based like the status bar */
+	p = cl_parse("go [pos 1 2]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.cy == 0 && e.cx == 1, "go pos cy=%zu cx=%zu",
+	    e.cy, e.cx);
+
+	/* go needs a position, not a bare number; the error is reported, no move */
+	p = cl_parse("go 3", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECK(t, e.cy == 0 && e.cx == 1);	/* unchanged */
+
+	free(e.jumps);		/* go recorded jump-list entries */
 	free(e.clip);
 	text_free(e.t);
 	g_cfg = old;
