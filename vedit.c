@@ -8465,6 +8465,16 @@ void vi_clamp(Editor *e);
 void vi_reset_pending(Editor *e);
 size_t vi_col_to_byte(Editor *e, size_t y, int target_col);
 
+/* Rectangle (column-block) primitives over the Text buffer, shared by draw
+ * mode, the vi visual block, the WordStar column block, and the command
+ * language. A rectangle is columns x1..x2 across rows y1..y2, inclusive. */
+static void vi_pad_to_col(Editor *e, size_t y, size_t col);
+static void rect_grab(Editor *e, size_t y1, size_t y2, size_t x1, size_t x2);
+static void rect_delete_cols(Editor *e, size_t y1, size_t y2, size_t x1,
+    size_t x2);
+static void rect_place_cols(Editor *e, size_t y, size_t col, const char *clip,
+    size_t clip_len);
+
 
 /****************************************************************
  * Text buffer
@@ -31232,19 +31242,15 @@ draw_block_bounds(Editor *e, size_t *y1, size_t *y2, size_t *x1,
 	*x2 = e->ax > e->cx ? e->ax : e->cx;
 }
 
-/* Copy the selected rectangle into the clipboard as blank-padded rows. */
+/* Copy the rectangle (rows y1..y2, columns x1..x2, inclusive) into the
+ * clipboard as blank-padded rows joined by newlines, marked as a block. Cells
+ * past a short line become spaces, so the clip is a true rectangle. */
 static void
-draw_block_copy(Editor *e)
+rect_grab(Editor *e, size_t y1, size_t y2, size_t x1, size_t x2)
 {
-	size_t y1, y2, x1, x2, w, y, cap, off = 0;
-	char *buf;
+	size_t w = x2 - x1 + 1, cap = (y2 - y1 + 1) * (w + 1) + 1, off = 0, y;
+	char *buf = malloc(cap);
 
-	if (!e->sel_active || !e->sel_block)
-		return;
-	draw_block_bounds(e, &y1, &y2, &x1, &x2);
-	w = x2 - x1 + 1;
-	cap = (y2 - y1 + 1) * (w + 1) + 1;
-	buf = malloc(cap);
 	if (!buf)
 		return;
 	for (y = y1; y <= y2; y++) {
@@ -31265,8 +31271,75 @@ draw_block_copy(Editor *e)
 	e->clip_len = off;
 	e->clip_block = 1;
 	e->clip_linewise = 0;
-	set_status(e, "copied %zux%zu block",
-	    w, y2 - y1 + 1);
+}
+
+/* Delete columns x1..x2 (inclusive) from rows y1..y2, closing up each row so
+ * the text to the right shifts left. One undo group; cursor to the top-left. */
+static void
+rect_delete_cols(Editor *e, size_t y1, size_t y2, size_t x1, size_t x2)
+{
+	size_t y;
+
+	text_undo_group_begin(e->t);
+	for (y = y1; y <= y2 && y < text_lines(e->t); y++) {
+		size_t len = text_line_len(e->t, y);
+		size_t a = x1 < len ? x1 : len;
+		size_t b = (x2 + 1) < len ? x2 + 1 : len;
+
+		if (b > a)
+			text_delete(e->t, y, a, b - a);
+		hl_touch(e, y);
+	}
+	text_undo_group_end(e->t);
+	e->cy = y1;
+	e->cx = x1;
+	vi_clamp(e);
+}
+
+/* Insert a block clip (blank-padded rows joined by newlines) as columns: each
+ * row's text goes in at column col on consecutive lines from y down, padding
+ * short lines and growing the buffer downward. One undo group. */
+static void
+rect_place_cols(Editor *e, size_t y, size_t col, const char *clip,
+    size_t clip_len)
+{
+	size_t i = 0;
+
+	text_undo_group_begin(e->t);
+	for (;;) {
+		size_t j = i, rlen;
+
+		while (j < clip_len && clip[j] != '\n')
+			j++;
+		rlen = j - i;
+		while (y >= text_lines(e->t)) {		/* grow the buffer downward */
+			size_t last = text_lines(e->t) - 1;
+
+			text_split(e->t, last, text_line_len(e->t, last));
+		}
+		vi_pad_to_col(e, y, col);
+		if (rlen)
+			text_insert(e->t, y, col, clip + i, rlen);
+		hl_touch(e, y);
+		y++;
+		if (j >= clip_len)
+			break;
+		i = j + 1;
+	}
+	text_undo_group_end(e->t);
+}
+
+/* Copy the selected rectangle into the clipboard. */
+static void
+draw_block_copy(Editor *e)
+{
+	size_t y1, y2, x1, x2;
+
+	if (!e->sel_active || !e->sel_block)
+		return;
+	draw_block_bounds(e, &y1, &y2, &x1, &x2);
+	rect_grab(e, y1, y2, x1, x2);
+	set_status(e, "copied %zux%zu block", x2 - x1 + 1, y2 - y1 + 1);
 }
 
 #ifdef VEDIT_DRAW
@@ -43932,26 +44005,13 @@ vi_pad_to_col(Editor *e, size_t y, size_t col)
 static void
 vi_block_delete(Editor *e)
 {
-	size_t y1, y2, x1, x2, y;
+	size_t y1, y2, x1, x2;
 
 	if (!e->sel_active)
 		return;
 	draw_block_bounds(e, &y1, &y2, &x1, &x2);
 	draw_block_copy(e);			/* fills the register, clip_block=1 */
-	text_undo_group_begin(e->t);
-	for (y = y1; y <= y2 && y < text_lines(e->t); y++) {
-		size_t len = text_line_len(e->t, y);
-		size_t a = x1 < len ? x1 : len;
-		size_t b = (x2 + 1) < len ? x2 + 1 : len;
-
-		if (b > a)
-			text_delete(e->t, y, a, b - a);
-		hl_touch(e, y);
-	}
-	text_undo_group_end(e->t);
-	e->cy = y1;
-	e->cx = x1;
-	vi_clamp(e);
+	rect_delete_cols(e, y1, y2, x1, x2);
 	set_status(e, "deleted %zux%zu block",
 	    x2 - x1 + 1, y2 - y1 + 1);
 }
@@ -44037,8 +44097,7 @@ vi_block_insert_finish(Editor *e)
 static void
 vi_block_put(Editor *e, int after)
 {
-	const char *clip = e->clip;
-	size_t clip_len = e->clip_len, i = 0, col, y, len = 0;
+	size_t col, len = 0;
 	const char *s;
 
 	col = e->cx;
@@ -44046,29 +44105,7 @@ vi_block_put(Editor *e, int after)
 		s = text_line(e->t, e->cy, &len);
 		col = (e->cx < len) ? e->cx + rune_len_at(s, len, e->cx) : len;
 	}
-	text_undo_group_begin(e->t);
-	y = e->cy;
-	for (;;) {
-		size_t j = i, rlen;
-
-		while (j < clip_len && clip[j] != '\n')
-			j++;
-		rlen = j - i;
-		while (y >= text_lines(e->t)) {		/* grow the buffer downward */
-			size_t last = text_lines(e->t) - 1;
-
-			text_split(e->t, last, text_line_len(e->t, last));
-		}
-		vi_pad_to_col(e, y, col);
-		if (rlen)
-			text_insert(e->t, y, col, clip + i, rlen);
-		hl_touch(e, y);
-		y++;
-		if (j >= clip_len)
-			break;
-		i = j + 1;
-	}
-	text_undo_group_end(e->t);
+	rect_place_cols(e, e->cy, col, e->clip, e->clip_len);
 	e->cx = col;
 	vi_clamp(e);
 	set_status(e, "pasted block");
