@@ -4891,6 +4891,96 @@ t_cl_capture(Test *t)
 	g_cfg = old;
 }
 
+/* Open files as buffers: a region may name another open file (1-based), which
+ * copy reads and put/delete edit in place, and go-file switches the focus. */
+static void
+t_cl_crossfile(Test *t)
+{
+	const Cfg *old = g_cfg;
+	ClProg *p;
+	char err[64];
+	const char *s;
+	size_t len;
+	int i;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.swap_enabled = 0;	/* no swap files from this test */
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "alpha", 5);
+
+	/* two open files: buffer 1 is current (e->t), buffer 2 is parked */
+	TAP_ASSERT(t, buf_slot(&e) == 0);
+	TAP_ASSERT(t, buf_slot(&e) == 1);
+	memset(&e.bufs[0], 0, sizeof(e.bufs[0]));
+	memset(&e.bufs[1], 0, sizeof(e.bufs[1]));
+	e.cur = 0;
+	e.bufs[0].t = e.t;
+	e.bufs[1].t = text_new();
+	TAP_ASSERT(t, e.bufs[1].t != NULL);
+	text_insert(e.bufs[1].t, 0, 0, "bravo", 5);
+
+	/* cross-file read: copy line 1 of file 2 into register a */
+	p = cl_parse("copy [region line 1 1 file 2] [reg a]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[0].len == 6 &&
+	    memcmp(e.vi_regs[0].bytes, "bravo\n", 6) == 0,
+	    "xfile read len=%zu", e.vi_regs[0].len);
+
+	/* cross-file write: insert a string at the head of file 2 */
+	p = cl_parse("put INS at [pos 1 1] file 2", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	s = text_line(e.bufs[1].t, 0, &len);
+	TAP_CHECKF(t, len == 8 && memcmp(s, "INSbravo", 8) == 0,
+	    "xfile put [%.*s]", (int)len, s);
+	/* the current file is untouched by edits aimed at file 2 */
+	s = text_line(e.t, 0, &len);
+	TAP_CHECK(t, len == 5 && memcmp(s, "alpha", 5) == 0);
+
+	/* cross-file delete: remove the inserted span from file 2 */
+	p = cl_parse("delete [region char [pos 1 1] [pos 1 4] file 2]",
+	    err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	s = text_line(e.bufs[1].t, 0, &len);
+	TAP_CHECKF(t, len == 5 && memcmp(s, "bravo", 5) == 0,
+	    "xfile delete [%.*s]", (int)len, s);
+
+	/* go-file switches the focus to file 2 */
+	p = cl_parse("go-file 2", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECK(t, e.cur == 1 && e.t == e.bufs[1].t);
+
+	/* an out-of-range file number is an error, not a crash or a switch */
+	p = cl_parse("go-file 9", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECK(t, e.cur == 1);
+
+	for (i = 0; i < 26; i++)
+		free(e.vi_regs[i].bytes);
+	for (i = 0; i < e.cl_nregs; i++) {
+		free(e.cl_regs[i].name);
+		free(e.cl_regs[i].reg.bytes);
+	}
+	free(e.cl_regs);
+	free(e.clip);
+	text_free(e.bufs[0].t);
+	text_free(e.bufs[1].t);
+	free(e.bufs);
+	g_cfg = old;
+}
+
 const Case tap_cases[] = {
 	{ "ed_pos", t_ed_pos },
 	{ "cl_parse", t_cl_parse },
@@ -4902,6 +4992,7 @@ const Case tap_cases[] = {
 	{ "cl_run", t_cl_run },
 	{ "cl_mark", t_cl_mark },
 	{ "cl_capture", t_cl_capture },
+	{ "cl_crossfile", t_cl_crossfile },
 	{ "keymap_prog", t_keymap_prog },
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },

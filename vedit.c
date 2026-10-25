@@ -27158,7 +27158,8 @@ typedef enum cl_kind {
 typedef enum cl_bufid {
 	CLB_CUR,		/* the current editing buffer */
 	CLB_SCRATCH,		/* the scratch buffer, i.e. the clip */
-	CLB_REG			/* a named register (reg holds the name) */
+	CLB_REG,		/* a named register (reg holds the name) */
+	CLB_FILE		/* another open file (file holds its index) */
 } ClBufId;
 
 #define REG_NAME_MAX 24		/* a register name fits inline in a region */
@@ -27168,6 +27169,7 @@ typedef struct cl_region {
 	ClKind	kind;
 	ClPos	start, end;	/* normalized: start is the earlier corner */
 	char	reg[REG_NAME_MAX];	/* the register name when buffer is CLB_REG */
+	int	file;		/* the open-file index when buffer is CLB_FILE */
 } ClRegion;
 
 typedef enum clv_type {
@@ -27505,9 +27507,58 @@ reg_set(Reg *r, const char *bytes, size_t len, int linewise, int block)
 	return 0;
 }
 
+/* Scope a region op onto open file idx without changing which file has focus.
+ * The active buffer's state lives in flat Editor fields, so pointing e->t at
+ * another file's text (and saving the active cursor and highlight, which a
+ * cross-file edit must not move) is all it takes to read or edit it in place.
+ * The current file is the idx == e->cur case: no swap at all. Returns 0, or -1
+ * for a bad index; pair every success with cl_buf_leave. */
+typedef struct cl_bufscope {
+	Text	*t;
+	size_t	cy, cx, hl;
+	int	idx, swapped;
+} ClBufScope;
+
+static int
+cl_buf_enter(Editor *e, int idx, ClBufScope *s)
+{
+	Text *target;
+
+	/* The current buffer is always enterable (it lives in the flat Editor,
+	 * even before any buffer list exists); another file must be in range. */
+	if (idx != e->cur && (idx < 0 || idx >= e->nbuf))
+		return -1;
+	target = (Text *)buf_text_at(e, idx);	/* handles the view-swap case */
+	s->idx = idx;
+	s->t = e->t;
+	s->cy = e->cy;
+	s->cx = e->cx;
+	s->hl = e->hl_valid;
+	s->swapped = (target != e->t);
+	if (s->swapped)
+		e->t = target;
+	return 0;
+}
+
+/* Leave the scope. When edited, the other file's highlight cache is dropped so
+ * its colors are recomputed the next time it is shown. */
+static void
+cl_buf_leave(Editor *e, ClBufScope *s, int edited)
+{
+	if (!s->swapped)
+		return;
+	if (edited)
+		e->bufs[s->idx].hl_valid = 0;
+	e->t = s->t;
+	e->cy = s->cy;
+	e->cx = s->cx;
+	e->hl_valid = s->hl;
+}
+
 /* The bytes of a region, newly allocated, with *outlen set. A line region
  * yields whole rows with a trailing newline; a char region the run between its
- * corners; a scratch region the whole clip. NULL on out of memory. */
+ * corners; a scratch region the whole clip; a register its bytes. The region
+ * may name another open file, which is read in place. NULL on out of memory. */
 static char *
 cl_region_bytes(Editor *e, const ClRegion *r, size_t *outlen)
 {
@@ -27535,27 +27586,34 @@ cl_region_bytes(Editor *e, const ClRegion *r, size_t *outlen)
 		*outlen = rg->len;
 		return b;
 	}
-	if (r->kind == CLK_LINE) {
-		size_t len = 0, endlen = text_line_len(e->t, r->end.row);
-		char *t = region_text(e, r->start.row, 0, r->end.row, endlen, &len);
-		char *b;
+	{
+		ClBufScope sc;
+		int fidx = (r->buffer == CLB_FILE) ? r->file : e->cur;
+		char *b = NULL;
 
-		if (!t)
+		if (cl_buf_enter(e, fidx, &sc) < 0)	/* read from e->t, now that file */
 			return NULL;
-		b = realloc(t, len + 1);
-		if (!b) {
-			free(t);
-			return NULL;
+		if (r->kind == CLK_LINE) {
+			size_t len = 0, endlen = text_line_len(e->t, r->end.row);
+			char *tx = region_text(e, r->start.row, 0, r->end.row,
+			    endlen, &len);
+
+			if (tx && (b = realloc(tx, len + 1)) != NULL) {
+				b[len] = '\n';		/* whole lines carry a newline */
+				*outlen = len + 1;
+			} else {
+				free(tx);
+			}
+		} else if (r->kind == CLK_RECT) {
+			b = rect_bytes(e, r->start.row, r->end.row, r->start.col,
+			    r->end.col, outlen);
+		} else {
+			b = region_text(e, r->start.row, r->start.col, r->end.row,
+			    r->end.col, outlen);
 		}
-		b[len] = '\n';			/* whole lines carry their newline */
-		*outlen = len + 1;
+		cl_buf_leave(e, &sc, 0);
 		return b;
 	}
-	if (r->kind == CLK_RECT)
-		return rect_bytes(e, r->start.row, r->end.row, r->start.col,
-		    r->end.col, outlen);
-	return region_text(e, r->start.row, r->start.col, r->end.row, r->end.col,
-	    outlen);
 }
 
 /* Delete a current-buffer region. A line region removes whole rows, newline
@@ -27623,7 +27681,9 @@ bi_pos(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 
 /* region line N1 N2: whole rows N1..N2, 1-based inclusive.
  * region char P1 P2: the text run between two positions.
- * Both reference the current buffer; the result is normalized. */
+ * region rect P1 P2: the column box with those two corners.
+ * A trailing "file N" measures the region against the Nth open file (1-based)
+ * instead of the current one. The result is normalized. */
 static int
 bi_region(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 {
@@ -27634,14 +27694,29 @@ bi_region(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		cle_err(ev, "region needs a kind");
 		return -1;
 	}
-	r.buffer = CLB_CUR;
+	int fidx = e->cur;
+	ClBufScope sc = { 0 };
+
+	/* an optional trailing "file N" measures against another open file */
+	if (argc >= 2 && argv[argc - 2].type == CLV_STR &&
+	    strcmp(argv[argc - 2].s, "file") == 0) {
+		long f = clv_arg_int(&argv[argc - 1]);
+
+		if (f < 1 || f > e->nbuf) {
+			cle_err(ev, "no file %ld (%d open)", f, e->nbuf);
+			return -1;
+		}
+		fidx = (int)f - 1;
+		argc -= 2;
+	}
+	cl_buf_enter(e, fidx, &sc);	/* e->t is now that file; leave before return */
 	if (strcmp(argv[0].s, "line") == 0) {
 		size_t n = text_lines(e->t);
 		long a, b;
 
 		if (argc != 3) {
 			cle_err(ev, "region line needs two row numbers");
-			return -1;
+			goto fail;
 		}
 		a = clv_arg_int(&argv[1]);
 		b = clv_arg_int(&argv[2]);
@@ -27674,7 +27749,7 @@ bi_region(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		if (argc != 3 || argv[1].type != CLV_POS ||
 		    argv[2].type != CLV_POS) {
 			cle_err(ev, "region char needs two positions");
-			return -1;
+			goto fail;
 		}
 		p1 = cl_clamp_pos(e, argv[1].pos);
 		p2 = cl_clamp_pos(e, argv[2].pos);
@@ -27692,7 +27767,7 @@ bi_region(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		if (argc != 3 || argv[1].type != CLV_POS ||
 		    argv[2].type != CLV_POS) {
 			cle_err(ev, "region rect needs two positions");
-			return -1;
+			goto fail;
 		}
 		/* A rect normalizes per axis into a box: the earlier row and the
 		 * earlier column are the top-left, unlike char's reading order. */
@@ -27705,10 +27780,16 @@ bi_region(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		r.end.col = p1.col > p2.col ? p1.col : p2.col;
 	} else {
 		cle_err(ev, "unknown region kind: %.20s", argv[0].s);
-		return -1;
+		goto fail;
 	}
+	cl_buf_leave(e, &sc, 0);
+	r.buffer = (fidx == e->cur) ? CLB_CUR : CLB_FILE;
+	r.file = fidx;
 	*result = clv_region(r);
 	return 0;
+fail:
+	cl_buf_leave(e, &sc, 0);
+	return -1;
 }
 
 /* reg NAME: a named register as a region, so copy can fill it and put can
@@ -27758,12 +27839,11 @@ cl_do_delete(ClEval *ev, int argc, ClVal *argv, int cap)
 		return -1;
 	}
 	r = &argv[0].reg;
-	if (r->buffer != CLB_CUR) {
-		cle_err(ev, "delete: cannot delete the scratch buffer");
+	if (r->buffer != CLB_CUR && r->buffer != CLB_FILE) {
+		cle_err(ev, "delete needs a buffer region");
 		return -1;
 	}
-	text_undo_group_begin(e->t);
-	if (cap) {
+	if (cap) {			/* read the span before the scope edits it */
 		size_t l = 0;
 		char *b = cl_region_bytes(e, r, &l);
 
@@ -27772,9 +27852,20 @@ cl_do_delete(ClEval *ev, int argc, ClVal *argv, int cap)
 			free(b);
 		}
 	}
-	cl_region_delete(e, r);
-	text_undo_group_end(e->t);
-	vi_clamp(e);
+	{
+		ClBufScope sc;
+		int fidx = (r->buffer == CLB_FILE) ? r->file : e->cur;
+
+		if (cl_buf_enter(e, fidx, &sc) < 0) {
+			cle_err(ev, "no such file");
+			return -1;
+		}
+		text_undo_group_begin(e->t);
+		cl_region_delete(e, r);
+		text_undo_group_end(e->t);
+		vi_clamp(e);
+		cl_buf_leave(e, &sc, 1);
+	}
 	return 0;
 }
 
@@ -27809,12 +27900,13 @@ bi_copy(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		ed_copy(e);
 		return 0;
 	}
-	if (argv[0].type != CLV_REGION || argv[0].reg.buffer != CLB_CUR) {
-		cle_err(ev, "copy needs a current-buffer region");
+	if (argv[0].type != CLV_REGION || (argv[0].reg.buffer != CLB_CUR &&
+	    argv[0].reg.buffer != CLB_FILE)) {
+		cle_err(ev, "copy needs a buffer region");
 		return -1;
 	}
 	r = &argv[0].reg;
-	b = cl_region_bytes(e, r, &l);
+	b = cl_region_bytes(e, r, &l);		/* reads another file in place */
 	if (!b) {
 		cle_err(ev, "out of memory");
 		return -1;
@@ -27863,10 +27955,11 @@ cl_place_at(Editor *e, ClPos p, const char *bytes, size_t len, int as_block)
 	text_undo_group_end(e->t);
 }
 
-/* put SRC [at] DST: place SRC at position DST. SRC is a region (the clip, or a
- * span of the current buffer) or a string; DST is a Pos. A rect region, or the
- * clip when it holds a block, goes in as columns. The literal word "at" between
- * them is optional. */
+/* put SRC [at] DST [file N]: place SRC at position DST. SRC is a region (the
+ * clip, a register, or a span of any open file) or a string; DST is a Pos. A
+ * rect, or the clip or a register when it holds a block, goes in as columns.
+ * The word "at" is optional; a trailing "file N" places into the Nth open file
+ * (1-based) rather than the current one. */
 static int
 bi_put(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 {
@@ -27875,10 +27968,22 @@ bi_put(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	const char *bytes = NULL;
 	char *owned = NULL;
 	size_t len = 0;
-	int as_block = 0;
+	int as_block = 0, fidx = e->cur;
+	ClBufScope sc = { 0 };
 	ClPos p;
 
 	(void)result;
+	if (argc >= 2 && argv[argc - 2].type == CLV_STR &&
+	    strcmp(argv[argc - 2].s, "file") == 0) {
+		long f = clv_arg_int(&argv[argc - 1]);
+
+		if (f < 1 || f > e->nbuf) {
+			cle_err(ev, "no file %ld (%d open)", f, e->nbuf);
+			return -1;
+		}
+		fidx = (int)f - 1;
+		argc -= 2;
+	}
 	if (argc == 3 && argv[1].type == CLV_STR &&
 	    strcmp(argv[1].s, "at") == 0) {
 		src = &argv[0];
@@ -27894,6 +27999,8 @@ bi_put(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		cle_err(ev, "put: the target is not a position");
 		return -1;
 	}
+	/* Read the source before entering the target file's scope, so a
+	 * current-buffer or other-file source is read from the right place. */
 	if (src->type == CLV_STR) {
 		bytes = src->s;
 		len = strlen(src->s);
@@ -27923,20 +28030,25 @@ bi_put(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		cle_err(ev, "put: cannot place that value");
 		return -1;
 	}
+	cl_buf_enter(e, fidx, &sc);		/* fidx is already range-checked */
 	p = cl_clamp_pos(e, dst->pos);
 	cl_place_at(e, p, bytes, len, as_block);
+	cl_buf_leave(e, &sc, 1);
 	free(owned);
 	return 0;
 }
 
 /* replace REGION: delete the region and place the clip where it began. A rect
- * region closes up its columns and the clip goes back in as columns. */
+ * region closes up its columns and the clip goes back in as columns. The
+ * region may name another open file, which is edited in place. */
 static int
 bi_replace(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 {
 	Editor *e = ev->e;
 	ClRegion *r;
+	ClBufScope sc;
 	ClPos start;
+	int fidx;
 
 	(void)result;
 	if (argc != 1 || argv[0].type != CLV_REGION) {
@@ -27944,8 +28056,13 @@ bi_replace(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		return -1;
 	}
 	r = &argv[0].reg;
-	if (r->buffer != CLB_CUR) {
-		cle_err(ev, "replace: cannot replace the scratch buffer");
+	if (r->buffer != CLB_CUR && r->buffer != CLB_FILE) {
+		cle_err(ev, "replace needs a buffer region");
+		return -1;
+	}
+	fidx = (r->buffer == CLB_FILE) ? r->file : e->cur;
+	if (cl_buf_enter(e, fidx, &sc) < 0) {
+		cle_err(ev, "no such file");
 		return -1;
 	}
 	start = r->start;
@@ -27954,6 +28071,7 @@ bi_replace(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	start = cl_clamp_pos(e, start);
 	cl_place_at(e, start, e->clip, e->clip_len, e->clip_block);
 	text_undo_group_end(e->t);
+	cl_buf_leave(e, &sc, 1);
 	return 0;
 }
 
@@ -28070,6 +28188,29 @@ bi_mark(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return -1;
 }
 
+/* go-file N: make the Nth open file (1-based) the active one. Unlike a region's
+ * "file N", which edits another file in place, this changes which file has
+ * focus, as F8 does. */
+static int
+bi_go_file(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	Editor *e = ev->e;
+	long n;
+
+	(void)result;
+	if (argc != 1) {
+		cle_err(ev, "go-file needs a file number");
+		return -1;
+	}
+	n = clv_arg_int(&argv[0]);
+	if (n < 1 || n > e->nbuf) {
+		cle_err(ev, "no file %ld (%d open)", n, e->nbuf);
+		return -1;
+	}
+	buf_switch(e, (int)n - 1);
+	return 0;
+}
+
 static const ClBuiltin cl_builtins[] = {
 	{ "set", bi_set },
 	{ "cursor", bi_cursor },
@@ -28083,6 +28224,7 @@ static const ClBuiltin cl_builtins[] = {
 	{ "replace", bi_replace },
 	{ "run", bi_run },
 	{ "mark", bi_mark },
+	{ "go-file", bi_go_file },
 };
 
 static const ClBuiltin *
