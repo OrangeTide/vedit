@@ -27860,6 +27860,28 @@ cl_mark_letter(const ClVal *v)
 	return v->s[0] - 'a';
 }
 
+/* Peel an optional trailing "file N" off an argument list, pointing *fidx at
+ * the Nth open file (1-based) and shrinking *argc past the two words. Leaves
+ * both untouched when no such suffix is present. Returns -1 on a bad index. */
+static int
+cl_take_file_suffix(ClEval *ev, int *argc, ClVal *argv, int *fidx)
+{
+	Editor *e = ev->e;
+
+	if (*argc >= 2 && argv[*argc - 2].type == CLV_STR &&
+	    strcmp(argv[*argc - 2].s, "file") == 0) {
+		long f = clv_arg_int(&argv[*argc - 1]);
+
+		if (f < 1 || f > e->nbuf) {
+			cle_err(ev, "no file %ld (%d open)", f, e->nbuf);
+			return -1;
+		}
+		*fidx = (int)f - 1;
+		*argc -= 2;
+	}
+	return 0;
+}
+
 /* region line N1 N2: whole rows N1..N2, 1-based inclusive.
  * region char P1 P2: the text run between two positions.
  * region rect P1 P2: the column box with those two corners.
@@ -27892,17 +27914,8 @@ bi_region(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	}
 
 	/* an optional trailing "file N" measures against another open file */
-	if (argc >= 2 && argv[argc - 2].type == CLV_STR &&
-	    strcmp(argv[argc - 2].s, "file") == 0) {
-		long f = clv_arg_int(&argv[argc - 1]);
-
-		if (f < 1 || f > e->nbuf) {
-			cle_err(ev, "no file %ld (%d open)", f, e->nbuf);
-			return -1;
-		}
-		fidx = (int)f - 1;
-		argc -= 2;
-	}
+	if (cl_take_file_suffix(ev, &argc, argv, &fidx) < 0)
+		return -1;
 
 	/* region KIND mark A B: an anchored region, held by mark and resolved
 	 * at use. The marks live in the current buffer, so this form is the
@@ -28322,17 +28335,8 @@ bi_put(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	ClPos p;
 
 	(void)result;
-	if (argc >= 2 && argv[argc - 2].type == CLV_STR &&
-	    strcmp(argv[argc - 2].s, "file") == 0) {
-		long f = clv_arg_int(&argv[argc - 1]);
-
-		if (f < 1 || f > e->nbuf) {
-			cle_err(ev, "no file %ld (%d open)", f, e->nbuf);
-			return -1;
-		}
-		fidx = (int)f - 1;
-		argc -= 2;
-	}
+	if (cl_take_file_suffix(ev, &argc, argv, &fidx) < 0)
+		return -1;
 	if (argc == 3 && argv[1].type == CLV_STR &&
 	    strcmp(argv[1].s, "at") == 0) {
 		src = &argv[0];
