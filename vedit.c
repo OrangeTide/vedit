@@ -27262,6 +27262,11 @@ typedef struct cl_region {
 	ClPos	start, end;	/* normalized: start is the earlier corner */
 	char	reg[REG_NAME_MAX];	/* the register name when buffer is CLB_REG */
 	int	file;		/* the open-file index when buffer is CLB_FILE */
+	/* An anchored region names its two endpoints by mark rather than by a
+	 * coordinate snapshot, so it tracks edits and a stored selection stays
+	 * right. The marks are resolved to a concrete region at each use. */
+	int	anchored;
+	char	m_start, m_end;	/* the endpoint mark letters when anchored */
 } ClRegion;
 
 typedef enum clv_type {
@@ -27776,9 +27781,73 @@ bi_pos(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return 0;
 }
 
+/* Normalize a kind and two positions (against the current e->t) into a region.
+ * A line region spans whole rows start.row..end.row; char runs between the two
+ * points in reading order; rect is the column box of their corners. Rows are
+ * clamped into the buffer and char/rect columns too; line keeps whole lines. */
+static void
+cl_region_build(Editor *e, ClKind kind, ClPos p1, ClPos p2, ClRegion *r)
+{
+	size_t n = text_lines(e->t);
+
+	r->kind = kind;
+	if (kind == CLK_LINE) {
+		size_t a = p1.row, b = p2.row;
+
+		if (n == 0) {
+			a = b = 0;
+		} else {
+			if (a >= n)
+				a = n - 1;
+			if (b >= n)
+				b = n - 1;
+		}
+		if (a > b) {
+			size_t tmp = a;
+
+			a = b;
+			b = tmp;
+		}
+		r->start.row = a;
+		r->start.col = 0;
+		r->end.row = b;
+		r->end.col = (n == 0) ? 0 : text_line_len(e->t, b);
+	} else if (kind == CLK_RECT) {
+		/* A rect normalizes per axis into a box: the earlier row and the
+		 * earlier column are the top-left, unlike char's reading order. */
+		p1 = cl_clamp_pos(e, p1);
+		p2 = cl_clamp_pos(e, p2);
+		r->start.row = p1.row < p2.row ? p1.row : p2.row;
+		r->end.row = p1.row > p2.row ? p1.row : p2.row;
+		r->start.col = p1.col < p2.col ? p1.col : p2.col;
+		r->end.col = p1.col > p2.col ? p1.col : p2.col;
+	} else {
+		p1 = cl_clamp_pos(e, p1);
+		p2 = cl_clamp_pos(e, p2);
+		if (cl_pos_le(p1, p2)) {
+			r->start = p1;
+			r->end = p2;
+		} else {
+			r->start = p2;
+			r->end = p1;
+		}
+	}
+}
+
+/* A single a-z mark letter, or -1. */
+static int
+cl_mark_letter(const ClVal *v)
+{
+	if (v->type != CLV_STR || v->s[0] < 'a' || v->s[0] > 'z' || v->s[1])
+		return -1;
+	return v->s[0] - 'a';
+}
+
 /* region line N1 N2: whole rows N1..N2, 1-based inclusive.
  * region char P1 P2: the text run between two positions.
  * region rect P1 P2: the column box with those two corners.
+ * region KIND mark A B: the same, but with the two endpoints named by mark, so
+ *   the region tracks edits and resolves to the marks' live positions at use.
  * A trailing "file N" measures the region against the Nth open file (1-based)
  * instead of the current one. The result is normalized. */
 static int
@@ -27786,13 +27855,24 @@ bi_region(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 {
 	Editor *e = ev->e;
 	ClRegion r = { 0 };
+	ClKind kind;
+	int fidx = e->cur;
+	ClBufScope sc = { 0 };
 
 	if (argc < 1 || argv[0].type != CLV_STR) {
 		cle_err(ev, "region needs a kind");
 		return -1;
 	}
-	int fidx = e->cur;
-	ClBufScope sc = { 0 };
+	if (strcmp(argv[0].s, "line") == 0)
+		kind = CLK_LINE;
+	else if (strcmp(argv[0].s, "char") == 0)
+		kind = CLK_CHAR;
+	else if (strcmp(argv[0].s, "rect") == 0)
+		kind = CLK_RECT;
+	else {
+		cle_err(ev, "unknown region kind: %.20s", argv[0].s);
+		return -1;
+	}
 
 	/* an optional trailing "file N" measures against another open file */
 	if (argc >= 2 && argv[argc - 2].type == CLV_STR &&
@@ -27806,9 +27886,37 @@ bi_region(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		fidx = (int)f - 1;
 		argc -= 2;
 	}
+
+	/* region KIND mark A B: an anchored region, held by mark and resolved
+	 * at use. The marks live in the current buffer, so this form is the
+	 * current file only for now. */
+	if (argc >= 2 && argv[1].type == CLV_STR &&
+	    strcmp(argv[1].s, "mark") == 0) {
+		int ms, me;
+
+		if (fidx != e->cur) {
+			cle_err(ev, "an anchored region is the current file only");
+			return -1;
+		}
+		if (argc != 4 || (ms = cl_mark_letter(&argv[2])) < 0 ||
+		    (me = cl_mark_letter(&argv[3])) < 0) {
+			cle_err(ev, "region %s mark needs two a-z marks",
+			    argv[0].s);
+			return -1;
+		}
+		r.buffer = CLB_CUR;
+		r.file = e->cur;
+		r.kind = kind;
+		r.anchored = 1;
+		r.m_start = (char)('a' + ms);
+		r.m_end = (char)('a' + me);
+		*result = clv_region(r);
+		return 0;
+	}
+
 	cl_buf_enter(e, fidx, &sc);	/* e->t is now that file; leave before return */
-	if (strcmp(argv[0].s, "line") == 0) {
-		size_t n = text_lines(e->t);
+	if (kind == CLK_LINE) {
+		ClPos p1 = { 0, 0 }, p2 = { 0, 0 };
 		long a, b;
 
 		if (argc != 3) {
@@ -27817,67 +27925,16 @@ bi_region(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		}
 		a = clv_arg_int(&argv[1]);
 		b = clv_arg_int(&argv[2]);
-		if (a < 1)
-			a = 1;
-		if (b < 1)
-			b = 1;
-		r.kind = CLK_LINE;
-		r.start.row = (size_t)(a - 1);
-		r.end.row = (size_t)(b - 1);
-		if (n == 0) {
-			r.start.row = r.end.row = 0;
-		} else {
-			if (r.start.row >= n)
-				r.start.row = n - 1;
-			if (r.end.row >= n)
-				r.end.row = n - 1;
-		}
-		if (r.start.row > r.end.row) {
-			size_t tmp = r.start.row;
-
-			r.start.row = r.end.row;
-			r.end.row = tmp;
-		}
-		r.start.col = 0;
-		r.end.col = (n == 0) ? 0 : text_line_len(e->t, r.end.row);
-	} else if (strcmp(argv[0].s, "char") == 0) {
-		ClPos p1, p2;
-
-		if (argc != 3 || argv[1].type != CLV_POS ||
-		    argv[2].type != CLV_POS) {
-			cle_err(ev, "region char needs two positions");
-			goto fail;
-		}
-		p1 = cl_clamp_pos(e, argv[1].pos);
-		p2 = cl_clamp_pos(e, argv[2].pos);
-		r.kind = CLK_CHAR;
-		if (cl_pos_le(p1, p2)) {
-			r.start = p1;
-			r.end = p2;
-		} else {
-			r.start = p2;
-			r.end = p1;
-		}
-	} else if (strcmp(argv[0].s, "rect") == 0) {
-		ClPos p1, p2;
-
-		if (argc != 3 || argv[1].type != CLV_POS ||
-		    argv[2].type != CLV_POS) {
-			cle_err(ev, "region rect needs two positions");
-			goto fail;
-		}
-		/* A rect normalizes per axis into a box: the earlier row and the
-		 * earlier column are the top-left, unlike char's reading order. */
-		p1 = cl_clamp_pos(e, argv[1].pos);
-		p2 = cl_clamp_pos(e, argv[2].pos);
-		r.kind = CLK_RECT;
-		r.start.row = p1.row < p2.row ? p1.row : p2.row;
-		r.end.row = p1.row > p2.row ? p1.row : p2.row;
-		r.start.col = p1.col < p2.col ? p1.col : p2.col;
-		r.end.col = p1.col > p2.col ? p1.col : p2.col;
+		p1.row = (a > 0) ? (size_t)(a - 1) : 0;
+		p2.row = (b > 0) ? (size_t)(b - 1) : 0;
+		cl_region_build(e, CLK_LINE, p1, p2, &r);
 	} else {
-		cle_err(ev, "unknown region kind: %.20s", argv[0].s);
-		goto fail;
+		if (argc != 3 || argv[1].type != CLV_POS ||
+		    argv[2].type != CLV_POS) {
+			cle_err(ev, "region %s needs two positions", argv[0].s);
+			goto fail;
+		}
+		cl_region_build(e, kind, argv[1].pos, argv[2].pos, &r);
 	}
 	cl_buf_leave(e, &sc, 0);
 	r.buffer = (fidx == e->cur) ? CLB_CUR : CLB_FILE;
@@ -27887,6 +27944,43 @@ bi_region(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 fail:
 	cl_buf_leave(e, &sc, 0);
 	return -1;
+}
+
+/* Resolve a region to a concrete one. An anchored region reads its two marks'
+ * live positions (current buffer) and builds a region of its kind; any other
+ * region is already concrete and copied through. Returns -1 with an error set
+ * when an endpoint mark is not set. */
+static int
+cl_region_resolve(ClEval *ev, const ClRegion *in, ClRegion *out)
+{
+	Editor *e = ev->e;
+	int s, d;
+	ClPos p1, p2;
+
+	if (!in->anchored) {
+		*out = *in;
+		return 0;
+	}
+	s = in->m_start - 'a';
+	d = in->m_end - 'a';
+	if (s < 0 || s >= MARK_LETTERS ||
+	    !(e->vi_marks_set & ((uint64_t)1 << s))) {
+		cle_err(ev, "mark %c is not set", in->m_start);
+		return -1;
+	}
+	if (d < 0 || d >= MARK_LETTERS ||
+	    !(e->vi_marks_set & ((uint64_t)1 << d))) {
+		cle_err(ev, "mark %c is not set", in->m_end);
+		return -1;
+	}
+	p1.row = e->vi_mark_y[s];
+	p1.col = e->vi_mark_x[s];
+	p2.row = e->vi_mark_y[d];
+	p2.col = e->vi_mark_x[d];
+	cl_region_build(e, in->kind, p1, p2, out);
+	out->buffer = CLB_CUR;
+	out->file = e->cur;
+	return 0;
 }
 
 /* reg NAME: a named register as a region, so copy can fill it and put can
@@ -27924,6 +28018,7 @@ static int
 cl_do_delete(ClEval *ev, int argc, ClVal *argv, int cap)
 {
 	Editor *e = ev->e;
+	ClRegion resolved;
 	ClRegion *r;
 
 	if (argc == 0) {
@@ -27935,11 +28030,13 @@ cl_do_delete(ClEval *ev, int argc, ClVal *argv, int cap)
 		cle_err(ev, "delete needs a region");
 		return -1;
 	}
-	r = &argv[0].reg;
-	if (r->buffer != CLB_CUR && r->buffer != CLB_FILE) {
+	if (argv[0].reg.buffer != CLB_CUR && argv[0].reg.buffer != CLB_FILE) {
 		cle_err(ev, "delete needs a buffer region");
 		return -1;
 	}
+	if (cl_region_resolve(ev, &argv[0].reg, &resolved) < 0)
+		return -1;
+	r = &resolved;
 	if (cap) {			/* read the span before the scope edits it */
 		size_t l = 0;
 		char *b = cl_region_bytes(e, r, &l);
@@ -27987,6 +28084,7 @@ static int
 bi_copy(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 {
 	Editor *e = ev->e;
+	ClRegion resolved;
 	ClRegion *r;
 	char *b;
 	size_t l = 0;
@@ -28002,7 +28100,9 @@ bi_copy(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		cle_err(ev, "copy needs a buffer region");
 		return -1;
 	}
-	r = &argv[0].reg;
+	if (cl_region_resolve(ev, &argv[0].reg, &resolved) < 0)
+		return -1;
+	r = &resolved;
 	b = cl_region_bytes(e, r, &l);		/* reads another file in place */
 	if (!b) {
 		cle_err(ev, "out of memory");
@@ -28116,13 +28216,17 @@ bi_put(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		len = rg->len;
 		as_block = rg->block;
 	} else if (src->type == CLV_REGION) {
-		owned = cl_region_bytes(e, &src->reg, &len);
+		ClRegion putsrc;
+
+		if (cl_region_resolve(ev, &src->reg, &putsrc) < 0)
+			return -1;
+		owned = cl_region_bytes(e, &putsrc, &len);
 		if (!owned) {
 			cle_err(ev, "out of memory");
 			return -1;
 		}
 		bytes = owned;
-		as_block = (src->reg.kind == CLK_RECT);
+		as_block = (putsrc.kind == CLK_RECT);
 	} else {
 		cle_err(ev, "put: cannot place that value");
 		return -1;
@@ -28142,6 +28246,7 @@ static int
 bi_replace(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 {
 	Editor *e = ev->e;
+	ClRegion resolved;
 	ClRegion *r;
 	ClBufScope sc;
 	ClPos start;
@@ -28152,11 +28257,13 @@ bi_replace(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		cle_err(ev, "replace needs a region");
 		return -1;
 	}
-	r = &argv[0].reg;
-	if (r->buffer != CLB_CUR && r->buffer != CLB_FILE) {
+	if (argv[0].reg.buffer != CLB_CUR && argv[0].reg.buffer != CLB_FILE) {
 		cle_err(ev, "replace needs a buffer region");
 		return -1;
 	}
+	if (cl_region_resolve(ev, &argv[0].reg, &resolved) < 0)
+		return -1;
+	r = &resolved;
 	fidx = (r->buffer == CLB_FILE) ? r->file : e->cur;
 	if (cl_buf_enter(e, fidx, &sc) < 0) {
 		cle_err(ev, "no such file");

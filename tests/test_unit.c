@@ -5013,6 +5013,77 @@ t_cl_crossfile(Test *t)
 	g_cfg = old;
 }
 
+/* An anchored region names its endpoints by mark, so it tracks edits: a region
+ * set up before an edit still spans the right text after lines move. */
+static void
+t_cl_anchored(Test *t)
+{
+	const Cfg *old = g_cfg;
+	ClProg *p;
+	char err[64];
+	const char *s;
+	size_t len;
+	int i;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	e.t->owner = &e;
+	text_insert(e.t, 0, 0, "one", 3);
+	text_split(e.t, 0, 3); text_insert(e.t, 1, 0, "two", 3);
+	text_split(e.t, 1, 3); text_insert(e.t, 2, 0, "three", 5);
+
+	/* marks a and b bracket "two" on line 2 (0-based row 1, cols 0..3) */
+	vi_mark_set(&e, 0, 1, 0);
+	vi_mark_set(&e, 1, 1, 3);
+
+	/* insert a blank line at the top; the tracking marks move down a row */
+	text_split(e.t, 0, 0);
+	TAP_CHECKF(t, e.vi_mark_y[0] == 2 && e.vi_mark_y[1] == 2,
+	    "marks tracked to row %zu,%zu", e.vi_mark_y[0], e.vi_mark_y[1]);
+
+	/* the anchored char region still spans "two" at its new place */
+	p = cl_parse("copy [region char mark a b] [reg c]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[2].len == 3 &&
+	    memcmp(e.vi_regs[2].bytes, "two", 3) == 0,
+	    "anchored char [%.*s]", (int)e.vi_regs[2].len, e.vi_regs[2].bytes);
+
+	/* the line form spans the whole row the marks sit on, with a newline */
+	p = cl_parse("copy [region line mark a b] [reg d]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[3].len == 4 &&
+	    memcmp(e.vi_regs[3].bytes, "two\n", 4) == 0,
+	    "anchored line [%.*s]", (int)e.vi_regs[3].len, e.vi_regs[3].bytes);
+
+	/* deleting through an anchored region removes the tracked span */
+	p = cl_parse("delete [region char mark a b]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	s = text_line(e.t, 2, &len);
+	TAP_CHECKF(t, len == 0, "after anchored delete row2 len=%zu", len);
+
+	/* an unset endpoint mark is an error, not a crash */
+	p = cl_parse("copy [region char mark a z] [reg e]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECK(t, e.vi_regs['e' - 'a'].bytes == NULL);	/* never filled */
+
+	for (i = 0; i < 26; i++)
+		free(e.vi_regs[i].bytes);
+	free(e.clip);
+	text_free(e.t);
+	g_cfg = old;
+}
+
 /* Marks ride edits instead of going stale: an edit before a mark shifts it,
  * with right gravity at the mark itself, across inserts, deletes, and the
  * line split and join. editor_init registers the editor for tracking. */
@@ -5081,6 +5152,7 @@ const Case tap_cases[] = {
 	{ "cl_mark", t_cl_mark },
 	{ "cl_capture", t_cl_capture },
 	{ "cl_crossfile", t_cl_crossfile },
+	{ "cl_anchored", t_cl_anchored },
 	{ "mark_track", t_mark_track },
 	{ "keymap_prog", t_keymap_prog },
 	{ "utf8_roundtrip", t_utf8_roundtrip },
