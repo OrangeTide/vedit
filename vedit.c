@@ -12752,21 +12752,24 @@ scroll_to_cursor(Editor *e, int text_h, int text_w)
 
 /* Order the anchor and cursor so (*y1,*x1) is the start of the selection and
  * (*y2,*x2) the end. */
+/* Order two points into reading order: (*y1,*x1) the earlier, (*y2,*x2) the
+ * later, with an equal pair left in (a) order. */
+static void
+order_pts(size_t ya, size_t xa, size_t yb, size_t xb,
+    size_t *y1, size_t *x1, size_t *y2, size_t *x2)
+{
+	if (ya < yb || (ya == yb && xa <= xb)) {
+		*y1 = ya; *x1 = xa; *y2 = yb; *x2 = xb;
+	} else {
+		*y1 = yb; *x1 = xb; *y2 = ya; *x2 = xa;
+	}
+}
+
 static void
 sel_bounds(const Editor *e, size_t *y1, size_t *x1,
     size_t *y2, size_t *x2)
 {
-	if (e->ay < e->cy || (e->ay == e->cy && e->ax <= e->cx)) {
-		*y1 = e->ay;
-		*x1 = e->ax;
-		*y2 = e->cy;
-		*x2 = e->cx;
-	} else {
-		*y1 = e->cy;
-		*x1 = e->cx;
-		*y2 = e->ay;
-		*x2 = e->ax;
-	}
+	order_pts(e->ay, e->ax, e->cy, e->cx, y1, x1, y2, x2);
 }
 
 /* Fill row [col, col+width) with a color, then write s over the start of it,
@@ -26719,14 +26722,7 @@ kb_block_bounds(const Editor *e, size_t *y1, size_t *x1, size_t *y2, size_t *x2)
 {
 	if (!e->blk_bset || !e->blk_eset)
 		return 0;
-	if (e->blk_by < e->blk_ey ||
-	    (e->blk_by == e->blk_ey && e->blk_bx <= e->blk_ex)) {
-		*y1 = e->blk_by; *x1 = e->blk_bx;
-		*y2 = e->blk_ey; *x2 = e->blk_ex;
-	} else {
-		*y1 = e->blk_ey; *x1 = e->blk_ex;
-		*y2 = e->blk_by; *x2 = e->blk_bx;
-	}
+	order_pts(e->blk_by, e->blk_bx, e->blk_ey, e->blk_ex, y1, x1, y2, x2);
 	return 1;
 }
 
@@ -46782,12 +46778,12 @@ vi_visual_key(Editor *e, const struct tkbd_seq *seq)
 
 	/* Keep '< and '> on the current selection, so they still point at the
 	 * last range after it is left (by Esc, a motion to normal, or an op). */
-	if (e->ay < e->cy || (e->ay == e->cy && e->ax <= e->cx)) {
-		vi_mark_set(e, MARK_VISLT, e->ay, e->ax);
-		vi_mark_set(e, MARK_VISGT, e->cy, e->cx);
-	} else {
-		vi_mark_set(e, MARK_VISLT, e->cy, e->cx);
-		vi_mark_set(e, MARK_VISGT, e->ay, e->ax);
+	{
+		size_t vy1, vx1, vy2, vx2;
+
+		order_pts(e->ay, e->ax, e->cy, e->cx, &vy1, &vx1, &vy2, &vx2);
+		vi_mark_set(e, MARK_VISLT, vy1, vx1);
+		vi_mark_set(e, MARK_VISGT, vy2, vx2);
 	}
 
 	/* gq on the selection reflows its lines (the g came through the
