@@ -18119,6 +18119,16 @@ kb_delete_span(Editor *e, size_t y, size_t from, size_t to, int cap)
 	e->hl_valid = 0;
 }
 
+/* Replace the editor's buffer with nt, freeing the old one and adopting nt so
+ * this editor's marks track its edits. */
+static void
+ed_set_text(Editor *e, Text *nt)
+{
+	text_free(e->t);
+	e->t = nt;
+	e->t->owner = e;
+}
+
 /* Free the kill stack. */
 void
 ed_kill_free(Editor *e)
@@ -23588,9 +23598,7 @@ ed_new(Editor *e)
 	swap_remove(e);
 	swap_detach(e->t, e->swapj);
 	e->swapj = NULL;
-	text_free(e->t);
-	e->t = nt;
-	e->t->owner = e;
+	ed_set_text(e, nt);
 	e->has_name = 0;
 	e->path[0] = '\0';
 	e->syn = NULL;
@@ -25911,9 +25919,7 @@ ed_open(Editor *e)
 			return;
 		}
 		swap_remove(e);			/* drop the replaced buffer's swap */
-		text_free(e->t);
-		e->t = nt;
-		e->t->owner = e;
+		ed_set_text(e, nt);
 		snprintf(e->path, sizeof(e->path), "%s", path);
 		e->has_name = 1;
 		e->syn = syn_for_path(e->path);
@@ -41143,9 +41149,7 @@ art_export(Editor *e)
 	free(buf);
 	text_set_eol(nt, text_eol(e->t));
 	nt->dirty = 1;
-	text_free(e->t);
-	e->t = nt;
-	e->t->owner = e;
+	ed_set_text(e, nt);
 	swap_rebind(e);
 	e->cy = e->cx = e->top = e->left = 0;
 	e->hl_valid = 0;
@@ -48155,9 +48159,7 @@ vi_ex_exec(Editor *e, char *buf)
 				text_free(nt);
 				return REQ_CONTINUE;
 			}
-			text_free(e->t);
-			e->t = nt;
-			e->t->owner = e;
+			ed_set_text(e, nt);
 			swap_rebind(e);
 			e->cy = e->cx = e->top = e->left = 0;
 			e->sel_active = 0;
