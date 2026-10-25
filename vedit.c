@@ -8469,6 +8469,8 @@ size_t vi_col_to_byte(Editor *e, size_t y, int target_col);
  * mode, the vi visual block, the WordStar column block, and the command
  * language. A rectangle is columns x1..x2 across rows y1..y2, inclusive. */
 static void vi_pad_to_col(Editor *e, size_t y, size_t col);
+static char *rect_bytes(Editor *e, size_t y1, size_t y2, size_t x1, size_t x2,
+    size_t *outlen);
 static void rect_grab(Editor *e, size_t y1, size_t y2, size_t x1, size_t x2);
 static void rect_delete_cols(Editor *e, size_t y1, size_t y2, size_t x1,
     size_t x2);
@@ -27076,8 +27078,8 @@ typedef struct cl_pos {
 
 typedef enum cl_kind {
 	CLK_CHAR,		/* a text run from start through end, reading order */
-	CLK_LINE		/* whole rows start.row through end.row */
-	/* CLK_RECT reserved: a literal column box, not built */
+	CLK_LINE,		/* whole rows start.row through end.row */
+	CLK_RECT		/* a literal column box, columns x1..x2 of rows y1..y2 */
 } ClKind;
 
 typedef enum cl_bufid {
@@ -27404,6 +27406,9 @@ cl_region_bytes(Editor *e, const ClRegion *r, size_t *outlen)
 		*outlen = len + 1;
 		return b;
 	}
+	if (r->kind == CLK_RECT)
+		return rect_bytes(e, r->start.row, r->end.row, r->start.col,
+		    r->end.col, outlen);
 	return region_text(e, r->start.row, r->start.col, r->end.row, r->end.col,
 	    outlen);
 }
@@ -27415,7 +27420,10 @@ cl_region_delete(Editor *e, const ClRegion *r)
 {
 	size_t n = text_lines(e->t);
 
-	if (r->kind == CLK_LINE) {
+	if (r->kind == CLK_RECT) {
+		rect_delete_cols(e, r->start.row, r->end.row, r->start.col,
+		    r->end.col);
+	} else if (r->kind == CLK_LINE) {
 		size_t a = r->start.row, b = r->end.row;
 
 		if (b + 1 < n)
@@ -27533,6 +27541,23 @@ bi_region(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 			r.start = p2;
 			r.end = p1;
 		}
+	} else if (strcmp(argv[0].s, "rect") == 0) {
+		ClPos p1, p2;
+
+		if (argc != 3 || argv[1].type != CLV_POS ||
+		    argv[2].type != CLV_POS) {
+			cle_err(ev, "region rect needs two positions");
+			return -1;
+		}
+		/* A rect normalizes per axis into a box: the earlier row and the
+		 * earlier column are the top-left, unlike char's reading order. */
+		p1 = cl_clamp_pos(e, argv[1].pos);
+		p2 = cl_clamp_pos(e, argv[2].pos);
+		r.kind = CLK_RECT;
+		r.start.row = p1.row < p2.row ? p1.row : p2.row;
+		r.end.row = p1.row > p2.row ? p1.row : p2.row;
+		r.start.col = p1.col < p2.col ? p1.col : p2.col;
+		r.end.col = p1.col > p2.col ? p1.col : p2.col;
 	} else {
 		cle_err(ev, "unknown region kind: %.20s", argv[0].s);
 		return -1;
@@ -27625,21 +27650,40 @@ bi_copy(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	}
 	clip_set(e, b, l);			/* takes ownership of b */
 	e->clip_linewise = (r->kind == CLK_LINE);
+	e->clip_block = (r->kind == CLK_RECT);	/* a rect pastes as columns */
 	set_status(e, "copied %zu byte%s", l, l == 1 ? "" : "s");
 	return 0;
 }
 
-/* put SRC [at] DST: insert SRC at position DST. SRC is a region (the clip, or a
- * span of the current buffer) or a string; DST is a Pos. The literal word "at"
- * between them is optional. */
+/* Place bytes at position p: a block goes in as columns (each row inserted at
+ * p.col on consecutive lines), otherwise as a stream. One undo group. */
+static void
+cl_place_at(Editor *e, ClPos p, const char *bytes, size_t len, int as_block)
+{
+	if (as_block) {
+		rect_place_cols(e, p.row, p.col, bytes, len);
+		return;
+	}
+	text_undo_group_begin(e->t);
+	e->cy = p.row;
+	e->cx = p.col;
+	insert_bytes(e, bytes, len);
+	text_undo_group_end(e->t);
+}
+
+/* put SRC [at] DST: place SRC at position DST. SRC is a region (the clip, or a
+ * span of the current buffer) or a string; DST is a Pos. A rect region, or the
+ * clip when it holds a block, goes in as columns. The literal word "at" between
+ * them is optional. */
 static int
 bi_put(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 {
 	Editor *e = ev->e;
 	ClVal *src, *dst;
-	char *bytes = NULL;
+	const char *bytes = NULL;
+	char *owned = NULL;
 	size_t len = 0;
-	int owned = 0;
+	int as_block = 0;
 	ClPos p;
 
 	(void)result;
@@ -27661,29 +27705,30 @@ bi_put(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	if (src->type == CLV_STR) {
 		bytes = src->s;
 		len = strlen(src->s);
+	} else if (src->type == CLV_REGION && src->reg.buffer == CLB_SCRATCH) {
+		bytes = e->clip;		/* the live clip */
+		len = e->clip_len;
+		as_block = e->clip_block;
 	} else if (src->type == CLV_REGION) {
-		bytes = cl_region_bytes(e, &src->reg, &len);
-		owned = 1;
-		if (!bytes) {
+		owned = cl_region_bytes(e, &src->reg, &len);
+		if (!owned) {
 			cle_err(ev, "out of memory");
 			return -1;
 		}
+		bytes = owned;
+		as_block = (src->reg.kind == CLK_RECT);
 	} else {
 		cle_err(ev, "put: cannot place that value");
 		return -1;
 	}
 	p = cl_clamp_pos(e, dst->pos);
-	text_undo_group_begin(e->t);
-	e->cy = p.row;
-	e->cx = p.col;
-	insert_bytes(e, bytes, len);
-	text_undo_group_end(e->t);
-	if (owned)
-		free(bytes);
+	cl_place_at(e, p, bytes, len, as_block);
+	free(owned);
 	return 0;
 }
 
-/* replace REGION: delete the region and insert the clip where it started. */
+/* replace REGION: delete the region and place the clip where it began. A rect
+ * region closes up its columns and the clip goes back in as columns. */
 static int
 bi_replace(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 {
@@ -27705,9 +27750,7 @@ bi_replace(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	text_undo_group_begin(e->t);
 	cl_region_delete(e, r);
 	start = cl_clamp_pos(e, start);
-	e->cy = start.row;
-	e->cx = start.col;
-	insert_bytes(e, e->clip, e->clip_len);
+	cl_place_at(e, start, e->clip, e->clip_len, e->clip_block);
 	text_undo_group_end(e->t);
 	return 0;
 }
@@ -27856,7 +27899,8 @@ cl_run(Editor *e, const struct cl_prog *p)
 	 * with put or replace. put and replace read the clip's live bytes, so
 	 * the snapshot kind here is only a label. */
 	cr.buffer = CLB_SCRATCH;
-	cr.kind = e->clip_linewise ? CLK_LINE : CLK_CHAR;
+	cr.kind = e->clip_block ? CLK_RECT :
+	    (e->clip_linewise ? CLK_LINE : CLK_CHAR);
 	clip = clv_region(cr);
 	cle_set(&ev, "clip", &clip);
 	if (cl_eval_prog(&ev, p, &result, &req, 1) < 0)
@@ -31242,17 +31286,17 @@ draw_block_bounds(Editor *e, size_t *y1, size_t *y2, size_t *x1,
 	*x2 = e->ax > e->cx ? e->ax : e->cx;
 }
 
-/* Copy the rectangle (rows y1..y2, columns x1..x2, inclusive) into the
- * clipboard as blank-padded rows joined by newlines, marked as a block. Cells
- * past a short line become spaces, so the clip is a true rectangle. */
-static void
-rect_grab(Editor *e, size_t y1, size_t y2, size_t x1, size_t x2)
+/* Build the rectangle (rows y1..y2, columns x1..x2, inclusive) as blank-padded
+ * rows joined by newlines, newly allocated with *outlen set. Cells past a short
+ * line become spaces, so the result is a true rectangle. NULL on OOM. */
+static char *
+rect_bytes(Editor *e, size_t y1, size_t y2, size_t x1, size_t x2, size_t *outlen)
 {
 	size_t w = x2 - x1 + 1, cap = (y2 - y1 + 1) * (w + 1) + 1, off = 0, y;
 	char *buf = malloc(cap);
 
 	if (!buf)
-		return;
+		return NULL;
 	for (y = y1; y <= y2; y++) {
 		size_t len = 0, c;
 		const char *s = y < text_lines(e->t) ?
@@ -31266,9 +31310,22 @@ rect_grab(Editor *e, size_t y1, size_t y2, size_t x1, size_t x2)
 		if (y < y2)
 			buf[off++] = '\n';
 	}
+	*outlen = off;
+	return buf;
+}
+
+/* Copy the rectangle into the clipboard, marked as a block. */
+static void
+rect_grab(Editor *e, size_t y1, size_t y2, size_t x1, size_t x2)
+{
+	size_t len = 0;
+	char *buf = rect_bytes(e, y1, y2, x1, x2, &len);
+
+	if (!buf)
+		return;
 	free(e->clip);
 	e->clip = buf;
-	e->clip_len = off;
+	e->clip_len = len;
 	e->clip_block = 1;
 	e->clip_linewise = 0;
 }

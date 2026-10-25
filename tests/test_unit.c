@@ -4558,6 +4558,63 @@ t_keymap_prog(Test *t)
 	unlink(mainpath);
 }
 
+/* The rect kind: a column box. Deleting one closes up the columns across
+ * ragged rows; copying one grabs a blank-padded block that put places back as
+ * columns, padding short rows. */
+static void
+t_cl_rect(Test *t)
+{
+	const Cfg *old = g_cfg;
+	ClProg *p;
+	char err[64];
+	const char *s;
+	size_t len;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "abcd", 4);
+	text_split(e.t, 0, 4); text_insert(e.t, 1, 0, "ef", 2);
+	text_split(e.t, 1, 2); text_insert(e.t, 2, 0, "ghij", 4);
+
+	/* rect delete closes up columns 2..3 (1-based) across the ragged rows */
+	p = cl_parse("delete [region rect [pos 1 2] [pos 3 3]]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	s = text_line(e.t, 0, &len);
+	TAP_CHECKF(t, len == 2 && memcmp(s, "ad", 2) == 0, "r0 len=%zu", len);
+	s = text_line(e.t, 1, &len);
+	TAP_CHECK(t, len == 1 && memcmp(s, "e", 1) == 0);	/* short row */
+	s = text_line(e.t, 2, &len);
+	TAP_CHECK(t, len == 2 && memcmp(s, "gj", 2) == 0);
+
+	/* rect copy then put places the block as columns, padding short rows */
+	text_free(e.t);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "abcd", 4);
+	text_split(e.t, 0, 4); text_insert(e.t, 1, 0, "ef", 2);
+	p = cl_parse(
+	    "copy [region rect [pos 1 1] [pos 2 2]] ; put $clip at [pos 1 5]",
+	    err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	s = text_line(e.t, 0, &len);
+	TAP_CHECKF(t, len == 6 && memcmp(s, "abcdab", 6) == 0,
+	    "put r0 [%.*s]", (int)len, s);
+	s = text_line(e.t, 1, &len);
+	TAP_CHECKF(t, len == 6 && memcmp(s, "ef  ef", 6) == 0,
+	    "put r1 [%.*s]", (int)len, s);
+
+	free(e.clip);
+	text_free(e.t);
+	g_cfg = old;
+}
+
 /* The capture suffix: a plain removing verb discards, its dotted twin also
  * pushes the removed text onto the kill stack, and kill-paste inserts the top
  * entry. The kill stack is separate from the clipboard and accumulates. */
@@ -4614,6 +4671,7 @@ const Case tap_cases[] = {
 	{ "cl_parse", t_cl_parse },
 	{ "cl_eval", t_cl_eval },
 	{ "cl_region", t_cl_region },
+	{ "cl_rect", t_cl_rect },
 	{ "cl_capture", t_cl_capture },
 	{ "keymap_prog", t_keymap_prog },
 	{ "utf8_roundtrip", t_utf8_roundtrip },
