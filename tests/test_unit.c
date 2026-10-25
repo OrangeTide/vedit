@@ -4671,6 +4671,175 @@ t_block_column(Test *t)
 	g_cfg = old;
 }
 
+/* Named registers: copy fills a register, put places it, a single-letter name
+ * is vi's register of that letter (shared store), an arbitrary name gets its
+ * own slot, and a rect remembers it is a block. */
+static void
+t_cl_reg(Test *t)
+{
+	const Cfg *old = g_cfg;
+	ClProg *p;
+	char err[64];
+	const char *s;
+	size_t len;
+	Reg *rg;
+	int i;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "hello", 5);
+	text_split(e.t, 0, 5); text_insert(e.t, 1, 0, "world", 5);
+
+	/* copy a line into register a; a is vi's "a (the shared store) */
+	p = cl_parse("copy [region line 1 1] [reg a]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[0].len == 6 &&
+	    memcmp(e.vi_regs[0].bytes, "hello\n", 6) == 0,
+	    "reg a len=%zu", e.vi_regs[0].len);
+	TAP_CHECK(t, e.vi_regs[0].linewise == 1);
+
+	/* an arbitrary name lands in the added store */
+	p = cl_parse("copy [region line 2 2] [reg scratch2]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	rg = reg_slot(&e, "scratch2");
+	TAP_ASSERT(t, rg != NULL);
+	TAP_CHECKF(t, rg->len == 6 && memcmp(rg->bytes, "world\n", 6) == 0,
+	    "named len=%zu", rg->len);
+
+	/* put a register back at a position */
+	p = cl_parse("put [reg a] at [pos 2 1]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, text_lines(e.t) == 3, "lines=%zu", text_lines(e.t));
+	s = text_line(e.t, 1, &len);
+	TAP_CHECK(t, len == 5 && memcmp(s, "hello", 5) == 0);
+
+	/* a rect copied into a register remembers it is a block */
+	p = cl_parse("copy [region rect [pos 1 1] [pos 2 1]] [reg b]",
+	    err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECK(t, e.vi_regs[1].block == 1);
+
+	for (i = 0; i < 26; i++)
+		free(e.vi_regs[i].bytes);
+	for (i = 0; i < e.cl_nregs; i++) {
+		free(e.cl_regs[i].name);
+		free(e.cl_regs[i].reg.bytes);
+	}
+	free(e.cl_regs);
+	free(e.clip);
+	text_free(e.t);
+	g_cfg = old;
+}
+
+/* run evaluates text as a program: a literal one, and one stored in a register
+ * (a macro). The program shares the caller's run and acts on the buffer. */
+static void
+t_cl_run(Test *t)
+{
+	const Cfg *old = g_cfg;
+	ClProg *p;
+	char err[64];
+	int i;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "line-end", 8);
+
+	/* run a literal program: a newline splits the line */
+	e.cy = 0; e.cx = 0;
+	p = cl_parse("run {newline}", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, text_lines(e.t) == 2, "after run lines=%zu",
+	    text_lines(e.t));
+
+	/* store a program (buffer text) in a register, then run it: line 2 holds
+	 * "line-end", so running it moves the cursor to the end of that line */
+	e.cy = 1; e.cx = 0;
+	p = cl_parse("copy [region line 2 2] [reg m] ; run [reg m]",
+	    err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.cy == 1 && e.cx == 8, "after run reg cy=%zu cx=%zu",
+	    e.cy, e.cx);
+
+	for (i = 0; i < 26; i++)
+		free(e.vi_regs[i].bytes);
+	for (i = 0; i < e.cl_nregs; i++) {
+		free(e.cl_regs[i].name);
+		free(e.cl_regs[i].reg.bytes);
+	}
+	free(e.cl_regs);
+	free(e.clip);
+	text_free(e.t);
+	g_cfg = old;
+}
+
+/* The mark bridge: a program sets and reads vi's marks as positions, and they
+ * are vi's own marks (shared). A position from a mark feeds another verb. */
+static void
+t_cl_mark(Test *t)
+{
+	const Cfg *old = g_cfg;
+	ClProg *p;
+	char err[64];
+	const char *s;
+	size_t len;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "aaa", 3);
+	text_split(e.t, 0, 3); text_insert(e.t, 1, 0, "bbbbb", 5);
+
+	/* set mark a at row 2, column 3 (1-based), read back as vi's mark a */
+	p = cl_parse("mark a [pos 2 3]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_ASSERT(t, e.vi_marks_set & ((uint64_t)1 << 0));
+	TAP_CHECKF(t, e.vi_mark_y[0] == 1 && e.vi_mark_x[0] == 2,
+	    "mark a y=%zu x=%zu", e.vi_mark_y[0], e.vi_mark_x[0]);
+
+	/* a mark read back feeds a position: put a string at mark a */
+	p = cl_parse("put X at [mark a]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	s = text_line(e.t, 1, &len);
+	TAP_CHECKF(t, len == 6 && memcmp(s, "bbXbbb", 6) == 0,
+	    "mark put [%.*s]", (int)len, s);
+
+	/* an unset mark is an error, handled without a crash */
+	p = cl_parse("put Y at [mark z]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECK(t, text_line_len(e.t, 1) == 6);	/* unchanged */
+
+	free(e.clip);
+	text_free(e.t);
+	g_cfg = old;
+}
+
 /* The capture suffix: a plain removing verb discards, its dotted twin also
  * pushes the removed text onto the kill stack, and kill-paste inserts the top
  * entry. The kill stack is separate from the clipboard and accumulates. */
@@ -4729,6 +4898,9 @@ const Case tap_cases[] = {
 	{ "cl_region", t_cl_region },
 	{ "cl_rect", t_cl_rect },
 	{ "block_column", t_block_column },
+	{ "cl_reg", t_cl_reg },
+	{ "cl_run", t_cl_run },
+	{ "cl_mark", t_cl_mark },
 	{ "cl_capture", t_cl_capture },
 	{ "keymap_prog", t_keymap_prog },
 	{ "utf8_roundtrip", t_utf8_roundtrip },

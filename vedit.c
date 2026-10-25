@@ -7626,12 +7626,14 @@ enum {
 	MARK_SLOTS
 };
 
-/* A yank/delete register: owned bytes, their length, and whether the content
- * is whole lines (put restores it as new lines). */
+/* A yank/delete register: owned bytes, their length, whether the content is
+ * whole lines (put restores it as new lines), and whether it is a column block
+ * (put restores it as columns). */
 typedef struct vi_reg {
 	char	*bytes;
 	size_t	len;
 	int	linewise;
+	int	block;
 } Reg;
 
 /* A recorded key sequence, used by the '.' repeat to replay the last change. */
@@ -8220,6 +8222,11 @@ typedef struct editor {
 	size_t		vi_mark_x[MARK_SLOTS];	/* byte column of the mark */
 	uint64_t	vi_marks_set;	/* bit i set: mark slot i is defined */
 	Reg	vi_regs[26];	/* named registers "a..z */
+	/* Command-language registers named by something other than a single a-z
+	 * letter; the a-z letters share vi_regs above, so a program's register a
+	 * is vi's "a. Session-persistent like vi_regs. */
+	struct { char *name; Reg reg; } *cl_regs;
+	int		cl_nregs, cl_regs_cap;
 	char		vi_reg;		/* selected register a-z/A-Z, 0 = none */
 	char		vi_reg_fresh;	/* vi_reg was just armed by " */
 	char		vi_regpending;	/* " typed, awaiting the register name */
@@ -27150,13 +27157,17 @@ typedef enum cl_kind {
 
 typedef enum cl_bufid {
 	CLB_CUR,		/* the current editing buffer */
-	CLB_SCRATCH		/* the scratch buffer, i.e. the clip */
+	CLB_SCRATCH,		/* the scratch buffer, i.e. the clip */
+	CLB_REG			/* a named register (reg holds the name) */
 } ClBufId;
+
+#define REG_NAME_MAX 24		/* a register name fits inline in a region */
 
 typedef struct cl_region {
 	ClBufId	buffer;
 	ClKind	kind;
 	ClPos	start, end;	/* normalized: start is the earlier corner */
+	char	reg[REG_NAME_MAX];	/* the register name when buffer is CLB_REG */
 } ClRegion;
 
 typedef enum clv_type {
@@ -27252,8 +27263,12 @@ typedef struct cl_eval {
 	Editor	*e;
 	ClVar	*vars;
 	int	nvars, varcap;
+	int	depth;		/* nested run depth, to stop runaway recursion */
+	Req	pending_req;	/* a host request a builtin (run) wants propagated */
 	char	err[160];
 } ClEval;
+
+#define CL_RUN_MAX 64		/* deepest run nesting before it is an error */
 
 static void
 cle_err(ClEval *ev, const char *fmt, ...)
@@ -27440,6 +27455,56 @@ cl_pos_le(ClPos a, ClPos b)
 	return a.row < b.row || (a.row == b.row && a.col <= b.col);
 }
 
+/* The register slot named by name. A single a-z letter is vi's register of
+ * that letter, so a program and vi share them; any other name lives in a small
+ * added store, created on first use. NULL on a bad name or out of memory. */
+static Reg *
+reg_slot(Editor *e, const char *name)
+{
+	int i;
+
+	if (!name || !name[0])
+		return NULL;
+	if (name[0] >= 'a' && name[0] <= 'z' && name[1] == '\0')
+		return &e->vi_regs[name[0] - 'a'];
+	for (i = 0; i < e->cl_nregs; i++)
+		if (strcmp(e->cl_regs[i].name, name) == 0)
+			return &e->cl_regs[i].reg;
+	if (e->cl_nregs >= e->cl_regs_cap) {
+		int na = e->cl_regs_cap ? e->cl_regs_cap * 2 : 8;
+		void *nr = realloc(e->cl_regs, (size_t)na * sizeof(*e->cl_regs));
+
+		if (!nr)
+			return NULL;
+		e->cl_regs = nr;
+		e->cl_regs_cap = na;
+	}
+	e->cl_regs[e->cl_nregs].name = clv_strdup(name);
+	if (!e->cl_regs[e->cl_nregs].name)
+		return NULL;
+	memset(&e->cl_regs[e->cl_nregs].reg, 0, sizeof(Reg));
+	return &e->cl_regs[e->cl_nregs++].reg;
+}
+
+/* Replace a register's content with a copy of bytes. Returns 0, or -1 on out
+ * of memory (the register is left unchanged). */
+static int
+reg_set(Reg *r, const char *bytes, size_t len, int linewise, int block)
+{
+	char *nb = malloc(len ? len : 1);
+
+	if (!nb)
+		return -1;
+	if (len)
+		memcpy(nb, bytes, len);
+	free(r->bytes);
+	r->bytes = nb;
+	r->len = len;
+	r->linewise = linewise;
+	r->block = block;
+	return 0;
+}
+
 /* The bytes of a region, newly allocated, with *outlen set. A line region
  * yields whole rows with a trailing newline; a char region the run between its
  * corners; a scratch region the whole clip. NULL on out of memory. */
@@ -27454,6 +27519,20 @@ cl_region_bytes(Editor *e, const ClRegion *r, size_t *outlen)
 		if (e->clip_len)
 			memcpy(b, e->clip, e->clip_len);
 		*outlen = e->clip_len;
+		return b;
+	}
+	if (r->buffer == CLB_REG) {
+		Reg *rg = reg_slot(e, r->reg);
+		char *b;
+
+		if (!rg)
+			return NULL;
+		b = malloc(rg->len ? rg->len : 1);
+		if (!b)
+			return NULL;
+		if (rg->len)
+			memcpy(b, rg->bytes, rg->len);
+		*outlen = rg->len;
 		return b;
 	}
 	if (r->kind == CLK_LINE) {
@@ -27549,7 +27628,7 @@ static int
 bi_region(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 {
 	Editor *e = ev->e;
-	ClRegion r;
+	ClRegion r = { 0 };
 
 	if (argc < 1 || argv[0].type != CLV_STR) {
 		cle_err(ev, "region needs a kind");
@@ -27632,6 +27711,34 @@ bi_region(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return 0;
 }
 
+/* reg NAME: a named register as a region, so copy can fill it and put can
+ * place it. A single a-z name is vi's register of that letter. */
+static int
+bi_reg(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	ClRegion r = { 0 };
+	Reg *rg;
+
+	if (argc != 1 || argv[0].type != CLV_STR) {
+		cle_err(ev, "reg needs a name");
+		return -1;
+	}
+	if (strlen(argv[0].s) >= REG_NAME_MAX) {
+		cle_err(ev, "register name too long");
+		return -1;
+	}
+	rg = reg_slot(ev->e, argv[0].s);
+	if (!rg) {
+		cle_err(ev, "bad register name: %.20s", argv[0].s);
+		return -1;
+	}
+	r.buffer = CLB_REG;
+	r.kind = rg->block ? CLK_RECT : (rg->linewise ? CLK_LINE : CLK_CHAR);
+	snprintf(r.reg, sizeof(r.reg), "%s", argv[0].s);
+	*result = clv_region(r);
+	return 0;
+}
+
 /* delete [REGION]: with a region, the region form; with none, the cursor form
  * (the selection, else the character under the cursor). The dotted twin also
  * pushes the removed text onto the kill stack. */
@@ -27685,8 +27792,9 @@ bi_delete_cap(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return cl_do_delete(ev, argc, argv, 1);
 }
 
-/* copy [REGION]: with a region, grab its content into the clip; with none, the
- * cursor form (the selection, else the whole line). */
+/* copy [SRC [DST]]: with no argument, the cursor form (the selection, else the
+ * whole line) into the clip. With a current-buffer SRC region, grab it into the
+ * clip, or into the register DST names when a second argument is given. */
 static int
 bi_copy(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 {
@@ -27694,29 +27802,47 @@ bi_copy(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	ClRegion *r;
 	char *b;
 	size_t l = 0;
+	int lw, blk;
 
 	(void)result;
 	if (argc == 0) {
 		ed_copy(e);
 		return 0;
 	}
-	if (argv[0].type != CLV_REGION) {
-		cle_err(ev, "copy needs a region");
+	if (argv[0].type != CLV_REGION || argv[0].reg.buffer != CLB_CUR) {
+		cle_err(ev, "copy needs a current-buffer region");
 		return -1;
 	}
 	r = &argv[0].reg;
-	if (r->buffer != CLB_CUR) {
-		cle_err(ev, "copy: that is already the clip");
-		return -1;
-	}
 	b = cl_region_bytes(e, r, &l);
 	if (!b) {
 		cle_err(ev, "out of memory");
 		return -1;
 	}
+	lw = (r->kind == CLK_LINE);
+	blk = (r->kind == CLK_RECT);		/* a rect pastes back as columns */
+	if (argc >= 2) {			/* copy into a named register */
+		Reg *rg;
+
+		if (argv[1].type != CLV_REGION || argv[1].reg.buffer != CLB_REG) {
+			cle_err(ev, "copy: the destination must be a register");
+			free(b);
+			return -1;
+		}
+		rg = reg_slot(e, argv[1].reg.reg);
+		if (!rg || reg_set(rg, b, l, lw, blk) < 0) {
+			cle_err(ev, "out of memory");
+			free(b);
+			return -1;
+		}
+		free(b);
+		set_status(e, "copied %zu byte%s to %.20s", l, l == 1 ? "" : "s",
+		    argv[1].reg.reg);
+		return 0;
+	}
 	clip_set(e, b, l);			/* takes ownership of b */
-	e->clip_linewise = (r->kind == CLK_LINE);
-	e->clip_block = (r->kind == CLK_RECT);	/* a rect pastes as columns */
+	e->clip_linewise = lw;
+	e->clip_block = blk;
 	set_status(e, "copied %zu byte%s", l, l == 1 ? "" : "s");
 	return 0;
 }
@@ -27775,6 +27901,16 @@ bi_put(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		bytes = e->clip;		/* the live clip */
 		len = e->clip_len;
 		as_block = e->clip_block;
+	} else if (src->type == CLV_REGION && src->reg.buffer == CLB_REG) {
+		Reg *rg = reg_slot(e, src->reg.reg);
+
+		if (!rg) {
+			cle_err(ev, "bad register name: %.20s", src->reg.reg);
+			return -1;
+		}
+		bytes = rg->bytes;		/* the register's own memory */
+		len = rg->len;
+		as_block = rg->block;
 	} else if (src->type == CLV_REGION) {
 		owned = cl_region_bytes(e, &src->reg, &len);
 		if (!owned) {
@@ -27821,16 +27957,132 @@ bi_replace(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return 0;
 }
 
+/* run SRC: evaluate SRC's text as a command-language program, sharing this
+ * run's variables. SRC is a string or a region (a register, the clip, or a
+ * span of the current buffer). The program is resumable like a top-level one;
+ * a quit it raises is propagated through the eval context. The result is the
+ * program's value. */
+static int
+bi_run(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	char *src = NULL, *bytes;
+	size_t len = 0;
+	ClProg *prog;
+	Req req = REQ_CONTINUE;
+	char perr[128];
+	int rc;
+
+	if (argc != 1) {
+		cle_err(ev, "run needs one program");
+		return -1;
+	}
+	if (ev->depth >= CL_RUN_MAX) {
+		cle_err(ev, "run nested too deep");
+		return -1;
+	}
+	if (argv[0].type == CLV_STR) {
+		bytes = argv[0].s;
+		len = strlen(argv[0].s);
+	} else if (argv[0].type == CLV_REGION) {
+		bytes = cl_region_bytes(ev->e, &argv[0].reg, &len);
+		if (!bytes) {
+			cle_err(ev, "out of memory");
+			return -1;
+		}
+		src = bytes;		/* owned: free before returning */
+	} else {
+		cle_err(ev, "run: cannot run that value");
+		return -1;
+	}
+	{				/* cl_parse needs a NUL-terminated source */
+		char *z = malloc(len + 1);
+
+		if (!z) {
+			free(src);
+			cle_err(ev, "out of memory");
+			return -1;
+		}
+		if (len)
+			memcpy(z, bytes, len);
+		z[len] = '\0';
+		free(src);
+		src = z;
+	}
+	prog = cl_parse(src, perr, sizeof(perr));
+	free(src);
+	if (!prog) {
+		cle_err(ev, "run: %.100s", perr);
+		return -1;
+	}
+	ev->depth++;
+	rc = cl_eval_prog(ev, prog, result, &req, 1);
+	ev->depth--;
+	cl_prog_free(prog);
+	if (rc == 0)
+		ev->pending_req = req;	/* a quit from the program propagates */
+	return rc;
+}
+
+/* mark NAME: the vi mark named by a single character, as a position; these are
+ * vi's own marks, so a program and vi share them. mark NAME POS sets an a-z
+ * mark. A program can read the special marks (. ^ < > [ ]) but, like vi's m,
+ * only sets letters. */
+static int
+bi_mark(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	Editor *e = ev->e;
+	int slot;
+
+	if (argc < 1 || argv[0].type != CLV_STR || argv[0].s[0] == '\0' ||
+	    argv[0].s[1] != '\0') {
+		cle_err(ev, "mark needs a one-character name");
+		return -1;
+	}
+	slot = mark_index((unsigned char)argv[0].s[0]);
+	if (slot < 0) {
+		cle_err(ev, "bad mark name: %.4s", argv[0].s);
+		return -1;
+	}
+	if (argc == 1) {			/* read the mark */
+		ClPos p;
+
+		if (!(e->vi_marks_set & ((uint64_t)1 << slot))) {
+			cle_err(ev, "mark %.4s is not set", argv[0].s);
+			return -1;
+		}
+		p.row = e->vi_mark_y[slot];
+		p.col = e->vi_mark_x[slot];
+		*result = clv_pos(p);
+		return 0;
+	}
+	if (argc == 2 && argv[1].type == CLV_POS) {	/* set the mark */
+		ClPos p = cl_clamp_pos(e, argv[1].pos);
+
+		if (slot >= MARK_LETTERS) {
+			cle_err(ev, "only a-z marks can be set");
+			return -1;
+		}
+		vi_mark_set(e, slot, p.row, p.col);
+		*result = clv_pos(p);
+		return 0;
+	}
+	cle_err(ev, "mark NAME reads a mark; mark NAME POS sets it");
+	return -1;
+}
+
 static const ClBuiltin cl_builtins[] = {
 	{ "set", bi_set },
 	{ "cursor", bi_cursor },
 	{ "pos", bi_pos },
 	{ "region", bi_region },
+	{ "reg", bi_reg },
 	{ "delete", bi_delete },
 	{ "delete.", bi_delete_cap },
 	{ "copy", bi_copy },
 	{ "put", bi_put },
 	{ "replace", bi_replace },
+	{ "run", bi_run },
+	{ "mark", bi_mark },
 };
 
 static const ClBuiltin *
@@ -27884,6 +28136,8 @@ cl_eval_cmd(ClEval *ev, const ClCmd *c, ClVal *result, Req *req)
 	bi = cl_builtin_find(name.s);
 	if (bi) {
 		rc = bi->fn(ev, argc, argv, result);
+		*req = ev->pending_req;		/* run may propagate a quit */
+		ev->pending_req = REQ_CONTINUE;
 		goto done;
 	}
 	act = kb_action_id(name.s);
@@ -33430,6 +33684,11 @@ editor_teardown(Editor *e)
 	free(e->art_clip);
 	for (i = 0; i < 26; i++)
 		free(e->vi_regs[i].bytes);
+	for (i = 0; i < e->cl_nregs; i++) {
+		free(e->cl_regs[i].name);
+		free(e->cl_regs[i].reg.bytes);
+	}
+	free(e->cl_regs);
 	free(e->vi_dot.ev);
 	free(e->vi_rec.ev);
 	free(e->hl_buf);
