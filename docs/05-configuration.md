@@ -181,20 +181,27 @@ use and is an error for now.
 `set NAME VALUE` binds a variable for the rest of the run; variables do not
 persist between keypresses. A position is a row and a column: `cursor` is the
 current cursor, and `pos ROW COL` is an explicit one, both numbers 1-based as
-in the status bar. A region names a span: `region line N1 N2` is whole rows N1
-through N2 (1-based, inclusive), and `region char P1 P2` is the run between two
-positions. `$clip` is the clipboard as a region.
+in the status bar. A region names a span:
+
+- `region line N1 N2` is whole rows N1 through N2 (1-based, inclusive).
+- `region char P1 P2` is the text run between two positions, in reading order.
+- `region rect P1 P2` is the column box with those two corners: columns P1's
+  through P2's across their rows.
+
+`$clip` is the clipboard as a region.
 
 The editing verbs take two forms. With no argument a verb acts on the selection
 or a default around the cursor, exactly as the plain action names do. Given a
 region it acts on that span:
 
 - `delete REGION` removes the span, and `delete.` also pushes it onto the kill
-  stack.
-- `copy REGION` grabs the span into the clipboard.
+  stack. Deleting a rect removes the columns and closes up each row.
+- `copy REGION` grabs the span into the clipboard; a rect is grabbed as a
+  blank-padded block.
 - `put VALUE at POS` inserts a string or a region at a position; the word `at`
-  is optional.
-- `replace REGION` removes the span and inserts the clipboard where it began.
+  is optional. A rect, or the clipboard when it holds a block, goes in as
+  columns, shifting existing text right and padding short rows.
+- `replace REGION` removes the span and puts the clipboard where it began.
 
 For example, a key that copies the first three lines and places them at the
 top of the file:
@@ -247,6 +254,9 @@ The actions are:
   `block-copy`, `block-move`, `block-delete`, `block-write`, `block-hide`,
   `block-column-toggle`. A block is two marks set independently of the cursor;
   copy and move act on it at the cursor, and write saves it to a file.
+  `block-column-toggle` switches the block between a stream (whole lines from
+  the first mark to the second) and a column box; in column mode copy, move,
+  and delete work on the rectangle, closing up or inserting columns.
 - Files and search: `find`, `find-next`, `replace`, `goto-line`, `symbol`,
   `file-insert`, `save`, `save-as`, `save-exit`, `quit`, `help`.
 

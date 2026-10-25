@@ -2,14 +2,16 @@
 
 Status: landing in phases. Phase 0 (consolidation), Phase 1 (mini-program
 bindings with the cursor-form verbs and the capture suffix), the value model
-(typed values, $variables, [substitution], and the region-form verbs over char
-and line kinds), and the resumable evaluator are implemented. The resumable
-evaluator is synchronous: the prompt helpers block on the modal frame stack, so
-a top-level program services a prompt request through run_req and resumes with
-the next command when the frame closes; a quit ends the program. A prompt
-inside a [substitution] stays an error, since a substitution must yield a value
-at once. Still reserved and not built: the rect kind, and arbitrary and
-register buffers. This note records the decisions behind the design. It is an
+(typed values, $variables, [substitution], and the region-form verbs over the
+char, line, and rect kinds), the rect kind (which also makes the WordStar
+column block do real rectangular edits), and the resumable evaluator are
+implemented. The resumable evaluator is synchronous: the prompt helpers block
+on the modal frame stack, so a top-level program services a prompt request
+through run_req and resumes with the next command when the frame closes; a quit
+ends the program. A prompt inside a [substitution] stays an error, since a
+substitution must yield a value at once. Still reserved and not built: arbitrary
+and register buffers, and art mode's colored Cell-grid rectangle. This note
+records the decisions behind the design. It is an
 engineering document, not user manual text; the user-facing chapters stay in
 `docs/01` through `docs/11`.
 
@@ -160,21 +162,36 @@ or rect. A paste uses the source region's kind. This is where today's
 
 ### Implemented today
 
-- kinds: `char` and `line`.
+- kinds: `char`, `line`, and `rect`.
 - buffers: the current buffer and the current clip or scratch buffer.
 - the core verbs over handles: motion to a `Pos`, build a `Region`, grab a
   region into scratch, put scratch at a point, delete a region, replace a region
   with scratch content, plus the existing named editor actions.
 
+### The rect kind
+
+A `rect` region is a column box: columns x1..x2 across rows y1..y2. It is
+normalized per axis (top-left and bottom-right corners), unlike `char` which is
+normalized by reading order. The rect verbs chose vi's block model over draw
+mode's: delete removes the columns and closes up each row (text shifts left);
+put and replace place a block clip as columns, shifting existing text right and
+padding short rows with spaces; a copied rect is a blank-padded block in the
+clip, marked blockwise. A rect over the Text buffer reuses three shared
+primitives (`rect_grab`, `rect_delete_cols`, `rect_place_cols`) that draw mode,
+the vi visual block, and the WordStar column block also call, so there is one
+rectangle implementation over text. The WordStar `block-column-toggle`, which
+was cosmetic (it changed only the highlight), now routes copy, move, and delete
+through those primitives, so a column block finally does rectangular edits.
+
+Art mode's rectangle stays separate. Art is a grid of `Cell` values carrying
+color and attributes, stored outside the Text buffer, with its own `art_clip`.
+A text rect and an art rect are not byte-identical, so folding art onto the
+region model would need regions over a polymorphic Cell-payload buffer. That is
+a larger project than the value model and is deliberately left out; `rect` over
+the Text buffer does not depend on it.
+
 ### Reserved, not built
 
-- the `rect` kind. The tag includes it from the start, so adding rectangular
-  operators later is additive and needs no verb signature change. This is what
-  will unify the WordStar block, the draw mode, and the art mode rectangle
-  operations onto one region-and-operator model. It unifies the selection and
-  operator model; the stored payload stays polymorphic, because draw cells carry
-  color and attributes that plain text does not, so a text rect and a draw rect
-  are not byte-identical values.
 - arbitrary buffers beyond current and scratch (multi-buffer editing).
 - registers as buffers. vi's 26 registers and the clipboard are, under this
   model, named scratch buffers, and a register reference is a buffer name. This
