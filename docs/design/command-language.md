@@ -165,7 +165,8 @@ or rect. A paste uses the source region's kind. This is where today's
 ### Implemented today
 
 - kinds: `char`, `line`, and `rect`.
-- buffers: the current buffer and the current clip or scratch buffer.
+- buffers: the current buffer, any other open file by number, named registers,
+  and the clip or scratch buffer.
 - the core verbs over handles: motion to a `Pos`, build a `Region`, grab a
   region into scratch, put scratch at a point, delete a region, replace a region
   with scratch content, plus the existing named editor actions.
@@ -211,11 +212,27 @@ and `mark NAME POS` sets a letter mark, sharing vi's own mark slots. A mark is a
 position, not bytes, so it is exposed as the existing `Pos` value rather than
 packed into the byte-register store.
 
-### Reserved, not built
+### Open files as buffers
 
-- arbitrary open files as buffers (copy and put across two open files). The
-  register store covers data buffers; cross-file editing over the `e->bufs`
-  array is a separate, larger step.
+Cross-file editing is built on the handle model, not a new mechanism. A region
+carries a 1-based file index, and a trailing `file N` on `region` or `put`
+points the operation at another open file. The current file is `file N` with
+`N` equal to the active index, so the current buffer is the degenerate case
+with no special path.
+
+Resolution is a thin scoped swap of the active `Text *`, not a buffer switch.
+`cl_buf_enter` saves the active cursor and highlight state, points `e->t` at the
+target file's text (through `buf_text_at`, which also covers the view-swap
+case), and `cl_buf_leave` restores them and invalidates the target's highlight
+cache after an edit. Readers (`copy`, a region source) enter and leave without
+saving anything; writers (`put`, `delete`, `replace`) save and restore the
+active cursor so an edit in another file does not move the cursor in the one on
+screen. No swap file, VCS, or focus side effect fires, because the active buffer
+never actually changes.
+
+`go-file N` is the one cross-file verb that does change focus. It calls the same
+`buf_switch` the next-buffer key uses, so the swap flush, buffer save and load,
+and VCS refresh all run. An out-of-range file number is an error, not a switch.
 
 ### A known refinement
 

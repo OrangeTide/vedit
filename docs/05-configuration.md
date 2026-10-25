@@ -195,6 +195,12 @@ name is a register of its own. `mark NAME` is a vi mark as a position, and
 `mark NAME POS` sets it; these are vi's own marks, shared, and a letter mark is
 settable while the special marks are read-only.
 
+A region measures against the current file by default. A trailing `file N`
+points it at another open file instead, numbered from 1 in buffer order:
+`region line 1 3 file 2` is the first three lines of the second open file.
+`put` takes the same `file N` suffix to place into another file. `go-file N`
+switches the focus to file N, the way the next-buffer key does.
+
 The editing verbs take two forms. With no argument a verb acts on the selection
 or a default around the cursor, exactly as the plain action names do. Given a
 region it acts on that span:
@@ -226,6 +232,14 @@ Registers persist, so one key can stash a region and another place it:
 [keys "demo"]
     bind = ^Y { copy [region line 1 1] [reg a] }
     bind = ^P { put [reg a] at [cursor] }
+```
+
+A key can carry text from one open file to another, reading from file 2 and
+placing at the top of file 1:
+
+```ini
+[keys "demo"]
+    bind = "^T { copy [region line 1 1 file 2] [reg a] ; put [reg a] at [pos 1 1] }"
 ```
 
 A `help` line adds a row to the F1 key-bindings screen shown while the keymap is
