@@ -173,6 +173,9 @@ or rect. A paste uses the source region's kind. This is where today's
 - `go POS` moves the cursor to a `Pos` (a mark or an explicit position), pushing
   the old spot onto the jump list so `jump-back` returns. It is the read side of
   the `mark` bridge: `mark` names a spot, `go` travels to it.
+- `selection` is the live selection as a region, its kind taken from the
+  selection's shape (linewise is a line region, block is a rect, else a char
+  run), so a Shift-selected or visual span can be named and stashed.
 
 ### The rect kind
 
@@ -296,12 +299,12 @@ Where the API starts to resist:
 - Delete the word under the cursor, roughly: `{ word-left ; delete-word-right }`.
   Expressible but fuzzy. Two motions only approximate "the word I am on" and get
   boundaries wrong mid-word. It wants a region, not two motions.
-- Faithful emacs kill-line, where the killed text is kept so it can be yanked
-  back: this cannot be written today. `copy` acts on the selection or the whole
-  line; there is no "copy from the cursor to end of line", and no verb builds a
-  selection inside a program. So "clear the line" is easy and "kill the line" is
-  not, and the only difference is whether a span can be named for both the copy
-  and the delete.
+- Naming the selection inside a program. At exploration time `copy` acted only
+  on the selection or the whole line, with no way to name the selected span for
+  both a copy and a delete. The `selection` region now names it, so a program
+  can copy it, delete it, or replace it like any other region. (A faithful
+  emacs kill-line, where the killed text is yankable, is served separately by
+  the capture suffix: `delete-to-eol.` kills onto the kill stack.)
 
 Where the Region currency is required, not more macros:
 

@@ -193,6 +193,12 @@ in the status bar. A region names a span:
   same text, which is how a selection stashed on one key stays right for another
   key after the buffer changes. This form is the current file only.
 
+`selection` is the current selection as a region, taken as it is read. Its kind
+follows the selection's shape: a linewise selection is a line region, a block
+selection a rect, and anything else a character run. It is an error when nothing
+is selected, so `copy [selection] [reg a]` stashes the selected text and
+`delete [selection]` removes it.
+
 `$clip` is the clipboard as a region. `reg NAME` is a named register as a
 region, a holder that persists between keypresses: a single letter `a`-`z` is
 vi's register of that letter, so a program and vi share them, and any other
