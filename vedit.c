@@ -25821,8 +25821,19 @@ ed_save_as(Editor *e)
  * added separately.
  ****************************************************************/
 
+/* A word is one argument source. A literal carries its text; a variable
+ * reference carries the name after '$'; a command substitution carries the
+ * bracketed sub-program whose value becomes the word when the program runs. */
+typedef enum cl_word_type {
+	CLW_LIT,		/* bare or brace-quoted literal text */
+	CLW_VAR,		/* $name */
+	CLW_SUB			/* [program] */
+} ClWordType;
+
 typedef struct cl_word {
-	char *text;		/* NUL-terminated literal argument */
+	ClWordType	type;
+	char		*text;	/* literal text (LIT) or variable name (VAR) */
+	struct cl_prog	*sub;	/* the sub-program (SUB), else NULL */
 } ClWord;
 
 typedef struct cl_cmd {
@@ -25860,13 +25871,17 @@ cl_buf_put(ClBuf *b, char c)
 	return 0;
 }
 
+static void cl_prog_free(ClProg *p);
+
 static void
 cl_cmd_free(ClCmd *c)
 {
 	int i;
 
-	for (i = 0; i < c->nwords; i++)
+	for (i = 0; i < c->nwords; i++) {
 		free(c->words[i].text);
+		cl_prog_free(c->words[i].sub);
+	}
 	free(c->words);
 	c->words = NULL;
 	c->nwords = c->cap = 0;
@@ -25885,9 +25900,9 @@ cl_prog_free(ClProg *p)
 	free(p);
 }
 
-/* Append a word (taking ownership of text) to a command. */
+/* Append a word to a command, taking ownership of text and sub. */
 static int
-cl_cmd_add(ClCmd *c, char *text)
+cl_cmd_add(ClCmd *c, ClWordType type, char *text, ClProg *sub)
 {
 	if (c->nwords >= c->cap) {
 		int na = c->cap ? c->cap * 2 : 4;
@@ -25898,7 +25913,10 @@ cl_cmd_add(ClCmd *c, char *text)
 		c->words = nw;
 		c->cap = na;
 	}
-	c->words[c->nwords++].text = text;
+	c->words[c->nwords].type = type;
+	c->words[c->nwords].text = text;
+	c->words[c->nwords].sub = sub;
+	c->nwords++;
 	return 0;
 }
 
@@ -25938,11 +25956,21 @@ cl_escapable(int c)
 	return strchr("{}[]$\";#\\ \t\r\n", c) != NULL;
 }
 
-/* A reserved character that cannot appear bare in a word. */
+/* A reserved character that cannot appear inside a bare word. A word may begin
+ * with '$' or '[' (a variable or a substitution, handled before this check),
+ * but once inside a bare word these stay reserved so a word stays one piece. */
 static int
 cl_reserved_bare(int c)
 {
 	return c == '[' || c == ']' || c == '$' || c == '"';
+}
+
+/* A character allowed in a $variable name. */
+static int
+cl_var_char(int c)
+{
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+	    (c >= '0' && c <= '9') || c == '_';
 }
 
 #define CL_ERR(msg) do { \
@@ -25983,6 +26011,8 @@ cl_parse(const char *src, char *err, size_t errlen)
 		cmd.words = NULL;
 		cmd.nwords = cmd.cap = 0;
 		while (!cl_is_eoc((unsigned char)*p)) {
+			ClWordType wtype = CLW_LIT;
+			ClProg *wsub = NULL;
 			char *word;
 
 			if (cl_is_sep((unsigned char)*p)) {
@@ -26020,6 +26050,65 @@ cl_parse(const char *src, char *err, size_t errlen)
 				if (!cl_is_eoc((unsigned char)*p) &&
 				    !cl_is_sep((unsigned char)*p))
 					CL_ERR("text after }");
+			} else if (*p == '$') {	/* a variable reference */
+				p++;
+				if (!cl_var_char((unsigned char)*p))
+					CL_ERR("empty variable name");
+				while (cl_var_char((unsigned char)*p)) {
+					if (cl_buf_put(&buf, *p) < 0)
+						CL_ERR("out of memory");
+					p++;
+				}
+				if (!cl_is_eoc((unsigned char)*p) &&
+				    !cl_is_sep((unsigned char)*p))
+					CL_ERR("text after variable");
+				wtype = CLW_VAR;
+			} else if (*p == '[') {	/* a command substitution */
+				int depth = 1;
+				char *inner;
+				char emsg[128];
+
+				p++;
+				while (depth > 0) {
+					if (*p == '\0')
+						CL_ERR("unterminated [");
+					if (*p == '\\') {
+						if (p[1] == '\0')
+							CL_ERR("trailing backslash");
+						if (cl_buf_put(&buf, *p) < 0 ||
+						    cl_buf_put(&buf, p[1]) < 0)
+							CL_ERR("out of memory");
+						p += 2;
+						continue;
+					}
+					if (*p == '[') {
+						depth++;
+					} else if (*p == ']') {
+						if (--depth == 0) {
+							p++;
+							break;
+						}
+					}
+					if (cl_buf_put(&buf, *p) < 0)
+						CL_ERR("out of memory");
+					p++;
+				}
+				if (!cl_is_eoc((unsigned char)*p) &&
+				    !cl_is_sep((unsigned char)*p))
+					CL_ERR("text after ]");
+				inner = malloc(buf.len + 1);
+				if (!inner)
+					CL_ERR("out of memory");
+				if (buf.len)
+					memcpy(inner, buf.s, buf.len);
+				inner[buf.len] = '\0';
+				wsub = cl_parse(inner, emsg, sizeof(emsg));
+				free(inner);
+				if (!wsub) {
+					snprintf(err, errlen, "%s", emsg);
+					goto fail;
+				}
+				wtype = CLW_SUB;
 			} else {		/* a bare word */
 				if (*p == '}')
 					CL_ERR("unexpected }");
@@ -26044,13 +26133,20 @@ cl_parse(const char *src, char *err, size_t errlen)
 					p++;
 				}
 			}
+			if (wtype == CLW_SUB) {
+				if (cl_cmd_add(&cmd, CLW_SUB, NULL, wsub) < 0) {
+					cl_prog_free(wsub);
+					CL_ERR("out of memory");
+				}
+				continue;
+			}
 			word = malloc(buf.len + 1);
 			if (!word)
 				CL_ERR("out of memory");
 			if (buf.len)
 				memcpy(word, buf.s, buf.len);
 			word[buf.len] = '\0';
-			if (cl_cmd_add(&cmd, word) < 0) {
+			if (cl_cmd_add(&cmd, wtype, word, NULL) < 0) {
 				free(word);
 				CL_ERR("out of memory");
 			}
@@ -26945,38 +27041,387 @@ kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
 	}
 }
 
-/* Run a parsed program: each command is a verb name and its literal arguments,
- * looked up in kb_actions[] and run through kb_run_action, in order, as the
- * cursor forms of those verbs. The commands run with no originating key, so a
- * motion in a program never extends a selection from the trigger key's Shift.
- * The program stops at the first host request (any Req other than
- * REQ_CONTINUE), handing control back to the main loop so a command that opens
- * a prompt or quits ends the run; the commands after it do not execute. An
- * unknown verb is reported and stops the program. */
-static Req
-cl_run(Editor *e, const struct cl_prog *p)
+/****************************************************************
+ * Command language: the value model
+ *
+ * Programs do not work in strings. The currency is a small set of typed
+ * values. A coordinate is a Pos, a row and a column. A span is a Region, a
+ * kind plus two Pos corners within a named buffer, normalized so start is the
+ * earlier corner. kind is char (a text run in reading order), line (whole
+ * rows), or the reserved rect (a literal box, not built). A clip is not its
+ * own type: it is the scratch buffer, so a region referencing it is all that
+ * multi-buffer editing needs. Strings are leaf scalars for patterns and names.
+ *
+ * Each command produces a value and may consume the values of its arguments.
+ * A bare or brace word is a string; $name is a variable; [program] is the
+ * value of a bracketed sub-program. Verbs come in two forms over the same
+ * operation: a region form that takes an explicit handle, and a cursor form
+ * with no handle that acts on the live selection or a default around the
+ * cursor. The existing named actions are the cursor forms.
+ ****************************************************************/
+
+typedef struct cl_pos {
+	size_t row, col;
+} ClPos;
+
+typedef enum cl_kind {
+	CLK_CHAR,		/* a text run from start through end, reading order */
+	CLK_LINE		/* whole rows start.row through end.row */
+	/* CLK_RECT reserved: a literal column box, not built */
+} ClKind;
+
+typedef enum cl_bufid {
+	CLB_CUR,		/* the current editing buffer */
+	CLB_SCRATCH		/* the scratch buffer, i.e. the clip */
+} ClBufId;
+
+typedef struct cl_region {
+	ClBufId	buffer;
+	ClKind	kind;
+	ClPos	start, end;	/* normalized: start is the earlier corner */
+} ClRegion;
+
+typedef enum clv_type {
+	CLV_NONE,		/* no value (a command that yields nothing) */
+	CLV_INT,
+	CLV_STR,
+	CLV_POS,
+	CLV_REGION
+} ClvType;
+
+typedef struct cl_val {
+	ClvType		type;
+	long		i;
+	char		*s;	/* owned iff type is CLV_STR */
+	ClPos		pos;
+	ClRegion	reg;
+} ClVal;
+
+static char *
+clv_strdup(const char *s)
+{
+	size_t n = strlen(s) + 1;
+	char *r = malloc(n);
+
+	if (r)
+		memcpy(r, s, n);
+	return r;
+}
+
+/* Release a value's owned storage and leave it as CLV_NONE. */
+static void
+clv_clear(ClVal *v)
+{
+	if (v->type == CLV_STR)
+		free(v->s);
+	memset(v, 0, sizeof(*v));
+}
+
+/* Deep-copy src into dst, which must be clear. Returns 0, or -1 out of memory. */
+static int
+clv_copy(ClVal *dst, const ClVal *src)
+{
+	*dst = *src;
+	if (src->type == CLV_STR) {
+		dst->s = clv_strdup(src->s);
+		if (!dst->s)
+			return -1;
+	}
+	return 0;
+}
+
+/* The integer an action argument should see: an int as itself, a string parsed
+ * in base ten, anything else -1. Mirrors the old atoi-of-the-first-argument. */
+static long
+clv_arg_int(const ClVal *v)
+{
+	switch (v->type) {
+	case CLV_INT:	return v->i;
+	case CLV_STR:	return strtol(v->s, NULL, 10);
+	default:	return -1;
+	}
+}
+
+/* A variable binding, and the per-run evaluation context that holds them. The
+ * context lives only for one program run; variables do not persist between
+ * keypresses. */
+typedef struct cl_var {
+	char	*name;
+	ClVal	val;
+} ClVar;
+
+typedef struct cl_eval {
+	Editor	*e;
+	ClVar	*vars;
+	int	nvars, varcap;
+	char	err[160];
+} ClEval;
+
+static void
+cle_err(ClEval *ev, const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(ev->err, sizeof(ev->err), fmt, ap);
+	va_end(ap);
+}
+
+static const ClVal *
+cle_find(ClEval *ev, const char *name)
 {
 	int i;
 
-	for (i = 0; i < p->ncmds; i++) {
-		const ClCmd *c = &p->cmds[i];
-		int act, arg;
-		Req r;
+	for (i = 0; i < ev->nvars; i++)
+		if (strcmp(ev->vars[i].name, name) == 0)
+			return &ev->vars[i].val;
+	return NULL;
+}
 
-		if (c->nwords == 0)
-			continue;
-		act = kb_action_id(c->words[0].text);
-		if (act == ACT_NONE) {
-			set_status(e, "unknown command: %.40s",
-			    c->words[0].text);
-			return REQ_CONTINUE;
+/* Bind name to a copy of val, replacing any prior binding. Returns 0/-1. */
+static int
+cle_set(ClEval *ev, const char *name, const ClVal *val)
+{
+	int i;
+	ClVal copy = { 0 };
+
+	if (clv_copy(&copy, val) < 0)
+		return -1;
+	for (i = 0; i < ev->nvars; i++)
+		if (strcmp(ev->vars[i].name, name) == 0) {
+			clv_clear(&ev->vars[i].val);
+			ev->vars[i].val = copy;
+			return 0;
 		}
-		arg = (c->nwords > 1) ? atoi(c->words[1].text) : -1;
-		r = kb_run_action(e, act, arg, NULL);
-		if (r != REQ_CONTINUE)
-			return r;
+	if (ev->nvars >= ev->varcap) {
+		int na = ev->varcap ? ev->varcap * 2 : 8;
+		ClVar *nv = realloc(ev->vars, (size_t)na * sizeof(*nv));
+
+		if (!nv) {
+			clv_clear(&copy);
+			return -1;
+		}
+		ev->vars = nv;
+		ev->varcap = na;
 	}
-	return REQ_CONTINUE;
+	ev->vars[ev->nvars].name = clv_strdup(name);
+	if (!ev->vars[ev->nvars].name) {
+		clv_clear(&copy);
+		return -1;
+	}
+	ev->vars[ev->nvars].val = copy;
+	ev->nvars++;
+	return 0;
+}
+
+static void
+cle_free(ClEval *ev)
+{
+	int i;
+
+	for (i = 0; i < ev->nvars; i++) {
+		free(ev->vars[i].name);
+		clv_clear(&ev->vars[i].val);
+	}
+	free(ev->vars);
+	ev->vars = NULL;
+	ev->nvars = ev->varcap = 0;
+}
+
+static int cl_eval_prog(ClEval *ev, const ClProg *p, ClVal *result, Req *req);
+
+/* Evaluate one word to a value in out, which must be clear. */
+static int
+cl_eval_word(ClEval *ev, const ClWord *w, ClVal *out)
+{
+	switch (w->type) {
+	case CLW_LIT:
+		out->type = CLV_STR;
+		out->s = clv_strdup(w->text);
+		if (!out->s) {
+			out->type = CLV_NONE;
+			cle_err(ev, "out of memory");
+			return -1;
+		}
+		return 0;
+	case CLW_VAR: {
+		const ClVal *v = cle_find(ev, w->text);
+
+		if (!v) {
+			cle_err(ev, "no such variable: %.32s", w->text);
+			return -1;
+		}
+		if (clv_copy(out, v) < 0) {
+			cle_err(ev, "out of memory");
+			return -1;
+		}
+		return 0;
+	}
+	case CLW_SUB: {
+		Req req = REQ_CONTINUE;
+
+		if (cl_eval_prog(ev, w->sub, out, &req) < 0)
+			return -1;
+		/* A command that opens a prompt cannot hand a value back to the
+		 * substitution that invoked it; that needs the resumable
+		 * evaluator, which is not built, so it is an error for now. */
+		if (req != REQ_CONTINUE) {
+			clv_clear(out);
+			cle_err(ev, "a command in [] cannot prompt");
+			return -1;
+		}
+		return 0;
+	}
+	}
+	cle_err(ev, "internal: bad word");
+	return -1;
+}
+
+/* A builtin verb: reads argc argument values, writes its result (already
+ * clear), returns 0 on success or -1 after setting ev->err. */
+typedef struct cl_builtin {
+	const char	*name;
+	int		(*fn)(ClEval *ev, int argc, ClVal *argv, ClVal *result);
+} ClBuiltin;
+
+/* set NAME VALUE: bind NAME to VALUE; the result is VALUE. */
+static int
+bi_set(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	if (argc != 2) {
+		cle_err(ev, "set needs a name and a value");
+		return -1;
+	}
+	if (argv[0].type != CLV_STR) {
+		cle_err(ev, "set: the name is not a word");
+		return -1;
+	}
+	if (cle_set(ev, argv[0].s, &argv[1]) < 0) {
+		cle_err(ev, "out of memory");
+		return -1;
+	}
+	if (clv_copy(result, &argv[1]) < 0) {
+		cle_err(ev, "out of memory");
+		return -1;
+	}
+	return 0;
+}
+
+static const ClBuiltin cl_builtins[] = {
+	{ "set", bi_set },
+};
+
+static const ClBuiltin *
+cl_builtin_find(const char *name)
+{
+	size_t i;
+
+	for (i = 0; i < sizeof(cl_builtins) / sizeof(cl_builtins[0]); i++)
+		if (strcmp(cl_builtins[i].name, name) == 0)
+			return &cl_builtins[i];
+	return NULL;
+}
+
+/* Evaluate one command: resolve its words to values, then dispatch. A builtin
+ * runs over the argument values. Otherwise the name is looked up in
+ * kb_actions[] and run as that verb's cursor form, with the first argument as
+ * its integer count; kb_run_action's Req is returned through req so a prompt or
+ * quit propagates. An unknown name is an error. result is left as the command's
+ * value (CLV_NONE for an action). */
+static int
+cl_eval_cmd(ClEval *ev, const ClCmd *c, ClVal *result, Req *req)
+{
+	ClVal name = { 0 };
+	ClVal *argv = NULL;
+	int argc, i, rc = -1, act;
+	const ClBuiltin *bi;
+
+	*req = REQ_CONTINUE;
+	clv_clear(result);
+	if (c->nwords == 0)
+		return 0;
+	if (cl_eval_word(ev, &c->words[0], &name) < 0)
+		return -1;
+	if (name.type != CLV_STR) {
+		cle_err(ev, "a command name must be a word");
+		clv_clear(&name);
+		return -1;
+	}
+	argc = c->nwords - 1;
+	if (argc > 0) {
+		argv = calloc((size_t)argc, sizeof(*argv));
+		if (!argv) {
+			cle_err(ev, "out of memory");
+			clv_clear(&name);
+			return -1;
+		}
+		for (i = 0; i < argc; i++)
+			if (cl_eval_word(ev, &c->words[i + 1], &argv[i]) < 0)
+				goto done;
+	}
+	bi = cl_builtin_find(name.s);
+	if (bi) {
+		rc = bi->fn(ev, argc, argv, result);
+		goto done;
+	}
+	act = kb_action_id(name.s);
+	if (act != ACT_NONE) {
+		int arg = (argc > 0) ? (int)clv_arg_int(&argv[0]) : -1;
+
+		*req = kb_run_action(ev->e, act, arg, NULL);
+		rc = 0;
+		goto done;
+	}
+	cle_err(ev, "unknown command: %.40s", name.s);
+	rc = -1;
+done:
+	if (argv) {
+		for (i = 0; i < argc; i++)
+			clv_clear(&argv[i]);
+		free(argv);
+	}
+	clv_clear(&name);
+	return rc;
+}
+
+/* Run a program's commands in order. result ends as the last command's value.
+ * Stops at the first error (returns -1, ev->err set) or the first host request
+ * (any Req other than REQ_CONTINUE), which it reports through req so the caller
+ * hands control back to the main loop; later commands do not run. */
+static int
+cl_eval_prog(ClEval *ev, const ClProg *p, ClVal *result, Req *req)
+{
+	int i;
+
+	*req = REQ_CONTINUE;
+	clv_clear(result);
+	for (i = 0; i < p->ncmds; i++) {
+		if (cl_eval_cmd(ev, &p->cmds[i], result, req) < 0)
+			return -1;
+		if (*req != REQ_CONTINUE)
+			break;
+	}
+	return 0;
+}
+
+/* Run a parsed program as a key binding's target. The commands run with no
+ * originating key, so a motion in a program never extends a selection from the
+ * trigger key's Shift. A syntax-clean but failing command reports its error on
+ * the status line; a command that prompts or quits ends the run and its Req is
+ * returned to the main loop. */
+static Req
+cl_run(Editor *e, const struct cl_prog *p)
+{
+	ClEval ev = { 0 };
+	ClVal result = { 0 };
+	Req req = REQ_CONTINUE;
+
+	ev.e = e;
+	if (cl_eval_prog(&ev, p, &result, &req) < 0)
+		set_status(e, "%s", ev.err);
+	clv_clear(&result);
+	cle_free(&ev);
+	return req;
 }
 
 /* Route a key through the active custom keymap. Tracks a one-key prefix for

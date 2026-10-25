@@ -4345,11 +4345,86 @@ t_cl_parse(Test *t)
 	TAP_CHECK(t, p->ncmds == 0);
 	cl_prog_free(p);
 
-	/* errors: unterminated brace, a reserved metacharacter, a bad escape */
+	/* a $variable is its own word, tagged, carrying the bare name */
+	p = cl_parse("set x $y", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	TAP_CHECK(t, p->ncmds == 1 && p->cmds[0].nwords == 3);
+	TAP_CHECK(t, p->cmds[0].words[2].type == CLW_VAR &&
+	    strcmp(p->cmds[0].words[2].text, "y") == 0);
+	cl_prog_free(p);
+
+	/* a [substitution] parses to a sub-program carried on the word */
+	p = cl_parse("marker-goto [set n 2]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	TAP_CHECK(t, p->ncmds == 1 && p->cmds[0].nwords == 2);
+	TAP_ASSERT(t, p->cmds[0].words[1].type == CLW_SUB &&
+	    p->cmds[0].words[1].sub != NULL);
+	TAP_CHECK(t, p->cmds[0].words[1].sub->ncmds == 1 &&
+	    p->cmds[0].words[1].sub->cmds[0].nwords == 3);
+	cl_prog_free(p);
+
+	/* errors: unterminated brace, a reserved metacharacter mid-word, a bad
+	 * escape, a quote, an empty variable name, text after a whole-word
+	 * variable or substitution, and an unterminated bracket */
 	TAP_CHECK(t, cl_parse("{unterminated", err, sizeof(err)) == NULL);
 	TAP_CHECK(t, cl_parse("a$b", err, sizeof(err)) == NULL);
 	TAP_CHECK(t, cl_parse("a\\x", err, sizeof(err)) == NULL);
 	TAP_CHECK(t, cl_parse("a\"b", err, sizeof(err)) == NULL);
+	TAP_CHECK(t, cl_parse("$", err, sizeof(err)) == NULL);
+	TAP_CHECK(t, cl_parse("$x[y]", err, sizeof(err)) == NULL);
+	TAP_CHECK(t, cl_parse("[unterminated", err, sizeof(err)) == NULL);
+}
+
+/* The evaluator resolves $variables and [substitutions] into the values that
+ * commands consume. A variable set earlier in a program, or a bracketed
+ * sub-program's value, supplies an action's numeric argument. Unknown commands
+ * and unset variables are reported, not crashes. */
+static void
+t_cl_eval(Test *t)
+{
+	const Cfg *old = g_cfg;
+	ClProg *p;
+	char err[64];
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "abc", 3);
+	text_split(e.t, 0, 1);			/* "a" / "bc" */
+	text_split(e.t, 1, 1);			/* "a" / "b" / "c" */
+
+	/* a variable feeds an action's numeric argument through $ */
+	e.cy = 2; e.cx = 0;
+	p = cl_parse("marker-set 1 ; file-top ; set m 1 ; marker-goto $m",
+	    err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	TAP_CHECKF(t, e.cy == 2, "after var goto cy=%zu", e.cy);
+	cl_prog_free(p);
+
+	/* a command substitution supplies the argument inline */
+	e.cy = 1; e.cx = 0;
+	p = cl_parse("marker-set 2 ; file-top ; marker-goto [set k 2]",
+	    err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	TAP_CHECKF(t, e.cy == 1, "after subst goto cy=%zu", e.cy);
+	cl_prog_free(p);
+
+	/* an unknown command and an unset variable run without crashing */
+	p = cl_parse("no-such-verb", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	p = cl_parse("marker-goto $nope", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+
+	text_free(e.t);
+	g_cfg = old;
 }
 
 /* A key bound to a {program} runs its commands in order. ^D here runs
@@ -4453,6 +4528,7 @@ t_cl_capture(Test *t)
 const Case tap_cases[] = {
 	{ "ed_pos", t_ed_pos },
 	{ "cl_parse", t_cl_parse },
+	{ "cl_eval", t_cl_eval },
 	{ "cl_capture", t_cl_capture },
 	{ "keymap_prog", t_keymap_prog },
 	{ "utf8_roundtrip", t_utf8_roundtrip },
