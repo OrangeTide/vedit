@@ -197,7 +197,8 @@ in the status bar. A region names a span:
 follows the selection's shape: a linewise selection is a line region, a block
 selection a rect, and anything else a character run. It is an error when nothing
 is selected, so `copy [selection] [reg a]` stashes the selected text and
-`delete [selection]` removes it.
+`delete [selection]` removes it. `deselect` drops the selection afterward, which
+a destructive verb over `selection` does not do on its own.
 
 `$clip` is the clipboard as a region. `reg NAME` is a named register as a
 region, a holder that persists between keypresses: a single letter `a`-`z` is

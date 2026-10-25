@@ -175,7 +175,8 @@ or rect. A paste uses the source region's kind. This is where today's
   the `mark` bridge: `mark` names a spot, `go` travels to it.
 - `selection` is the live selection as a region, its kind taken from the
   selection's shape (linewise is a line region, block is a rect, else a char
-  run), so a Shift-selected or visual span can be named and stashed.
+  run), so a Shift-selected or visual span can be named and stashed. `deselect`
+  drops the selection, pairing with a destructive verb over `selection`.
 
 ### The rect kind
 
