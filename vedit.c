@@ -18089,6 +18089,22 @@ ed_kill_line_span(Editor *e, size_t y, size_t x0, size_t x1)
 		ed_kill_push(e, s + x0, x1 - x0);
 }
 
+/* Delete columns [from, to) on row y as one undo group, pushing the removed
+ * text onto the kill stack first when cap is set. A no-op on an empty span;
+ * invalidates the highlight when anything is removed. */
+static void
+kb_delete_span(Editor *e, size_t y, size_t from, size_t to, int cap)
+{
+	if (to <= from)
+		return;
+	if (cap)
+		ed_kill_line_span(e, y, from, to);
+	text_undo_group_begin(e->t);
+	text_delete(e->t, y, from, to - from);
+	text_undo_group_end(e->t);
+	e->hl_valid = 0;
+}
+
 /* Free the kill stack. */
 void
 ed_kill_free(Editor *e)
@@ -26890,14 +26906,7 @@ kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
 			to = x;
 		else
 			to = (e->cx < len) ? len : e->cx;
-		if (to > e->cx) {
-			if (cap)
-				ed_kill_line_span(e, e->cy, e->cx, to);
-			text_undo_group_begin(e->t);
-			text_delete(e->t, e->cy, e->cx, to - e->cx);
-			text_undo_group_end(e->t);
-			e->hl_valid = 0;
-		}
+		kb_delete_span(e, e->cy, e->cx, to, cap);
 		vi_clamp(e);
 		return REQ_CONTINUE;
 	}
@@ -26906,14 +26915,7 @@ kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
 		int cap = (act == ACT_DELETE_TO_EOL_CAP);
 
 		len = text_line_len(e->t, e->cy);
-		if (e->cx < len) {
-			if (cap)
-				ed_kill_line_span(e, e->cy, e->cx, len);
-			text_undo_group_begin(e->t);
-			text_delete(e->t, e->cy, e->cx, len - e->cx);
-			text_undo_group_end(e->t);
-			e->hl_valid = 0;
-		}
+		kb_delete_span(e, e->cy, e->cx, len, cap);
 		return REQ_CONTINUE;
 	}
 	case ACT_DELETE_TO_BOL:
@@ -26921,13 +26923,8 @@ kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
 		int cap = (act == ACT_DELETE_TO_BOL_CAP);
 
 		if (e->cx > 0) {
-			if (cap)
-				ed_kill_line_span(e, e->cy, 0, e->cx);
-			text_undo_group_begin(e->t);
-			text_delete(e->t, e->cy, 0, e->cx);
-			text_undo_group_end(e->t);
+			kb_delete_span(e, e->cy, 0, e->cx, cap);
 			e->cx = 0;
-			e->hl_valid = 0;
 		}
 		return REQ_CONTINUE;
 	}
