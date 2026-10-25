@@ -12713,6 +12713,22 @@ cursor_dispcol(const Editor *e)
 	return disp_cols(line, len) + (int)(e->cx - len);
 }
 
+/* Pull index v back into the visible window [top, top+span): top when v sits
+ * above it, the last visible index when below, else v unchanged. A span of
+ * zero or less only pushes v up to top. Used by the mouse, pane, and art
+ * scrollers. */
+#if defined(VEDIT_TERM) || defined(VEDIT_ART) || !defined(VEDIT_NO_MOUSE)
+static long
+clamp_span(long v, long top, long span)
+{
+	if (v < top)
+		return top;
+	if (span > 0 && v >= top + span)
+		return top + span - 1;
+	return v;
+}
+#endif
+
 /* Adjust top/left so the cursor stays on screen. */
 static void
 scroll_to_cursor(Editor *e, int text_h, int text_w)
@@ -32813,10 +32829,7 @@ mouse_scroll(Editor *e, long delta, int text_h)
 	else
 		top = top + (size_t)delta >= n ? n - 1 : top + (size_t)delta;
 	e->top = top;
-	if (e->cy < top)
-		e->cy = top;
-	else if (text_h > 0 && e->cy >= top + (size_t)text_h)
-		e->cy = top + (size_t)text_h - 1;
+	e->cy = (size_t)clamp_span((long)e->cy, (long)top, text_h);
 	if (e->cy >= n)
 		e->cy = n - 1;
 	e->cx = vi_col_to_byte(e, e->cy, col);
@@ -32933,10 +32946,7 @@ pane_scroll_parked(Editor *e, int idx, long delta, int rows)
 	else
 		top = top + (size_t)delta >= n ? n - 1 : top + (size_t)delta;
 	e->bufs[idx].top = top;
-	if (e->bufs[idx].cy < top)
-		e->bufs[idx].cy = top;
-	else if (rows > 0 && e->bufs[idx].cy >= top + (size_t)rows)
-		e->bufs[idx].cy = top + (size_t)rows - 1;
+	e->bufs[idx].cy = (size_t)clamp_span((long)e->bufs[idx].cy, (long)top, rows);
 	if (e->bufs[idx].cy >= n)
 		e->bufs[idx].cy = n - 1;
 }
@@ -33075,10 +33085,7 @@ art_scroll_to(Art *a, size_t top, int h)
 	if ((long)top > max)
 		top = (size_t)max;
 	a->top = (int)top;
-	if (a->cy < a->top)
-		a->cy = a->top;
-	else if (h > 0 && a->cy >= a->top + h)
-		a->cy = a->top + h - 1;
+	a->cy = (int)clamp_span(a->cy, a->top, h);
 }
 
 /* Scroll the art view by delta rows (negative up). */
@@ -33101,10 +33108,7 @@ art_hscroll_to(Art *a, long left, int w)
 	if (left > max)
 		left = max;
 	a->left = (int)left;
-	if (a->cx < a->left)
-		a->cx = a->left;
-	else if (w > 0 && a->cx >= a->left + w)
-		a->cx = a->left + w - 1;
+	a->cx = (int)clamp_span(a->cx, a->left, w);
 }
 #endif /* VEDIT_ART */
 
