@@ -177,6 +177,14 @@ or rect. A paste uses the source region's kind. This is where today's
   selection's shape (linewise is a line region, block is a rect, else a char
   run), so a Shift-selected or visual span can be named and stashed. `deselect`
   drops the selection, pairing with a destructive verb over `selection`.
+- `to MOTION` and `span inner|around word` borrow vi's own motion and
+  text-object engine (`vi_pos_word_*`, `vi_text_object`): `to` yields the
+  position a motion reaches, `span` a text object as a region. They let the
+  operators reach spans like "the word" or "to end of line" without naming
+  coordinates, which is what the native vi commands bundle a motion to do.
+  The first set is deliberately small (word, word-back, word-end, line-end;
+  the word object); it grows by adding cases over the same engine, not by
+  reimplementing motions.
 
 ### The rect kind
 

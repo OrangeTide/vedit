@@ -193,6 +193,18 @@ in the status bar. A region names a span:
   same text, which is how a selection stashed on one key stays right for another
   key after the buffer changes. This form is the current file only.
 
+`to MOTION` is the position a vi motion reaches from the cursor, as a position.
+The motions are `word`, `word-back`, `word-end`, and `line-end`. It reads with
+`go` and inside a region, so `go [to word-end]` jumps and
+`delete [region char [cursor] [to word]]` deletes to the next word. A char
+region's end is exclusive, so `[to line-end]` reaches the line's end while
+`[to word-end]` stops on the word's last character.
+
+`span inner word` and `span around word` are the vi word text objects as a
+region: the word under the cursor, and the word with its trailing space. So
+`delete [span inner word]` is vi's `diw` and `copy [span around word] [reg a]`
+grabs the word and the space after it.
+
 `selection` is the current selection as a region, taken as it is read. Its kind
 follows the selection's shape: a linewise selection is a line region, a block
 selection a rect, and anything else a character run. It is an error when nothing
