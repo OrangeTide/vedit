@@ -5083,6 +5083,16 @@ t_cl_selection(Test *t)
 	TAP_CHECKF(t, len == 5 && memcmp(s, "world", 5) == 0,
 	    "after sel delete [%.*s]", (int)len, s);
 
+	/* deselect drops the selection state */
+	e.sel_active = 1;
+	e.vi_visual = VI_VBLOCK;
+	e.sel_block = 1;
+	p = cl_parse("deselect", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECK(t, e.sel_active == 0 && e.vi_visual == 0 && e.sel_block == 0);
+
 	/* with no selection, the form is an error, not a crash */
 	e.sel_active = 0;
 	p = cl_parse("copy [selection] [reg u]", err, sizeof(err));

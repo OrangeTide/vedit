@@ -28022,6 +28022,26 @@ bi_selection(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return 0;
 }
 
+/* deselect: drop the selection, so its highlight clears and later keys act on
+ * the cursor again. A no-op when nothing is selected. Pairs with a destructive
+ * verb over [selection], which leaves the selection flag set otherwise. */
+static int
+bi_deselect(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	Editor *e = ev->e;
+
+	(void)argv;
+	(void)result;
+	if (argc != 0) {
+		cle_err(ev, "deselect takes no arguments");
+		return -1;
+	}
+	e->sel_active = 0;
+	e->vi_visual = 0;
+	e->sel_block = 0;
+	return 0;
+}
+
 /* reg NAME: a named register as a region, so copy can fill it and put can
  * place it. A single a-z name is vi's register of that letter. */
 static int
@@ -28483,6 +28503,7 @@ static const ClBuiltin cl_builtins[] = {
 	{ "pos", bi_pos },
 	{ "region", bi_region },
 	{ "selection", bi_selection },
+	{ "deselect", bi_deselect },
 	{ "reg", bi_reg },
 	{ "delete", bi_delete },
 	{ "delete.", bi_delete_cap },
