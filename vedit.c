@@ -26587,6 +26587,21 @@ kb_block_bounds(const Editor *e, size_t *y1, size_t *x1, size_t *y2, size_t *x2)
 	return 1;
 }
 
+/* The marked block as a column box (top-left and bottom-right corners,
+ * inclusive). Returns 1 when both ends are set, else 0. Unlike kb_block_bounds
+ * this normalizes per axis, since a column block is a rectangle. */
+static int
+kb_block_box(const Editor *e, size_t *y1, size_t *x1, size_t *y2, size_t *x2)
+{
+	if (!e->blk_bset || !e->blk_eset)
+		return 0;
+	*y1 = e->blk_by < e->blk_ey ? e->blk_by : e->blk_ey;
+	*y2 = e->blk_by > e->blk_ey ? e->blk_by : e->blk_ey;
+	*x1 = e->blk_bx < e->blk_ex ? e->blk_bx : e->blk_ex;
+	*x2 = e->blk_bx > e->blk_ex ? e->blk_bx : e->blk_ex;
+	return 1;
+}
+
 /* Copy the marked block's text, or report why it cannot. Returns the malloc'd
  * text (caller frees) and its length and byte span, or NULL. */
 static char *
@@ -26939,9 +26954,21 @@ kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
 		}
 		return REQ_CONTINUE;
 	case ACT_BLOCK_COPY: {
-		size_t span;
-		char *text = kb_block_grab(e, &len, &span);
+		size_t span, y1, x1, y2, x2;
+		char *text;
 
+		if (e->blk_column) {	/* a column block: grab and place as columns */
+			if (!kb_block_box(e, &y1, &x1, &y2, &x2)) {
+				set_status(e, "mark a block first (begin and end)");
+				return REQ_CONTINUE;
+			}
+			rect_grab(e, y1, y2, x1, x2);	/* fills clip, clip_block=1 */
+			rect_place_cols(e, e->cy, e->cx, e->clip, e->clip_len);
+			e->hl_valid = 0;
+			set_status(e, "column block copied");
+			return REQ_CONTINUE;
+		}
+		text = kb_block_grab(e, &len, &span);
 		if (text) {
 			text_undo_group_begin(e->t);
 			insert_bytes(e, text, len);
@@ -26955,6 +26982,17 @@ kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
 	case ACT_BLOCK_DELETE: {
 		size_t y1, x1, y2, x2;
 
+		if (e->blk_column) {	/* a column block: close up the columns */
+			if (!kb_block_box(e, &y1, &x1, &y2, &x2)) {
+				set_status(e, "mark a block first (begin and end)");
+				return REQ_CONTINUE;
+			}
+			rect_delete_cols(e, y1, y2, x1, x2);
+			e->blk_bset = e->blk_eset = 0;
+			e->hl_valid = 0;
+			set_status(e, "column block deleted");
+			return REQ_CONTINUE;
+		}
 		if (!kb_block_bounds(e, &y1, &x1, &y2, &x2)) {
 			set_status(e, "mark a block first (begin and end)");
 			return REQ_CONTINUE;
@@ -26972,6 +27010,34 @@ kb_run_action(Editor *e, int act, int arg, const struct tkbd_seq *seq)
 		size_t y1, x1, y2, x2, span, co, bo, eo, at;
 		char *text;
 
+		if (e->blk_column) {	/* a column block: delete columns, replace */
+			size_t ty = e->cy, tx = e->cx, rl = 0;
+			char *rect;
+
+			if (!kb_block_box(e, &y1, &x1, &y2, &x2)) {
+				set_status(e, "mark a block first (begin and end)");
+				return REQ_CONTINUE;
+			}
+			if (e->cy >= y1 && e->cy <= y2) {
+				set_status(e, "cursor is inside the block");
+				return REQ_CONTINUE;
+			}
+			rect = rect_bytes(e, y1, y2, x1, x2, &rl);
+			if (!rect)
+				return REQ_CONTINUE;
+			text_undo_group_begin(e->t);
+			rect_delete_cols(e, y1, y2, x1, x2);
+			rect_place_cols(e, ty, tx, rect, rl);
+			text_undo_group_end(e->t);
+			free(rect);
+			e->cy = ty;
+			e->cx = tx;
+			e->blk_bset = e->blk_eset = 0;
+			e->hl_valid = 0;
+			vi_clamp(e);
+			set_status(e, "column block moved");
+			return REQ_CONTINUE;
+		}
 		if (!kb_block_bounds(e, &y1, &x1, &y2, &x2)) {
 			set_status(e, "mark a block first (begin and end)");
 			return REQ_CONTINUE;

@@ -4615,6 +4615,62 @@ t_cl_rect(Test *t)
 	g_cfg = old;
 }
 
+/* The WordStar column block, once toggled to column mode, does real
+ * rectangular edits: delete closes up the columns across the rows, and copy
+ * grabs the rectangle and places it as columns at the cursor. */
+static void
+t_block_column(Test *t)
+{
+	const Cfg *old = g_cfg;
+	const char *s;
+	size_t len;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "abcd", 4);
+	text_split(e.t, 0, 4); text_insert(e.t, 1, 0, "ef", 2);
+	text_split(e.t, 1, 2); text_insert(e.t, 2, 0, "ghij", 4);
+
+	/* mark a column block over columns 1..2 of rows 0..2, then delete it */
+	e.cy = 0; e.cx = 1; kb_run_action(&e, ACT_BLOCK_BEGIN, -1, NULL);
+	e.cy = 2; e.cx = 2; kb_run_action(&e, ACT_BLOCK_END, -1, NULL);
+	kb_run_action(&e, ACT_BLOCK_COLUMN_TOGGLE, -1, NULL);
+	TAP_ASSERT(t, e.blk_column);
+	kb_run_action(&e, ACT_BLOCK_DELETE, -1, NULL);
+	s = text_line(e.t, 0, &len);
+	TAP_CHECKF(t, len == 2 && memcmp(s, "ad", 2) == 0, "r0 len=%zu", len);
+	s = text_line(e.t, 1, &len);
+	TAP_CHECK(t, len == 1 && memcmp(s, "e", 1) == 0);
+	s = text_line(e.t, 2, &len);
+	TAP_CHECK(t, len == 2 && memcmp(s, "gj", 2) == 0);
+
+	/* column copy: grab a box and place it as columns at the cursor */
+	text_free(e.t);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "abcd", 4);
+	text_split(e.t, 0, 4); text_insert(e.t, 1, 0, "ef", 2);
+	e.blk_bset = e.blk_eset = 0; e.blk_column = 0;
+	e.cy = 0; e.cx = 0; kb_run_action(&e, ACT_BLOCK_BEGIN, -1, NULL);
+	e.cy = 1; e.cx = 1; kb_run_action(&e, ACT_BLOCK_END, -1, NULL);
+	kb_run_action(&e, ACT_BLOCK_COLUMN_TOGGLE, -1, NULL);
+	e.cy = 0; e.cx = 4;			/* paste target: end of row 0 */
+	kb_run_action(&e, ACT_BLOCK_COPY, -1, NULL);
+	s = text_line(e.t, 0, &len);
+	TAP_CHECKF(t, len == 6 && memcmp(s, "abcdab", 6) == 0,
+	    "copy r0 [%.*s]", (int)len, s);
+	s = text_line(e.t, 1, &len);
+	TAP_CHECKF(t, len == 6 && memcmp(s, "ef  ef", 6) == 0,
+	    "copy r1 [%.*s]", (int)len, s);
+
+	free(e.clip);
+	text_free(e.t);
+	g_cfg = old;
+}
+
 /* The capture suffix: a plain removing verb discards, its dotted twin also
  * pushes the removed text onto the kill stack, and kill-paste inserts the top
  * entry. The kill stack is separate from the clipboard and accumulates. */
@@ -4672,6 +4728,7 @@ const Case tap_cases[] = {
 	{ "cl_eval", t_cl_eval },
 	{ "cl_region", t_cl_region },
 	{ "cl_rect", t_cl_rect },
+	{ "block_column", t_block_column },
 	{ "cl_capture", t_cl_capture },
 	{ "keymap_prog", t_keymap_prog },
 	{ "utf8_roundtrip", t_utf8_roundtrip },
