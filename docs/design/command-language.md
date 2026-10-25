@@ -237,14 +237,28 @@ never actually changes.
 `buf_switch` the next-buffer key uses, so the swap flush, buffer save and load,
 and VCS refresh all run. An out-of-range file number is an error, not a switch.
 
-### A known refinement
+### Marks that track edits
 
-A region is a coordinate snapshot into a buffer, so a persistent selection, or
-anything that must survive edits, needs its endpoints anchored to marks that
-track insertions and deletions rather than raw coordinates. vi's marks are raw
-coordinates today and go stale on edits above them; the `mark` bridge exposes
-them as they are. A `Pos` that tracks edits (a mark handle) is still a refinement
-noted in the type design and not built.
+The `mark` bridge exposes vi's marks as a `Pos`, and those marks now follow their
+text through edits rather than going stale. Every primitive edit passes through
+one choke point, `apply_op`, which carries the edit as `(op, line, col, n)` and
+fires for undo and redo too. A small pass there adjusts the a-z marks of the
+buffer being edited: an insert or delete above a mark shifts its row, an edit
+earlier on its line shifts its column, and a deletion that straddles a mark
+clamps it to the deletion start. Marks use right gravity, so text typed at a mark
+pushes the mark along with it. Because the pass rides `apply_op`, marks move back
+correctly on undo and redo.
+
+The special marks (`[ ] ^ . < >` and the jump mark) are left alone: the edit
+machinery sets them to fixed spots as a side effect of a change, so adjusting
+them during that same change would corrupt them. Marks reach the adjuster through
+a single `g_mark_ed` editor pointer, since marks live on the editor, not the
+text; a cross-file op sets `mark_fbuf` so the parked file's marks move, not the
+active buffer's.
+
+A region is still a plain coordinate snapshot. A region whose endpoints are
+anchored to tracking marks, so a stored selection survives edits, is the next
+step this enables but is not built.
 
 ## Worked examples
 
