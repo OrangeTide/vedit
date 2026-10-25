@@ -65,6 +65,11 @@ a mark and `go [pos 5 1]` jumps to a line.
 - `selection` is the current selection, its kind following the selection's
   shape: a linewise selection is a line region, a block selection a rect, and
   anything else a character run. It is an error when nothing is selected.
+- `block` is the WordStar block bracketed by its begin and end markers, a rect
+  for a column block and a character run otherwise. It is the counterpart of
+  `selection` for the persistent markers, so a WordStar keymap can act on the
+  marked block through the command language. It is an error when either marker
+  is unset.
 - `span inner OBJECT` and `span around OBJECT` are vi text objects. The objects
   are `word` and `big-word`; the bracket pairs `paren`, `brace`, `bracket` and
   `angle`; and the quotes `double-quote`, `single-quote` and `back-quote`.

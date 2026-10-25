@@ -28123,6 +28123,37 @@ bi_selection(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return 0;
 }
 
+/* block: the WordStar block (its begin and end markers) as a region of the
+ * current file, parallel to selection but for the persistent block markers the
+ * native ^K B / ^K K set. A column block is a rect, otherwise a char run. An
+ * error when either marker is unset. A coordinate snapshot taken now. */
+static int
+bi_block(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	Editor *e = ev->e;
+	ClRegion r = { 0 };
+	ClPos p1, p2;
+
+	(void)argv;
+	if (argc != 0) {
+		cle_err(ev, "block takes no arguments");
+		return -1;
+	}
+	if (!e->blk_bset || !e->blk_eset) {
+		cle_err(ev, "no block (mark begin and end first)");
+		return -1;
+	}
+	p1.row = e->blk_by;
+	p1.col = e->blk_bx;
+	p2.row = e->blk_ey;
+	p2.col = e->blk_ex;
+	cl_region_build(e, e->blk_column ? CLK_RECT : CLK_CHAR, p1, p2, &r);
+	r.buffer = CLB_CUR;
+	r.file = e->cur;
+	*result = clv_region(r);
+	return 0;
+}
+
 /* deselect: drop the selection, so its highlight clears and later keys act on
  * the cursor again. A no-op when nothing is selected. Pairs with a destructive
  * verb over [selection], which leaves the selection flag set otherwise. */
@@ -28722,6 +28753,7 @@ static const ClBuiltin cl_builtins[] = {
 	{ "pos", bi_pos },
 	{ "region", bi_region },
 	{ "selection", bi_selection },
+	{ "block", bi_block },
 	{ "deselect", bi_deselect },
 	{ "to", bi_to },
 	{ "span", bi_span },

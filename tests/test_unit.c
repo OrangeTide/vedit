@@ -5271,6 +5271,79 @@ t_cl_selection(Test *t)
 	g_cfg = old;
 }
 
+/* The block form turns the WordStar block markers into a region, a char run or,
+ * for a column block, a rect, parallel to the selection form. */
+static void
+t_cl_block(Test *t)
+{
+	const Cfg *old = g_cfg;
+	ClProg *p;
+	char err[64];
+	int i;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "hello world", 11);
+	text_split(e.t, 0, 11); text_insert(e.t, 1, 0, "foo bar", 7);
+
+	/* a char block from (0,0) to (0,5) is "hello" */
+	e.blk_bset = e.blk_eset = 1;
+	e.blk_column = 0;
+	e.blk_by = 0; e.blk_bx = 0; e.blk_ey = 0; e.blk_ex = 5;
+	p = cl_parse("copy [block] [reg a]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[0].len == 5 &&
+	    memcmp(e.vi_regs[0].bytes, "hello", 5) == 0,
+	    "block char [%.*s]", (int)e.vi_regs[0].len, e.vi_regs[0].bytes);
+
+	/* a column block spanning columns 0..2 of both rows is a rect */
+	e.blk_column = 1;
+	e.blk_by = 0; e.blk_bx = 0; e.blk_ey = 1; e.blk_ex = 2;
+	p = cl_parse("copy [block] [reg b]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[1].len == 7 &&
+	    memcmp(e.vi_regs[1].bytes, "hel\nfoo", 7) == 0,
+	    "block column [%.*s]", (int)e.vi_regs[1].len, e.vi_regs[1].bytes);
+	TAP_CHECK(t, e.vi_regs[1].block == 1);
+
+	/* deleting through a char block removes the span */
+	e.blk_column = 0;
+	e.blk_by = 0; e.blk_bx = 0; e.blk_ey = 0; e.blk_ex = 6;	/* "hello " */
+	p = cl_parse("delete [block]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	{
+		const char *s;
+		size_t len;
+
+		s = text_line(e.t, 0, &len);
+		TAP_CHECKF(t, len == 5 && memcmp(s, "world", 5) == 0,
+		    "after block delete [%.*s]", (int)len, s);
+	}
+
+	/* with no block marked, the form is an error, not a crash */
+	e.blk_bset = e.blk_eset = 0;
+	p = cl_parse("copy [block] [reg c]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECK(t, e.vi_regs['c' - 'a'].bytes == NULL);
+
+	for (i = 0; i < 26; i++)
+		free(e.vi_regs[i].bytes);
+	free(e.clip);
+	text_free(e.t);
+	g_cfg = old;
+}
+
 /* An anchored region names its endpoints by mark, so it tracks edits: a region
  * set up before an edit still spans the right text after lines move. */
 static void
@@ -5493,6 +5566,7 @@ const Case tap_cases[] = {
 	{ "cl_crossfile", t_cl_crossfile },
 	{ "cl_motion", t_cl_motion },
 	{ "cl_selection", t_cl_selection },
+	{ "cl_block", t_cl_block },
 	{ "cl_anchored", t_cl_anchored },
 	{ "cl_anchored_xfile", t_cl_anchored_xfile },
 	{ "mark_track", t_mark_track },
