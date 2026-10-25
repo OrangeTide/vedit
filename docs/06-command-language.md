@@ -59,8 +59,9 @@ a mark and `go [pos 5 1]` jumps to a line.
 - `region KIND mark A B` is the same shape, but anchored: its two endpoints are
   the marks A and B, read fresh at each use. Because a mark follows its text, an
   anchored region keeps spanning the same text, so a span bracketed on one key
-  stays right for another key after the buffer changes. This form is the current
-  file only.
+  stays right for another key after the buffer changes. A trailing `file N`
+  anchors it in another open file, whose own marks A and B track that file's
+  edits, so `region char mark a b file 2` follows the marked span in file 2.
 - `selection` is the current selection, its kind following the selection's
   shape: a linewise selection is a line region, a block selection a rect, and
   anything else a character run. It is an error when nothing is selected.

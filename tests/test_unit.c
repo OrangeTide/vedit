@@ -5342,6 +5342,87 @@ t_cl_anchored(Test *t)
 	g_cfg = old;
 }
 
+/* An anchored region can name another open file: its endpoint marks live in
+ * that file and track its edits, so a span bracketed in file 2 stays right
+ * even as file 2 changes. */
+static void
+t_cl_anchored_xfile(Test *t)
+{
+	const Cfg *old = g_cfg;
+	ClProg *p;
+	char err[64];
+	int i;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.swap_enabled = 0;
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "alpha", 5);
+
+	/* file 1 current, file 2 parked holding "aa bb cc" */
+	TAP_ASSERT(t, buf_slot(&e) == 0);
+	TAP_ASSERT(t, buf_slot(&e) == 1);
+	memset(&e.bufs[0], 0, sizeof(e.bufs[0]));
+	memset(&e.bufs[1], 0, sizeof(e.bufs[1]));
+	e.cur = 0;
+	e.bufs[0].t = e.t;
+	e.bufs[1].t = text_new();
+	TAP_ASSERT(t, e.bufs[1].t != NULL);
+	text_insert(e.bufs[1].t, 0, 0, "aa bb cc", 8);
+
+	/* marks a and b bracket "bb" (cols 3..5) in the parked file's own slot */
+	e.bufs[1].vi_mark_y[0] = 0; e.bufs[1].vi_mark_x[0] = 3;
+	e.bufs[1].vi_mark_y[1] = 0; e.bufs[1].vi_mark_x[1] = 5;
+	e.bufs[1].vi_marks_set = ((uint64_t)1 << 0) | ((uint64_t)1 << 1);
+
+	/* anchored char region over file 2 grabs "bb" */
+	p = cl_parse("copy [region char mark a b file 2] [reg a]",
+	    err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[0].len == 2 &&
+	    memcmp(e.vi_regs[0].bytes, "bb", 2) == 0,
+	    "xfile anchored [%.*s]", (int)e.vi_regs[0].len, e.vi_regs[0].bytes);
+
+	/* an edit at the head of file 2 shifts those marks right; the anchored
+	 * region still spans "bb" at its new columns */
+	p = cl_parse("put XX at [pos 1 1] file 2", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.bufs[1].vi_mark_x[0] == 5 && e.bufs[1].vi_mark_x[1] == 7,
+	    "xfile marks tracked to %zu,%zu",
+	    e.bufs[1].vi_mark_x[0], e.bufs[1].vi_mark_x[1]);
+	p = cl_parse("copy [region char mark a b file 2] [reg b]",
+	    err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[1].len == 2 &&
+	    memcmp(e.vi_regs[1].bytes, "bb", 2) == 0,
+	    "xfile anchored after edit [%.*s]",
+	    (int)e.vi_regs[1].len, e.vi_regs[1].bytes);
+
+	/* the current file never moved under these file-2 operations */
+	TAP_CHECK(t, e.cur == 0 && e.t == e.bufs[0].t);
+
+	for (i = 0; i < 26; i++)
+		free(e.vi_regs[i].bytes);
+	for (i = 0; i < e.cl_nregs; i++) {
+		free(e.cl_regs[i].name);
+		free(e.cl_regs[i].reg.bytes);
+	}
+	free(e.cl_regs);
+	free(e.clip);
+	text_free(e.bufs[0].t);
+	text_free(e.bufs[1].t);
+	free(e.bufs);
+	g_cfg = old;
+}
+
 /* Marks ride edits instead of going stale: an edit before a mark shifts it,
  * with right gravity at the mark itself, across inserts, deletes, and the
  * line split and join. editor_init registers the editor for tracking. */
@@ -5413,6 +5494,7 @@ const Case tap_cases[] = {
 	{ "cl_motion", t_cl_motion },
 	{ "cl_selection", t_cl_selection },
 	{ "cl_anchored", t_cl_anchored },
+	{ "cl_anchored_xfile", t_cl_anchored_xfile },
 	{ "mark_track", t_mark_track },
 	{ "keymap_prog", t_keymap_prog },
 	{ "utf8_roundtrip", t_utf8_roundtrip },

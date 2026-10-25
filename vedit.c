@@ -27974,24 +27974,20 @@ bi_region(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		return -1;
 
 	/* region KIND mark A B: an anchored region, held by mark and resolved
-	 * at use. The marks live in the current buffer, so this form is the
-	 * current file only for now. */
+	 * at use. The marks live in the region's file (the current one, or the
+	 * "file N" target), read fresh each time the region is used. */
 	if (argc >= 2 && argv[1].type == CLV_STR &&
 	    strcmp(argv[1].s, "mark") == 0) {
 		int ms, me;
 
-		if (fidx != e->cur) {
-			cle_err(ev, "an anchored region is the current file only");
-			return -1;
-		}
 		if (argc != 4 || (ms = cl_mark_letter(&argv[2])) < 0 ||
 		    (me = cl_mark_letter(&argv[3])) < 0) {
 			cle_err(ev, "region %s mark needs two a-z marks",
 			    argv[0].s);
 			return -1;
 		}
-		r.buffer = CLB_CUR;
-		r.file = e->cur;
+		r.buffer = (fidx == e->cur) ? CLB_CUR : CLB_FILE;
+		r.file = fidx;
 		r.kind = kind;
 		r.anchored = 1;
 		r.m_start = (char)('a' + ms);
@@ -28033,15 +28029,19 @@ fail:
 }
 
 /* Resolve a region to a concrete one. An anchored region reads its two marks'
- * live positions (current buffer) and builds a region of its kind; any other
- * region is already concrete and copied through. Returns -1 with an error set
- * when an endpoint mark is not set. */
+ * live positions from its own file (the current buffer, or a parked one named
+ * by "file N") and builds a region of its kind, clamped to that file's text;
+ * any other region is already concrete and copied through. Returns -1 with an
+ * error set when an endpoint mark is not set. */
 static int
 cl_region_resolve(ClEval *ev, const ClRegion *in, ClRegion *out)
 {
 	Editor *e = ev->e;
-	int s, d;
+	int s, d, fidx;
 	ClPos p1, p2;
+	ClBufScope sc = { 0 };
+	const size_t *my, *mx;
+	uint64_t set;
 
 	if (!in->anchored) {
 		*out = *in;
@@ -28049,23 +28049,38 @@ cl_region_resolve(ClEval *ev, const ClRegion *in, ClRegion *out)
 	}
 	s = in->m_start - 'a';
 	d = in->m_end - 'a';
-	if (s < 0 || s >= MARK_LETTERS ||
-	    !(e->vi_marks_set & ((uint64_t)1 << s))) {
+	fidx = (in->buffer == CLB_FILE) ? in->file : e->cur;
+	if (fidx == e->cur) {			/* the active buffer's flat marks */
+		my = e->vi_mark_y;
+		mx = e->vi_mark_x;
+		set = e->vi_marks_set;
+	} else {				/* a parked buffer keeps its own */
+		const Buf *b = &e->bufs[fidx];
+
+		my = b->vi_mark_y;
+		mx = b->vi_mark_x;
+		set = b->vi_marks_set;
+	}
+	if (s < 0 || s >= MARK_LETTERS || !(set & ((uint64_t)1 << s))) {
 		cle_err(ev, "mark %c is not set", in->m_start);
 		return -1;
 	}
-	if (d < 0 || d >= MARK_LETTERS ||
-	    !(e->vi_marks_set & ((uint64_t)1 << d))) {
+	if (d < 0 || d >= MARK_LETTERS || !(set & ((uint64_t)1 << d))) {
 		cle_err(ev, "mark %c is not set", in->m_end);
 		return -1;
 	}
-	p1.row = e->vi_mark_y[s];
-	p1.col = e->vi_mark_x[s];
-	p2.row = e->vi_mark_y[d];
-	p2.col = e->vi_mark_x[d];
+	p1.row = my[s];
+	p1.col = mx[s];
+	p2.row = my[d];
+	p2.col = mx[d];
+	if (cl_buf_enter(e, fidx, &sc) < 0) {	/* clamp against that file */
+		cle_err(ev, "no such file");
+		return -1;
+	}
 	cl_region_build(e, in->kind, p1, p2, out);
-	out->buffer = CLB_CUR;
-	out->file = e->cur;
+	cl_buf_leave(e, &sc, 0);
+	out->buffer = in->buffer;
+	out->file = fidx;
 	return 0;
 }
 
