@@ -82,7 +82,8 @@ The manual is in `docs/`, in reading order:
    large files
 4. [View settings](docs/04-view.md): line numbers, word wrap, tabs and
    indentation, color schemes, syntax highlighting
-5. [Configuration](docs/05-configuration.md): the config file and every key
+5. [Configuration](docs/05-configuration.md): the config file, every key
+   setting, custom keymaps, and the key-binding command language
 6. [The vi keys](docs/06-vi.md): the complete list of what the vi
    personality implements, for readers who do not know vi
 7. [Tools](docs/07-tools.md): compile, make, and run; terminals inside the
