@@ -27983,6 +27983,45 @@ cl_region_resolve(ClEval *ev, const ClRegion *in, ClRegion *out)
 	return 0;
 }
 
+/* selection: the live selection as a region of the current file. Its kind
+ * follows the selection's own shape: a linewise visual selection is a line
+ * region, a block selection a rect, and anything else a char run. The span is
+ * the anchor and the cursor, normalized by the kind. An error when nothing is
+ * selected. This is a coordinate snapshot taken now, not a live handle. */
+static int
+bi_selection(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	Editor *e = ev->e;
+	ClRegion r = { 0 };
+	ClPos anchor, point;
+	ClKind kind;
+
+	(void)argv;
+	if (argc != 0) {
+		cle_err(ev, "selection takes no arguments");
+		return -1;
+	}
+	if (!e->sel_active) {
+		cle_err(ev, "no selection");
+		return -1;
+	}
+	if (e->vi_visual == 'V')
+		kind = CLK_LINE;
+	else if (e->sel_block || e->vi_visual == VI_VBLOCK)
+		kind = CLK_RECT;
+	else
+		kind = CLK_CHAR;
+	anchor.row = e->ay;
+	anchor.col = e->ax;
+	point.row = e->cy;
+	point.col = e->cx;
+	cl_region_build(e, kind, anchor, point, &r);
+	r.buffer = CLB_CUR;
+	r.file = e->cur;
+	*result = clv_region(r);
+	return 0;
+}
+
 /* reg NAME: a named register as a region, so copy can fill it and put can
  * place it. A single a-z name is vi's register of that letter. */
 static int
@@ -28443,6 +28482,7 @@ static const ClBuiltin cl_builtins[] = {
 	{ "cursor", bi_cursor },
 	{ "pos", bi_pos },
 	{ "region", bi_region },
+	{ "selection", bi_selection },
 	{ "reg", bi_reg },
 	{ "delete", bi_delete },
 	{ "delete.", bi_delete_cap },

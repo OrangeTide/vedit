@@ -5013,6 +5013,91 @@ t_cl_crossfile(Test *t)
 	g_cfg = old;
 }
 
+/* The selection form turns the live selection into a region, with its kind
+ * following the selection's shape (char run, whole lines, or a block). */
+static void
+t_cl_selection(Test *t)
+{
+	const Cfg *old = g_cfg;
+	ClProg *p;
+	char err[64];
+	const char *s;
+	size_t len;
+	int i;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "hello world", 11);
+	text_split(e.t, 0, 11); text_insert(e.t, 1, 0, "foo bar", 7);
+
+	/* a charwise selection of "hello" (anchor 0,0 to cursor 0,5) */
+	e.sel_active = 1;
+	e.vi_visual = 'v';
+	e.sel_block = 0;
+	e.ay = 0; e.ax = 0; e.cy = 0; e.cx = 5;
+	p = cl_parse("copy [selection] [reg r]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[17].len == 5 &&
+	    memcmp(e.vi_regs[17].bytes, "hello", 5) == 0,
+	    "sel char [%.*s]", (int)e.vi_regs[17].len, e.vi_regs[17].bytes);
+
+	/* a linewise selection spans whole rows, each with its newline */
+	e.vi_visual = 'V';
+	e.ay = 0; e.ax = 0; e.cy = 1; e.cx = 0;
+	p = cl_parse("copy [selection] [reg s]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[18].len == 20 &&
+	    memcmp(e.vi_regs[18].bytes, "hello world\nfoo bar\n", 20) == 0,
+	    "sel line len=%zu", e.vi_regs[18].len);
+	TAP_CHECK(t, e.vi_regs[18].linewise == 1);
+
+	/* a block selection is a rect: columns 0..2 of both rows */
+	e.vi_visual = VI_VBLOCK;
+	e.sel_block = 1;
+	e.ay = 0; e.ax = 0; e.cy = 1; e.cx = 2;
+	p = cl_parse("copy [selection] [reg t]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[19].len == 7 &&
+	    memcmp(e.vi_regs[19].bytes, "hel\nfoo", 7) == 0,
+	    "sel block [%.*s]", (int)e.vi_regs[19].len, e.vi_regs[19].bytes);
+	TAP_CHECK(t, e.vi_regs[19].block == 1);
+
+	/* delete through the selection removes the span */
+	e.vi_visual = 'v';
+	e.sel_block = 0;
+	e.ay = 0; e.ax = 0; e.cy = 0; e.cx = 6;	/* "hello " */
+	p = cl_parse("delete [selection]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	s = text_line(e.t, 0, &len);
+	TAP_CHECKF(t, len == 5 && memcmp(s, "world", 5) == 0,
+	    "after sel delete [%.*s]", (int)len, s);
+
+	/* with no selection, the form is an error, not a crash */
+	e.sel_active = 0;
+	p = cl_parse("copy [selection] [reg u]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECK(t, e.vi_regs['u' - 'a'].bytes == NULL);
+
+	for (i = 0; i < 26; i++)
+		free(e.vi_regs[i].bytes);
+	free(e.clip);
+	text_free(e.t);
+	g_cfg = old;
+}
+
 /* An anchored region names its endpoints by mark, so it tracks edits: a region
  * set up before an edit still spans the right text after lines move. */
 static void
@@ -5152,6 +5237,7 @@ const Case tap_cases[] = {
 	{ "cl_mark", t_cl_mark },
 	{ "cl_capture", t_cl_capture },
 	{ "cl_crossfile", t_cl_crossfile },
+	{ "cl_selection", t_cl_selection },
 	{ "cl_anchored", t_cl_anchored },
 	{ "mark_track", t_mark_track },
 	{ "keymap_prog", t_keymap_prog },
