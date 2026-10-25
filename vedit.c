@@ -44775,6 +44775,38 @@ vi_op_lines(Editor *e, char op, size_t lo, size_t hi)
 	return REQ_CONTINUE;
 }
 
+/* Apply a d/c/y operator to the charwise span [sy,sx)..(ey,ex), ex one byte
+ * past the last. The caller must already have an undo group open; this closes
+ * it, except for c, which leaves it open so the typed text undoes with the
+ * deletion (the insert-mode Esc closes it). */
+static Req
+vi_op_charspan(Editor *e, char op, size_t sy, size_t sx, size_t ey, size_t ex)
+{
+	if (sy == ey && sx == ex) {		/* empty span */
+		text_undo_group_end(e->t);
+		return REQ_CONTINUE;
+	}
+	vi_yank_region(e, sy, sx, ey, ex);
+	if (op == 'y') {
+		vi_mark_bracket(e, sy, sx, ey, ex);
+		e->cy = sy;
+		e->cx = sx;
+		vi_clamp(e);
+		text_undo_group_end(e->t);
+		return REQ_CONTINUE;
+	}
+	delete_region(e, sy, sx, ey, ex);
+	if (op == 'c') {
+		enter_insert(e);
+		return REQ_CONTINUE;		/* group stays open until Esc */
+	}
+	vi_mark_set(e, MARK_LBRACK, sy, sx);	/* a delete collapses '[ = '] */
+	vi_mark_set(e, MARK_RBRACK, sy, sx);
+	vi_clamp(e);
+	text_undo_group_end(e->t);
+	return REQ_CONTINUE;
+}
+
 /* Apply an armed operator (d/c/y, or the > / < shifts) over a resolved
  * motion. */
 static Req
@@ -44837,29 +44869,7 @@ vi_apply_operator(Editor *e, char op, Motion m)
 		if (sx <= first_nonblank(e, sy))
 			return vi_op_lines(e, op, sy, ey);
 	}
-	if (sy == ey && sx == ex) {		/* empty span */
-		text_undo_group_end(e->t);
-		return REQ_CONTINUE;
-	}
-	vi_yank_region(e, sy, sx, ey, ex);
-	if (op == 'y') {
-		vi_mark_bracket(e, sy, sx, ey, ex);
-		e->cy = sy;
-		e->cx = sx;
-		vi_clamp(e);
-		text_undo_group_end(e->t);
-		return REQ_CONTINUE;
-	}
-	delete_region(e, sy, sx, ey, ex);
-	if (op == 'c') {
-		enter_insert(e);
-		return REQ_CONTINUE;		/* group stays open until Esc */
-	}
-	vi_mark_set(e, MARK_LBRACK, sy, sx);	/* a delete collapses '[ = '] */
-	vi_mark_set(e, MARK_RBRACK, sy, sx);
-	vi_clamp(e);
-	text_undo_group_end(e->t);
-	return REQ_CONTINUE;
+	return vi_op_charspan(e, op, sy, sx, ey, ex);
 }
 
 /* Put the register after (or before) the cursor: linewise as new lines,
@@ -45649,29 +45659,7 @@ vi_apply_textobject_op(Editor *e, char op, size_t sy, size_t sx,
 		return REQ_CONTINUE;
 	}
 	text_undo_group_begin(e->t);
-	if (sy == ey && sx == ex) {		/* empty object: nothing to do */
-		text_undo_group_end(e->t);
-		return REQ_CONTINUE;
-	}
-	vi_yank_region(e, sy, sx, ey, ex);
-	if (op == 'y') {
-		vi_mark_bracket(e, sy, sx, ey, ex);
-		e->cy = sy;
-		e->cx = sx;
-		vi_clamp(e);
-		text_undo_group_end(e->t);
-		return REQ_CONTINUE;
-	}
-	delete_region(e, sy, sx, ey, ex);
-	if (op == 'c') {
-		enter_insert(e);
-		return REQ_CONTINUE;		/* group stays open until Esc */
-	}
-	vi_mark_set(e, MARK_LBRACK, sy, sx);	/* a delete collapses '[ = '] */
-	vi_mark_set(e, MARK_RBRACK, sy, sx);
-	vi_clamp(e);
-	text_undo_group_end(e->t);
-	return REQ_CONTINUE;
+	return vi_op_charspan(e, op, sy, sx, ey, ex);
 }
 
 /* Map a mark character to a slot index, or -1 if it names no mark. The special
