@@ -21607,6 +21607,31 @@ ed_offer_swap_recover(Editor *e, const char *path, Text *nt, time_t *mtime)
 	return swap_recover(e, path, nt, mt);
 }
 
+/* Park the current buffer and install nt as the flat buffer in slot i, zeroing
+ * the per-buffer editing state every fresh buffer starts with. The caller then
+ * sets the buffer's identity (path, kind, syntax, tabs, swap) and does the
+ * final buf_save once the slot is consistent. */
+static void
+buf_install_slot(Editor *e, Text *nt, int i)
+{
+	buf_save(e, &e->bufs[e->cur]);		/* park the current buffer */
+	e->cur = i;
+	e->t = nt;
+	e->t->owner = e;
+	e->swapj = NULL;		/* parked with its buffer; the slot gets its own */
+	e->cy = e->cx = e->top = e->left = 0;
+	e->sel_active = 0;
+	e->line_state = NULL;
+	e->line_state_cap = 0;
+	e->hl_valid = 0;
+	memset(e->vi_mark_y, 0, sizeof(e->vi_mark_y));
+	memset(e->vi_mark_x, 0, sizeof(e->vi_mark_x));
+	e->vi_marks_set = 0;
+	e->vi_visual = 0;
+	vi_reset_pending(e);
+	e->tbl = NULL;
+}
+
 int
 buf_open(Editor *e, const char *path)
 {
@@ -21652,11 +21677,7 @@ buf_open(Editor *e, const char *path)
 		set_status(e, "out of memory");
 		return -1;
 	}
-	buf_save(e, &e->bufs[e->cur]);		/* park the current buffer */
-	e->cur = i;
-	e->swapj = NULL;		/* parked with its buffer; the new slot gets its own */
-	e->t = nt;				/* set up the flat new buffer */
-	e->t->owner = e;
+	buf_install_slot(e, nt, i);
 #ifdef VEDIT_TERM
 	e->kind = BUF_TEXT;		/* parked a terminal: this slot is text */
 	e->vterm = NULL;
@@ -21664,7 +21685,6 @@ buf_open(Editor *e, const char *path)
 #ifdef VEDIT_ART
 	e->art = NULL;
 #endif
-	e->tbl = NULL;
 	e->tabs = NULL;
 	e->label[0] = '\0';
 	e->vcs_src[0] = '\0';
@@ -21683,21 +21703,11 @@ buf_open(Editor *e, const char *path)
 	}
 	e->expand_tabs = indent_expand_default(e->syn ? e->syn->name : NULL);
 	tabs_config(e);
-	e->cy = e->cx = e->top = e->left = 0;
 #ifdef VEDIT_ART
 	art_sync_file(e);
 #endif
 	tbl_sync_file(e);
 	vcs_refresh(e);
-	e->sel_active = 0;
-	e->line_state = NULL;
-	e->line_state_cap = 0;
-	e->hl_valid = 0;
-	memset(e->vi_mark_y, 0, sizeof(e->vi_mark_y));
-	memset(e->vi_mark_x, 0, sizeof(e->vi_mark_x));
-	e->vi_marks_set = 0;
-	e->vi_visual = 0;
-	vi_reset_pending(e);
 	if (e->has_name)
 		swap_adopt(e, swap_mtime, swap_action);
 	else {
@@ -40530,26 +40540,12 @@ term_install(Editor *e, Term *t)
 		term_discard(t);
 		return -1;
 	}
-	buf_save(e, &e->bufs[e->cur]);		/* park the current buffer */
-	e->cur = i;
-	e->t = nt;
-	e->t->owner = e;
+	buf_install_slot(e, nt, i);
 	e->path[0] = '\0';
-	e->swapj = NULL;
 	e->has_name = 0;
 	e->syn = NULL;
 	e->expand_tabs = 0;
-	e->cy = e->cx = e->top = e->left = 0;
-	e->sel_active = 0;
-	e->line_state = NULL;
-	e->line_state_cap = 0;
-	e->hl_valid = 0;
 	e->hex_view = 0;
-	memset(e->vi_mark_y, 0, sizeof(e->vi_mark_y));
-	memset(e->vi_mark_x, 0, sizeof(e->vi_mark_x));
-	e->vi_marks_set = 0;
-	e->vi_visual = 0;
-	vi_reset_pending(e);
 	e->swap_path[0] = '\0';
 	e->swap_on = 0;
 	e->swap_rev = e->t->rev;
@@ -40558,7 +40554,6 @@ term_install(Editor *e, Term *t)
 	e->vterm = t;
 	e->term_prefix = 0;
 	e->art = NULL;
-	e->tbl = NULL;
 #ifdef VEDIT_MAIL
 	e->mref = NULL;
 #endif
