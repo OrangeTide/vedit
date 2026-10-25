@@ -1,9 +1,14 @@
 # Command language: design note
 
-Status: design, not implemented. This note records the decisions behind a
-config-driven command language for vedit so the grammar and the value model are
-settled before any code lands. It is an engineering document, not user manual
-text; the user-facing chapters stay in `docs/01` through `docs/11`.
+Status: landing in phases. Phase 0 (consolidation), Phase 1 (mini-program
+bindings with the cursor-form verbs and the capture suffix), and the value
+model (typed values, $variables, [substitution], and the region-form verbs over
+char and line kinds) are implemented. Still reserved and not built: the rect
+kind, arbitrary and register buffers, and the resumable evaluator (a command in
+a program, or in a substitution, that opens a prompt ends the run rather than
+suspending). This note records the decisions behind the design. It is an
+engineering document, not user manual text; the user-facing chapters stay in
+`docs/01` through `docs/11`.
 
 ## Why
 

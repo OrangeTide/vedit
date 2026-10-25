@@ -163,12 +163,45 @@ order:
 Quote the whole value. The config file treats `;` and `#` as the start of a
 comment, so a program that uses them must sit inside double quotes, which the
 parser strips before reading the program. Inside the program, braces group an
-argument that holds spaces and a backslash escapes the next character. The
-characters `[ ] $ "` are reserved for later use and are errors for now, so
-brace or escape one to use it as text. A program stops at the first command
-that opens a prompt or quits (`find`, `save`, `quit`, and the like), so put
-such a command last. An unknown command name is reported and stops the
-program.
+argument that holds spaces and a backslash escapes the next character. A
+program stops at the first command that opens a prompt or quits (`find`,
+`save`, `quit`, and the like), so put such a command last. An unknown command
+name is reported and stops the program.
+
+#### Values, variables, and regions
+
+A program's commands pass values, not only text. A bare or braced word is a
+string, `$name` is a variable, and `[ ... ]` runs a bracketed program and uses
+its value. A `$name` or a `[program]` stands alone as one whole argument; the
+characters `[`, `]`, `$`, and `"` stay reserved inside a plain word, so brace
+or escape one to use it as literal text. A double quote is reserved for later
+use and is an error for now.
+
+`set NAME VALUE` binds a variable for the rest of the run; variables do not
+persist between keypresses. A position is a row and a column: `cursor` is the
+current cursor, and `pos ROW COL` is an explicit one, both numbers 1-based as
+in the status bar. A region names a span: `region line N1 N2` is whole rows N1
+through N2 (1-based, inclusive), and `region char P1 P2` is the run between two
+positions. `$clip` is the clipboard as a region.
+
+The editing verbs take two forms. With no argument a verb acts on the selection
+or a default around the cursor, exactly as the plain action names do. Given a
+region it acts on that span:
+
+- `delete REGION` removes the span, and `delete.` also pushes it onto the kill
+  stack.
+- `copy REGION` grabs the span into the clipboard.
+- `put VALUE at POS` inserts a string or a region at a position; the word `at`
+  is optional.
+- `replace REGION` removes the span and inserts the clipboard where it began.
+
+For example, a key that copies the first three lines and places them at the
+top of the file:
+
+```ini
+[keys "demo"]
+    bind = "^D { copy [region line 1 3] ; put $clip at [pos 1 1] }"
+```
 
 A `help` line adds a row to the F1 key-bindings screen shown while the keymap is
 active, so the file documents its own keys:
