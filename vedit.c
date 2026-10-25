@@ -26326,6 +26326,9 @@ enum kb_act {
 /* Position helpers used by the word motions, defined with the vi code below. */
 static void vi_pos_word_fwd(Editor *e, size_t *py, size_t *px, int big);
 static void vi_pos_word_back(Editor *e, size_t *py, size_t *px, int big);
+static void vi_pos_word_end(Editor *e, size_t *py, size_t *px, int big);
+static int vi_text_object(Editor *e, char kind, uint32_t obj, size_t *sy,
+    size_t *sx, size_t *ey, size_t *ex);
 
 static const struct { const char *name; int act; } kb_actions[] = {
 	{ "up", ACT_UP }, { "down", ACT_DOWN },
@@ -28042,6 +28045,82 @@ bi_deselect(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return 0;
 }
 
+/* to MOTION: the position a vi motion moves to from the cursor, as a Pos. It is
+ * where the cursor would land, so it reads with go ("go [to word-end]") and
+ * with a char region ("region char [cursor] [to word]"); a char region's end is
+ * exclusive, so [to line-end] reaches the line's end but [to word-end] stops on
+ * the word's last rune. Minimal set: word, word-back, word-end, line-end. */
+static int
+bi_to(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	Editor *e = ev->e;
+	ClPos p;
+	size_t y = e->cy, x = e->cx;
+
+	if (argc != 1 || argv[0].type != CLV_STR) {
+		cle_err(ev, "to needs a motion");
+		return -1;
+	}
+	if (strcmp(argv[0].s, "word") == 0)
+		vi_pos_word_fwd(e, &y, &x, 0);
+	else if (strcmp(argv[0].s, "word-back") == 0)
+		vi_pos_word_back(e, &y, &x, 0);
+	else if (strcmp(argv[0].s, "word-end") == 0)
+		vi_pos_word_end(e, &y, &x, 0);
+	else if (strcmp(argv[0].s, "line-end") == 0)
+		x = text_line_len(e->t, y);
+	else {
+		cle_err(ev, "unknown motion: %.20s", argv[0].s);
+		return -1;
+	}
+	p.row = y;
+	p.col = x;
+	*result = clv_pos(cl_clamp_pos(e, p));
+	return 0;
+}
+
+/* span inner|around word: a vi text object as a char region, built from the
+ * vi engine's own object span. Minimal set: the word object. */
+static int
+bi_span(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	Editor *e = ev->e;
+	ClRegion r = { 0 };
+	ClPos p1, p2;
+	size_t sy, sx, ey, ex;
+	char kind;
+
+	if (argc != 2 || argv[0].type != CLV_STR || argv[1].type != CLV_STR) {
+		cle_err(ev, "span needs inner or around and an object");
+		return -1;
+	}
+	if (strcmp(argv[0].s, "inner") == 0)
+		kind = 'i';
+	else if (strcmp(argv[0].s, "around") == 0)
+		kind = 'a';
+	else {
+		cle_err(ev, "span needs inner or around");
+		return -1;
+	}
+	if (strcmp(argv[1].s, "word") != 0) {
+		cle_err(ev, "unknown span object: %.20s", argv[1].s);
+		return -1;
+	}
+	if (!vi_text_object(e, kind, 'w', &sy, &sx, &ey, &ex)) {
+		cle_err(ev, "no %s %s here", argv[0].s, argv[1].s);
+		return -1;
+	}
+	p1.row = sy;
+	p1.col = sx;
+	p2.row = ey;
+	p2.col = ex;
+	cl_region_build(e, CLK_CHAR, p1, p2, &r);
+	r.buffer = CLB_CUR;
+	r.file = e->cur;
+	*result = clv_region(r);
+	return 0;
+}
+
 /* reg NAME: a named register as a region, so copy can fill it and put can
  * place it. A single a-z name is vi's register of that letter. */
 static int
@@ -28504,6 +28583,8 @@ static const ClBuiltin cl_builtins[] = {
 	{ "region", bi_region },
 	{ "selection", bi_selection },
 	{ "deselect", bi_deselect },
+	{ "to", bi_to },
+	{ "span", bi_span },
 	{ "reg", bi_reg },
 	{ "delete", bi_delete },
 	{ "delete.", bi_delete_cap },

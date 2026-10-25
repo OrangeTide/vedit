@@ -5013,6 +5013,101 @@ t_cl_crossfile(Test *t)
 	g_cfg = old;
 }
 
+/* to and span borrow vi's motions and text objects: to yields the position a
+ * motion lands on, span a text object as a region, so operators reach "the
+ * word" and "to end of line" without naming coordinates. */
+static void
+t_cl_motion(Test *t)
+{
+	const Cfg *old = g_cfg;
+	ClProg *p;
+	char err[64];
+	int i;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "hello world foo", 15);
+
+	/* to word: the next word start; a char region to it is dw-like */
+	e.cy = 0; e.cx = 0;
+	p = cl_parse("copy [region char [cursor] [to word]] [reg a]",
+	    err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[0].len == 6 &&
+	    memcmp(e.vi_regs[0].bytes, "hello ", 6) == 0,
+	    "to word [%.*s]", (int)e.vi_regs[0].len, e.vi_regs[0].bytes);
+
+	/* to word-end lands on the last rune, so the exclusive region stops short */
+	e.cy = 0; e.cx = 0;
+	p = cl_parse("copy [region char [cursor] [to word-end]] [reg b]",
+	    err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[1].len == 4 &&
+	    memcmp(e.vi_regs[1].bytes, "hell", 4) == 0,
+	    "to word-end [%.*s]", (int)e.vi_regs[1].len, e.vi_regs[1].bytes);
+
+	/* to line-end reaches the line's end (the end position is past the last
+	 * rune, so the region includes it) */
+	e.cy = 0; e.cx = 0;
+	p = cl_parse("copy [region char [cursor] [to line-end]] [reg c]",
+	    err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[2].len == 15 &&
+	    memcmp(e.vi_regs[2].bytes, "hello world foo", 15) == 0,
+	    "to line-end len=%zu", e.vi_regs[2].len);
+
+	/* span inner word is the word under the cursor */
+	e.cy = 0; e.cx = 0;
+	p = cl_parse("copy [span inner word] [reg d]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[3].len == 5 &&
+	    memcmp(e.vi_regs[3].bytes, "hello", 5) == 0,
+	    "span iw [%.*s]", (int)e.vi_regs[3].len, e.vi_regs[3].bytes);
+
+	/* span around word takes the trailing whitespace too */
+	e.cy = 0; e.cx = 0;
+	p = cl_parse("copy [span around word] [reg e]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[4].len == 6 &&
+	    memcmp(e.vi_regs[4].bytes, "hello ", 6) == 0,
+	    "span aw [%.*s]", (int)e.vi_regs[4].len, e.vi_regs[4].bytes);
+
+	/* go accepts a motion position: jump to the next word start */
+	e.cy = 0; e.cx = 0;
+	p = cl_parse("go [to word]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.cy == 0 && e.cx == 6, "go to word cx=%zu", e.cx);
+
+	/* an unknown motion is an error, not a move */
+	p = cl_parse("go [to sideways]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECK(t, e.cx == 6);		/* unchanged */
+
+	free(e.jumps);
+	for (i = 0; i < 26; i++)
+		free(e.vi_regs[i].bytes);
+	free(e.clip);
+	text_free(e.t);
+	g_cfg = old;
+}
+
 /* The selection form turns the live selection into a region, with its kind
  * following the selection's shape (char run, whole lines, or a block). */
 static void
@@ -5247,6 +5342,7 @@ const Case tap_cases[] = {
 	{ "cl_mark", t_cl_mark },
 	{ "cl_capture", t_cl_capture },
 	{ "cl_crossfile", t_cl_crossfile },
+	{ "cl_motion", t_cl_motion },
 	{ "cl_selection", t_cl_selection },
 	{ "cl_anchored", t_cl_anchored },
 	{ "mark_track", t_mark_track },
