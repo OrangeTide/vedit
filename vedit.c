@@ -27248,7 +27248,17 @@ cle_free(ClEval *ev)
 	ev->nvars = ev->varcap = 0;
 }
 
-static int cl_eval_prog(ClEval *ev, const ClProg *p, ClVal *result, Req *req);
+static int run_req(Editor *e, Req req);
+static int cl_eval_prog(ClEval *ev, const ClProg *p, ClVal *result, Req *req,
+    int top);
+
+/* The requests that end a program rather than suspend it: a quit leaves no
+ * program to resume. */
+static int
+cl_req_is_quit(Req r)
+{
+	return r == REQ_QUIT || r == REQ_FORCE_QUIT || r == REQ_QUIT_ERR;
+}
 
 /* Evaluate one word to a value in out, which must be clear. */
 static int
@@ -27280,11 +27290,11 @@ cl_eval_word(ClEval *ev, const ClWord *w, ClVal *out)
 	case CLW_SUB: {
 		Req req = REQ_CONTINUE;
 
-		if (cl_eval_prog(ev, w->sub, out, &req) < 0)
+		if (cl_eval_prog(ev, w->sub, out, &req, 0) < 0)
 			return -1;
-		/* A command that opens a prompt cannot hand a value back to the
-		 * substitution that invoked it; that needs the resumable
-		 * evaluator, which is not built, so it is an error for now. */
+		/* A substitution must yield a value now, so a command that opens
+		 * a prompt or quits cannot stand in for one. The top-level
+		 * program resumes across a prompt; a bracketed one does not. */
 		if (req != REQ_CONTINUE) {
 			clv_clear(out);
 			cle_err(ev, "a command in [] cannot prompt");
@@ -27778,21 +27788,39 @@ done:
 }
 
 /* Run a program's commands in order. result ends as the last command's value.
- * Stops at the first error (returns -1, ev->err set) or the first host request
- * (any Req other than REQ_CONTINUE), which it reports through req so the caller
- * hands control back to the main loop; later commands do not run. */
+ * Returns -1 on the first error (ev->err set).
+ *
+ * A command may raise a host request, a Req other than REQ_CONTINUE: a prompt
+ * (find, replace, goto, help, save) or a quit. At top level the evaluator is
+ * resumable: a prompt request is serviced here, run to completion on the modal
+ * frame stack, and the program then continues with the next command. The
+ * prompt helpers block until the frame closes, so when run_req returns the
+ * interaction is finished; if one instead left a frame pending, the program
+ * stops rather than run on underneath it. A quit request is not serviced here:
+ * there is nothing to resume to, so it is reported through req and the program
+ * ends. Inside a substitution (top is 0) any host request ends the sub-program
+ * and is reported through req, since a substitution must yield a value now. */
 static int
-cl_eval_prog(ClEval *ev, const ClProg *p, ClVal *result, Req *req)
+cl_eval_prog(ClEval *ev, const ClProg *p, ClVal *result, Req *req, int top)
 {
 	int i;
 
 	*req = REQ_CONTINUE;
 	clv_clear(result);
 	for (i = 0; i < p->ncmds; i++) {
+		int base;
+
 		if (cl_eval_cmd(ev, &p->cmds[i], result, req) < 0)
 			return -1;
-		if (*req != REQ_CONTINUE)
+		if (*req == REQ_CONTINUE)
+			continue;
+		if (!top || cl_req_is_quit(*req))
 			break;
+		base = ev->e->ui_depth;
+		run_req(ev->e, *req);
+		*req = REQ_CONTINUE;
+		if (ev->e->ui_depth != base)
+			break;		/* a handler left a frame up: do not resume */
 	}
 	return 0;
 }
@@ -27800,8 +27828,10 @@ cl_eval_prog(ClEval *ev, const ClProg *p, ClVal *result, Req *req)
 /* Run a parsed program as a key binding's target. The commands run with no
  * originating key, so a motion in a program never extends a selection from the
  * trigger key's Shift. A syntax-clean but failing command reports its error on
- * the status line; a command that prompts or quits ends the run and its Req is
- * returned to the main loop. */
+ * the status line. A command that opens a prompt (find, goto, save, and the
+ * like) is run to completion and the program then resumes, so a prompt no
+ * longer has to be a program's last step. A quit ends the run and its Req is
+ * returned to the main loop to carry out. */
 static Req
 cl_run(Editor *e, const struct cl_prog *p)
 {
@@ -27819,7 +27849,7 @@ cl_run(Editor *e, const struct cl_prog *p)
 	cr.kind = e->clip_linewise ? CLK_LINE : CLK_CHAR;
 	clip = clv_region(cr);
 	cle_set(&ev, "clip", &clip);
-	if (cl_eval_prog(&ev, p, &result, &req) < 0)
+	if (cl_eval_prog(&ev, p, &result, &req, 1) < 0)
 		set_status(e, "%s", ev.err);
 	clv_clear(&result);
 	cle_free(&ev);

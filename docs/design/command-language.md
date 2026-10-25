@@ -1,12 +1,15 @@
 # Command language: design note
 
 Status: landing in phases. Phase 0 (consolidation), Phase 1 (mini-program
-bindings with the cursor-form verbs and the capture suffix), and the value
-model (typed values, $variables, [substitution], and the region-form verbs over
-char and line kinds) are implemented. Still reserved and not built: the rect
-kind, arbitrary and register buffers, and the resumable evaluator (a command in
-a program, or in a substitution, that opens a prompt ends the run rather than
-suspending). This note records the decisions behind the design. It is an
+bindings with the cursor-form verbs and the capture suffix), the value model
+(typed values, $variables, [substitution], and the region-form verbs over char
+and line kinds), and the resumable evaluator are implemented. The resumable
+evaluator is synchronous: the prompt helpers block on the modal frame stack, so
+a top-level program services a prompt request through run_req and resumes with
+the next command when the frame closes; a quit ends the program. A prompt
+inside a [substitution] stays an error, since a substitution must yield a value
+at once. Still reserved and not built: the rect kind, and arbitrary and
+register buffers. This note records the decisions behind the design. It is an
 engineering document, not user manual text; the user-facing chapters stay in
 `docs/01` through `docs/11`.
 

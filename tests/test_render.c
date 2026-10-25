@@ -3452,6 +3452,48 @@ t_find_prompt_edit(Test *t)
 	memio_free(&m);
 }
 
+/* The command language resumes across a prompt. A key bound to
+ * "{ goto-line ; delete-line }" opens the goto prompt, and after it closes the
+ * program carries on and deletes the line it landed on, rather than ending at
+ * the prompt. */
+static void
+t_cmd_resume(Test *t)
+{
+	static const char *const L[] = { "aaa", "bbb", "ccc", "ddd", "eee" };
+	const char keys[] = "\007" "3\r";	/* Ctrl-G, then "3" Enter */
+	Cfg *cfg;
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	cfg = cfg_from_text(
+	    "[keys \"pg\"]\n"
+	    "\tbind = \"^G { goto-line ; delete-line }\"\n"
+	    "[keys]\n\tmodes = pg\n");
+	TAP_ASSERT(t, cfg != NULL);
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	vedit_set_config(v, cfg);
+	fill_lines(v->e.t, L, 5);
+	TAP_ASSERT(t, v->e.kb_map != NULL);		/* the keymap is active */
+
+	vedit_run(v);
+
+	/* goto line 3 landed on "ccc"; the program then deleted that line */
+	TAP_CHECKF(t, text_lines(v->e.t) == 4, "lines=%zu", text_lines(v->e.t));
+	TAP_CHECK(t, vline_is(v, 0, "aaa"));
+	TAP_CHECK(t, vline_is(v, 1, "bbb"));
+	TAP_CHECK(t, vline_is(v, 2, "ddd"));	/* "ccc" is gone */
+	TAP_CHECK(t, vline_is(v, 3, "eee"));
+
+	vedit_free(v);
+	memio_free(&m);
+	g_cfg = NULL;				/* the editor borrowed it */
+	vedit_cfg_free(cfg);
+}
+
 #ifndef VEDIT_NO_TOOLS
 /* The Compile menu is hidden with no build command and shown once one exists. */
 static void
@@ -5234,6 +5276,7 @@ const Case tap_cases[] = {
 	{ "menu_item_enabled", t_menu_item_enabled },
 	{ "menu_checked_toggles", t_menu_checked_toggles },
 	{ "find_prompt_edit", t_find_prompt_edit },
+	{ "cmd_resume", t_cmd_resume },
 	{ "menu_col_pack", t_menu_col_pack },
 	{ "menu_narrow", t_menu_narrow },
 	{ "win_too_small", t_win_too_small },

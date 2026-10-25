@@ -164,9 +164,10 @@ Quote the whole value. The config file treats `;` and `#` as the start of a
 comment, so a program that uses them must sit inside double quotes, which the
 parser strips before reading the program. Inside the program, braces group an
 argument that holds spaces and a backslash escapes the next character. A
-program stops at the first command that opens a prompt or quits (`find`,
-`save`, `quit`, and the like), so put such a command last. An unknown command
-name is reported and stops the program.
+command that opens a prompt (`find`, `goto-line`, `save`, and the like) runs
+to completion and the program then continues, so a prompt need not be the last
+step. A quit ends the program. An unknown command name is reported and stops
+the program.
 
 #### Values, variables, and regions
 
