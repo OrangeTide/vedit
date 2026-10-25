@@ -27130,6 +27130,26 @@ clv_copy(ClVal *dst, const ClVal *src)
 	return 0;
 }
 
+static ClVal
+clv_pos(ClPos p)
+{
+	ClVal v = { 0 };
+
+	v.type = CLV_POS;
+	v.pos = p;
+	return v;
+}
+
+static ClVal
+clv_region(ClRegion r)
+{
+	ClVal v = { 0 };
+
+	v.type = CLV_REGION;
+	v.reg = r;
+	return v;
+}
+
 /* The integer an action argument should see: an int as itself, a string parsed
  * in base ten, anything else -1. Mirrors the old atoi-of-the-first-argument. */
 static long
@@ -27307,8 +27327,381 @@ bi_set(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return 0;
 }
 
+/* Clamp a position into the current buffer. An empty buffer is (0,0). */
+static ClPos
+cl_clamp_pos(Editor *e, ClPos p)
+{
+	size_t n = text_lines(e->t), ll;
+
+	if (n == 0) {
+		p.row = p.col = 0;
+		return p;
+	}
+	if (p.row >= n)
+		p.row = n - 1;
+	ll = text_line_len(e->t, p.row);
+	if (p.col > ll)
+		p.col = ll;
+	return p;
+}
+
+/* Does a come at or before b in reading order? */
+static int
+cl_pos_le(ClPos a, ClPos b)
+{
+	return a.row < b.row || (a.row == b.row && a.col <= b.col);
+}
+
+/* The bytes of a region, newly allocated, with *outlen set. A line region
+ * yields whole rows with a trailing newline; a char region the run between its
+ * corners; a scratch region the whole clip. NULL on out of memory. */
+static char *
+cl_region_bytes(Editor *e, const ClRegion *r, size_t *outlen)
+{
+	if (r->buffer == CLB_SCRATCH) {
+		char *b = malloc(e->clip_len ? e->clip_len : 1);
+
+		if (!b)
+			return NULL;
+		if (e->clip_len)
+			memcpy(b, e->clip, e->clip_len);
+		*outlen = e->clip_len;
+		return b;
+	}
+	if (r->kind == CLK_LINE) {
+		size_t len = 0, endlen = text_line_len(e->t, r->end.row);
+		char *t = region_text(e, r->start.row, 0, r->end.row, endlen, &len);
+		char *b;
+
+		if (!t)
+			return NULL;
+		b = realloc(t, len + 1);
+		if (!b) {
+			free(t);
+			return NULL;
+		}
+		b[len] = '\n';			/* whole lines carry their newline */
+		*outlen = len + 1;
+		return b;
+	}
+	return region_text(e, r->start.row, r->start.col, r->end.row, r->end.col,
+	    outlen);
+}
+
+/* Delete a current-buffer region. A line region removes whole rows, newline
+ * included; a char region removes the run. The cursor lands at the start. */
+static void
+cl_region_delete(Editor *e, const ClRegion *r)
+{
+	size_t n = text_lines(e->t);
+
+	if (r->kind == CLK_LINE) {
+		size_t a = r->start.row, b = r->end.row;
+
+		if (b + 1 < n)
+			delete_region(e, a, 0, b + 1, 0);
+		else if (a > 0)
+			delete_region(e, a - 1, text_line_len(e->t, a - 1), b,
+			    text_line_len(e->t, b));
+		else
+			delete_region(e, 0, 0, b, text_line_len(e->t, b));
+	} else {
+		delete_region(e, r->start.row, r->start.col, r->end.row,
+		    r->end.col);
+	}
+}
+
+/* cursor: the current cursor as a Pos. */
+static int
+bi_cursor(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	ClPos p;
+
+	(void)argv;
+	if (argc != 0) {
+		cle_err(ev, "cursor takes no arguments");
+		return -1;
+	}
+	p.row = ev->e->cy;
+	p.col = ev->e->cx;
+	*result = clv_pos(p);
+	return 0;
+}
+
+/* pos ROW COL: a position from a 1-based row and column, the status bar's
+ * numbering, clamped into the buffer. */
+static int
+bi_pos(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	ClPos p;
+	long r, c;
+
+	if (argc != 2) {
+		cle_err(ev, "pos needs a row and a column");
+		return -1;
+	}
+	r = clv_arg_int(&argv[0]);
+	c = clv_arg_int(&argv[1]);
+	p.row = (r > 0) ? (size_t)(r - 1) : 0;
+	p.col = (c > 0) ? (size_t)(c - 1) : 0;
+	*result = clv_pos(cl_clamp_pos(ev->e, p));
+	return 0;
+}
+
+/* region line N1 N2: whole rows N1..N2, 1-based inclusive.
+ * region char P1 P2: the text run between two positions.
+ * Both reference the current buffer; the result is normalized. */
+static int
+bi_region(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	Editor *e = ev->e;
+	ClRegion r;
+
+	if (argc < 1 || argv[0].type != CLV_STR) {
+		cle_err(ev, "region needs a kind");
+		return -1;
+	}
+	r.buffer = CLB_CUR;
+	if (strcmp(argv[0].s, "line") == 0) {
+		size_t n = text_lines(e->t);
+		long a, b;
+
+		if (argc != 3) {
+			cle_err(ev, "region line needs two row numbers");
+			return -1;
+		}
+		a = clv_arg_int(&argv[1]);
+		b = clv_arg_int(&argv[2]);
+		if (a < 1)
+			a = 1;
+		if (b < 1)
+			b = 1;
+		r.kind = CLK_LINE;
+		r.start.row = (size_t)(a - 1);
+		r.end.row = (size_t)(b - 1);
+		if (n == 0) {
+			r.start.row = r.end.row = 0;
+		} else {
+			if (r.start.row >= n)
+				r.start.row = n - 1;
+			if (r.end.row >= n)
+				r.end.row = n - 1;
+		}
+		if (r.start.row > r.end.row) {
+			size_t tmp = r.start.row;
+
+			r.start.row = r.end.row;
+			r.end.row = tmp;
+		}
+		r.start.col = 0;
+		r.end.col = (n == 0) ? 0 : text_line_len(e->t, r.end.row);
+	} else if (strcmp(argv[0].s, "char") == 0) {
+		ClPos p1, p2;
+
+		if (argc != 3 || argv[1].type != CLV_POS ||
+		    argv[2].type != CLV_POS) {
+			cle_err(ev, "region char needs two positions");
+			return -1;
+		}
+		p1 = cl_clamp_pos(e, argv[1].pos);
+		p2 = cl_clamp_pos(e, argv[2].pos);
+		r.kind = CLK_CHAR;
+		if (cl_pos_le(p1, p2)) {
+			r.start = p1;
+			r.end = p2;
+		} else {
+			r.start = p2;
+			r.end = p1;
+		}
+	} else {
+		cle_err(ev, "unknown region kind: %.20s", argv[0].s);
+		return -1;
+	}
+	*result = clv_region(r);
+	return 0;
+}
+
+/* delete [REGION]: with a region, the region form; with none, the cursor form
+ * (the selection, else the character under the cursor). The dotted twin also
+ * pushes the removed text onto the kill stack. */
+static int
+cl_do_delete(ClEval *ev, int argc, ClVal *argv, int cap)
+{
+	Editor *e = ev->e;
+	ClRegion *r;
+
+	if (argc == 0) {
+		kb_run_action(e, cap ? ACT_DELETE_RIGHT_CAP : ACT_DELETE_RIGHT,
+		    -1, NULL);
+		return 0;
+	}
+	if (argv[0].type != CLV_REGION) {
+		cle_err(ev, "delete needs a region");
+		return -1;
+	}
+	r = &argv[0].reg;
+	if (r->buffer != CLB_CUR) {
+		cle_err(ev, "delete: cannot delete the scratch buffer");
+		return -1;
+	}
+	text_undo_group_begin(e->t);
+	if (cap) {
+		size_t l = 0;
+		char *b = cl_region_bytes(e, r, &l);
+
+		if (b) {
+			ed_kill_push(e, b, l);
+			free(b);
+		}
+	}
+	cl_region_delete(e, r);
+	text_undo_group_end(e->t);
+	vi_clamp(e);
+	return 0;
+}
+
+static int
+bi_delete(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	(void)result;
+	return cl_do_delete(ev, argc, argv, 0);
+}
+
+static int
+bi_delete_cap(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	(void)result;
+	return cl_do_delete(ev, argc, argv, 1);
+}
+
+/* copy [REGION]: with a region, grab its content into the clip; with none, the
+ * cursor form (the selection, else the whole line). */
+static int
+bi_copy(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	Editor *e = ev->e;
+	ClRegion *r;
+	char *b;
+	size_t l = 0;
+
+	(void)result;
+	if (argc == 0) {
+		ed_copy(e);
+		return 0;
+	}
+	if (argv[0].type != CLV_REGION) {
+		cle_err(ev, "copy needs a region");
+		return -1;
+	}
+	r = &argv[0].reg;
+	if (r->buffer != CLB_CUR) {
+		cle_err(ev, "copy: that is already the clip");
+		return -1;
+	}
+	b = cl_region_bytes(e, r, &l);
+	if (!b) {
+		cle_err(ev, "out of memory");
+		return -1;
+	}
+	clip_set(e, b, l);			/* takes ownership of b */
+	e->clip_linewise = (r->kind == CLK_LINE);
+	set_status(e, "copied %zu byte%s", l, l == 1 ? "" : "s");
+	return 0;
+}
+
+/* put SRC [at] DST: insert SRC at position DST. SRC is a region (the clip, or a
+ * span of the current buffer) or a string; DST is a Pos. The literal word "at"
+ * between them is optional. */
+static int
+bi_put(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	Editor *e = ev->e;
+	ClVal *src, *dst;
+	char *bytes = NULL;
+	size_t len = 0;
+	int owned = 0;
+	ClPos p;
+
+	(void)result;
+	if (argc == 3 && argv[1].type == CLV_STR &&
+	    strcmp(argv[1].s, "at") == 0) {
+		src = &argv[0];
+		dst = &argv[2];
+	} else if (argc == 2) {
+		src = &argv[0];
+		dst = &argv[1];
+	} else {
+		cle_err(ev, "put needs a value and a position");
+		return -1;
+	}
+	if (dst->type != CLV_POS) {
+		cle_err(ev, "put: the target is not a position");
+		return -1;
+	}
+	if (src->type == CLV_STR) {
+		bytes = src->s;
+		len = strlen(src->s);
+	} else if (src->type == CLV_REGION) {
+		bytes = cl_region_bytes(e, &src->reg, &len);
+		owned = 1;
+		if (!bytes) {
+			cle_err(ev, "out of memory");
+			return -1;
+		}
+	} else {
+		cle_err(ev, "put: cannot place that value");
+		return -1;
+	}
+	p = cl_clamp_pos(e, dst->pos);
+	text_undo_group_begin(e->t);
+	e->cy = p.row;
+	e->cx = p.col;
+	insert_bytes(e, bytes, len);
+	text_undo_group_end(e->t);
+	if (owned)
+		free(bytes);
+	return 0;
+}
+
+/* replace REGION: delete the region and insert the clip where it started. */
+static int
+bi_replace(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	Editor *e = ev->e;
+	ClRegion *r;
+	ClPos start;
+
+	(void)result;
+	if (argc != 1 || argv[0].type != CLV_REGION) {
+		cle_err(ev, "replace needs a region");
+		return -1;
+	}
+	r = &argv[0].reg;
+	if (r->buffer != CLB_CUR) {
+		cle_err(ev, "replace: cannot replace the scratch buffer");
+		return -1;
+	}
+	start = r->start;
+	text_undo_group_begin(e->t);
+	cl_region_delete(e, r);
+	start = cl_clamp_pos(e, start);
+	e->cy = start.row;
+	e->cx = start.col;
+	insert_bytes(e, e->clip, e->clip_len);
+	text_undo_group_end(e->t);
+	return 0;
+}
+
 static const ClBuiltin cl_builtins[] = {
 	{ "set", bi_set },
+	{ "cursor", bi_cursor },
+	{ "pos", bi_pos },
+	{ "region", bi_region },
+	{ "delete", bi_delete },
+	{ "delete.", bi_delete_cap },
+	{ "copy", bi_copy },
+	{ "put", bi_put },
+	{ "replace", bi_replace },
 };
 
 static const ClBuiltin *
@@ -27415,8 +27808,17 @@ cl_run(Editor *e, const struct cl_prog *p)
 	ClEval ev = { 0 };
 	ClVal result = { 0 };
 	Req req = REQ_CONTINUE;
+	ClRegion cr = { 0 };
+	ClVal clip;
 
 	ev.e = e;
+	/* Seed $clip: the scratch buffer as a region, so a program can place it
+	 * with put or replace. put and replace read the clip's live bytes, so
+	 * the snapshot kind here is only a label. */
+	cr.buffer = CLB_SCRATCH;
+	cr.kind = e->clip_linewise ? CLK_LINE : CLK_CHAR;
+	clip = clv_region(cr);
+	cle_set(&ev, "clip", &clip);
 	if (cl_eval_prog(&ev, p, &result, &req) < 0)
 		set_status(e, "%s", ev.err);
 	clv_clear(&result);

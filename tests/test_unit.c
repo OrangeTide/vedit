@@ -4427,6 +4427,90 @@ t_cl_eval(Test *t)
 	g_cfg = old;
 }
 
+/* The buffer currency: a region names a span, and the region-form verbs act on
+ * it. region/delete removes whole lines; the dotted twin captures them; copy
+ * grabs a region into the clip and put/$clip places it; pos builds positions
+ * and replace swaps a region's content for the clip. */
+static void
+t_cl_region(Test *t)
+{
+	const Cfg *old = g_cfg;
+	ClProg *p;
+	char err[64];
+	const char *s;
+	size_t len;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	text_insert(e.t, 0, 0, "aaa", 3);
+	text_split(e.t, 0, 3); text_insert(e.t, 1, 0, "bbb", 3);
+	text_split(e.t, 1, 3); text_insert(e.t, 2, 0, "ccc", 3);
+	text_split(e.t, 2, 3); text_insert(e.t, 3, 0, "ddd", 3);
+	TAP_ASSERT(t, text_lines(e.t) == 4);
+
+	/* a line region deleted removes whole rows */
+	p = cl_parse("delete [region line 2 3]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, text_lines(e.t) == 2, "after delete lines=%zu",
+	    text_lines(e.t));
+	s = text_line(e.t, 0, &len);
+	TAP_CHECK(t, len == 3 && memcmp(s, "aaa", 3) == 0);
+	s = text_line(e.t, 1, &len);
+	TAP_CHECK(t, len == 3 && memcmp(s, "ddd", 3) == 0);
+
+	/* the dotted twin captures the removed line, newline included */
+	p = cl_parse("delete. [region line 1 1]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.kill_n == 1, "kill_n=%d", e.kill_n);
+	TAP_CHECK(t, e.kill[0].len == 4 &&
+	    memcmp(e.kill[0].bytes, "aaa\n", 4) == 0);
+	TAP_CHECKF(t, text_lines(e.t) == 1, "left lines=%zu", text_lines(e.t));
+
+	/* copy a line into the clip, then place $clip at the top */
+	p = cl_parse("copy [region line 1 1] ; put $clip at [pos 1 1]",
+	    err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, text_lines(e.t) == 2, "after put lines=%zu",
+	    text_lines(e.t));
+	s = text_line(e.t, 0, &len);
+	TAP_CHECK(t, len == 3 && memcmp(s, "ddd", 3) == 0);
+	s = text_line(e.t, 1, &len);
+	TAP_CHECK(t, len == 3 && memcmp(s, "ddd", 3) == 0);
+
+	/* replace swaps a region's content for the clip */
+	text_insert(e.t, 0, 0, "X", 1);			/* "Xddd" on line 0 */
+	p = cl_parse("copy [region line 1 1] ; replace [region line 2 2]",
+	    err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	s = text_line(e.t, 1, &len);
+	TAP_CHECKF(t, len == 4 && memcmp(s, "Xddd", 4) == 0,
+	    "replaced len=%zu", len);
+
+	/* put a literal string at a position */
+	p = cl_parse("put hi at [pos 1 1]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	s = text_line(e.t, 0, &len);
+	TAP_CHECK(t, len == 6 && memcmp(s, "hiXddd", 6) == 0);
+
+	free(e.clip);
+	ed_kill_free(&e);
+	text_free(e.t);
+	g_cfg = old;
+}
+
 /* A key bound to a {program} runs its commands in order. ^D here runs
  * line-end then newline, which opens a blank line below "hello" and lands on
  * it. */
@@ -4529,6 +4613,7 @@ const Case tap_cases[] = {
 	{ "ed_pos", t_ed_pos },
 	{ "cl_parse", t_cl_parse },
 	{ "cl_eval", t_cl_eval },
+	{ "cl_region", t_cl_region },
 	{ "cl_capture", t_cl_capture },
 	{ "keymap_prog", t_keymap_prog },
 	{ "utf8_roundtrip", t_utf8_roundtrip },
