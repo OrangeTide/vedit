@@ -217,6 +217,9 @@ region it acts on that span:
 - `run SRC` evaluates a string or a register's text as a command-language
   program, sharing the current run's variables. A program stored in a register
   is a reusable macro.
+- `go POS` moves the cursor to a position, recording the old spot so a
+  `jump-back` returns to it. A mark and an explicit position both read as a
+  position, so `go [mark a]` jumps to a mark and `go [pos 5 1]` jumps to a line.
 
 For example, a key that copies the first three lines and places them at the
 top of the file:

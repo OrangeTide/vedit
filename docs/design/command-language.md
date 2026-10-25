@@ -170,6 +170,9 @@ or rect. A paste uses the source region's kind. This is where today's
 - the core verbs over handles: motion to a `Pos`, build a `Region`, grab a
   region into scratch, put scratch at a point, delete a region, replace a region
   with scratch content, plus the existing named editor actions.
+- `go POS` moves the cursor to a `Pos` (a mark or an explicit position), pushing
+  the old spot onto the jump list so `jump-back` returns. It is the read side of
+  the `mark` bridge: `mark` names a spot, `go` travels to it.
 
 ### The rect kind
 
