@@ -37,8 +37,13 @@ persist between keypresses.
 
 **Positions.** A position is a row and a column, both 1-based as in the status
 bar. `cursor` is the current cursor and `pos ROW COL` an explicit one. `to
-MOTION` is where a vi motion reaches from the cursor; the motions are `word`,
-`word-back`, `word-end`, and `line-end`. `mark NAME` reads a vi mark as a
+MOTION` is where a vi motion reaches from the cursor. The motions are `word`,
+`word-back`, `word-end` and their whitespace-delimited twins `big-word`,
+`big-word-back`, `big-word-end`; `line-begin`, `first-nonblank`, `line-end`;
+`file-top` and `file-bottom`, which land on the first non-blank of the first or
+last line as vi's `gg` and `G` do; and `matching-bracket`, the match of the
+bracket at or after the cursor, which is an error when the line has none. `mark
+NAME` reads a vi mark as a
 position and `mark NAME POS` sets it; these are vi's own marks, shared, so a
 letter mark is settable while the special marks are read-only, and a mark
 follows its text through edits. `go POS` moves the cursor to a position,
@@ -59,8 +64,12 @@ a mark and `go [pos 5 1]` jumps to a line.
 - `selection` is the current selection, its kind following the selection's
   shape: a linewise selection is a line region, a block selection a rect, and
   anything else a character run. It is an error when nothing is selected.
-- `span inner word` and `span around word` are the vi word text objects: the
-  word under the cursor, and the word with its trailing space.
+- `span inner OBJECT` and `span around OBJECT` are vi text objects. The objects
+  are `word` and `big-word`; the bracket pairs `paren`, `brace`, `bracket` and
+  `angle`; and the quotes `double-quote`, `single-quote` and `back-quote`.
+  `inner` is the content, `around` takes the delimiters or the trailing space
+  too, so `span inner word` is the word under the cursor and `span around paren`
+  is a `(...)` with its parentheses.
 - `$clip` is the clipboard, and `reg NAME` a named register. A register persists
   between keypresses; a single letter `a` to `z` is vi's register of that
   letter, so a program and vi share it, and any other name is a register of its

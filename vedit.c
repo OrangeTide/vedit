@@ -26423,6 +26423,8 @@ static void vi_pos_word_back(Editor *e, size_t *py, size_t *px, int big);
 static void vi_pos_word_end(Editor *e, size_t *py, size_t *px, int big);
 static int vi_text_object(Editor *e, char kind, uint32_t obj, size_t *sy,
     size_t *sx, size_t *ey, size_t *ex);
+static int vi_pos_match(Editor *e, size_t *py, size_t *px);
+static size_t first_nonblank(Editor *e, size_t y);
 
 static const struct { const char *name; int act; } kb_actions[] = {
 	{ "up", ACT_UP }, { "down", ACT_DOWN },
@@ -28130,28 +28132,52 @@ bi_deselect(ClEval *ev, int argc, ClVal *argv, ClVal *result)
  * where the cursor would land, so it reads with go ("go [to word-end]") and
  * with a char region ("region char [cursor] [to word]"); a char region's end is
  * exclusive, so [to line-end] reaches the line's end but [to word-end] stops on
- * the word's last rune. Minimal set: word, word-back, word-end, line-end. */
+ * the word's last rune. The big-word forms are vi's WORD (whitespace-delimited);
+ * file-top and file-bottom land on the first non-blank like vi gg and G. */
 static int
 bi_to(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 {
 	Editor *e = ev->e;
 	ClPos p;
 	size_t y = e->cy, x = e->cx;
+	const char *m;
 
 	if (argc != 1 || argv[0].type != CLV_STR) {
 		cle_err(ev, "to needs a motion");
 		return -1;
 	}
-	if (strcmp(argv[0].s, "word") == 0)
+	m = argv[0].s;
+	if (strcmp(m, "word") == 0)
 		vi_pos_word_fwd(e, &y, &x, 0);
-	else if (strcmp(argv[0].s, "word-back") == 0)
+	else if (strcmp(m, "word-back") == 0)
 		vi_pos_word_back(e, &y, &x, 0);
-	else if (strcmp(argv[0].s, "word-end") == 0)
+	else if (strcmp(m, "word-end") == 0)
 		vi_pos_word_end(e, &y, &x, 0);
-	else if (strcmp(argv[0].s, "line-end") == 0)
+	else if (strcmp(m, "big-word") == 0)
+		vi_pos_word_fwd(e, &y, &x, 1);
+	else if (strcmp(m, "big-word-back") == 0)
+		vi_pos_word_back(e, &y, &x, 1);
+	else if (strcmp(m, "big-word-end") == 0)
+		vi_pos_word_end(e, &y, &x, 1);
+	else if (strcmp(m, "line-begin") == 0)
+		x = 0;
+	else if (strcmp(m, "first-nonblank") == 0)
+		x = first_nonblank(e, y);
+	else if (strcmp(m, "line-end") == 0)
 		x = text_line_len(e->t, y);
-	else {
-		cle_err(ev, "unknown motion: %.20s", argv[0].s);
+	else if (strcmp(m, "file-top") == 0) {
+		y = 0;
+		x = first_nonblank(e, y);
+	} else if (strcmp(m, "file-bottom") == 0) {
+		y = text_lines(e->t) ? text_lines(e->t) - 1 : 0;
+		x = first_nonblank(e, y);
+	} else if (strcmp(m, "matching-bracket") == 0) {
+		if (!vi_pos_match(e, &y, &x)) {
+			cle_err(ev, "no matching bracket here");
+			return -1;
+		}
+	} else {
+		cle_err(ev, "unknown motion: %.20s", m);
 		return -1;
 	}
 	p.row = y;
@@ -28160,8 +28186,36 @@ bi_to(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return 0;
 }
 
-/* span inner|around word: a vi text object as a char region, built from the
- * vi engine's own object span. Minimal set: the word object. */
+/* Map a span object name to the vi_text_object selector, or 0 if unknown. The
+ * word objects are vi w/W; the bracket and quote objects name the opening
+ * delimiter of the pair the vi engine already matches. */
+static uint32_t
+cl_span_object(const char *name)
+{
+	if (strcmp(name, "word") == 0)
+		return 'w';
+	if (strcmp(name, "big-word") == 0)
+		return 'W';
+	if (strcmp(name, "paren") == 0)
+		return '(';
+	if (strcmp(name, "brace") == 0)
+		return '{';
+	if (strcmp(name, "bracket") == 0)
+		return '[';
+	if (strcmp(name, "angle") == 0)
+		return '<';
+	if (strcmp(name, "double-quote") == 0)
+		return '"';
+	if (strcmp(name, "single-quote") == 0)
+		return '\'';
+	if (strcmp(name, "back-quote") == 0)
+		return '`';
+	return 0;
+}
+
+/* span inner|around OBJECT: a vi text object as a char region, built from the
+ * vi engine's own object span. OBJECT is word, big-word, a bracket pair (paren,
+ * brace, bracket, angle), or a quote (double-quote, single-quote, back-quote). */
 static int
 bi_span(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 {
@@ -28169,6 +28223,7 @@ bi_span(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	ClRegion r = { 0 };
 	ClPos p1, p2;
 	size_t sy, sx, ey, ex;
+	uint32_t obj;
 	char kind;
 
 	if (argc != 2 || argv[0].type != CLV_STR || argv[1].type != CLV_STR) {
@@ -28183,11 +28238,12 @@ bi_span(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		cle_err(ev, "span needs inner or around");
 		return -1;
 	}
-	if (strcmp(argv[1].s, "word") != 0) {
+	obj = cl_span_object(argv[1].s);
+	if (!obj) {
 		cle_err(ev, "unknown span object: %.20s", argv[1].s);
 		return -1;
 	}
-	if (!vi_text_object(e, kind, 'w', &sy, &sx, &ey, &ex)) {
+	if (!vi_text_object(e, kind, obj, &sy, &sx, &ey, &ex)) {
 		cle_err(ev, "no %s %s here", argv[0].s, argv[1].s);
 		return -1;
 	}
@@ -44298,6 +44354,22 @@ vi_match_pair(Editor *e)
 		}
 	}
 	return r;				/* no match found */
+}
+
+/* The match of the bracket at or after the cursor on this line (the vi '%'
+ * target), as a position. Returns 1 with (*py,*px) on the matching bracket, or
+ * 0 when the line has no bracket at/after the cursor or the pair is unbalanced.
+ * Used by the command language's "to matching-bracket". */
+static int
+vi_pos_match(Editor *e, size_t *py, size_t *px)
+{
+	Motion m = vi_match_pair(e);
+
+	if (!m.valid)
+		return 0;
+	*py = m.y;
+	*px = m.x;
+	return 1;
 }
 
 /* Byte offset of the rune that occupies display column target_col (0-based)

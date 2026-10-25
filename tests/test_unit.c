@@ -5100,6 +5100,74 @@ t_cl_motion(Test *t)
 	cl_prog_free(p);
 	TAP_CHECK(t, e.cx == 6);		/* unchanged */
 
+	/* extra lines for the bracket, quote, indent, and big-word motions:
+	 * 1 "  indented", 2 "a(bc)d", 3 x "q" y, 4 "foo.bar baz" */
+	text_split(e.t, 0, 15); text_insert(e.t, 1, 0, "  indented", 10);
+	text_split(e.t, 1, 10); text_insert(e.t, 2, 0, "a(bc)d", 6);
+	text_split(e.t, 2, 6);  text_insert(e.t, 3, 0, "x \"q\" y", 7);
+	text_split(e.t, 3, 7);  text_insert(e.t, 4, 0, "foo.bar baz", 11);
+
+	/* to line-begin and to first-nonblank on the indented line */
+	e.cy = 1; e.cx = 6;
+	p = cl_parse("go [to line-begin]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p); cl_prog_free(p);
+	TAP_CHECKF(t, e.cy == 1 && e.cx == 0, "to line-begin cx=%zu", e.cx);
+	p = cl_parse("go [to first-nonblank]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p); cl_prog_free(p);
+	TAP_CHECKF(t, e.cy == 1 && e.cx == 2, "to first-nonblank cx=%zu", e.cx);
+
+	/* to file-top and file-bottom land on the first non-blank of each end */
+	e.cy = 2; e.cx = 0;
+	p = cl_parse("go [to file-top]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p); cl_prog_free(p);
+	TAP_CHECKF(t, e.cy == 0 && e.cx == 0, "to file-top %zu,%zu", e.cy, e.cx);
+	p = cl_parse("go [to file-bottom]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p); cl_prog_free(p);
+	TAP_CHECKF(t, e.cy == 4 && e.cx == 0, "to file-bottom %zu,%zu",
+	    e.cy, e.cx);
+
+	/* to matching-bracket on "a(bc)d": from '(' (col 1) to ')' (col 4) */
+	e.cy = 2; e.cx = 1;
+	p = cl_parse("go [to matching-bracket]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p); cl_prog_free(p);
+	TAP_CHECKF(t, e.cy == 2 && e.cx == 4, "to match cx=%zu", e.cx);
+
+	/* span inner/around paren inside "a(bc)d" */
+	e.cy = 2; e.cx = 2;
+	p = cl_parse("copy [span inner paren] [reg f]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p); cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[5].len == 2 &&
+	    memcmp(e.vi_regs[5].bytes, "bc", 2) == 0,
+	    "span i paren [%.*s]", (int)e.vi_regs[5].len, e.vi_regs[5].bytes);
+	e.cy = 2; e.cx = 2;
+	p = cl_parse("copy [span around paren] [reg g]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p); cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[6].len == 4 &&
+	    memcmp(e.vi_regs[6].bytes, "(bc)", 4) == 0,
+	    "span a paren [%.*s]", (int)e.vi_regs[6].len, e.vi_regs[6].bytes);
+
+	/* span inner double-quote inside x "q" y */
+	e.cy = 3; e.cx = 3;
+	p = cl_parse("copy [span inner double-quote] [reg h]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p); cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[7].len == 1 && e.vi_regs[7].bytes[0] == 'q',
+	    "span i dquote [%.*s]", (int)e.vi_regs[7].len, e.vi_regs[7].bytes);
+
+	/* big-word skips the punctuation that word stops on: "foo.bar baz" */
+	e.cy = 4; e.cx = 0;
+	p = cl_parse("go [to big-word]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p); cl_prog_free(p);
+	TAP_CHECKF(t, e.cy == 4 && e.cx == 8, "to big-word cx=%zu", e.cx);
+
 	free(e.jumps);
 	for (i = 0; i < 26; i++)
 		free(e.vi_regs[i].bytes);
