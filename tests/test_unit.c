@@ -4807,6 +4807,7 @@ t_cl_mark(Test *t)
 	editor_init(&e);
 	e.t = text_new();
 	TAP_ASSERT(t, e.t != NULL);
+	e.t->owner = &e;		/* so marks track edits, as in the editor */
 	text_insert(e.t, 0, 0, "aaa", 3);
 	text_split(e.t, 0, 3); text_insert(e.t, 1, 0, "bbbbb", 5);
 
@@ -4835,7 +4836,12 @@ t_cl_mark(Test *t)
 	cl_prog_free(p);
 	TAP_CHECK(t, text_line_len(e.t, 1) == 6);	/* unchanged */
 
-	/* go moves the cursor to a position; a mark is the jump-to-register form */
+	/* go moves the cursor to a position; a mark is the jump-to-register form.
+	 * Reset mark a first: the earlier put shifted it by tracking the edit. */
+	p = cl_parse("mark a [pos 2 3]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
 	e.cy = 0; e.cx = 0;
 	p = cl_parse("go [mark a]", err, sizeof(err));
 	TAP_ASSERT(t, p != NULL);
@@ -5007,6 +5013,62 @@ t_cl_crossfile(Test *t)
 	g_cfg = old;
 }
 
+/* Marks ride edits instead of going stale: an edit before a mark shifts it,
+ * with right gravity at the mark itself, across inserts, deletes, and the
+ * line split and join. editor_init registers the editor for tracking. */
+static void
+t_mark_track(Test *t)
+{
+	const Cfg *old = g_cfg;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	e.t->owner = &e;		/* edits adjust this editor's marks */
+	text_insert(e.t, 0, 0, "hello", 5);
+	text_split(e.t, 0, 5); text_insert(e.t, 1, 0, "world", 5);
+
+	/* mark on line 2 at column 3 (0-based row 1, col 2) */
+	vi_mark_set(&e, 0, 1, 2);
+
+	/* inserting earlier on the same line shifts the column right */
+	text_insert(e.t, 1, 0, "XY", 2);		/* "XYworld" */
+	TAP_CHECKF(t, e.vi_mark_y[0] == 1 && e.vi_mark_x[0] == 4,
+	    "after insert y=%zu x=%zu", e.vi_mark_y[0], e.vi_mark_x[0]);
+
+	/* right gravity: an insert exactly at the mark pushes it along */
+	text_insert(e.t, 1, 4, "Z", 1);			/* at the mark */
+	TAP_CHECKF(t, e.vi_mark_x[0] == 5, "right gravity x=%zu",
+	    e.vi_mark_x[0]);
+
+	/* deleting earlier on the line shifts the column back */
+	text_delete(e.t, 1, 0, 2);			/* remove "XY" */
+	TAP_CHECKF(t, e.vi_mark_x[0] == 3, "after delete x=%zu",
+	    e.vi_mark_x[0]);
+
+	/* inserting a line above shifts the row down (split on line 1) */
+	text_split(e.t, 0, 0);				/* a blank line above */
+	TAP_CHECKF(t, e.vi_mark_y[0] == 2 && e.vi_mark_x[0] == 3,
+	    "after split y=%zu x=%zu", e.vi_mark_y[0], e.vi_mark_x[0]);
+
+	/* joining the blank line back lifts the row up again */
+	text_join(e.t, 0);
+	TAP_CHECKF(t, e.vi_mark_y[0] == 1 && e.vi_mark_x[0] == 3,
+	    "after join y=%zu x=%zu", e.vi_mark_y[0], e.vi_mark_x[0]);
+
+	/* a mark on a joined-away line folds onto the join point. Set mark b at
+	 * the head of line 2, join line 1 with it; b lands after line 1's text. */
+	vi_mark_set(&e, 1, 1, 0);			/* line 2, col 0 */
+	text_join(e.t, 0);				/* "hello" + "Zworld" */
+	TAP_CHECKF(t, e.vi_mark_y[1] == 0 && e.vi_mark_x[1] == 5,
+	    "join fold y=%zu x=%zu", e.vi_mark_y[1], e.vi_mark_x[1]);
+
+	text_free(e.t);
+	g_cfg = old;
+}
+
 const Case tap_cases[] = {
 	{ "ed_pos", t_ed_pos },
 	{ "cl_parse", t_cl_parse },
@@ -5019,6 +5081,7 @@ const Case tap_cases[] = {
 	{ "cl_mark", t_cl_mark },
 	{ "cl_capture", t_cl_capture },
 	{ "cl_crossfile", t_cl_crossfile },
+	{ "mark_track", t_mark_track },
 	{ "keymap_prog", t_keymap_prog },
 	{ "utf8_roundtrip", t_utf8_roundtrip },
 	{ "rune_width", t_rune_width },

@@ -8227,6 +8227,10 @@ typedef struct editor {
 	 * is vi's "a. Session-persistent like vi_regs. */
 	struct { char *name; Reg reg; } *cl_regs;
 	int		cl_nregs, cl_regs_cap;
+	/* While a command-language op edits another open file in place, this is
+	 * that file's index plus one, so edit tracking adjusts its marks and not
+	 * the active buffer's. Zero means the active buffer (the flat marks). */
+	int		mark_fbuf;
 	char		vi_reg;		/* selected register a-z/A-Z, 0 = none */
 	char		vi_reg_fresh;	/* vi_reg was just armed by " */
 	char		vi_regpending;	/* " typed, awaiting the register name */
@@ -8583,6 +8587,12 @@ struct text {
 	 * text is still as it was. NULL when nothing listens. */
 	void		(*edit_cb)(void *ctx, const struct text *t, const Erec *op);
 	void		*edit_ctx;
+
+	/* The editor that owns this buffer, or NULL for a text with no editor
+	 * (a bare text in a test). apply_op uses it to adjust that editor's
+	 * marks so they track edits. Set when the editor adopts the text; a
+	 * text never outlives its editor, so the pointer cannot dangle. */
+	Editor		*owner;
 
 	/* The loaded file mapped read-only (NULL when read into the heap).
 	 * Borrowed lines (cap == 0) point into it; map_st identifies the file
@@ -9598,6 +9608,81 @@ op_valid(const Text *t, const Erec *in)
 	return in->col <= line_len(t, in->line);
 }
 
+/* Make marks ride an edit instead of going stale, called from apply_op before
+ * the primitive mutates the buffer (the text is still as it was). Marks use
+ * right gravity: text inserted at a mark pushes the mark along with it. The
+ * fast path is a single bitmask test when the edited buffer has no marks set. */
+static void
+marks_adjust(Editor *e, const Text *t, const Erec *op)
+{
+	size_t *my, *mx;
+	uint64_t set;
+	int i;
+
+	if (t != e->t)			/* only the file currently being edited */
+		return;
+	if (e->mark_fbuf > 0) {		/* a cross-file op targets a parked file */
+		Buf *b = &e->bufs[e->mark_fbuf - 1];
+
+		my = b->vi_mark_y;
+		mx = b->vi_mark_x;
+		set = b->vi_marks_set;
+	} else {
+		my = e->vi_mark_y;
+		mx = e->vi_mark_x;
+		set = e->vi_marks_set;
+	}
+	/* Only the user-settable a-z marks track. The special slots ([ ] ^ . < >
+	 * and the jump mark) are records the edit machinery sets to fixed spots,
+	 * so adjusting them during the edit that defines them would corrupt them. */
+	set &= ((uint64_t)1 << MARK_LETTERS) - 1;
+	if (set == 0)
+		return;
+	for (i = 0; i < MARK_SLOTS; i++) {
+		size_t r, c;
+
+		if (!(set & ((uint64_t)1 << i)))
+			continue;
+		r = my[i];
+		c = mx[i];
+		switch (op->op) {
+		case OP_INSERT:
+			if (r == op->line && c >= op->col)
+				mx[i] = c + op->n;
+			break;
+		case OP_DELETE: {
+			size_t nn = op->n, ll = line_len(t, op->line);
+
+			if (op->col < ll && nn > ll - op->col)
+				nn = ll - op->col;	/* as apply_op clamps */
+			if (r == op->line && c > op->col)
+				mx[i] = (c >= op->col + nn) ? c - nn : op->col;
+			break;
+		}
+		case OP_SPLIT:
+			if (r > op->line)
+				my[i] = r + 1;
+			else if (r == op->line && c >= op->col) {
+				my[i] = r + 1;
+				mx[i] = c - op->col;
+			}
+			break;
+		case OP_JOIN: {
+			size_t boundary = line_len(t, op->line);
+
+			if (r == op->line + 1) {
+				my[i] = op->line;
+				mx[i] = boundary + c;
+			} else if (r > op->line + 1)
+				my[i] = r - 1;
+			break;
+		}
+		default:
+			break;
+		}
+	}
+}
+
 /* Apply one primitive to the buffer and fill inv with the primitive that
  * reverses it. inv->bytes, when set, is owned by the caller. */
 static int
@@ -9607,6 +9692,8 @@ apply_op(Text *t, const Erec *in, Erec *inv)
 		return ERR;
 	if (t->edit_cb)
 		t->edit_cb(t->edit_ctx, t, in);
+	if (t->owner)
+		marks_adjust(t->owner, t, in);
 	inv->bytes = NULL;
 	inv->n = 0;
 	inv->col = 0;
@@ -21343,6 +21430,8 @@ buf_copy_in(Editor *e, const Buf *b)
 	BUF_STATE_ARRAYS(CP)
 #undef CP
 	g_tabs = e->tabs;
+	if (e->t)
+		e->t->owner = e;	/* this editor's marks track its edits */
 }
 
 /* Mirror a slot into the flat editor and drop any in-flight vi command. */
@@ -21479,6 +21568,7 @@ buf_open(Editor *e, const char *path)
 	e->cur = i;
 	e->swapj = NULL;		/* parked with its buffer; the new slot gets its own */
 	e->t = nt;				/* set up the flat new buffer */
+	e->t->owner = e;
 #ifdef VEDIT_TERM
 	e->kind = BUF_TEXT;		/* parked a terminal: this slot is text */
 	e->vterm = NULL;
@@ -23456,6 +23546,7 @@ ed_new(Editor *e)
 	e->swapj = NULL;
 	text_free(e->t);
 	e->t = nt;
+	e->t->owner = e;
 	e->has_name = 0;
 	e->path[0] = '\0';
 	e->syn = NULL;
@@ -25778,6 +25869,7 @@ ed_open(Editor *e)
 		swap_remove(e);			/* drop the replaced buffer's swap */
 		text_free(e->t);
 		e->t = nt;
+		e->t->owner = e;
 		snprintf(e->path, sizeof(e->path), "%s", path);
 		e->has_name = 1;
 		e->syn = syn_for_path(e->path);
@@ -27516,7 +27608,7 @@ reg_set(Reg *r, const char *bytes, size_t len, int linewise, int block)
 typedef struct cl_bufscope {
 	Text	*t;
 	size_t	cy, cx, hl;
-	int	idx, swapped;
+	int	idx, swapped, fbuf_prev;
 } ClBufScope;
 
 static int
@@ -27535,8 +27627,12 @@ cl_buf_enter(Editor *e, int idx, ClBufScope *s)
 	s->cx = e->cx;
 	s->hl = e->hl_valid;
 	s->swapped = (target != e->t);
-	if (s->swapped)
+	s->fbuf_prev = e->mark_fbuf;
+	if (s->swapped) {
 		e->t = target;
+		e->t->owner = e;
+		e->mark_fbuf = idx + 1;	/* track the parked file's marks */
+	}
 	return 0;
 }
 
@@ -27553,6 +27649,7 @@ cl_buf_leave(Editor *e, ClBufScope *s, int edited)
 	e->cy = s->cy;
 	e->cx = s->cx;
 	e->hl_valid = s->hl;
+	e->mark_fbuf = s->fbuf_prev;
 }
 
 /* The bytes of a region, newly allocated, with *outlen set. A line region
@@ -33898,6 +33995,7 @@ vedit_new(const struct vedit_io *io)
 		free(v);
 		return NULL;
 	}
+	v->e.t->owner = &v->e;
 	term = scr_new_io(io);
 	if (!term) {
 		text_free(v->e.t);
@@ -40163,6 +40261,7 @@ term_install(Editor *e, Term *t)
 	buf_save(e, &e->bufs[e->cur]);		/* park the current buffer */
 	e->cur = i;
 	e->t = nt;
+	e->t->owner = e;
 	e->path[0] = '\0';
 	e->swapj = NULL;
 	e->has_name = 0;
@@ -40814,6 +40913,7 @@ art_export(Editor *e)
 	nt->dirty = 1;
 	text_free(e->t);
 	e->t = nt;
+	e->t->owner = e;
 	swap_rebind(e);
 	e->cy = e->cx = e->top = e->left = 0;
 	e->hl_valid = 0;
@@ -47825,6 +47925,7 @@ vi_ex_exec(Editor *e, char *buf)
 			}
 			text_free(e->t);
 			e->t = nt;
+			e->t->owner = e;
 			swap_rebind(e);
 			e->cy = e->cx = e->top = e->left = 0;
 			e->sel_active = 0;
