@@ -11275,21 +11275,25 @@ split_rect(const Editor *e, int which, Rect *r)
  * so it is the text-mode counterpart of the hex view's address column. It is
  * sized from the total line count, not the visible lines, so it does not jitter
  * as the view scrolls. */
+/* Decimal digit count of n (at least one), raised to at least minw. */
 static int
-gutter_width(const Editor *e)
+digits_width(size_t n, int minw)
 {
-	size_t n = text_lines(e->t);
 	int d = 1;
 
-	if (!e->show_lineno)
-		return 0;
 	while (n >= 10) {
 		n /= 10;
 		d++;
 	}
-	if (d < 3)
-		d = 3;
-	return d + 1;
+	return d < minw ? minw : d;
+}
+
+static int
+gutter_width(const Editor *e)
+{
+	if (!e->show_lineno)
+		return 0;
+	return digits_width(text_lines(e->t), 3) + 1;
 }
 
 /* Paint the gutter cells for one screen row: the 1-based number of line `idx`
@@ -13973,16 +13977,7 @@ tbl_cell_value(const Editor *e, size_t row, int col, char *buf, size_t n)
 static int
 tbl_gutter(const Editor *e)
 {
-	size_t n = text_lines(e->t);
-	int w = 1;
-
-	while (n >= 10) {
-		n /= 10;
-		w++;
-	}
-	if (w < 2)
-		w = 2;
-	return w + 1;
+	return digits_width(text_lines(e->t), 2) + 1;
 }
 
 /* First data row: 1 under a header, else 0. */
