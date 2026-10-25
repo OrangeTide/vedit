@@ -35,7 +35,7 @@ name?` first, and a save into a directory that does not exist asks
 
 File > Open and File > New replace the file in view, after the save
 prompt if it has unsaved changes. To keep the current file open as well,
-use `:e name` or `:enew` in the vi keys (chapter 6). Each open file is
+use `:e name` or `:enew` in the vi keys (chapter 7). Each open file is
 then a buffer, and one buffer is shown at a time.
 
 - **F8** switches to the next buffer and **Shift-F8** to the previous one.
@@ -50,9 +50,9 @@ then a buffer, and one buffer is shown at a time.
 symlink, a `./` or `../` detour, or a hard link), switches to the existing
 buffer instead of loading a second copy.
 
-Some features open buffers of their own: a terminal (chapter 7), a commit
-message or a file's history (chapter 7), the parts of a mail message
-(chapter 8). They appear in the buffer list like any other.
+Some features open buffers of their own: a terminal (chapter 8), a commit
+message or a file's history (chapter 8), the parts of a mail message
+(chapter 9). They appear in the buffer list like any other.
 
 ## Two panes
 
@@ -87,7 +87,7 @@ focused pane's title is drawn reversed, and the status line describes
 it. A click in the other pane moves the focus there; the wheel over it
 scrolls it in place.
 
-The pane under the text (chapter 7) sits under the focused pane and
+The pane under the text (chapter 8) sits under the focused pane and
 follows the focus; Ctrl-W j enters it from the text pane above it and
 Ctrl-W w returns. Opening a split takes a text buffer out of that pane,
 and Buffer in Pane waits until the split is closed. A window too small

@@ -81,7 +81,7 @@ key in upper case with each `.` turned into `_`:
 | `vcs.<name>.<cmd>` | `VEDIT_VCS_<NAME>_<CMD>` |
 
 Those keys, `VEDIT_MOUSE` (chapter 2), and the rendering flags, which
-have their own variables listed in chapter 9, are the only ones that
+have their own variables listed in chapter 10, are the only ones that
 read the environment.
 
 ## Every key
@@ -95,18 +95,18 @@ environment variables say; it starts with `ui.clipboard = on`.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `scheme` | `dos` | `dos`, `black`, `plain`, or a `[theme]` name (chapter 10) |
+| `scheme` | `dos` | `dos`, `black`, `plain`, or a `[theme]` name (chapter 11) |
 | `statusline` | `plain` | `plain` or `powerline`, the status line style (chapter 4) |
 | `separator-left` | U+E0B0 | the glyph after each left-hand powerline segment; empty for none. Under ASCII box drawing the default is a space |
 | `separator-right` | U+E0B2 | the glyph before each right-hand segment |
 | `number` | `off` | line-number gutter |
 | `wrap` | `off` | word wrap |
-| `box` | `utf8` under a UTF-8 locale, else `ascii` | frame style: `utf8`, `dec`, or `ascii` (chapter 9) |
-| `colors` | `256` when the terminal advertises it, else `16` | `256` or `16` (chapter 9) |
-| `scroll` | `off` | use the terminal scroll region when scrolling (chapter 9) |
+| `box` | `utf8` under a UTF-8 locale, else `ascii` | frame style: `utf8`, `dec`, or `ascii` (chapter 10) |
+| `colors` | `256` when the terminal advertises it, else `16` | `256` or `16` (chapter 10) |
+| `scroll` | `off` | use the terminal scroll region when scrolling (chapter 10) |
 | `clipboard` | `off` | also send every copy and cut to the terminal clipboard (chapter 2) |
 | `tabs` | `on` | mark hard tabs with a guide glyph |
-| `paneheight` | `0` | rows for the pane under the text, 0 to 500; 0 is a third (chapter 7; builds with terminals) |
+| `paneheight` | `0` | rows for the pane under the text, 0 to 500; 0 is a third (chapter 8; builds with terminals) |
 | `mouse` | `on` | mouse reporting (chapter 2) |
 
 ### `[keys]`: keybinding modes
@@ -152,7 +152,7 @@ bind those three by their key names, not as `^J`, `^M`, or `^I`.
 A few editor-wide keys stay fixed in every mode, so a keymap does not bind them:
 F2 (cycle modes), F6 (other pane), F8 and Shift-F8 (next and previous buffer),
 Ctrl-W (the pane prefix), Ctrl-] (jump to the tag under the cursor), the build
-keys (chapter 7), F10 and Alt+letter (the menu bar), and the mouse. Everything
+keys (chapter 8), F10 and Alt+letter (the menu bar), and the mouse. Everything
 else is the mode's to claim. The built-in `msedit` and `vi` keys are still
 compiled in rather than written as config, so they are the one thing a keymap
 cannot yet redefine.
@@ -212,130 +212,11 @@ A smaller `examples/emacs.conf` ships the same way, a simple subset of the
 GNU Emacs keys. Meta (Alt) bindings are left out, since vedit has none and Alt
 plus a letter opens the menu bar.
 
-#### The command language
+#### Programs
 
-A binding can run a short program instead of a single action, so one key
-performs several steps. Wrap the program in braces as the bind target; its
-commands run in order, separated by `;` or a newline:
-
-```ini
-[keys "wordstar"]
-    bind = "^Y { line-end ; delete-to-bol }"   # clear the line's text
-    bind = "^N { line-end ; newline }"         # open a blank line below
-```
-
-Quote the whole value when a program uses `;` or `#`. The config file treats
-both as the start of a comment, so a program that uses them must sit inside
-double quotes, which the parser strips before reading the program. Inside the
-program, braces group an argument that holds spaces and a backslash escapes the
-next character. A command that opens a prompt (`find`, `goto-line`, `save`, and
-the like) runs to completion and the program then continues, so a prompt need
-not be the last step. A quit ends the program. An unknown command name is
-reported and stops the program.
-
-Every action name above is also a command. On top of them the language passes
-typed values, not only text, so a command can name a position or a span and a
-verb can act on it.
-
-**Words and values.** A bare or braced word is a string, `$name` is a variable,
-and `[ ... ]` runs a bracketed program and uses its value. A `$name` or a
-`[program]` stands alone as one whole argument; the characters `[`, `]`, `$`,
-and `"` stay reserved inside a plain word, so brace or escape one to use it as
-literal text. A double quote is reserved for later use and is an error for now.
-`set NAME VALUE` binds a variable for the rest of the run; variables do not
-persist between keypresses.
-
-**Positions.** A position is a row and a column, both 1-based as in the status
-bar. `cursor` is the current cursor and `pos ROW COL` an explicit one. `to
-MOTION` is where a vi motion reaches from the cursor; the motions are `word`,
-`word-back`, `word-end`, and `line-end`. `mark NAME` reads a vi mark as a
-position and `mark NAME POS` sets it; these are vi's own marks, shared, so a
-letter mark is settable while the special marks are read-only, and a mark
-follows its text through edits. `go POS` moves the cursor to a position,
-recording the old spot so `jump-back` returns to it, so `go [mark a]` jumps to
-a mark and `go [pos 5 1]` jumps to a line.
-
-**Regions.** A region names a span of text:
-
-- `region line N1 N2` is whole rows N1 through N2 (1-based, inclusive).
-- `region char P1 P2` is the text run between two positions, in reading order.
-- `region rect P1 P2` is the column box with those two corners: columns P1's
-  through P2's across their rows.
-- `region KIND mark A B` is the same shape, but anchored: its two endpoints are
-  the marks A and B, read fresh at each use. Because a mark follows its text, an
-  anchored region keeps spanning the same text, so a span bracketed on one key
-  stays right for another key after the buffer changes. This form is the current
-  file only.
-- `selection` is the current selection, its kind following the selection's
-  shape: a linewise selection is a line region, a block selection a rect, and
-  anything else a character run. It is an error when nothing is selected.
-- `span inner word` and `span around word` are the vi word text objects: the
-  word under the cursor, and the word with its trailing space.
-- `$clip` is the clipboard, and `reg NAME` a named register. A register persists
-  between keypresses; a single letter `a` to `z` is vi's register of that
-  letter, so a program and vi share it, and any other name is a register of its
-  own.
-
-A region measures against the current file. A trailing `file N` points it at
-another open file instead, numbered from 1 in buffer order, and `put` takes the
-same suffix, so `region line 1 3 file 2` is the first three lines of the second
-open file. A char region's end is exclusive, so `[to line-end]` reaches the
-line's end while `[to word-end]` stops on the word's last character; `span` uses
-the object's own span, so `delete [span inner word]` is vi's `diw`.
-
-**Verbs.** A verb with no argument acts on the selection or a default around the
-cursor, exactly as the plain action names do; given a region it acts on that
-span:
-
-- `delete REGION` removes the span, and `delete.` also pushes it onto the kill
-  stack. Deleting a rect removes the columns and closes up each row.
-- `copy SRC [DST]` grabs the span into the clipboard, or into the register DST
-  names; a rect is grabbed as a blank-padded block.
-- `put VALUE at POS` inserts a string or a region (the clip or a register) at a
-  position; the word `at` is optional, and a trailing `file N` places into
-  another open file. A rect, or a register or clip holding a block, goes in as
-  columns, shifting existing text right and padding short rows.
-- `replace REGION` removes the span and puts the clipboard where it began.
-- `run SRC` evaluates a string or a register's text as a program, sharing the
-  current run's variables, so a program stored in a register is a reusable
-  macro.
-- `go POS` moves the cursor, and `go-file N` switches the focus to the Nth open
-  file, the way the next-buffer key does.
-- `deselect` drops the selection, which a destructive verb over `selection` does
-  not do on its own.
-
-A key that copies the first three lines and places them at the top of the file:
-
-```ini
-[keys "demo"]
-    bind = "^D { copy [region line 1 3] ; put $clip at [pos 1 1] }"
-```
-
-Registers persist, so one key can stash a region and another place it:
-
-```ini
-[keys "demo"]
-    bind = ^Y { copy [region line 1 1] [reg a] }
-    bind = ^P { put [reg a] at [cursor] }
-```
-
-A key can carry text from one open file to another, reading from file 2 and
-placing at the top of file 1:
-
-```ini
-[keys "demo"]
-    bind = "^T { copy [region line 1 1 file 2] [reg a] ; put [reg a] at [pos 1 1] }"
-```
-
-Marks persist too, so one key can bracket a span and a later key act on it as an
-anchored region, even after the text in between has changed:
-
-```ini
-[keys "demo"]
-    bind = ^B { mark a [cursor] }
-    bind = ^E { mark b [cursor] }
-    bind = ^X { delete [region char mark a b] }
-```
+A binding's target can be a program instead of a single action, so one key
+takes several steps and acts on named positions and spans. That program runs in
+the command language, which has its own chapter (chapter 6).
 
 ### `[include]`: merge another file
 
@@ -362,7 +243,7 @@ takes effect where it appears, so later settings in the including file win.
 | `mmap` | `on` | map files instead of reading them (chapter 3) |
 | `backup` | `off` | keep the previous version as a `~` file on save |
 | `backupdir` | | where backups go; empty is beside the file |
-| `formatonsave` | `off` | run the language's formatter before each save (chapter 7) |
+| `formatonsave` | `off` | run the language's formatter before each save (chapter 8) |
 
 ### `[indent]`: tabs or spaces
 
@@ -371,7 +252,7 @@ takes effect where it appears, so later settings in the including file win.
 | `expand` | `off` | `on` indents with spaces |
 | `indent.<lang>.expand` | | the same for one language, named as in the table in chapter 4, such as `[indent "sh"]` |
 
-### `[art]` and `[table]`: the views (chapter 8)
+### `[art]` and `[table]`: the views (chapter 9)
 
 The `[art]` keys apply to a build with terminals.
 
@@ -395,7 +276,7 @@ The `[art]` keys apply to a build with terminals.
 Chapter 10 describes the `[color]`, `[words]`, and `[state]` sections that
 define a language.
 
-### `[tags]`, `[cc]`, `[command]`, `[error]`: the tools (chapter 7)
+### `[tags]`, `[cc]`, `[command]`, `[error]`: the tools (chapter 8)
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -410,13 +291,13 @@ define a language.
 | `command.<lang>.format` | | a filter that reformats the buffer |
 | `error.pattern` | | an extra build-error pattern; may be repeated |
 
-### `[vcs]`: version control (chapter 7)
+### `[vcs]`: version control (chapter 8)
 
 | Key | Default | Meaning |
 |---|---|---|
 | `vcs.enable` | `on` | branch and change mark on the status line |
 | `vcs.git.*` | built in | the git command lines, in a `[vcs "git"]` section |
-| `vcs.<name>.*` | | another system's command lines (chapter 10) |
+| `vcs.<name>.*` | | another system's command lines (chapter 11) |
 
 ### `[insert]`
 
@@ -430,7 +311,7 @@ define a language.
 |---|---|
 | `enable` | mouse on or off for terminals whose `$TERM` matches the glob. Later sections win |
 
-### `[mail]` (chapter 8)
+### `[mail]` (chapter 9)
 
 | Key | Meaning |
 |---|---|

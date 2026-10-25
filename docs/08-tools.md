@@ -133,7 +133,7 @@ talking to the editor instead:
 | Ctrl-W 1 to Ctrl-W 9 | switch to that buffer |
 | Ctrl-W n | open another terminal |
 | Ctrl-W r | copy the terminal's output into a new text buffer |
-| Ctrl-W R | copy it into a new art-view buffer, keeping the colors (chapter 8) |
+| Ctrl-W R | copy it into a new art-view buffer, keeping the colors (chapter 9) |
 | Ctrl-W c, Ctrl-W q | close the terminal. Closing the last buffer quits |
 | Ctrl-W +, Ctrl-W - | a row taller or shorter, for a terminal in the pane |
 | Ctrl-W Ctrl-W | send a literal Ctrl-W to the program |

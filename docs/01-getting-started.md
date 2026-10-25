@@ -115,7 +115,7 @@ described in this chapter and the next: keys always insert text, and
 commands are control keys and menus. The other is a vi: keys are commands
 until you enter insert mode. **F2** switches between them (from the vi insert mode, press Esc
 first), and the status line shows `-- NORMAL --` or `-- INSERT --` while the vi keys are active.
-The vi personality is described in chapter 6, which assumes no previous
+The vi personality is described in chapter 7, which assumes no previous
 knowledge of vi. The config file can make it the default (chapter 5).
 
 ## If the editor dies

@@ -3,7 +3,7 @@
 The toggles in the View menu, tab stops and indentation, the color
 schemes, and syntax highlighting. Each setting names its config key, for
 making it the default (chapter 5), and the vi `:set` spelling is in
-chapter 6.
+chapter 7.
 
 ## Line numbers
 
@@ -94,7 +94,7 @@ Chapter 2 describes what the mouse does. Config: `ui.mouse`.
 
 The scheme covers the whole interface: menus, dialogs, prompts, and the
 help screen. Config: `ui.scheme`. A config file can also define schemes of
-its own (chapter 10).
+its own (chapter 11).
 
 ## Status line
 
@@ -110,8 +110,8 @@ from the editor takes the mode segment. The glyphs are the powerline
 arrows, which need a font that has them; under ASCII box drawing they
 are spaces. Config: `ui.statusline`, `ui.separator-left`, and
 `ui.separator-right`, or `:set statusline=powerline` for the session.
-A theme can recolour the segments (chapter 10). With the powerline style
-on, the version-control history browser (chapter 7) draws its title as a
+A theme can recolour the segments (chapter 11). With the powerline style
+on, the version-control history browser (chapter 8) draws its title as a
 matching powerline tab.
 
 ## Syntax highlighting
@@ -130,8 +130,8 @@ files such as `config` and `COMMIT_EDITMSG`:
 | HTML | `.html .htm .xhtml` |
 | INI | `.ini .cfg .conf .gitconfig .editorconfig .veditrc .desktop .service`, and a file named `config` |
 | git commit message | `COMMIT_EDITMSG`, `MERGE_MSG`, `SQUASH_MSG`, `TAG_EDITMSG`, `.gitmessage` |
-| diff | `.diff .patch .rej`, and the buffer that History opens (chapter 7) |
-| blame | the buffer that Blame opens (chapter 7) |
+| diff | `.diff .patch .rej`, and the buffer that History opens (chapter 8) |
+| blame | the buffer that Blame opens (chapter 8) |
 
 The C grammar colors keywords, types, strings, character and number
 literals, comments, and preprocessor lines. The shell grammar also colors
@@ -146,4 +146,4 @@ lines are comments.
 
 In the vi keys, `:syntax off` and `:syntax on` turn it off and on, and
 `:syntax c` forces a language. The config file can map more extensions and define
-new languages (chapter 10). Config: `syntax.enable`.
+new languages (chapter 11). Config: `syntax.enable`.

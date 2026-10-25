@@ -1,8 +1,8 @@
 -- Rewrite links between manual pages to their rendered form.
 --
 -- The site is flat: every docs/<name>.md becomes <name>.html beside the
--- others, so "docs/06-vi.md", "./06-vi.md" and "06-vi.md" all become
--- "06-vi.html". External links and bare anchors are left alone.
+-- others, so "docs/07-vi.md", "./07-vi.md" and "07-vi.md" all become
+-- "07-vi.html". External links and bare anchors are left alone.
 
 function Link(el)
     local target = el.target

@@ -82,7 +82,7 @@ started, and the view follows. The prompt reads `ISearch:`, with
 
 **Search > Repeat Find** finds the next match of the last pattern,
 forward. The search wraps around the end of the file. The pattern is a
-regular expression (the Regular expressions section of chapter 6), and matches do not
+regular expression (the Regular expressions section of chapter 7), and matches do not
 cross lines. Searches are case sensitive unless `edit.ignorecase = on` is
 set in the config.
 
@@ -117,7 +117,7 @@ the pane scrolls it so the selection can reach offscreen lines. The wheel
 scrolls three lines, and the cursor is pulled along when it would leave the
 window. On the scrollbar, the arrows scroll a line, the track pages toward
 the click, and dragging the block scrolls the view. In a split, or with a
-file shown in the pane under another (chapter 7), a click in either view
+file shown in the pane under another (chapter 8), a click in either view
 moves the focus there and places the cursor, and the wheel over the one
 without focus scrolls it in place.
 
@@ -206,16 +206,16 @@ tab stops and the indent settings.
 | Ctrl-F | find |
 | Ctrl-R | replace |
 | Ctrl-L | go to line |
-| Ctrl-T | go to a symbol (chapter 7) |
-| Ctrl-] | jump to the tag under the cursor (chapter 7) |
+| Ctrl-T | go to a symbol (chapter 8) |
+| Ctrl-] | jump to the tag under the cursor (chapter 8) |
 | Ctrl-W | split, pane, and terminal prefix (chapters 3 and 7) |
 | F6 | the other pane of a split (chapter 3) |
 | Ctrl-S | save |
 | Ctrl-Q | quit |
-| Insert | draw mode (chapter 8) |
+| Insert | draw mode (chapter 9) |
 | F1 | key bindings |
-| F2 | the vi keys (chapter 6) |
-| F4, Shift-F4, F9, Alt-F9, Ctrl-F9, Alt-F5 | build commands (chapter 7) |
+| F2 | the vi keys (chapter 7) |
+| F4, Shift-F4, F9, Alt-F9, Ctrl-F9, Alt-F5 | build commands (chapter 8) |
 | F8, Shift-F8 | next and previous buffer |
 | F10, Alt+letter | the menu bar |
 

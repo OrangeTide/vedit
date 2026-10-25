@@ -83,18 +83,21 @@ The manual is in `docs/`, in reading order:
 4. [View settings](docs/04-view.md): line numbers, word wrap, tabs and
    indentation, color schemes, syntax highlighting
 5. [Configuration](docs/05-configuration.md): the config file, every key
-   setting, custom keymaps, and the key-binding command language
-6. [The vi keys](docs/06-vi.md): the complete list of what the vi
+   setting, and custom keymaps
+6. [The command language](docs/06-command-language.md): the programs a key
+   binding can run, with positions, regions, registers, marks, and
+   cross-file edits
+7. [The vi keys](docs/07-vi.md): the complete list of what the vi
    personality implements, for readers who do not know vi
-7. [Tools](docs/07-tools.md): compile, make, and run; terminals inside the
+8. [Tools](docs/08-tools.md): compile, make, and run; terminals inside the
    editor; the pane; tags; version control
-8. [Other views](docs/08-views.md): draw mode, color text art, CSV tables,
+9. [Other views](docs/09-views.md): draw mode, color text art, CSV tables,
    the hex dump, mail
-9. [Terminals and platforms](docs/09-terminals.md): frame styles, color
-   depth, slow links, gvedit, Windows
-10. [Advanced](docs/10-advanced.md): syntax grammars, themes, other version
+10. [Terminals and platforms](docs/10-terminals.md): frame styles, color
+    depth, slow links, gvedit, Windows
+11. [Advanced](docs/11-advanced.md): syntax grammars, themes, other version
     control systems, embedding in a host, build-time knobs
-11. [Showcase](docs/11-showcase.md): examples and pictures
+12. [Showcase](docs/12-showcase.md): examples and pictures
 
 [Developing](docs/developing.md) covers tests, CI, screenshots, and
 releases. `man vedit` is the terse reference for options, environment

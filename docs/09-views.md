@@ -86,7 +86,7 @@ but the pen cycles only the base 16; Alt+P picks the rest up from a cell.
 A cell holds one code point.
 
 A terminal buffer's output can be turned into an art buffer with Ctrl-W R
-(chapter 7).
+(chapter 8).
 
 ## Table view
 

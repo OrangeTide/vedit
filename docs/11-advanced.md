@@ -142,7 +142,7 @@ sets it off. Up to eight themes can be defined.
 
 ## Another version control system
 
-The VCS menu (chapter 7) is driven by command lines in a `[vcs "<name>"]`
+The VCS menu (chapter 8) is driven by command lines in a `[vcs "<name>"]`
 section. The configured systems are tried in order, then git, and the
 first whose `branch` command succeeds owns the file. For Mercurial:
 
