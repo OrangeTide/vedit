@@ -187,6 +187,11 @@ in the status bar. A region names a span:
 - `region char P1 P2` is the text run between two positions, in reading order.
 - `region rect P1 P2` is the column box with those two corners: columns P1's
   through P2's across their rows.
+- `region KIND mark A B` is the same shape as those, but anchored: its two
+  endpoints are the marks A and B, read fresh each time the region is used. A
+  mark follows its text through edits, so an anchored region keeps spanning the
+  same text, which is how a selection stashed on one key stays right for another
+  key after the buffer changes. This form is the current file only.
 
 `$clip` is the clipboard as a region. `reg NAME` is a named register as a
 region, a holder that persists between keypresses: a single letter `a`-`z` is
@@ -243,6 +248,16 @@ placing at the top of file 1:
 ```ini
 [keys "demo"]
     bind = "^T { copy [region line 1 1 file 2] [reg a] ; put [reg a] at [pos 1 1] }"
+```
+
+Marks persist too, so one key can bracket a selection and a later key act on it
+as an anchored region, even after the text in between has changed:
+
+```ini
+[keys "demo"]
+    bind = ^B { mark a [cursor] }
+    bind = ^E { mark b [cursor] }
+    bind = ^X { delete [region char mark a b] }
 ```
 
 A `help` line adds a row to the F1 key-bindings screen shown while the keymap is

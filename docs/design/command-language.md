@@ -256,9 +256,19 @@ a single `g_mark_ed` editor pointer, since marks live on the editor, not the
 text; a cross-file op sets `mark_fbuf` so the parked file's marks move, not the
 active buffer's.
 
-A region is still a plain coordinate snapshot. A region whose endpoints are
-anchored to tracking marks, so a stored selection survives edits, is the next
-step this enables but is not built.
+### Anchored regions
+
+A region is a coordinate snapshot by default, but `region KIND mark A B` is
+anchored: it stores the two endpoint mark letters instead of coordinates and
+resolves them at each use, through `cl_region_resolve`, which reads the marks'
+live positions and builds a concrete region of the stored kind with the shared
+`cl_region_build`. Because marks track edits and persist between keypresses, a
+selection bracketed by two marks on one key stays right for another key after
+the buffer changes. Every region consumer (copy, delete, replace, and put's
+region source) resolves first, so an anchored region flows through the same
+paths as a concrete one. Anchored regions are the current file only for now,
+since the marks they read are the current buffer's; an anchored region over
+another open file waits on resolving a parked buffer's marks.
 
 ## Worked examples
 
