@@ -5060,6 +5060,75 @@ t_cl_loop(Test *t)
 	TAP_CHECK(t, bi_for(&ev, 3, argv, &result) == -1);
 }
 
+/* Evaluate src with no environment and check the number, within tolerance. */
+static int
+expr_is(const char *src, double want)
+{
+	ExprVal out;
+	char err[64];
+	double d;
+
+	if (expr_eval(src, NULL, &out, err, sizeof(err)) != 0)
+		return 0;
+	d = out.num - want;
+	return (d < 0 ? -d : d) < 1e-9;
+}
+
+/* The expression evaluator: precedence, parentheses, comparison and logic,
+ * the built-in functions, and the errors. Then the expr verb feeding a value
+ * back into a program, including a while counter. */
+static void
+t_cl_expr(Test *t)
+{
+	ExprVal out;
+	char err[64];
+	char o[64];
+
+	/* arithmetic and precedence */
+	TAP_CHECK(t, expr_is("2+3*4", 14));
+	TAP_CHECK(t, expr_is("(2+3)*4", 20));
+	TAP_CHECK(t, expr_is("-5 + 2", -3));
+	TAP_CHECK(t, expr_is("7/2", 3.5));
+	TAP_CHECK(t, expr_is("7%3", 1));
+	TAP_CHECK(t, expr_is("2*2*2", 8));
+
+	/* comparison and logic yield 1 or 0 */
+	TAP_CHECK(t, expr_is("10 > 3", 1));
+	TAP_CHECK(t, expr_is("3 >= 3 && 2 < 1", 0));
+	TAP_CHECK(t, expr_is("2 == 2", 1));
+	TAP_CHECK(t, expr_is("1 != 1", 0));
+	TAP_CHECK(t, expr_is("0 || 5", 1));
+	TAP_CHECK(t, expr_is("!0", 1));
+	TAP_CHECK(t, expr_is("!3", 0));
+
+	/* built-in functions */
+	TAP_CHECK(t, expr_is("abs(-4)", 4));
+	TAP_CHECK(t, expr_is("min(3, 1, 2)", 1));
+	TAP_CHECK(t, expr_is("max(3, 1, 2)", 3));
+	TAP_CHECK(t, expr_is("int(7/2)", 3));
+	TAP_CHECK(t, expr_is("mod(10, 3)", 1));
+
+	/* errors: a dangling operator, division by zero, an unknown name with
+	 * no environment, a bad function, and trailing input */
+	TAP_CHECK(t, expr_eval("2 +", NULL, &out, err, sizeof(err)) == -1);
+	TAP_CHECK(t, expr_eval("1/0", NULL, &out, err, sizeof(err)) == -1);
+	TAP_CHECK(t, expr_eval("foo", NULL, &out, err, sizeof(err)) == -1);
+	TAP_CHECK(t, expr_eval("nope(1)", NULL, &out, err, sizeof(err)) == -1);
+	TAP_CHECK(t, expr_eval("2 3", NULL, &out, err, sizeof(err)) == -1);
+
+	/* the expr verb computes a value a program places; a bare name reads a
+	 * run variable */
+	cl_if_run("put [expr 3 * 4] at [pos 1 1]", o, sizeof(o));
+	TAP_CHECKF(t, strcmp(o, "12a/b/c") == 0, "expr const -> %s", o);
+	cl_if_run("set i 5 ; put [expr $i + 1] at [pos 1 1]", o, sizeof(o));
+	TAP_CHECKF(t, strcmp(o, "6a/b/c") == 0, "expr var -> %s", o);
+
+	/* the point of it all: a while loop advancing an expr counter */
+	cl_if_run("set i 0 ; while { $i < 3 } { put x at [pos 1 1] ; "
+	    "set i [expr $i + 1] }", o, sizeof(o));
+	TAP_CHECKF(t, strcmp(o, "xxxa/b/c") == 0, "while + expr -> %s", o);
+}
+
 /* A key bound to a {program} runs its commands in order. ^D here runs
  * line-end then newline, which opens a blank line below "hello" and lands on
  * it. */
@@ -6249,6 +6318,7 @@ const Case tap_cases[] = {
 	{ "cl_if", t_cl_if },
 	{ "cl_bool", t_cl_bool },
 	{ "cl_loop", t_cl_loop },
+	{ "cl_expr", t_cl_expr },
 	{ "cl_region", t_cl_region },
 	{ "cl_rect", t_cl_rect },
 	{ "block_column", t_block_column },

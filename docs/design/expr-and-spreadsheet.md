@@ -1,8 +1,11 @@
 # Expression evaluator and the spreadsheet: design note
 
-Status: planned, not implemented. This note records the design for two features
-that share one piece: an arithmetic `expr` for the command language, and
-formulas for the CSV/TSV table view. The shared piece is an expression
+Status: Phase A implemented, Phase B planned. The standalone `expr_*` evaluator
+and the command-language `expr` verb are built (`vedit.c`, the Expression
+evaluator section); the `env` seam, `EVAL`, and the spreadsheet engine are not.
+This note records the design for two features that share one piece: an
+arithmetic `expr` for the command language, and formulas for the CSV/TSV table
+view. The shared piece is an expression
 evaluator. The point of writing this before building `expr` is to give the
 evaluator the right seam from the start, so the later spreadsheet engine reuses
 it instead of growing a second parser. It is an engineering document, not user
@@ -172,9 +175,12 @@ language (whose values are `long` today through `clv_arg_int`) and the sheet
 
 - Build `expr_*` with the `env` seam first, even though only the `expr` verb
   needs it at the start.
-- Phase A: the `expr` verb. Env over `ClEval` variables, a few math functions,
-  no `EVAL` yet. This is the arithmetic the command language is missing and
-  unblocks `while` counters and computed arguments.
+- Phase A (done): the `expr` verb. Env over `ClEval` variables through
+  `cl_expr_lookup`, the built-in functions `abs`, `int`, `mod`, `min`, and
+  `max`, no `EVAL` yet. This is the arithmetic the command language was missing
+  and unblocks `while` counters and computed arguments. `ExprVal` is numeric
+  only for now; the string and error variants arrive with Phase B. The built-in
+  functions are libm-free on purpose, since only the GUI build links libm.
 - Phase B: the spreadsheet. The `=` convention, the value cache in `Tbl`, the
   cell and range resolver, the sheet functions, recompute-all with cycle
   detection, a formula bar, error values, and `EVAL` with the restricted formula

@@ -207,6 +207,19 @@ as a value (`1` or `0`), so a comparison can feed `and`, `or`, and `not`:
     bind = "^J { if [and [cmp $n < 10] [confirm {Insert?}]] { put ok at [cursor] } }"
 ```
 
+**Arithmetic.** `expr EXPR...` evaluates an arithmetic expression and yields its
+value. The arguments are joined with spaces, so the words of `expr $i + 1` are
+substituted first and then read as one expression. It has the usual operators
+`+ - * / %`, the comparisons `< <= > >= == !=` and the logic `&& || !` (each
+yielding `1` or `0`), parentheses, and the functions `abs`, `int`, `mod`, `min`,
+and `max`. A bare name reads a run variable. The value prints as a whole number
+when it is one. This is what advances a loop counter:
+
+```ini
+[keys "demo"]
+    bind = "^N { set i 1 ; while { $i <= 5 } { put [expr $i] at [cursor] ; set i [expr $i + 1] } }"
+```
+
 **Loops.** Three verbs repeat a body:
 
 - `for VAR START END { BODY }` runs `BODY` with `VAR` set to each integer from

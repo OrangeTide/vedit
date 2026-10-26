@@ -48,6 +48,11 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
 - The command language gains loops: `for VAR START END { BODY }` counts a
   variable over a range, and `while { COND } { BODY }` and `until { COND }
   { BODY }` repeat on a re-evaluated condition.
+- The command language gains an `expr` verb: an arithmetic expression evaluator
+  with `+ - * / %`, comparisons, `&& || !`, parentheses, and the functions
+  `abs`, `int`, `mod`, `min`, and `max`, so a loop can advance a counter with
+  `set i [expr $i + 1]`. The evaluator is standalone, ready to serve a future
+  spreadsheet formula engine (see `docs/design/expr-and-spreadsheet.md`).
 - The command language gains a `menu TITLE LABEL BODY ...` verb: it lists the
   labels and runs the chosen entry's program, so a keymap can build its own menu
   with no change to the editor.

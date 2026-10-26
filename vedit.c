@@ -29687,6 +29687,516 @@ bi_for(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return 0;
 }
 
+/****************************************************************
+ * Expression evaluator
+ *
+ * A small infix evaluator, standalone so the command language's expr verb and
+ * a future spreadsheet formula engine share one parser (see
+ * docs/design/expr-and-spreadsheet.md). It knows the grammar; an ExprEnv gives
+ * names and functions their meaning. Numbers are doubles. It avoids libm, which
+ * only the GUI build links, so it offers only functions that need none.
+ ****************************************************************/
+
+typedef struct expr_val {
+	double	num;
+} ExprVal;
+
+typedef struct expr_env {
+	void	*ctx;
+	int	(*lookup)(void *ctx, const char *name, ExprVal *out);
+	int	(*call)(void *ctx, const char *fn, int argc, const ExprVal *argv,
+		    ExprVal *out);
+} ExprEnv;
+
+enum {
+	ETK_END, ETK_NUM, ETK_IDENT,
+	ETK_PLUS, ETK_MINUS, ETK_STAR, ETK_SLASH, ETK_PCT,
+	ETK_LP, ETK_RP, ETK_COMMA, ETK_NOT,
+	ETK_LT, ETK_LE, ETK_GT, ETK_GE, ETK_EQ, ETK_NE,
+	ETK_AND, ETK_OR
+};
+
+typedef struct expr_p {
+	const char	*p;		/* lexer cursor */
+	const ExprEnv	*env;
+	int		 tok;		/* current token */
+	double		 num;		/* ETK_NUM value */
+	char		 name[64];	/* ETK_IDENT text */
+	int		 error;
+	char		 err[160];
+} ExprP;
+
+static double expr_or(ExprP *x);
+static double expr_unary(ExprP *x);
+
+/* Record the first error and stop the parse by forcing the end token. */
+static void
+expr_fail(ExprP *x, const char *fmt, ...)
+{
+	va_list ap;
+
+	if (x->error)
+		return;
+	va_start(ap, fmt);
+	vsnprintf(x->err, sizeof(x->err), fmt, ap);
+	va_end(ap);
+	x->error = 1;
+	x->tok = ETK_END;
+}
+
+/* Advance to the next token. */
+static void
+expr_lex(ExprP *x)
+{
+	const char *p = x->p;
+
+	while (*p == ' ' || *p == '\t')
+		p++;
+	if (*p == '\0') {
+		x->tok = ETK_END;
+		x->p = p;
+		return;
+	}
+	if (isdigit((unsigned char)*p) ||
+	    (*p == '.' && isdigit((unsigned char)p[1]))) {
+		char *end;
+
+		x->num = strtod(p, &end);
+		x->p = end;
+		x->tok = ETK_NUM;
+		return;
+	}
+	if (isalpha((unsigned char)*p) || *p == '_') {
+		size_t i = 0;
+
+		while ((isalnum((unsigned char)*p) || *p == '_') &&
+		    i < sizeof(x->name) - 1)
+			x->name[i++] = *p++;
+		x->name[i] = '\0';
+		x->p = p;
+		x->tok = ETK_IDENT;
+		return;
+	}
+	switch (*p) {
+	case '+': x->tok = ETK_PLUS;  x->p = p + 1; return;
+	case '-': x->tok = ETK_MINUS; x->p = p + 1; return;
+	case '*': x->tok = ETK_STAR;  x->p = p + 1; return;
+	case '/': x->tok = ETK_SLASH; x->p = p + 1; return;
+	case '%': x->tok = ETK_PCT;   x->p = p + 1; return;
+	case '(': x->tok = ETK_LP;    x->p = p + 1; return;
+	case ')': x->tok = ETK_RP;    x->p = p + 1; return;
+	case ',': x->tok = ETK_COMMA; x->p = p + 1; return;
+	case '<':
+		x->tok = p[1] == '=' ? ETK_LE : ETK_LT;
+		x->p = p + (p[1] == '=' ? 2 : 1);
+		return;
+	case '>':
+		x->tok = p[1] == '=' ? ETK_GE : ETK_GT;
+		x->p = p + (p[1] == '=' ? 2 : 1);
+		return;
+	case '=':
+		if (p[1] == '=') {
+			x->tok = ETK_EQ;
+			x->p = p + 2;
+			return;
+		}
+		break;
+	case '!':
+		x->tok = p[1] == '=' ? ETK_NE : ETK_NOT;
+		x->p = p + (p[1] == '=' ? 2 : 1);
+		return;
+	case '&':
+		if (p[1] == '&') {
+			x->tok = ETK_AND;
+			x->p = p + 2;
+			return;
+		}
+		break;
+	case '|':
+		if (p[1] == '|') {
+			x->tok = ETK_OR;
+			x->p = p + 2;
+			return;
+		}
+		break;
+	}
+	expr_fail(x, "bad character '%c'", *p);
+}
+
+/* Dispatch a function call: the built-in math first (libm-free), then the env's
+ * own functions. Returns 0, or -1 (error set). */
+static int
+expr_apply(ExprP *x, const char *name, int argc, const ExprVal *argv,
+    ExprVal *out)
+{
+	int i;
+
+	if (strcmp(name, "abs") == 0) {
+		if (argc != 1) {
+			expr_fail(x, "abs takes one argument");
+			return -1;
+		}
+		out->num = argv[0].num < 0 ? -argv[0].num : argv[0].num;
+		return 0;
+	}
+	if (strcmp(name, "int") == 0) {
+		if (argc != 1) {
+			expr_fail(x, "int takes one argument");
+			return -1;
+		}
+		out->num = (double)(long)argv[0].num;	/* toward zero */
+		return 0;
+	}
+	if (strcmp(name, "mod") == 0) {
+		long b;
+
+		if (argc != 2) {
+			expr_fail(x, "mod takes two arguments");
+			return -1;
+		}
+		b = (long)argv[1].num;
+		if (b == 0) {
+			expr_fail(x, "division by zero");
+			return -1;
+		}
+		out->num = (double)((long)argv[0].num % b);
+		return 0;
+	}
+	if (strcmp(name, "min") == 0 || strcmp(name, "max") == 0) {
+		int wantmax = name[1] == 'a';
+		double v;
+
+		if (argc < 1) {
+			expr_fail(x, "%s needs at least one argument", name);
+			return -1;
+		}
+		v = argv[0].num;
+		for (i = 1; i < argc; i++)
+			if ((wantmax && argv[i].num > v) ||
+			    (!wantmax && argv[i].num < v))
+				v = argv[i].num;
+		out->num = v;
+		return 0;
+	}
+	if (x->env && x->env->call &&
+	    x->env->call(x->env->ctx, name, argc, argv, out) == 0)
+		return 0;
+	expr_fail(x, "unknown function '%s'", name);
+	return -1;
+}
+
+/* A number, a parenthesized expression, a variable, or a function call. */
+static double
+expr_primary(ExprP *x)
+{
+	double v;
+
+	if (x->error)
+		return 0;
+	if (x->tok == ETK_NUM) {
+		v = x->num;
+		expr_lex(x);
+		return v;
+	}
+	if (x->tok == ETK_LP) {
+		expr_lex(x);
+		v = expr_or(x);
+		if (x->tok != ETK_RP) {
+			expr_fail(x, "expected )");
+			return 0;
+		}
+		expr_lex(x);
+		return v;
+	}
+	if (x->tok == ETK_IDENT) {
+		char name[64];
+		ExprVal out = { 0 };
+
+		snprintf(name, sizeof(name), "%s", x->name);
+		expr_lex(x);
+		if (x->tok == ETK_LP) {			/* a function call */
+			ExprVal argv[16];
+			int argc = 0;
+
+			expr_lex(x);
+			if (x->tok != ETK_RP)
+				for (;;) {
+					if (argc >= (int)(sizeof(argv) /
+					    sizeof(argv[0]))) {
+						expr_fail(x, "too many "
+						    "arguments");
+						return 0;
+					}
+					argv[argc++].num = expr_or(x);
+					if (x->error)
+						return 0;
+					if (x->tok == ETK_COMMA) {
+						expr_lex(x);
+						continue;
+					}
+					break;
+				}
+			if (x->tok != ETK_RP) {
+				expr_fail(x, "expected )");
+				return 0;
+			}
+			expr_lex(x);
+			if (expr_apply(x, name, argc, argv, &out) < 0)
+				return 0;
+			return out.num;
+		}
+		if (!x->env || !x->env->lookup ||
+		    x->env->lookup(x->env->ctx, name, &out) < 0) {
+			expr_fail(x, "unknown name '%s'", name);
+			return 0;
+		}
+		return out.num;
+	}
+	expr_fail(x, "unexpected token in expression");
+	return 0;
+}
+
+static double
+expr_unary(ExprP *x)
+{
+	if (x->tok == ETK_MINUS) {
+		expr_lex(x);
+		return -expr_unary(x);
+	}
+	if (x->tok == ETK_PLUS) {
+		expr_lex(x);
+		return expr_unary(x);
+	}
+	if (x->tok == ETK_NOT) {
+		expr_lex(x);
+		return expr_unary(x) == 0.0 ? 1.0 : 0.0;
+	}
+	return expr_primary(x);
+}
+
+static double
+expr_mul(ExprP *x)
+{
+	double v = expr_unary(x);
+
+	while (!x->error && (x->tok == ETK_STAR || x->tok == ETK_SLASH ||
+	    x->tok == ETK_PCT)) {
+		int op = x->tok;
+		double r;
+
+		expr_lex(x);
+		r = expr_unary(x);
+		if (op == ETK_STAR)
+			v *= r;
+		else if (op == ETK_SLASH) {
+			if (r == 0.0) {
+				expr_fail(x, "division by zero");
+				return 0;
+			}
+			v /= r;
+		} else {
+			long b = (long)r;
+
+			if (b == 0) {
+				expr_fail(x, "division by zero");
+				return 0;
+			}
+			v = (double)((long)v % b);
+		}
+	}
+	return v;
+}
+
+static double
+expr_add(ExprP *x)
+{
+	double v = expr_mul(x);
+
+	while (!x->error && (x->tok == ETK_PLUS || x->tok == ETK_MINUS)) {
+		int op = x->tok;
+
+		expr_lex(x);
+		if (op == ETK_PLUS)
+			v += expr_mul(x);
+		else
+			v -= expr_mul(x);
+	}
+	return v;
+}
+
+static double
+expr_rel(ExprP *x)
+{
+	double v = expr_add(x);
+
+	while (!x->error && (x->tok == ETK_LT || x->tok == ETK_LE ||
+	    x->tok == ETK_GT || x->tok == ETK_GE)) {
+		int op = x->tok;
+		double r;
+
+		expr_lex(x);
+		r = expr_add(x);
+		v = (op == ETK_LT ? v < r : op == ETK_LE ? v <= r :
+		    op == ETK_GT ? v > r : v >= r) ? 1.0 : 0.0;
+	}
+	return v;
+}
+
+static double
+expr_eq(ExprP *x)
+{
+	double v = expr_rel(x);
+
+	while (!x->error && (x->tok == ETK_EQ || x->tok == ETK_NE)) {
+		int op = x->tok;
+		double r;
+
+		expr_lex(x);
+		r = expr_rel(x);
+		v = ((op == ETK_EQ) ? (v == r) : (v != r)) ? 1.0 : 0.0;
+	}
+	return v;
+}
+
+static double
+expr_and(ExprP *x)
+{
+	double v = expr_eq(x);
+
+	while (!x->error && x->tok == ETK_AND) {
+		double r;
+
+		expr_lex(x);
+		r = expr_eq(x);
+		v = (v != 0.0 && r != 0.0) ? 1.0 : 0.0;
+	}
+	return v;
+}
+
+static double
+expr_or(ExprP *x)
+{
+	double v = expr_and(x);
+
+	while (!x->error && x->tok == ETK_OR) {
+		double r;
+
+		expr_lex(x);
+		r = expr_and(x);
+		v = (v != 0.0 || r != 0.0) ? 1.0 : 0.0;
+	}
+	return v;
+}
+
+/* Evaluate src to a number in out. Returns 0, or -1 with err set. */
+static int
+expr_eval(const char *src, const ExprEnv *env, ExprVal *out, char *err,
+    size_t errlen)
+{
+	ExprP x;
+	double v;
+
+	memset(&x, 0, sizeof(x));
+	x.p = src;
+	x.env = env;
+	expr_lex(&x);
+	v = expr_or(&x);
+	if (!x.error && x.tok != ETK_END)
+		expr_fail(&x, "unexpected trailing input");
+	if (x.error) {
+		if (err && errlen)
+			snprintf(err, errlen, "%s", x.err);
+		return -1;
+	}
+	out->num = v;
+	return 0;
+}
+
+/****************************************************************
+ * Command-language builtins, continued
+ ****************************************************************/
+
+/* The expr verb's name resolver: a bare name reads a run variable, coerced to a
+ * number. A missing or non-numeric variable fails. */
+static int
+cl_expr_lookup(void *ctx, const char *name, ExprVal *out)
+{
+	ClEval *ev = ctx;
+	const ClVal *v = cle_find(ev, name);
+	char *end;
+	double d;
+
+	if (!v)
+		return -1;
+	if (v->type == CLV_INT) {
+		out->num = (double)v->i;
+		return 0;
+	}
+	if (v->type != CLV_STR)
+		return -1;
+	d = strtod(v->s, &end);
+	while (*end == ' ' || *end == '\t')
+		end++;
+	if (end == v->s || *end != '\0')
+		return -1;		/* not a clean number */
+	out->num = d;
+	return 0;
+}
+
+/* expr EXPR...: evaluate an arithmetic expression and yield its value. The
+ * arguments are joined with spaces, so the words of `expr $i + 1` are
+ * substituted first and then read as one expression. A bare name reads a run
+ * variable. The result prints as an integer when whole. */
+static int
+bi_expr(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	char buf[1024], nb[32], rbuf[64];
+	ExprEnv env;
+	ExprVal out;
+	char err[160];
+	size_t n = 0;
+	double v;
+	int i;
+
+	if (argc < 1) {
+		cle_err(ev, "expr needs an expression");
+		return -1;
+	}
+	for (i = 0; i < argc; i++) {
+		const char *s;
+		int w;
+
+		if (argv[i].type == CLV_STR)
+			s = argv[i].s;
+		else if (argv[i].type == CLV_INT) {
+			snprintf(nb, sizeof(nb), "%ld", argv[i].i);
+			s = nb;
+		} else {
+			cle_err(ev, "expr: an operand is not a value");
+			return -1;
+		}
+		w = snprintf(buf + n, sizeof(buf) - n, "%s%s", i ? " " : "", s);
+		if (w < 0 || (size_t)w >= sizeof(buf) - n) {
+			cle_err(ev, "expr: expression too long");
+			return -1;
+		}
+		n += (size_t)w;
+	}
+	env.ctx = ev;
+	env.lookup = cl_expr_lookup;
+	env.call = NULL;
+	if (expr_eval(buf, &env, &out, err, sizeof(err)) < 0) {
+		cle_err(ev, "expr: %.120s", err);
+		return -1;
+	}
+	v = out.num;
+	if (v == (double)(long)v && v >= -9e18 && v <= 9e18)
+		snprintf(rbuf, sizeof(rbuf), "%ld", (long)v);
+	else
+		snprintf(rbuf, sizeof(rbuf), "%.12g", v);
+	return cl_result_str(ev, result, rbuf);
+}
+
 /* The list picker backing menu: the title and the (label, body) pairs
  * (argv + 1, label at an even offset, body at the next), and the entry the user
  * activated, or -1. */
@@ -29789,6 +30299,7 @@ static const ClBuiltin cl_builtins[] = {
 	{ "while", bi_while },
 	{ "until", bi_until },
 	{ "for", bi_for },
+	{ "expr", bi_expr },
 	{ "menu", bi_menu },
 	{ "ask", bi_ask },
 	{ "confirm", bi_confirm },
