@@ -191,6 +191,22 @@ dialog verbs, so a program can branch on what the user typed or chose:
     bind = "^L { set n [ask {Count: }] ; if $n < 10 { put {single digit} at [cursor] } }"
 ```
 
+**Boolean combinators.** `not V` yields `1` when `V` is false and `0` when
+true. `and V...` yields `1` when every value is true, and `or V...` yields `1`
+when any value is true; each yields `0` otherwise. These read truthiness the
+same way `if` does, so they combine the dialog verbs and variables. Every
+operand is a value, evaluated before the combinator runs, so a dialog among
+them always opens; reach for nested `if`s when a later prompt should open only
+on one path.
+
+`cmp A OP B` runs the same comparison as `if`'s infix form but yields the result
+as a value (`1` or `0`), so a comparison can feed `and`, `or`, and `not`:
+
+```ini
+[keys "demo"]
+    bind = "^J { if [and [cmp $n < 10] [confirm {Insert?}]] { put ok at [cursor] } }"
+```
+
 **Dialogs.** Four verbs open a dialog and return what the user chose, so a
 program can ask for a value and act on it:
 

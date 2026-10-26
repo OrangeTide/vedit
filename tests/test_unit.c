@@ -4940,6 +4940,64 @@ t_cl_if(Test *t)
 	TAP_CHECKF(t, strcmp(out, "a/c") == 0, "nested compare -> %s", out);
 }
 
+/* not/and/or combine truthiness, and cmp exposes a comparison as a value, so
+ * compound conditions feed if. */
+static void
+t_cl_bool(Test *t)
+{
+	Editor e;
+	ClEval ev;
+	ClVal argv[3], result;
+	char out[64];
+
+	/* not negates truthiness */
+	cl_if_run("if [not 0] { delete [region line 1 1] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "not 0 -> %s", out);
+	cl_if_run("if [not foo] { delete [region line 1 1] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "a/b/c") == 0, "not foo -> %s", out);
+
+	/* and is true only when every operand is */
+	cl_if_run("if [and 1 1] { delete [region line 1 1] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "and 1 1 -> %s", out);
+	cl_if_run("if [and 1 {}] { delete [region line 1 1] }",
+	    out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "a/b/c") == 0, "and 1 empty -> %s", out);
+
+	/* or is true when any operand is */
+	cl_if_run("if [or 0 0] { delete [region line 1 1] } else "
+	    "{ delete [region line 3 3] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "a/b") == 0, "or 0 0 else -> %s", out);
+	cl_if_run("if [or 0 1] { delete [region line 1 1] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "or 0 1 -> %s", out);
+
+	/* cmp yields a comparison as a value, and and/or/not compose them */
+	cl_if_run("if [cmp 3 < 10] { delete [region line 1 1] }",
+	    out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "cmp 3<10 -> %s", out);
+	cl_if_run("set m raw ; if [and [cmp $m = raw] [cmp 2 < 9]] "
+	    "{ delete [region line 1 1] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "and of cmps -> %s", out);
+	cl_if_run("if [or [cmp 1 > 9] [not [cmp 1 > 9]]] "
+	    "{ delete [region line 1 1] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "or with not -> %s", out);
+
+	/* arity and operator errors, without touching a buffer */
+	editor_init(&e);
+	memset(&ev, 0, sizeof(ev));
+	ev.e = &e;
+	memset(argv, 0, sizeof(argv));
+	memset(&result, 0, sizeof(result));
+	TAP_CHECK(t, cl_builtin_find("and") && cl_builtin_find("or") &&
+	    cl_builtin_find("not") && cl_builtin_find("cmp"));
+	TAP_CHECK(t, bi_not(&ev, 0, NULL, &result) == -1);
+	TAP_CHECK(t, bi_and(&ev, 0, NULL, &result) == -1);
+	TAP_CHECK(t, bi_or(&ev, 0, NULL, &result) == -1);
+	TAP_CHECK(t, bi_cmp(&ev, 2, argv, &result) == -1);	/* no operator */
+	argv[0].type = argv[1].type = argv[2].type = CLV_STR;
+	argv[0].s = (char *)"3"; argv[1].s = (char *)"nope"; argv[2].s = (char *)"4";
+	TAP_CHECK(t, bi_cmp(&ev, 3, argv, &result) == -1);	/* bad operator */
+}
+
 /* A key bound to a {program} runs its commands in order. ^D here runs
  * line-end then newline, which opens a blank line below "hello" and lands on
  * it. */
@@ -6127,6 +6185,7 @@ const Case tap_cases[] = {
 	{ "cl_eval", t_cl_eval },
 	{ "cl_dialog_builtins", t_cl_dialog_builtins },
 	{ "cl_if", t_cl_if },
+	{ "cl_bool", t_cl_bool },
 	{ "cl_region", t_cl_region },
 	{ "cl_rect", t_cl_rect },
 	{ "block_column", t_block_column },

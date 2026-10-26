@@ -42,6 +42,9 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
   is true), so a dialog verb reads as a condition, and the untaken branch does
   not run. A condition may also compare two operands, `if A OP B { ... }`, with
   `=`, `==`, `!=` as text and `<`, `<=`, `>`, `>=` as numbers.
+- The command language gains the boolean combinators `not`, `and`, and `or`
+  over truthiness, and `cmp A OP B` to use a comparison as a value, so compound
+  conditions such as `if [and [cmp $n < 10] [confirm {ok?}]] { ... }` work.
 - The command language gains a `menu TITLE LABEL BODY ...` verb: it lists the
   labels and runs the chosen entry's program, so a keymap can build its own menu
   with no change to the editor.

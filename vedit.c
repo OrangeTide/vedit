@@ -29471,6 +29471,67 @@ bi_if(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return cl_eval_string(ev, body, result);
 }
 
+/* not V: "1" when V is false, "0" when true (truthiness as in if). */
+static int
+bi_not(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	if (argc != 1) {
+		cle_err(ev, "not needs one value");
+		return -1;
+	}
+	return cl_result_str(ev, result, cl_truthy(&argv[0]) ? "0" : "1");
+}
+
+/* and V...: "1" when every value is true, else "0". or V...: "1" when any is
+ * true, else "0". Every operand is evaluated, as it is an ordinary argument, so
+ * a dialog among them always opens; use nested ifs for an exclusive prompt. */
+static int
+bi_and(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	int i;
+
+	if (argc < 1) {
+		cle_err(ev, "and needs at least one value");
+		return -1;
+	}
+	for (i = 0; i < argc; i++)
+		if (!cl_truthy(&argv[i]))
+			return cl_result_str(ev, result, "0");
+	return cl_result_str(ev, result, "1");
+}
+
+static int
+bi_or(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	int i;
+
+	if (argc < 1) {
+		cle_err(ev, "or needs at least one value");
+		return -1;
+	}
+	for (i = 0; i < argc; i++)
+		if (cl_truthy(&argv[i]))
+			return cl_result_str(ev, result, "1");
+	return cl_result_str(ev, result, "0");
+}
+
+/* cmp A OP B: the comparison if's infix form runs, as a value "1" or "0", so a
+ * comparison can feed and/or/not or stand on its own. OP is one of
+ * = == != < <= > >=. */
+static int
+bi_cmp(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	int b;
+
+	if (argc != 3 || argv[1].type != CLV_STR || !cl_is_cmp_op(argv[1].s)) {
+		cle_err(ev, "cmp needs A OP B, OP one of = == != < <= > >=");
+		return -1;
+	}
+	if (cl_cmp(ev, &argv[0], argv[1].s, &argv[2], &b) < 0)
+		return -1;
+	return cl_result_str(ev, result, b ? "1" : "0");
+}
+
 /* The list picker backing menu: the title and the (label, body) pairs
  * (argv + 1, label at an even offset, body at the next), and the entry the user
  * activated, or -1. */
@@ -29566,6 +29627,10 @@ static const ClBuiltin cl_builtins[] = {
 	{ "go", bi_go },
 	{ "go-file", bi_go_file },
 	{ "if", bi_if },
+	{ "not", bi_not },
+	{ "and", bi_and },
+	{ "or", bi_or },
+	{ "cmp", bi_cmp },
 	{ "menu", bi_menu },
 	{ "ask", bi_ask },
 	{ "confirm", bi_confirm },
