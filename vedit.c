@@ -29137,6 +29137,188 @@ bi_go_file(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return 0;
 }
 
+/* Set result to a copy of s, as the value a dialog builtin yields. result is
+ * already clear. Returns 0, or -1 (ev->err set) out of memory. */
+static int
+cl_result_str(ClEval *ev, ClVal *result, const char *s)
+{
+	result->s = clv_strdup(s);
+	if (!result->s) {
+		cle_err(ev, "out of memory");
+		return -1;
+	}
+	result->type = CLV_STR;
+	return 0;
+}
+
+/* ask PROMPT [DEFAULT]: read a line of text in a prompt and yield it. DEFAULT
+ * pre-fills the field. The result is the typed text, or empty when cancelled.
+ * The prompt blocks and resumes the program, so ask works inside [] too, which
+ * is how a program reads a value: set name [ask "Name: "]. */
+static int
+bi_ask(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	char buf[1024];
+
+	if (argc < 1 || argc > 2) {
+		cle_err(ev, "ask needs a prompt and an optional default");
+		return -1;
+	}
+	if (argv[0].type != CLV_STR) {
+		cle_err(ev, "ask: the prompt is not a word");
+		return -1;
+	}
+	buf[0] = '\0';
+	if (argc == 2) {
+		if (argv[1].type != CLV_STR) {
+			cle_err(ev, "ask: the default is not a word");
+			return -1;
+		}
+		snprintf(buf, sizeof(buf), "%s", argv[1].s);
+	}
+	if (!dlg_prompt_line(ev->e, argv[0].s, buf, sizeof(buf)))
+		buf[0] = '\0';			/* cancelled: an empty result */
+	return cl_result_str(ev, result, buf);
+}
+
+/* confirm MESSAGE: a yes/no prompt. The result is "1" for yes, "0" otherwise. */
+static int
+bi_confirm(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	if (argc != 1) {
+		cle_err(ev, "confirm needs a message");
+		return -1;
+	}
+	if (argv[0].type != CLV_STR) {
+		cle_err(ev, "confirm: the message is not a word");
+		return -1;
+	}
+	return cl_result_str(ev, result,
+	    dlg_confirm_yesno(ev->e, argv[0].s) ? "1" : "0");
+}
+
+/* The list picker backing choose: the title and the item strings (argv + 1),
+ * and the row the user activated, or -1. */
+typedef struct cl_choose_ctx {
+	const char	*title;
+	ClVal		*items;
+	int		 n;
+	int		 chosen;
+} ClChooseCtx;
+
+static const char *
+cl_choose_title(void *ctx)
+{
+	return ((ClChooseCtx *)ctx)->title;
+}
+
+static int
+cl_choose_count(void *ctx)
+{
+	return ((ClChooseCtx *)ctx)->n;
+}
+
+static const char *
+cl_choose_label(void *ctx, int i)
+{
+	ClChooseCtx *cc = ctx;
+
+	return (i >= 0 && i < cc->n) ? cc->items[i].s : "";
+}
+
+static int
+cl_choose_pick(void *ctx, int i)
+{
+	((ClChooseCtx *)ctx)->chosen = i;
+	return PICK_DONE;
+}
+
+/* choose TITLE ITEM...: a scrollable list of the items. The result is the
+ * chosen item's text, or empty when cancelled. */
+static int
+bi_choose(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	ClChooseCtx cc = { 0 };
+	Picksrc s = { 0 };
+	int i, ok;
+
+	if (argc < 2) {
+		cle_err(ev, "choose needs a title and at least one item");
+		return -1;
+	}
+	if (argv[0].type != CLV_STR) {
+		cle_err(ev, "choose: the title is not a word");
+		return -1;
+	}
+	for (i = 1; i < argc; i++) {		/* render a number as its text */
+		if (argv[i].type == CLV_INT) {
+			char b[32];
+
+			snprintf(b, sizeof(b), "%ld", argv[i].i);
+			argv[i].s = clv_strdup(b);
+			if (!argv[i].s) {
+				argv[i].type = CLV_NONE;
+				cle_err(ev, "out of memory");
+				return -1;
+			}
+			argv[i].type = CLV_STR;
+		} else if (argv[i].type != CLV_STR) {
+			cle_err(ev, "choose: item %d is not a word", i);
+			return -1;
+		}
+	}
+	cc.title = argv[0].s;
+	cc.items = argv + 1;
+	cc.n = argc - 1;
+	cc.chosen = -1;
+	s.ctx = &cc;
+	s.title = cl_choose_title;
+	s.count = cl_choose_count;
+	s.label = cl_choose_label;
+	s.choose = cl_choose_pick;
+	ok = dlg_pick(ev->e, &s);
+	return cl_result_str(ev, result,
+	    (ok && cc.chosen >= 0) ? cc.items[cc.chosen].s : "");
+}
+
+/* pick-file [open|save] [START]: the file browser. The result is the chosen
+ * path, or empty when cancelled. START opens the browser in that directory. */
+static int
+bi_pick_file(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	char out[PATH_MAX];
+	const char *start = NULL;
+	int save = 0, ok;
+
+	if (argc > 2) {
+		cle_err(ev, "pick-file takes an optional mode and start dir");
+		return -1;
+	}
+	if (argc >= 1) {
+		if (argv[0].type != CLV_STR) {
+			cle_err(ev, "pick-file: the mode is not a word");
+			return -1;
+		}
+		if (strcmp(argv[0].s, "save") == 0)
+			save = 1;
+		else if (strcmp(argv[0].s, "open") != 0) {
+			cle_err(ev, "pick-file: mode must be open or save");
+			return -1;
+		}
+	}
+	if (argc == 2) {
+		if (argv[1].type != CLV_STR) {
+			cle_err(ev, "pick-file: the start dir is not a word");
+			return -1;
+		}
+		start = argv[1].s;
+	}
+	out[0] = '\0';
+	ok = dlg_file(ev->e, save ? "Save As" : "Open", start, NULL, save,
+	    out, sizeof(out));
+	return cl_result_str(ev, result, ok ? out : "");
+}
+
 static const ClBuiltin cl_builtins[] = {
 	{ "set", bi_set },
 	{ "cursor", bi_cursor },
@@ -29158,6 +29340,10 @@ static const ClBuiltin cl_builtins[] = {
 	{ "mark", bi_mark },
 	{ "go", bi_go },
 	{ "go-file", bi_go_file },
+	{ "ask", bi_ask },
+	{ "confirm", bi_confirm },
+	{ "choose", bi_choose },
+	{ "pick-file", bi_pick_file },
 };
 
 static const ClBuiltin *

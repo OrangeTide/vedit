@@ -4689,6 +4689,43 @@ t_cl_eval(Test *t)
 	g_cfg = old;
 }
 
+/* The Phase 1 dialog builtins (ask/confirm/choose/pick-file) are registered and
+ * reject bad arguments before any modal opens. The modals themselves need a
+ * host event loop, so their interactive paths are exercised by the run-vedit
+ * driver, not here. */
+static void
+t_cl_dialog_builtins(Test *t)
+{
+	Editor e;
+	ClEval ev;
+	ClVal argv[2], result;
+
+	editor_init(&e);
+	memset(&ev, 0, sizeof(ev));
+	ev.e = &e;
+	memset(argv, 0, sizeof(argv));
+	memset(&result, 0, sizeof(result));
+
+	TAP_CHECK(t, cl_builtin_find("ask") != NULL);
+	TAP_CHECK(t, cl_builtin_find("confirm") != NULL);
+	TAP_CHECK(t, cl_builtin_find("choose") != NULL);
+	TAP_CHECK(t, cl_builtin_find("pick-file") != NULL);
+
+	/* ask: zero args, or too many, is an error before a prompt opens */
+	TAP_CHECK(t, bi_ask(&ev, 0, NULL, &result) == -1 && ev.err[0]);
+	/* confirm: needs exactly one message */
+	TAP_CHECK(t, bi_confirm(&ev, 0, NULL, &result) == -1);
+	/* choose: a title and at least one item */
+	TAP_CHECK(t, bi_choose(&ev, 1, argv, &result) == -1);
+	/* pick-file: at most a mode and a start dir, and a known mode */
+	TAP_CHECK(t, bi_pick_file(&ev, 3, argv, &result) == -1);
+	argv[0].type = CLV_STR;
+	argv[0].s = (char *)"nonsense";
+	TAP_CHECK(t, bi_pick_file(&ev, 1, argv, &result) == -1);
+
+	TAP_CHECK(t, result.type == CLV_NONE);	/* no value left on an error */
+}
+
 /* The buffer currency: a region names a span, and the region-form verbs act on
  * it. region/delete removes whole lines; the dotted twin captures them; copy
  * grabs a region into the clip and put/$clip places it; pos builds positions
@@ -5958,6 +5995,7 @@ const Case tap_cases[] = {
 	{ "ed_pos", t_ed_pos },
 	{ "cl_parse", t_cl_parse },
 	{ "cl_eval", t_cl_eval },
+	{ "cl_dialog_builtins", t_cl_dialog_builtins },
 	{ "cl_region", t_cl_region },
 	{ "cl_rect", t_cl_rect },
 	{ "block_column", t_block_column },

@@ -165,3 +165,25 @@ show what the marks bracket before another key acts on it:
 [keys "demo"]
     bind = ^H { select [region char mark a b] }
 ```
+
+**Dialogs.** Four verbs open a dialog and return what the user chose, so a
+program can ask for a value and act on it:
+
+- `ask PROMPT [DEFAULT]` opens a one-line prompt and yields the typed text, or
+  empty when cancelled. `DEFAULT` pre-fills the field.
+- `confirm MESSAGE` opens a yes/no prompt and yields `1` for yes, `0` otherwise.
+- `choose TITLE ITEM...` opens a scrollable list of the items and yields the
+  chosen one, or empty when cancelled.
+- `pick-file [open|save] [START]` opens the file browser and yields the chosen
+  path, or empty when cancelled. The mode defaults to `open`, and `START` opens
+  the browser in that directory.
+
+Each one blocks until it closes and the program then continues, so a dialog
+works inside `[ ... ]`: that is how a program reads a value. A key that asks for
+a name and inserts it, and one that offers a short menu:
+
+```ini
+[keys "demo"]
+    bind = "^N { put [ask {Name: }] at [cursor] }"
+    bind = "^K { put [choose Insert tab newline space] at [cursor] }"
+```

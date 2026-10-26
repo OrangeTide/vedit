@@ -33,6 +33,10 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
 - The file browser shows a clickable breadcrumb bar of the current directory's
   path. It shows at most the five deepest levels, each capped at ten columns
   (truncated with an ellipsis), and clicking a segment changes into it.
+- The command language gains four dialog verbs that return what the user chose:
+  `ask` (a line prompt), `confirm` (yes/no), `choose` (a list), and `pick-file`
+  (the file browser). Each blocks and resumes the program, so a program can read
+  a value with `set x [ask "Name: "]`.
 
 ### Changed
 - View and mode key dispatch is centralized, and the grid-view render path is
