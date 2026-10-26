@@ -4710,6 +4710,7 @@ t_cl_dialog_builtins(Test *t)
 	TAP_CHECK(t, cl_builtin_find("confirm") != NULL);
 	TAP_CHECK(t, cl_builtin_find("choose") != NULL);
 	TAP_CHECK(t, cl_builtin_find("pick-file") != NULL);
+	TAP_CHECK(t, cl_builtin_find("menu") != NULL);
 
 	/* ask: zero args, or too many, is an error before a prompt opens */
 	TAP_CHECK(t, bi_ask(&ev, 0, NULL, &result) == -1 && ev.err[0]);
@@ -4723,7 +4724,28 @@ t_cl_dialog_builtins(Test *t)
 	argv[0].s = (char *)"nonsense";
 	TAP_CHECK(t, bi_pick_file(&ev, 1, argv, &result) == -1);
 
+	/* menu: a title plus label/body pairs; a dangling label is an error */
+	TAP_CHECK(t, bi_menu(&ev, 1, argv, &result) == -1);	/* title only */
+	TAP_CHECK(t, bi_menu(&ev, 2, argv, &result) == -1);	/* no body */
+
 	TAP_CHECK(t, result.type == CLV_NONE);	/* no value left on an error */
+
+	/* menu labels sit at even offsets, bodies at the odd ones between */
+	{
+		ClVal pairs[4];
+		ClMenuCtx mc = { 0 };
+
+		pairs[0].type = CLV_STR; pairs[0].s = (char *)"L0";
+		pairs[1].type = CLV_STR; pairs[1].s = (char *)"B0";
+		pairs[2].type = CLV_STR; pairs[2].s = (char *)"L1";
+		pairs[3].type = CLV_STR; pairs[3].s = (char *)"B1";
+		mc.pairs = pairs;
+		mc.n = 2;
+		TAP_CHECK(t, cl_menu_count(&mc) == 2);
+		TAP_CHECK(t, strcmp(cl_menu_label(&mc, 0), "L0") == 0);
+		TAP_CHECK(t, strcmp(cl_menu_label(&mc, 1), "L1") == 0);
+		TAP_CHECK(t, cl_menu_label(&mc, 2)[0] == '\0');	/* out of range */
+	}
 }
 
 /* The buffer currency: a region names a span, and the region-form verbs act on

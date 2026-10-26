@@ -200,3 +200,14 @@ a name and inserts it, and one that offers a short menu:
     bind = "^N { put [ask {Name: }] at [cursor] }"
     bind = "^K { put [choose Insert tab newline space] at [cursor] }"
 ```
+
+**Menus.** `menu TITLE LABEL BODY [LABEL BODY ...]` shows a list of the labels
+and runs the chosen entry's `BODY` as a program. The entries are given as
+alternating arguments, so a keymap or a personality builds its own menu with no
+change to the editor, and a body may open another menu for a submenu. The result
+is the chosen body's value, or none when cancelled.
+
+```ini
+[keys "demo"]
+    bind = "^G { menu Actions {Clear line} { delete [region line 1 1] } {Insert a file path} { put [pick-file open] at [cursor] } }"
+```

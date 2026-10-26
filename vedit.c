@@ -29387,6 +29387,79 @@ bi_if(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return cl_eval_string(ev, body, result);
 }
 
+/* The list picker backing menu: the title and the (label, body) pairs
+ * (argv + 1, label at an even offset, body at the next), and the entry the user
+ * activated, or -1. */
+typedef struct cl_menu_ctx {
+	const char	*title;
+	ClVal		*pairs;
+	int		 n;
+	int		 chosen;
+} ClMenuCtx;
+
+static const char *
+cl_menu_title(void *ctx)
+{
+	return ((ClMenuCtx *)ctx)->title;
+}
+
+static int
+cl_menu_count(void *ctx)
+{
+	return ((ClMenuCtx *)ctx)->n;
+}
+
+static const char *
+cl_menu_label(void *ctx, int i)
+{
+	ClMenuCtx *m = ctx;
+
+	return (i >= 0 && i < m->n) ? m->pairs[2 * i].s : "";
+}
+
+static int
+cl_menu_pick(void *ctx, int i)
+{
+	((ClMenuCtx *)ctx)->chosen = i;
+	return PICK_DONE;
+}
+
+/* menu TITLE LABEL BODY [LABEL BODY ...]: a list of the labels; choosing one
+ * runs its BODY as a program. The entries are alternating arguments, each BODY
+ * the program text to run (usually braced), so a keymap or a personality can
+ * build its own menu with no change to the editor. The result is the chosen
+ * body's value, or none when cancelled. A body may itself open a menu. */
+static int
+bi_menu(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	ClMenuCtx mc = { 0 };
+	Picksrc s = { 0 };
+	int i, ok;
+
+	if (argc < 3 || (argc % 2) == 0) {
+		cle_err(ev, "menu needs a title and label/body pairs");
+		return -1;
+	}
+	for (i = 0; i < argc; i++)
+		if (argv[i].type != CLV_STR) {
+			cle_err(ev, "menu: argument %d is not a word", i);
+			return -1;
+		}
+	mc.title = argv[0].s;
+	mc.pairs = argv + 1;
+	mc.n = (argc - 1) / 2;
+	mc.chosen = -1;
+	s.ctx = &mc;
+	s.title = cl_menu_title;
+	s.count = cl_menu_count;
+	s.label = cl_menu_label;
+	s.choose = cl_menu_pick;
+	ok = dlg_pick(ev->e, &s);
+	if (!ok || mc.chosen < 0)
+		return 0;		/* cancelled: the result stays none */
+	return cl_eval_string(ev, mc.pairs[2 * mc.chosen + 1].s, result);
+}
+
 static const ClBuiltin cl_builtins[] = {
 	{ "set", bi_set },
 	{ "cursor", bi_cursor },
@@ -29409,6 +29482,7 @@ static const ClBuiltin cl_builtins[] = {
 	{ "go", bi_go },
 	{ "go-file", bi_go_file },
 	{ "if", bi_if },
+	{ "menu", bi_menu },
 	{ "ask", bi_ask },
 	{ "confirm", bi_confirm },
 	{ "choose", bi_choose },
