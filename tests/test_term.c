@@ -384,6 +384,22 @@ t_term_mouse_forward(Test *t)
 	close(child);
 	vedit_free(v);
 	memio_free(&m);
+
+	/* a partial that is not a mouse report (ESC [ < 5 then Ctrl-W w) flushes
+	 * the buffered bytes raw to the child, and the Ctrl-W still opens the
+	 * window prefix rather than being swallowed: w cycles the buffer, so it
+	 * never reaches the child. */
+	v = term_editor_in(&m, &io, "\033[<5\027w", 6, 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_CONT);
+	n = read_all(child, buf, sizeof(buf));
+	TAP_CHECKF(t, n == 4 && memcmp(buf, "\033[<5", 4) == 0,
+	    "child got %d bytes (Ctrl-W must not leak)", n);
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
 }
 
 /* Ctrl-W q on the only buffer asks the editor to quit. */

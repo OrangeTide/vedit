@@ -5011,8 +5011,10 @@ syntax_merge_color_only(void)
 		for (k = 1; k < nc && k < JSF_CLASS_MAX; k++) {
 			int ci = jsf_class(u, names[k]);
 
-			u->fg[ci] = fg[k];
-			u->attr[ci] = attr[k];
+			if (ci > 0) {		/* 0 means the class table is full: */
+				u->fg[ci] = fg[k];	/* do not clobber the default */
+				u->attr[ci] = attr[k];
+			}
 		}
 		g_user.syn[i].start = u->start;	/* name/fsm still point at this slot */
 	}
@@ -5890,13 +5892,15 @@ syntax_reload_defaults(void)
 }
 
 /* Find a grammar named name: a user grammar first (so a user config overrides a
- * built-in), then a default one. */
+ * built-in), then a default one. A user grammar with no states cannot highlight
+ * (a color-only section whose state clone failed, or an empty definition), so it
+ * does not shadow the built-in. */
 static const Syntax *
 syn_reg_find(const char *name)
 {
 	int i = jsf_find(&g_user, name);
 
-	if (i >= 0)
+	if (i >= 0 && g_user.lang[i].nstates > 0)
 		return &g_user.syn[i];
 	i = jsf_find(&g_def, name);
 	if (i >= 0)
@@ -19904,16 +19908,18 @@ swap_recover(Editor *e, const char *path, Text *t, time_t orig_mtime)
 	    !swap_base_for(path, base, sizeof(base)))
 		return SWAP_NONE;
 	if (vf_read_file(jnl, &s, &n) != 0) {
-		Vstat bst;
+		Vstat jst, bst;
 
-		/* No journal, so no edits to recover. But a base (.swpf) left
-		 * beside the file by an interrupted session would otherwise be
-		 * ignored here and silently overwritten on the next edit. The
-		 * base alone is just the file as it was loaded, holding no
-		 * unsaved changes (those live in the journal), so there is
-		 * nothing to recover from it; report the leftover and offer to
-		 * clear it. */
-		if (g_vfs->stat(base, &bst) == 0 && bst.is_reg) {
+		/* The journal could not be read. Only when it is genuinely absent
+		 * is this a leftover base (.swpf) from an interrupted session,
+		 * which would otherwise be silently overwritten on the next edit.
+		 * The base alone is just the file as it was loaded, holding no
+		 * unsaved changes (those live in the journal), so there is nothing
+		 * to recover from it; report the leftover and offer to clear it. A
+		 * journal that exists but is unreadable (I/O error, permissions) is
+		 * left alone: its base is still the key to a later recovery. */
+		if (g_vfs->stat(jnl, &jst) != 0 &&
+		    g_vfs->stat(base, &bst) == 0 && bst.is_reg) {
 			key = dlg_prompt_key(e,
 			    "Leftover swap base, no journal "
 			    "(no changes to recover). (d)elete (k)eep? ");
@@ -41160,6 +41166,10 @@ term_loop_step(Editor *e)
 	}
 #endif
 	if (rc == 0) {				/* idle: drain/render, swap tick */
+		if (e->term_mseq_n > 0) {	/* a held ESC/partial: deliver it */
+			term_write(t, e->term_mseq, e->term_mseq_n);
+			e->term_mseq_n = 0;
+		}
 		if (e->term_dirty) {
 			ed_render(e, e->d);
 			e->term_dirty = 0;
@@ -41169,42 +41179,58 @@ term_loop_step(Editor *e)
 	}
 
 	n = scr_raw_take(e->d, raw, sizeof(raw));
+	if (n == 0 && e->term_mseq_n > 0) {	/* woke on output, no more input */
+		term_write(t, e->term_mseq, e->term_mseq_n);
+		e->term_mseq_n = 0;
+	}
 	for (i = 0; i < n; i++) {
 		unsigned char b = raw[i];
 
 		if (!e->term_prefix) {
-			/* Collecting a confirmed partial mouse CSI (ESC [ < ...)
-			 * from a previous byte: take digits and ';' until the
-			 * final M/m, then forward it to the child's grid. A byte
-			 * that cannot belong to the report flushes it raw. */
+			/* Collecting a possible SGR mouse report
+			 * (ESC [ < digits ; ... M|m) from the outer terminal,
+			 * validated one byte at a time. A completed report is
+			 * translated to the child's grid; a byte that cannot
+			 * continue the report flushes the buffered prefix to the
+			 * child raw and is then handled normally (so Ctrl-W and
+			 * other sequences are never swallowed). A partial left at
+			 * a read boundary is carried to the next read and, if no
+			 * more input follows, flushed on the idle tick, so a lone
+			 * ESC key is delivered rather than held. */
 			if (e->term_mseq_n > 0) {
-				e->term_mseq[e->term_mseq_n++] = (char)b;
-				if (b == 'M' || b == 'm') {
-					term_forward_mouse(e, t, in_pane,
-					    e->term_mseq, e->term_mseq_n);
-					e->term_mseq_n = 0;
-				} else if (!((b >= '0' && b <= '9') ||
-				    b == ';') ||
-				    e->term_mseq_n >= (int)sizeof(e->term_mseq)) {
-					term_write(t, e->term_mseq, e->term_mseq_n);
-					e->term_mseq_n = 0;
+				char c = (char)b;
+				int cont;
+
+				if (e->term_mseq_n == 1)
+					cont = c == '[';
+				else if (e->term_mseq_n == 2)
+					cont = c == '<';
+				else
+					cont = (c >= '0' && c <= '9') ||
+					    c == ';' || c == 'M' || c == 'm';
+				if (cont && e->term_mseq_n <
+				    (int)sizeof(e->term_mseq)) {
+					e->term_mseq[e->term_mseq_n++] = c;
+					if (c == 'M' || c == 'm') {
+						term_forward_mouse(e, t, in_pane,
+						    e->term_mseq,
+						    e->term_mseq_n);
+						e->term_mseq_n = 0;
+					}
+					continue;
 				}
-				continue;
+				/* diverged or overflowed: flush the buffered
+				 * prefix, then fall through to handle b */
+				term_write(t, e->term_mseq, e->term_mseq_n);
+				e->term_mseq_n = 0;
 			}
-			/* An outer SGR mouse report begins ESC [ < ; start
-			 * collecting it (only once confirmed, so a lone ESC key
-			 * is never held back). */
-			if (b == 0x1b && i + 2 < n && raw[i + 1] == '[' &&
-			    raw[i + 2] == '<') {
+			if (b == 0x1b) {	/* ESC: an SGR report may begin */
 				if (outn) {
 					term_write(t, out, outn);
 					outn = 0;
 				}
 				e->term_mseq[0] = '\033';
-				e->term_mseq[1] = '[';
-				e->term_mseq[2] = '<';
-				e->term_mseq_n = 3;
-				i += 2;			/* consumed [ and < */
+				e->term_mseq_n = 1;
 				continue;
 			}
 			if (b == 0x17) {	/* Ctrl-W: begin prefix */

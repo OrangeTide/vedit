@@ -2785,6 +2785,27 @@ t_jsf_color_only(Test *t)
 	syntax_load_cfg(&g_user, NULL);		/* clear for other tests */
 	vedit_cfg_free(c);
 	unlink(path);
+
+	/* a color-only section for a language with no built-in to inherit from
+	 * stays stateless, so it must not shadow: the resolver finds nothing
+	 * rather than an empty grammar that would highlight nothing. */
+	{
+		static const char *orphan =
+		    "[color \"nosuchlang\"]\n"
+		    "  keyword = 160\n";
+		char p2[256];
+		Cfg *c2 = load_cfg_text(orphan, p2, sizeof(p2));
+
+		TAP_ASSERT(t, c2 != NULL);
+		g_cfg = c2;
+		syntax_load_user(c2);
+		TAP_CHECK(t, jsf_find(&g_user, "nosuchlang") >= 0);	/* loaded */
+		TAP_CHECK(t, syn_for_ext("nosuchlang") == NULL);	/* not shadowing */
+		g_cfg = old;
+		syntax_load_cfg(&g_user, NULL);
+		vedit_cfg_free(c2);
+		unlink(p2);
+	}
 }
 
 /* A user grammar can embed one by name with a mid-line end string, matched

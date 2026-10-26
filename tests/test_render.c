@@ -1548,6 +1548,24 @@ t_swap_orphan_base(Test *t)
 	vedit_free(v);
 	memio_free(&m);
 
+	/* a journal that EXISTS but cannot be read (here a directory in its
+	 * place) is not an orphan: its base must be left for a later recovery,
+	 * so no prompt fires and the base is untouched even with no key queued */
+	plant_swap(path, "stale");
+	unlink(sp);
+	TAP_ASSERT(t, mkdir(sp, 0700) == 0);		/* unreadable as a file */
+	TAP_ASSERT(t, access(base, F_OK) == 0);
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	vedit_run(v);
+	TAP_CHECK(t, access(base, F_OK) == 0);		/* base kept, not deleted */
+	vedit_free(v);
+	memio_free(&m);
+	rmdir(sp);
+
 	unlink(base);
 	unlink(path);
 	rmdir(dir);
