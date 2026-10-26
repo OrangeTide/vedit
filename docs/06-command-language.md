@@ -106,6 +106,12 @@ span:
   macro.
 - `go POS` moves the cursor, and `go-file N` switches the focus to the Nth open
   file, the way the next-buffer key does.
+- `select REGION` makes a region the live on-screen selection: a line region
+  becomes a linewise selection, a rect a block one, a char run a plain one, and
+  the cursor lands at the far end. It is the counterpart of `selection`, which
+  reads the selection out, so one key can bracket a span as an anchored `region
+  ... mark a b` and a later key light it up as a real highlight. The region must
+  be in the current file.
 - `deselect` drops the selection, which a destructive verb over `selection` does
   not do on its own.
 
@@ -148,4 +154,12 @@ anchored region, even after the text in between has changed:
     bind = ^B { mark a [cursor] }
     bind = ^E { mark b [cursor] }
     bind = ^X { delete [region char mark a b] }
+```
+
+`select` turns that same anchored span into a visible highlight, so a key can
+show what the marks bracket before another key acts on it:
+
+```ini
+[keys "demo"]
+    bind = ^H { select [region char mark a b] }
 ```

@@ -28174,6 +28174,59 @@ bi_deselect(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return 0;
 }
 
+/* select REGION: make a region the live on-screen selection, so its highlight
+ * shows and a later verb with no argument acts on it. The kind sets the shape:
+ * a line region is a linewise selection, a rect a block selection, a char run a
+ * plain one. The cursor moves to the region's far end, where finishing a visual
+ * selection leaves it. This is the counterpart of [selection], which reads the
+ * selection out; together they let one key bracket a span (often as an anchored
+ * [region ... mark a b]) and a later key light it up as a real highlight. The
+ * region must be in the current file; one in another file is an error, so
+ * go-file there first. An anchored region resolves now, so the highlight sits
+ * where its marks are at this use, not tied to them as they move on. */
+static int
+bi_select(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	Editor *e = ev->e;
+	ClRegion r;
+
+	(void)result;
+	if (argc != 1 || argv[0].type != CLV_REGION) {
+		cle_err(ev, "select needs a region");
+		return -1;
+	}
+	if (cl_region_resolve(ev, &argv[0].reg, &r) < 0)
+		return -1;
+	if (r.buffer != CLB_CUR && r.buffer != CLB_FILE) {
+		cle_err(ev, "select: not a text region");
+		return -1;
+	}
+	if (r.file != e->cur) {
+		cle_err(ev, "select: region is in another file");
+		return -1;
+	}
+	jump_record(e);			/* remember where we left, for jump-back */
+	e->sel_active = 1;
+	e->vi_visual = (r.kind == CLK_LINE) ? 'V' : 0;
+	e->sel_block = (r.kind == CLK_RECT);
+	if (r.kind == CLK_LINE) {
+		e->ay = r.start.row;
+		e->ax = 0;
+		e->cy = r.end.row;
+		e->cx = 0;
+	} else {
+		/* A char end is exclusive and a rect end-column inclusive, which
+		 * is exactly what the plain and block highlights draw, so the two
+		 * corners go in as they are; vi_clamp would pull a line-end point
+		 * back one and shrink the span, so it is left alone. */
+		e->ay = r.start.row;
+		e->ax = r.start.col;
+		e->cy = r.end.row;
+		e->cx = r.end.col;
+	}
+	return 0;
+}
+
 /* to MOTION: the position a vi motion moves to from the cursor, as a Pos. It is
  * where the cursor would land, so it reads with go ("go [to word-end]") and
  * with a char region ("region char [cursor] [to word]"); a char region's end is
@@ -28754,6 +28807,7 @@ static const ClBuiltin cl_builtins[] = {
 	{ "region", bi_region },
 	{ "selection", bi_selection },
 	{ "block", bi_block },
+	{ "select", bi_select },
 	{ "deselect", bi_deselect },
 	{ "to", bi_to },
 	{ "span", bi_span },

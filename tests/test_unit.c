@@ -5344,6 +5344,83 @@ t_cl_block(Test *t)
 	g_cfg = old;
 }
 
+/* select REGION lights a region up as the live selection, so its kind sets the
+ * selection shape, the cursor lands at the far end, and reading [selection]
+ * back gives the same span. An anchored region drives it, so marks become a
+ * visible highlight. */
+static void
+t_cl_select(Test *t)
+{
+	const Cfg *old = g_cfg;
+	ClProg *p;
+	char err[64];
+	int i;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	e.t->owner = &e;
+	text_insert(e.t, 0, 0, "hello world", 11);
+	text_split(e.t, 0, 11); text_insert(e.t, 1, 0, "foo bar", 7);
+
+	/* an anchored char region a..b brackets "hello" (row 0, cols 0..5) */
+	vi_mark_set(&e, 0, 0, 0);
+	vi_mark_set(&e, 1, 0, 5);
+	p = cl_parse("select [region char mark a b]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.sel_active && e.vi_visual == 0 && !e.sel_block &&
+	    e.ay == 0 && e.ax == 0 && e.cy == 0 && e.cx == 5,
+	    "char sel a=%zu,%zu c=%zu,%zu vis=%d blk=%d",
+	    e.ay, e.ax, e.cy, e.cx, e.vi_visual, e.sel_block);
+	/* [selection] reads the same span back out */
+	p = cl_parse("copy [selection] [reg a]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[0].len == 5 &&
+	    memcmp(e.vi_regs[0].bytes, "hello", 5) == 0,
+	    "selection round-trip [%.*s]",
+	    (int)e.vi_regs[0].len, e.vi_regs[0].bytes);
+
+	/* a line region makes a linewise selection spanning rows 0..1 */
+	p = cl_parse("select [region line 1 2]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.sel_active && e.vi_visual == 'V' && !e.sel_block &&
+	    e.ay == 0 && e.cy == 1, "line sel a=%zu c=%zu vis=%d",
+	    e.ay, e.cy, e.vi_visual);
+
+	/* a rect region makes a block selection with inclusive corners */
+	p = cl_parse("select [region rect [pos 1 1] [pos 2 3]]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.sel_active && e.sel_block && e.vi_visual == 0 &&
+	    e.ay == 0 && e.ax == 0 && e.cy == 1 && e.cx == 2,
+	    "rect sel a=%zu,%zu c=%zu,%zu blk=%d",
+	    e.ay, e.ax, e.cy, e.cx, e.sel_block);
+
+	/* a non-text value (the clipboard) is an error and leaves the selection */
+	e.sel_active = 0;
+	p = cl_parse("select $clip", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECK(t, e.sel_active == 0);
+
+	for (i = 0; i < 26; i++)
+		free(e.vi_regs[i].bytes);
+	free(e.clip);
+	free(e.jumps);		/* select records a jump-back origin */
+	text_free(e.t);
+	g_cfg = old;
+}
+
 /* An anchored region names its endpoints by mark, so it tracks edits: a region
  * set up before an edit still spans the right text after lines move. */
 static void
@@ -5567,6 +5644,7 @@ const Case tap_cases[] = {
 	{ "cl_motion", t_cl_motion },
 	{ "cl_selection", t_cl_selection },
 	{ "cl_block", t_cl_block },
+	{ "cl_select", t_cl_select },
 	{ "cl_anchored", t_cl_anchored },
 	{ "cl_anchored_xfile", t_cl_anchored_xfile },
 	{ "mark_track", t_mark_track },
