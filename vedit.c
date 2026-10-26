@@ -8447,6 +8447,7 @@ typedef struct editor {
 	int		tbl_on;		/* table.view: open .csv/.tsv files as a table */
 	int		tbl_header;	/* table.header: line 1 is a header row */
 	int		tbl_width;	/* table.width: default column width; 0 = built-in */
+	int		tbl_formulas;	/* table.formulas: a cell starting '=' is a formula */
 	UiFrame		ui_stack[UI_STACK_MAX];	/* active modal frames; empty = editor focus */
 	int		ui_depth;	/* number of frames on ui_stack */
 } Editor;
@@ -13514,6 +13515,25 @@ hex_render(Editor *e, Screen *d)
 }
 #endif /* !VEDIT_NO_HEX */
 
+/* The expression evaluator's value and environment, defined here so the table
+ * formulas and the command language's expr verb both see them; the evaluator
+ * itself is defined further down. An ExprEnv gives names and functions their
+ * meaning through its callbacks. */
+typedef struct expr_val {
+	double	num;
+} ExprVal;
+
+typedef struct expr_env {
+	void	*ctx;
+	int	(*lookup)(void *ctx, const char *name, ExprVal *out);
+	int	(*call)(void *ctx, const char *fn, int argc, const ExprVal *argv,
+		    ExprVal *out);
+} ExprEnv;
+
+static int expr_eval(const char *src, const ExprEnv *env, ExprVal *out,
+    char *err, size_t errlen);
+static void expr_format(double v, char *buf, size_t n);
+
 /****************************************************************
  * Table view: CSV and TSV as a grid of cells
  *
@@ -14109,6 +14129,153 @@ tbl_cell_value(const Editor *e, size_t row, int col, char *buf, size_t n)
 	tbl_unquote(&f, s, buf, n);
 }
 
+/****************************************************************
+ * Table formulas
+ *
+ * A cell whose text begins with '=' is a formula over the shared expression
+ * evaluator. References are A1-style (the column label the grid shows, the row
+ * the gutter shows), so A1 is column A of line 1. The file stays plain CSV: the
+ * formula is stored as its '=' text and the grid shows the computed value. The
+ * recalc is recompute-on-read: a referenced cell is evaluated when a formula
+ * reads it, with a visiting stack to catch cycles. Phase B first cut: numbers
+ * only, single-cell references, no A1:B3 ranges yet (see
+ * docs/design/expr-and-spreadsheet.md).
+ ****************************************************************/
+
+#define TBL_FORMULA_DEPTH 64	/* deepest reference chain before it is a cycle */
+
+/* The state threaded through one cell's evaluation: the editor, the chain of
+ * cells currently being evaluated (to catch a cycle), and the error code to
+ * show when a reference cannot be resolved. */
+typedef struct tbl_eval {
+	const Editor	*e;
+	long		 visiting[TBL_FORMULA_DEPTH];
+	int		 nvis;
+	char		 err[8];	/* "#REF!", "#CYCLE!", "#DIV/0!", "#ERR!" */
+} TblEval;
+
+static int tbl_cell_num(TblEval *tv, size_t row, int col, double *out);
+static int tbl_ref_lookup(void *ctx, const char *name, ExprVal *out);
+
+/* Evaluate the formula text (the part after '=') of cell (row, col) to a
+ * number. Pushes the cell on the visiting chain so a reference back to it is a
+ * cycle. Returns 0, or -1 with tv->err set. */
+static int
+tbl_formula_num(TblEval *tv, size_t row, int col, const char *expr, double *out)
+{
+	long id = ((long)row << 20) | (col & 0xfffff);
+	ExprEnv env;
+	ExprVal ov;
+	char err[64];
+	int i;
+
+	for (i = 0; i < tv->nvis; i++)
+		if (tv->visiting[i] == id) {
+			snprintf(tv->err, sizeof(tv->err), "#CYCLE!");
+			return -1;
+		}
+	if (tv->nvis >= TBL_FORMULA_DEPTH) {
+		snprintf(tv->err, sizeof(tv->err), "#CYCLE!");
+		return -1;
+	}
+	tv->visiting[tv->nvis++] = id;
+	env.ctx = tv;
+	env.lookup = tbl_ref_lookup;
+	env.call = NULL;
+	if (expr_eval(expr, &env, &ov, err, sizeof(err)) < 0) {
+		tv->nvis--;
+		if (tv->err[0] == '\0') {	/* not already a #REF!/#CYCLE! */
+			snprintf(tv->err, sizeof(tv->err), "%s",
+			    strstr(err, "division by zero") ? "#DIV/0!" :
+			    "#ERR!");
+		}
+		return -1;
+	}
+	tv->nvis--;
+	*out = ov.num;
+	return 0;
+}
+
+/* The formula name resolver: a name like B12 is a cell reference. Its value is
+ * the referenced cell's number, computed if that cell is itself a formula. A
+ * malformed or out-of-range reference is #REF!. */
+static int
+tbl_ref_lookup(void *ctx, const char *name, ExprVal *out)
+{
+	TblEval *tv = ctx;
+	char colpart[TBL_LABEL_MAX];
+	char *endp;
+	long row;
+	int i = 0, col;
+	double v;
+
+	while (name[i] && isalpha((unsigned char)name[i]) &&
+	    i + 1 < (int)sizeof(colpart)) {
+		colpart[i] = name[i];
+		i++;
+	}
+	colpart[i] = '\0';
+	col = i ? tbl_label_col(colpart) : -1;
+	row = isdigit((unsigned char)name[i]) ? strtol(name + i, &endp, 10) : 0;
+	if (col < 0 || row < 1 || !isdigit((unsigned char)name[i]) ||
+	    *endp != '\0') {
+		snprintf(tv->err, sizeof(tv->err), "#REF!");
+		return -1;
+	}
+	if (tbl_cell_num(tv, (size_t)(row - 1), col, &v) < 0)
+		return -1;		/* tv->err set by the nested call */
+	out->num = v;
+	return 0;
+}
+
+/* The numeric value of cell (row, col): a formula is computed, a number is
+ * itself, and an empty or non-numeric cell is zero. Returns 0, or -1 with
+ * tv->err set. */
+static int
+tbl_cell_num(TblEval *tv, size_t row, int col, double *out)
+{
+	char cell[256], *endp;
+	const char *s;
+	double d;
+
+	if (col < 0 || col >= tv->e->tbl->ncols || row >= text_lines(tv->e->t)) {
+		snprintf(tv->err, sizeof(tv->err), "#REF!");
+		return -1;
+	}
+	tbl_cell_value(tv->e, row, col, cell, sizeof(cell));
+	if (cell[0] == '=')
+		return tbl_formula_num(tv, row, col, cell + 1, out);
+	for (s = cell; *s == ' '; s++)
+		;
+	if (*s == '\0') {			/* empty reads as zero */
+		*out = 0;
+		return 0;
+	}
+	d = strtod(s, &endp);
+	while (*endp == ' ')
+		endp++;
+	*out = (endp == s || *endp != '\0') ? 0 : d;	/* text reads as zero */
+	return 0;
+}
+
+/* If cell (row, col) in buf is a formula and formulas are on, replace buf with
+ * its computed value (or an error code). Otherwise leave buf as it is. */
+static void
+tbl_cell_display(const Editor *e, size_t row, int col, char *buf, size_t n)
+{
+	TblEval tv;
+	double v;
+
+	if (!e->tbl_formulas || buf[0] != '=')
+		return;
+	memset(&tv, 0, sizeof(tv));
+	tv.e = e;
+	if (tbl_formula_num(&tv, row, col, buf + 1, &v) < 0)
+		snprintf(buf, n, "%s", tv.err[0] ? tv.err : "#ERR!");
+	else
+		expr_format(v, buf, n);
+}
+
 /* Row-number gutter width: the digits of the line count, at least two, plus
  * a space. */
 static int
@@ -14262,6 +14429,7 @@ tbl_render(Editor *e, Screen *d)
 			if (row == e->cy && c == tb->cx)
 				at |= ATTR_REVERSE;
 			tbl_cell_value(e, row, c, buf, sizeof(buf));
+			tbl_cell_display(e, row, c, buf, sizeof(buf));
 			tbl_paint_cell(d, y, x0 + x, w, buf, p->content_fg,
 			    p->content_bg, at);
 			x += w + 1;
@@ -14939,6 +15107,16 @@ tbl_cell_status(const Editor *e, char *buf, size_t n)
 	for (i = 0; val[i]; i++)
 		if ((unsigned char)val[i] < 0x20)
 			val[i] = ' ';
+	if (e->tbl_formulas && val[0] == '=') {	/* show source = computed */
+		char got[sizeof(val)];
+
+		snprintf(got, sizeof(got), "%s", val);
+		tbl_cell_display(e, e->cy, e->tbl->cx, got, sizeof(got));
+		snprintf(buf, n, "-- TABLE --  %s%zu: %.70s = %.24s",
+		    tbl_label(e->tbl->cx, label, sizeof(label)), e->cy + 1,
+		    val, got);
+		return;
+	}
 	snprintf(buf, n, "-- TABLE --  %s%zu: %s",
 	    tbl_label(e->tbl->cx, label, sizeof(label)), e->cy + 1, val);
 }
@@ -29697,17 +29875,6 @@ bi_for(ClEval *ev, int argc, ClVal *argv, ClVal *result)
  * only the GUI build links, so it offers only functions that need none.
  ****************************************************************/
 
-typedef struct expr_val {
-	double	num;
-} ExprVal;
-
-typedef struct expr_env {
-	void	*ctx;
-	int	(*lookup)(void *ctx, const char *name, ExprVal *out);
-	int	(*call)(void *ctx, const char *fn, int argc, const ExprVal *argv,
-		    ExprVal *out);
-} ExprEnv;
-
 enum {
 	ETK_END, ETK_NUM, ETK_IDENT,
 	ETK_PLUS, ETK_MINUS, ETK_STAR, ETK_SLASH, ETK_PCT,
@@ -30112,6 +30279,17 @@ expr_eval(const char *src, const ExprEnv *env, ExprVal *out, char *err,
 	return 0;
 }
 
+/* Format an expression result as text: an integer when it is whole, otherwise a
+ * trimmed decimal. Shared by the expr verb and the table formulas. */
+static void
+expr_format(double v, char *buf, size_t n)
+{
+	if (v == (double)(long)v && v >= -9e18 && v <= 9e18)
+		snprintf(buf, n, "%ld", (long)v);
+	else
+		snprintf(buf, n, "%.12g", v);
+}
+
 /****************************************************************
  * Command-language builtins, continued
  ****************************************************************/
@@ -30155,7 +30333,6 @@ bi_expr(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	ExprVal out;
 	char err[160];
 	size_t n = 0;
-	double v;
 	int i;
 
 	if (argc < 1) {
@@ -30189,11 +30366,7 @@ bi_expr(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		cle_err(ev, "expr: %.120s", err);
 		return -1;
 	}
-	v = out.num;
-	if (v == (double)(long)v && v >= -9e18 && v <= 9e18)
-		snprintf(rbuf, sizeof(rbuf), "%ld", (long)v);
-	else
-		snprintf(rbuf, sizeof(rbuf), "%.12g", v);
+	expr_format(out.num, rbuf, sizeof(rbuf));
 	return cl_result_str(ev, result, rbuf);
 }
 
@@ -34479,6 +34652,7 @@ editor_init(Editor *e)
 	e->art_on = 1;		/* .ans files open in the art view */
 	e->tbl_on = 1;		/* .csv/.tsv files open in the table view */
 	e->tbl_header = 1;
+	e->tbl_formulas = 1;	/* a cell starting with '=' is a formula */
 	kb_config(e);		/* the built-in F2 cycle; config may replace it */
 }
 
@@ -36211,6 +36385,7 @@ ed_apply_config(Editor *e)
 	e->tbl_on = cfg_bool(g_cfg, "table.view", e->tbl_on);
 	e->tbl_header = cfg_bool(g_cfg, "table.header", e->tbl_header);
 	e->tbl_width = cfg_int_range(g_cfg, "table.width", e->tbl_width, 0, TBL_WIDTH_MAX);
+	e->tbl_formulas = cfg_bool(g_cfg, "table.formulas", e->tbl_formulas);
 #endif
 	e->shiftwidth = cfg_int_range(g_cfg, "edit.shiftwidth", e->shiftwidth, 0, 32);
 	e->textwidth = cfg_int_range(g_cfg, "edit.textwidth", e->textwidth, 0, TEXTWIDTH_MAX);

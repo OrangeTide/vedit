@@ -4481,6 +4481,88 @@ t_tbl_join(Test *t)
 	text_free(tx);
 }
 
+/* Compute the display of cell (row, col) of a just-attached table into buf. */
+static void
+tbl_disp(Editor *e, size_t row, int col, char *buf, size_t n)
+{
+	tbl_cell_value(e, row, col, buf, n);
+	tbl_cell_display(e, row, col, buf, n);
+}
+
+/* A cell beginning '=' is a formula over the shared evaluator: references name
+ * other cells (A1 is column A, row 1), formulas chain, and the grid shows the
+ * computed value while the buffer keeps the '=' text. Errors show as codes. */
+static void
+t_tbl_formula(Test *t)
+{
+	static const char *const L[] = {
+		"10,20,=A1+B1", "=A1*2,=C1,=A2+1", "=1/0,=B1+Q9,=A3" };
+	Editor e;
+	char buf[64];
+
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, L, 3);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+
+	/* references and arithmetic: C1 = A1 + B1 = 30 */
+	tbl_disp(&e, 0, 2, buf, sizeof(buf));
+	TAP_CHECKF(t, strcmp(buf, "30") == 0, "C1 -> %s", buf);
+	/* a formula reading a literal cell: A2 = A1 * 2 = 20 */
+	tbl_disp(&e, 1, 0, buf, sizeof(buf));
+	TAP_CHECKF(t, strcmp(buf, "20") == 0, "A2 -> %s", buf);
+	/* a formula reading another formula: B2 = C1 = 30 */
+	tbl_disp(&e, 1, 1, buf, sizeof(buf));
+	TAP_CHECKF(t, strcmp(buf, "30") == 0, "B2 -> %s", buf);
+	/* a chain: C2 = A2 + 1 = 21 */
+	tbl_disp(&e, 1, 2, buf, sizeof(buf));
+	TAP_CHECKF(t, strcmp(buf, "21") == 0, "C2 -> %s", buf);
+
+	/* a literal cell is shown as itself */
+	tbl_disp(&e, 0, 0, buf, sizeof(buf));
+	TAP_CHECK(t, strcmp(buf, "10") == 0);
+
+	/* errors: division by zero, an out-of-range reference */
+	tbl_disp(&e, 2, 0, buf, sizeof(buf));
+	TAP_CHECKF(t, strcmp(buf, "#DIV/0!") == 0, "A3 -> %s", buf);
+	tbl_disp(&e, 2, 1, buf, sizeof(buf));	/* Q9 is out of range */
+	TAP_CHECKF(t, strcmp(buf, "#REF!") == 0, "B3 -> %s", buf);
+
+	/* with formulas off, the '=' text shows literally */
+	e.tbl_formulas = 0;
+	tbl_disp(&e, 0, 2, buf, sizeof(buf));
+	TAP_CHECK(t, strcmp(buf, "=A1+B1") == 0);
+
+	tbl_detach(&e);
+	text_free(e.t);
+}
+
+/* A reference cycle is caught and shown as #CYCLE!, not a hang or a crash. */
+static void
+t_tbl_formula_cycle(Test *t)
+{
+	static const char *const L[] = { "=B1,=A1,=C1" };	/* A1->B1->A1 */
+	Editor e;
+	char buf[64];
+
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, L, 1);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+
+	tbl_disp(&e, 0, 0, buf, sizeof(buf));
+	TAP_CHECKF(t, strcmp(buf, "#CYCLE!") == 0, "A1 -> %s", buf);
+	tbl_disp(&e, 0, 2, buf, sizeof(buf));	/* C1 = C1 is a self-cycle */
+	TAP_CHECKF(t, strcmp(buf, "#CYCLE!") == 0, "C1 -> %s", buf);
+
+	tbl_detach(&e);
+	text_free(e.t);
+}
+
 /* The non-vi motion layer maps a position to where a modeless motion lands,
  * without touching the editor cursor. Left and right step by rune and wrap
  * across line ends; up and down clamp the column to the target line; the
@@ -6370,6 +6452,8 @@ const Case tap_cases[] = {
 	{ "tbl_label", t_tbl_label },
 	{ "tbl_sniff", t_tbl_sniff },
 	{ "tbl_join", t_tbl_join },
+	{ "tbl_formula", t_tbl_formula },
+	{ "tbl_formula_cycle", t_tbl_formula_cycle },
 	{ "swap_paths", t_swap_paths },
 	{ "atomic_save", t_atomic_save },
 	{ "save_rodir_fallback", t_save_rodir_fallback },

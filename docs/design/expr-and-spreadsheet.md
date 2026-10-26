@@ -1,11 +1,14 @@
 # Expression evaluator and the spreadsheet: design note
 
-Status: Phase A implemented, Phase B planned. The standalone `expr_*` evaluator
-and the command-language `expr` verb are built (`vedit.c`, the Expression
-evaluator section); the `env` seam, `EVAL`, and the spreadsheet engine are not.
-This note records the design for two features that share one piece: an
-arithmetic `expr` for the command language, and formulas for the CSV/TSV table
-view. The shared piece is an expression
+Status: Phase A and a first cut of Phase B implemented. The standalone `expr_*`
+evaluator, the command-language `expr` verb, and the table view's formulas are
+built (`vedit.c`, the Expression evaluator and Table formulas sections). The
+formula cut is numbers only, single-cell references, recompute-on-read with a
+visiting stack for cycles; `A1:B3` ranges, string and error value variants in
+`ExprVal`, incremental recalc, reference adjustment on row and column edits, and
+`EVAL` are not built yet. This note records the design for two features that
+share one piece: an arithmetic `expr` for the command language, and formulas for
+the CSV/TSV table view. The shared piece is an expression
 evaluator. The point of writing this before building `expr` is to give the
 evaluator the right seam from the start, so the later spreadsheet engine reuses
 it instead of growing a second parser. It is an engineering document, not user
@@ -181,10 +184,13 @@ language (whose values are `long` today through `clv_arg_int`) and the sheet
   and unblocks `while` counters and computed arguments. `ExprVal` is numeric
   only for now; the string and error variants arrive with Phase B. The built-in
   functions are libm-free on purpose, since only the GUI build links libm.
-- Phase B: the spreadsheet. The `=` convention, the value cache in `Tbl`, the
-  cell and range resolver, the sheet functions, recompute-all with cycle
-  detection, a formula bar, error values, and `EVAL` with the restricted formula
-  context.
+- Phase B (first cut done): the spreadsheet. The `=` convention, a cell resolver
+  (`tbl_ref_lookup`) over A1 references, recompute-on-read with a visiting stack
+  for cycles (`tbl_formula_num`), error values, and the source-and-value status
+  line. Numbers only, single-cell references. Still to come: a value cache, the
+  `A1:B3` range resolver and range functions, incremental recalc, reference
+  adjustment on row and column edits, string formulas, and `EVAL` with the
+  restricted formula context.
 - Gating. `expr_*` stays ungated and small, so the `expr` verb works in builds
   without the table, and the table works without arithmetic. The spreadsheet
   engine stays behind `VEDIT_TABLE`.

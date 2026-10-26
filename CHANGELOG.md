@@ -53,6 +53,11 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
   `abs`, `int`, `mod`, `min`, and `max`, so a loop can advance a counter with
   `set i [expr $i + 1]`. The evaluator is standalone, ready to serve a future
   spreadsheet formula engine (see `docs/design/expr-and-spreadsheet.md`).
+- The table view evaluates formulas. A cell starting with `=` is an arithmetic
+  expression over A1-style cell references, shown computed in the grid while the
+  file keeps the `=` text as plain CSV. Errors show as `#DIV/0!`, `#REF!`,
+  `#CYCLE!`, or `#ERR!`. The `table.formulas` config turns it off. Ranges
+  (`A1:B3`) are not supported yet.
 - The command language gains a `menu TITLE LABEL BODY ...` verb: it lists the
   labels and runs the chosen entry's program, so a keymap can build its own menu
   with no change to the editor.

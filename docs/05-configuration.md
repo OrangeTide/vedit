@@ -269,6 +269,7 @@ The `[art]` keys apply to a build with terminals.
 | `table.view` | `on` | open `.csv`, `.tsv`, and `.tab` files in the table view |
 | `table.header` | `on` | line 1 is a frozen header row |
 | `table.width` | `10` | the default column width, 1 to 200; 0 means 10 |
+| `table.formulas` | `on` | a cell starting with `=` is a formula, shown computed |
 
 ### `[syntax]`, `[gitcommit]`, `[color]`, `[words]`, `[state]`: highlighting
 

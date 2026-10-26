@@ -152,6 +152,20 @@ A search starts from the current cell and the grid follows the match as
 you type. `:cell C7` moves to column C, row 7; `:cell C` or `:cell 7`
 moves one way only.
 
+A cell whose text starts with `=` is a formula. The grid shows the computed
+value, while the file keeps the `=` text, so a file with formulas is still
+plain CSV that other tools read. A formula is an arithmetic expression (the same
+one the command language's `expr` verb evaluates, chapter 6) over cell
+references: `A1` is column A, row 1, the labels the grid shows. So `=B2*C2`
+multiplies two cells and `=(A1+A2)/2` averages two. A formula may read a cell
+that is itself a formula. When a value cannot be computed the cell shows a code:
+`#DIV/0!` for division by zero, `#REF!` for a reference outside the table,
+`#CYCLE!` when formulas depend on each other in a loop, and `#ERR!` for anything
+else. The status line shows a formula cell as its source and its value,
+`C7: =B2*C2 = 12`, and editing a cell edits the `=` text. Ranges such as
+`A1:B3` are not supported yet. Set `table.formulas = off` for a file that uses a
+leading `=` as literal text.
+
 `:rowadd [N]` inserts N blank rows above the cursor row and `:rowadd! [N]`
 below it. `:rowdel [N]` deletes N rows from the cursor. `:coladd [N]` inserts N empty columns
 left of the cursor column, `:coladd! [N]` right of it, and `:coldel [N]`
@@ -170,7 +184,8 @@ Other commands:
   cell, and `:colwidth fit all` or Edit > Fit Column Widths fits them all.
   The default width is 10.
 
-Config: `table.view`, `table.header`, `table.width` (chapter 5). A record
+Config: `table.view`, `table.header`, `table.width`, `table.formulas`
+(chapter 5). A record
 longer than 64 lines is left as separate lines and reported, so one stray
 quote cannot swallow the rest of the file.
 
