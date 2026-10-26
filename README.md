@@ -11,6 +11,35 @@ desktop without a terminal.
 
 ![Editing a C file, with syntax highlighting and the MS-EDIT chrome](docs/shot-edit.png)
 
+## What it does
+
+- **Two key personalities, one editor.** The MS-EDIT modeless keys and a full
+  vi mode, switched with F2. A config file adds its own modes, which join the
+  same F2 cycle as equals; WordStar and Emacs layouts ship as examples.
+- **Syntax highlighting** for C, shell, JavaScript, HTML, Markdown, INI, diffs,
+  git commits, and git blame, from a small FSM grammar you can extend.
+- **Color themes** for the whole editor, the chrome and the syntax together, in
+  16 or 256 colors. A theme can recolor the built-in languages in a few lines,
+  and a spooky Halloween theme ships as an example (`examples/halloween.conf`).
+- **Many files at once**, a file browser, two side-by-side panes, every line
+  ending, and large files opened by memory-mapping rather than reading in full.
+- **Crash recovery** from a journal kept beside the file, plus an Emacs-style
+  lock so two editors warn about each other.
+- **A command language**: a key binding can run a small program over typed
+  positions, regions, registers, and marks, reaching across open files.
+- **Other views** of the same buffer: a box-drawing draw mode, colored ANSI
+  text art, CSV and TSV tables, and a hex dump.
+- **Embedded terminals**: run a shell or a command in a buffer or the pane, with
+  the mouse passed through to programs that ask for it.
+- **A Maildir mail reader** with reply and reply-all, attachments, and RFC 2047
+  encoded headers.
+- **Mouse support** throughout: text, scrollbars, menus, dialogs, the hex and
+  table views, and terminal programs.
+- **Build, make, and run** your code from the editor, jumping to the first
+  error, with tags and version-control integration alongside.
+
+![The same C file under the example Halloween theme](docs/shot-theme.png)
+
 ## Building
 
 The only requirement is a C11 compiler on a POSIX system, or mingw-w64 for

@@ -274,6 +274,17 @@ cd "$work"
 # keystroke, so the status line keeps its pristine "Press F1 for help" hint.
 render "$here/shot-edit.png" ring.c
 
+# The same file under the example Halloween theme (examples/halloween.conf):
+# pumpkin keywords, green strings, and purple types over a dark grey chrome,
+# with the 256-palette colors the theme reaches for.
+cat > "$work/veditrc-spooky" <<EOF
+[include]
+    path = $here/../examples/halloween.conf
+[command "c"]
+    compile = cc -Wall -c \$(filename)
+EOF
+VEDIT_CONFIG=$work/veditrc-spooky render "$here/shot-theme.png" ring.c
+
 # The same file with the Edit menu dropped (Alt+E).
 render "$here/shot-menu.png" ring.c ctrl+Home alt+e
 
