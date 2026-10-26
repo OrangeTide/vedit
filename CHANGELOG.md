@@ -30,6 +30,9 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
   mode, swap files, reflow, themes, tags, the table view, and syntax
   highlighting; the text editor, the vi keys, and search stay in.
 - The file browser's `File:` line expands a leading `~` to the home directory.
+- The file browser shows a clickable breadcrumb bar of the current directory's
+  path. It shows at most the five deepest levels, each capped at ten columns
+  (truncated with an ellipsis), and clicking a segment changes into it.
 
 ### Changed
 - View and mode key dispatch is centralized, and the grid-view render path is

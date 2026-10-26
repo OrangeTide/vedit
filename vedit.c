@@ -16518,10 +16518,21 @@ struct picksrc {
 	int		 (*key)(void *ctx, int i, uint32_t ch);
 	/* Optional hint for the bottom border, such as the keys. */
 	const char	*(*footer)(void *ctx);
+	/* Optional clickable breadcrumb bar under the title: crumb_count
+	 * segments from the outermost to the current one, crumb_label(i) the
+	 * text of segment i, and crumb_click(i) navigates to it and returns the
+	 * choose() tri-state. The panel shows at most the deepest five segments,
+	 * each capped at ten columns. */
+	int		 (*crumb_count)(void *ctx);
+	const char	*(*crumb_label)(void *ctx, int i);
+	int		 (*crumb_click)(void *ctx, int i);
 	/* Draw the title as a powerline tab (arrow end-caps) when the terminal
 	 * has the glyphs and the powerline status style is on. */
 	int		 pl_frame;
 };
+
+/* The most breadcrumb segments the panel draws. */
+#define PICK_CRUMB_MAX 5
 
 typedef struct picker {
 	const Picksrc	*src;
@@ -16531,6 +16542,10 @@ typedef struct picker {
 	int		 listy;		/* first list row on screen (set by draw) */
 	int		 focus;		/* 0 list, 1 entry */
 	int		 ecurx;		/* entry cursor column on screen (set by draw) */
+	int		 entryy;	/* entry line row on screen (set by draw) */
+	int		 crumby;	/* breadcrumb row on screen, or -1 (set by draw) */
+	int		 crumb_nhit;	/* breadcrumb segments drawn (set by draw) */
+	struct { int x0, x1, idx; } crumb_hit[PICK_CRUMB_MAX];
 	int		 result;	/* 1 chosen, 0 cancelled (set by the key cb) */
 	char		 entry[PATH_MAX];
 } Picker;
@@ -16595,6 +16610,35 @@ pick_fit(char *dst, size_t dstsz, const char *src, int w)
 		col += cw;
 	}
 	dst[di] = '\0';
+	return col;
+}
+
+/* Copy src into dst to at most w display columns. When src does not fit, the
+ * tail is replaced by an ellipsis ("…" when utf8, "..." otherwise) so the whole
+ * string stays within w. Returns the columns used. */
+static int
+pick_fit_crumb(int utf8, char *dst, size_t dstsz, const char *src, int w)
+{
+	const char *ell = utf8 ? "\xe2\x80\xa6" : "...";
+	int ellw = utf8 ? 1 : 3;
+	int keep, col;
+	size_t di;
+
+	if (w <= 0) {
+		dst[0] = '\0';
+		return 0;
+	}
+	if (disp_cols(src, strlen(src)) <= w)
+		return pick_fit(dst, dstsz, src, w);
+	keep = w - ellw;
+	if (keep < 0)
+		keep = 0;
+	col = pick_fit(dst, dstsz, src, keep);
+	di = strlen(dst);
+	if (di + strlen(ell) + 1 <= dstsz) {
+		memcpy(dst + di, ell, strlen(ell) + 1);
+		col += ellw;
+	}
 	return col;
 }
 
@@ -16675,9 +16719,48 @@ pick_draw(Editor *e, const Modal *m, void *ctx)
 	}
 
 	row = m->y + 1;
+	pk->crumby = -1;
+	pk->crumb_nhit = 0;
+	if (src->crumb_count) {
+		int total = src->crumb_count(src->ctx);
+		int start = total > PICK_CRUMB_MAX ? total - PICK_CRUMB_MAX : 0;
+		int right = m->x + m->w - 2;	/* one past the last interior col */
+		int utf8 = d->t->box_mode == VEDIT_BOX_UTF8;
+		uint32_t sep = utf8 ? 0x203a : '>';	/* '›' between segments */
+		int cx = listx, ci;
+
+		scr_fill(d, row, m->x + 1, m->w - 2, ' ', m->fg, m->bg, m->base);
+		pk->crumby = row;
+		for (ci = start; ci < total && cx < right; ci++) {
+			const char *name = src->crumb_label(src->ctx, ci);
+			int avail, nx;
+
+			if (ci > start) {		/* a separator between segments */
+				scr_cell(d, row, cx, sep, m->fg, m->bg, m->base);
+				if (++cx >= right)
+					break;
+			}
+			avail = right - cx;
+			if (avail > 10)
+				avail = 10;
+			pick_fit_crumb(utf8, buf, sizeof(buf),
+			    (name && name[0]) ? name : "/", avail);
+			nx = scr_text(d, row, cx, buf, m->fg, m->bg,
+			    m->base | ATTR_UNDERLINE);
+			if (pk->crumb_nhit < PICK_CRUMB_MAX && nx > cx) {
+				pk->crumb_hit[pk->crumb_nhit].x0 = cx;
+				pk->crumb_hit[pk->crumb_nhit].x1 = nx - 1;
+				pk->crumb_hit[pk->crumb_nhit].idx = ci;
+				pk->crumb_nhit++;
+			}
+			cx = nx;
+		}
+		row++;
+	}
 	if (src->entry_label) {
 		int lw, avail, used, eoff;
 
+		pk->entryy = row;
 		scr_fill(d, row, m->x + 1, m->w - 2, ' ', m->fg, m->bg, m->base);
 		lw = scr_text(d, row, listx, src->entry_label,
 		    m->fg, m->bg, m->base);
@@ -16728,7 +16811,7 @@ pick_draw(Editor *e, const Modal *m, void *ctx)
 		}
 	}
 	if (pk->focus == 1 && src->entry_label) {
-		scr_cursor(d, m->y + 1, pk->ecurx);	/* kept within the field */
+		scr_cursor(d, pk->entryy, pk->ecurx);	/* kept within the field */
 		scr_cursor_vis(d, 1);
 	} else {
 		scr_cursor_vis(d, 0);
@@ -16795,7 +16878,19 @@ pick_key(Editor *e, const Modal *m, const Event *ev, void *ctx)
 		}
 		if (!press)
 			return 0;
-		if (src->entry_label && k->y == m->y + 1) {
+		if (pk->crumby >= 0 && k->y == pk->crumby) {
+			int ci;
+
+			for (ci = 0; ci < pk->crumb_nhit; ci++)
+				if (k->x >= pk->crumb_hit[ci].x0 &&
+				    k->x <= pk->crumb_hit[ci].x1) {
+					act = src->crumb_click(src->ctx,
+					    pk->crumb_hit[ci].idx);
+					goto resolve;
+				}
+			return 0;
+		}
+		if (src->entry_label && k->y == pk->entryy) {
 			pk->focus = 1;		/* click the entry line */
 			return 0;
 		}
@@ -16948,6 +17043,8 @@ dlg_pick(Editor *e, const Picksrc *src)
 	boxh = n + 2;				/* list rows + top/bottom border */
 	if (src->entry_label)
 		boxh += 2;			/* entry line + separator */
+	if (src->crumb_count)
+		boxh += 1;			/* breadcrumb bar */
 	if (boxh < 7)
 		boxh = 7;
 	if (boxh > e->rows - 2)
@@ -25999,6 +26096,73 @@ filepick_submit(void *ctx, const char *text)
 	return PICK_DONE;
 }
 
+/* Walk the components of fp->dir. Component 0 is the root "/", then each path
+ * element in turn. Returns the total count. When idx is in range, name (if
+ * non-NULL) gets that component's display text and path (if non-NULL) gets the
+ * absolute path up to and including it, for a chdir. */
+static int
+filepick_crumbs(const Filepick *fp, int idx, char *name, size_t namesz,
+    char *path, size_t pathsz)
+{
+	const char *s = fp->dir;
+	size_t i, len = strlen(s);
+	int c = 0;
+
+	if (c == idx) {				/* the root itself */
+		if (name)
+			snprintf(name, namesz, "/");
+		if (path)
+			snprintf(path, pathsz, "/");
+	}
+	c++;
+	for (i = 1; i < len; ) {
+		size_t start = i;
+
+		while (i < len && s[i] != '/')
+			i++;
+		if (c == idx) {
+			if (name)
+				snprintf(name, namesz, "%.*s",
+				    (int)(i - start), s + start);
+			if (path)
+				snprintf(path, pathsz, "%.*s", (int)i, s);
+		}
+		c++;
+		if (i < len)			/* step over the '/' */
+			i++;
+	}
+	return c;
+}
+
+static int
+filepick_crumb_count(void *ctx)
+{
+	return filepick_crumbs(ctx, -1, NULL, 0, NULL, 0);
+}
+
+static const char *
+filepick_crumb_label(void *ctx, int i)
+{
+	static char name[PATH_MAX];	/* the panel draws it before the next call */
+
+	name[0] = '\0';
+	filepick_crumbs(ctx, i, name, sizeof(name), NULL, 0);
+	return name;
+}
+
+static int
+filepick_crumb_click(void *ctx, int i)
+{
+	Filepick *fp = ctx;
+	char path[PATH_MAX];
+
+	path[0] = '\0';
+	filepick_crumbs(fp, i, NULL, 0, path, sizeof(path));
+	if (path[0])
+		filepick_chdir(fp, path);
+	return PICK_STAY;
+}
+
 /* Run the file browser. verb names the action in the title. When start names a
  * file, the browser opens in its directory; a non-empty init pre-fills the
  * entry line and (with focus_entry) starts focus there, for a save prompt.
@@ -26041,6 +26205,9 @@ dlg_file(Editor *e, const char *verb, const char *start, const char *init,
 		.title = filepick_title, .count = filepick_count,
 		.label = filepick_label, .choose = filepick_choose,
 		.entry_label = "File: ", .submit = filepick_submit,
+		.crumb_count = filepick_crumb_count,
+		.crumb_label = filepick_crumb_label,
+		.crumb_click = filepick_crumb_click,
 	};
 	Filepick fp;
 	int ok;

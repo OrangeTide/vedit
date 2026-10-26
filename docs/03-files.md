@@ -16,7 +16,14 @@ sorted by name.
 | Enter on a directory | descend into it (`../` goes up) |
 | Enter on a file | open it |
 | Tab | move to the `File:` line at the top |
+| click a path segment | change to that directory |
 | Esc | cancel |
+
+A breadcrumb bar under the title shows the directory as clickable segments,
+the current directory on the right and its parents to its left. It shows at
+most the five deepest levels, each capped at ten columns and truncated with an
+ellipsis when longer. Clicking a segment changes into that directory, and the
+list below descends from there.
 
 The `File:` line takes a typed name or path. A leading `~` expands to the
 home directory, an absolute path is taken as given, and any other name is

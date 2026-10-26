@@ -2156,6 +2156,55 @@ t_filepick_submit(Test *t)
 	rmdir(real);
 }
 
+/* The breadcrumb walk splits the current directory into clickable components:
+ * component 0 is the root, then each path element, each carrying the absolute
+ * path to navigate to. */
+static void
+t_filepick_crumbs(Test *t)
+{
+	Filepick fp;
+	char name[64], path[PATH_MAX];
+
+	memset(&fp, 0, sizeof(fp));
+
+	snprintf(fp.dir, sizeof(fp.dir), "/home/jon/Vibe");
+	TAP_CHECKF(t, filepick_crumbs(&fp, -1, NULL, 0, NULL, 0) == 4,
+	    "component count %d", filepick_crumbs(&fp, -1, NULL, 0, NULL, 0));
+	filepick_crumbs(&fp, 0, name, sizeof(name), path, sizeof(path));
+	TAP_CHECKF(t, strcmp(name, "/") == 0 && strcmp(path, "/") == 0,
+	    "root: %s @ %s", name, path);
+	filepick_crumbs(&fp, 1, name, sizeof(name), path, sizeof(path));
+	TAP_CHECKF(t, strcmp(name, "home") == 0 && strcmp(path, "/home") == 0,
+	    "lvl1: %s @ %s", name, path);
+	filepick_crumbs(&fp, 2, name, sizeof(name), path, sizeof(path));
+	TAP_CHECKF(t, strcmp(name, "jon") == 0 &&
+	    strcmp(path, "/home/jon") == 0, "lvl2: %s @ %s", name, path);
+	filepick_crumbs(&fp, 3, name, sizeof(name), path, sizeof(path));
+	TAP_CHECKF(t, strcmp(name, "Vibe") == 0 &&
+	    strcmp(path, "/home/jon/Vibe") == 0, "lvl3: %s @ %s", name, path);
+
+	/* the root alone is a single component */
+	snprintf(fp.dir, sizeof(fp.dir), "/");
+	TAP_CHECK(t, filepick_crumbs(&fp, -1, NULL, 0, NULL, 0) == 1);
+	filepick_crumbs(&fp, 0, name, sizeof(name), path, sizeof(path));
+	TAP_CHECK(t, strcmp(name, "/") == 0 && strcmp(path, "/") == 0);
+}
+
+/* The ellipsis fit truncates with "…" (or "..." in ASCII) only when needed. */
+static void
+t_pick_fit_crumb(Test *t)
+{
+	char buf[64];
+
+	pick_fit_crumb(1, buf, sizeof(buf), "Documents", 10);
+	TAP_CHECKF(t, strcmp(buf, "Documents") == 0, "fits: %s", buf);
+	pick_fit_crumb(1, buf, sizeof(buf), "LongDirectoryName", 10);
+	TAP_CHECKF(t, strcmp(buf, "LongDirec\xe2\x80\xa6") == 0,
+	    "utf8 ellipsis: %s", buf);
+	pick_fit_crumb(0, buf, sizeof(buf), "LongDirectoryName", 10);
+	TAP_CHECKF(t, strcmp(buf, "LongDir...") == 0, "ascii ellipsis: %s", buf);
+}
+
 /* Write text to a temp file and parse it; caller frees *out and unlinks path. */
 static Cfg *
 load_cfg_text(const char *text, char *path, size_t pathsz)
@@ -5981,6 +6030,8 @@ const Case tap_cases[] = {
 	{ "filepick_load", t_filepick_load },
 	{ "filepick_start_dir", t_filepick_start_dir },
 	{ "filepick_submit", t_filepick_submit },
+	{ "filepick_crumbs", t_filepick_crumbs },
+	{ "pick_fit_crumb", t_pick_fit_crumb },
 	{ "cfg_parse", t_cfg_parse },
 	{ "cfg_include_resolve", t_cfg_include_resolve },
 	{ "cfg_resolve", t_cfg_resolve },
