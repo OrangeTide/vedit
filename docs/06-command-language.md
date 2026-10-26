@@ -166,6 +166,19 @@ show what the marks bracket before another key acts on it:
     bind = ^H { select [region char mark a b] }
 ```
 
+**Conditionals.** `if COND { THEN } else { ELSE }` runs `THEN` when `COND` is
+true and `ELSE` otherwise; the `else { ELSE }` part is optional. The condition
+is any value: a non-empty string that is not `0`, or a non-zero number, is true,
+and an empty string, `0`, or no value is false. That is what the dialog verbs
+below yield, so `[confirm ...]` and `[ask ...]` read as conditions directly. The
+branches are program text, run only when taken, so their edits and prompts
+happen only on the chosen path and a branch may hold another `if`.
+
+```ini
+[keys "demo"]
+    bind = "^D { if [confirm {Delete the line?}] { delete [region line 1 1] } }"
+```
+
 **Dialogs.** Four verbs open a dialog and return what the user chose, so a
 program can ask for a value and act on it:
 

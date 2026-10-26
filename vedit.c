@@ -28978,6 +28978,36 @@ bi_replace(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return 0;
 }
 
+/* Parse src (a NUL-terminated program) and run it as a sub-program, sharing
+ * this run's variables. A quit raised inside it propagates through pending_req;
+ * a prompt is serviced and the sub-program resumes. Returns 0, or -1 (ev->err
+ * set). Shared by run and if. */
+static int
+cl_eval_string(ClEval *ev, const char *src, ClVal *result)
+{
+	ClProg *prog;
+	Req req = REQ_CONTINUE;
+	char perr[128];
+	int rc;
+
+	if (ev->depth >= CL_RUN_MAX) {
+		cle_err(ev, "program nested too deep");
+		return -1;
+	}
+	prog = cl_parse(src, perr, sizeof(perr));
+	if (!prog) {
+		cle_err(ev, "%.100s", perr);
+		return -1;
+	}
+	ev->depth++;
+	rc = cl_eval_prog(ev, prog, result, &req, 1);
+	ev->depth--;
+	cl_prog_free(prog);
+	if (rc == 0)
+		ev->pending_req = req;	/* a quit from the program propagates */
+	return rc;
+}
+
 /* run SRC: evaluate SRC's text as a command-language program, sharing this
  * run's variables. SRC is a string or a region (a register, the clip, or a
  * span of the current buffer). The program is resumable like a top-level one;
@@ -28986,19 +29016,12 @@ bi_replace(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 static int
 bi_run(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 {
-	char *src = NULL, *bytes;
+	char *src = NULL, *bytes, *z;
 	size_t len = 0;
-	ClProg *prog;
-	Req req = REQ_CONTINUE;
-	char perr[128];
 	int rc;
 
 	if (argc != 1) {
 		cle_err(ev, "run needs one program");
-		return -1;
-	}
-	if (ev->depth >= CL_RUN_MAX) {
-		cle_err(ev, "run nested too deep");
 		return -1;
 	}
 	if (argv[0].type == CLV_STR) {
@@ -29015,32 +29038,18 @@ bi_run(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		cle_err(ev, "run: cannot run that value");
 		return -1;
 	}
-	{				/* cl_parse needs a NUL-terminated source */
-		char *z = malloc(len + 1);
-
-		if (!z) {
-			free(src);
-			cle_err(ev, "out of memory");
-			return -1;
-		}
-		if (len)
-			memcpy(z, bytes, len);
-		z[len] = '\0';
+	z = malloc(len + 1);		/* cl_parse needs a NUL-terminated source */
+	if (!z) {
 		free(src);
-		src = z;
-	}
-	prog = cl_parse(src, perr, sizeof(perr));
-	free(src);
-	if (!prog) {
-		cle_err(ev, "run: %.100s", perr);
+		cle_err(ev, "out of memory");
 		return -1;
 	}
-	ev->depth++;
-	rc = cl_eval_prog(ev, prog, result, &req, 1);
-	ev->depth--;
-	cl_prog_free(prog);
-	if (rc == 0)
-		ev->pending_req = req;	/* a quit from the program propagates */
+	if (len)
+		memcpy(z, bytes, len);
+	z[len] = '\0';
+	free(src);
+	rc = cl_eval_string(ev, z, result);
+	free(z);
 	return rc;
 }
 
@@ -29319,6 +29328,65 @@ bi_pick_file(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return cl_result_str(ev, result, ok ? out : "");
 }
 
+/* A value's truth: a non-zero int, or a string that is neither empty nor "0",
+ * is true; a position or region is true; no value is false. This is what
+ * confirm (1/0), ask (empty on cancel), and choose yield, so they read as
+ * conditions without a comparison operator. */
+static int
+cl_truthy(const ClVal *v)
+{
+	switch (v->type) {
+	case CLV_INT:
+		return v->i != 0;
+	case CLV_STR:
+		return v->s[0] != '\0' &&
+		    !(v->s[0] == '0' && v->s[1] == '\0');
+	case CLV_POS:
+	case CLV_REGION:
+		return 1;
+	default:
+		return 0;		/* CLV_NONE */
+	}
+}
+
+/* if COND { THEN } [else { ELSE }]: run THEN when COND is true, otherwise ELSE.
+ * COND is any value (see cl_truthy), so `if [confirm {Delete?}] { ... }` works.
+ * The branches are program text run only when taken, so their side effects and
+ * prompts happen only on the chosen path, and an else body can hold another if.
+ * The result is the taken branch's value, or none when no branch runs. */
+static int
+bi_if(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	const char *body = NULL;
+
+	if (argc != 2 && argc != 4) {
+		cle_err(ev, "if needs a condition, a body, and an optional "
+		    "else body");
+		return -1;
+	}
+	if (argv[1].type != CLV_STR) {
+		cle_err(ev, "if: the body is not a program");
+		return -1;
+	}
+	if (argc == 4) {
+		if (argv[2].type != CLV_STR || strcmp(argv[2].s, "else") != 0) {
+			cle_err(ev, "if: expected else before the second body");
+			return -1;
+		}
+		if (argv[3].type != CLV_STR) {
+			cle_err(ev, "if: the else body is not a program");
+			return -1;
+		}
+	}
+	if (cl_truthy(&argv[0]))
+		body = argv[1].s;
+	else if (argc == 4)
+		body = argv[3].s;
+	if (!body)
+		return 0;		/* no branch taken: the result stays none */
+	return cl_eval_string(ev, body, result);
+}
+
 static const ClBuiltin cl_builtins[] = {
 	{ "set", bi_set },
 	{ "cursor", bi_cursor },
@@ -29340,6 +29408,7 @@ static const ClBuiltin cl_builtins[] = {
 	{ "mark", bi_mark },
 	{ "go", bi_go },
 	{ "go-file", bi_go_file },
+	{ "if", bi_if },
 	{ "ask", bi_ask },
 	{ "confirm", bi_confirm },
 	{ "choose", bi_choose },

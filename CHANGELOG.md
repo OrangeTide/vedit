@@ -37,6 +37,10 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
   `ask` (a line prompt), `confirm` (yes/no), `choose` (a list), and `pick-file`
   (the file browser). Each blocks and resumes the program, so a program can read
   a value with `set x [ask "Name: "]`.
+- The command language gains an `if COND { THEN } else { ELSE }` conditional.
+  The condition is any value (a non-empty, non-`0` string, or a non-zero number,
+  is true), so a dialog verb reads as a condition, and the untaken branch does
+  not run.
 
 ### Changed
 - View and mode key dispatch is centralized, and the grid-view render path is

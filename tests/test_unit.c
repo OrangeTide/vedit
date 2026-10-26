@@ -4810,6 +4810,83 @@ t_cl_region(Test *t)
 	g_cfg = old;
 }
 
+/* Run prog on a fresh three-line buffer (a / b / c) and join the surviving
+ * lines with '/' into out, for the if tests below. */
+static void
+cl_if_run(const char *prog, char *out, size_t outsz)
+{
+	const Cfg *old = g_cfg;
+	Editor e;
+	ClProg *p;
+	char err[64];
+	size_t n, i, di = 0;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	text_insert(e.t, 0, 0, "a", 1); text_split(e.t, 0, 1);
+	text_insert(e.t, 1, 0, "b", 1); text_split(e.t, 1, 1);
+	text_insert(e.t, 2, 0, "c", 1);
+	p = cl_parse(prog, err, sizeof(err));
+	if (p) {
+		cl_run(&e, p);
+		cl_prog_free(p);
+	}
+	out[0] = '\0';
+	n = text_lines(e.t);
+	for (i = 0; i < n && di + 1 < outsz; i++) {
+		const char *s;
+		size_t len;
+
+		s = text_line(e.t, i, &len);
+		di += (size_t)snprintf(out + di, outsz - di, "%s%.*s",
+		    i ? "/" : "", (int)len, s ? s : "");
+	}
+	text_free(e.t);
+	g_cfg = old;
+}
+
+/* if runs the chosen branch's program. The condition's truth follows cl_truthy:
+ * a non-empty, non-"0" string (or non-zero int) is true. The untaken branch and
+ * its effects do not run, an else body is optional, and a body may nest. */
+static void
+t_cl_if(Test *t)
+{
+	char out[64];
+
+	/* a true condition runs the body (delete line 1 -> "b/c") */
+	cl_if_run("if 1 { delete [region line 1 1] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "if 1 -> %s", out);
+
+	/* a false condition ("0") leaves the buffer untouched */
+	cl_if_run("if 0 { delete [region line 1 1] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "a/b/c") == 0, "if 0 -> %s", out);
+
+	/* an empty string is false; any other non-empty string is true */
+	cl_if_run("if {} { delete [region line 1 1] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "a/b/c") == 0, "if empty -> %s", out);
+	cl_if_run("if hi { delete [region line 1 1] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "if hi -> %s", out);
+
+	/* else runs on the false path, and not on the true path */
+	cl_if_run("if 0 { delete [region line 1 1] } else "
+	    "{ delete [region line 3 3] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "a/b") == 0, "else taken -> %s", out);
+	cl_if_run("if 1 { delete [region line 1 1] } else "
+	    "{ delete [region line 3 3] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "then over else -> %s", out);
+
+	/* a variable supplies the condition */
+	cl_if_run("set x 0 ; if $x { delete [region line 1 1] } else "
+	    "{ delete [region line 3 3] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "a/b") == 0, "var cond -> %s", out);
+
+	/* branches nest: the inner else runs (delete line 2 -> "a/c") */
+	cl_if_run("if 1 { if 0 { delete [region line 1 1] } else "
+	    "{ delete [region line 2 2] } }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "a/c") == 0, "nested if -> %s", out);
+}
+
 /* A key bound to a {program} runs its commands in order. ^D here runs
  * line-end then newline, which opens a blank line below "hello" and lands on
  * it. */
@@ -5996,6 +6073,7 @@ const Case tap_cases[] = {
 	{ "cl_parse", t_cl_parse },
 	{ "cl_eval", t_cl_eval },
 	{ "cl_dialog_builtins", t_cl_dialog_builtins },
+	{ "cl_if", t_cl_if },
 	{ "cl_region", t_cl_region },
 	{ "cl_rect", t_cl_rect },
 	{ "block_column", t_block_column },
