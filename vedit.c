@@ -19812,8 +19812,27 @@ swap_recover(Editor *e, const char *path, Text *t, time_t orig_mtime)
 	if (!swap_path_for(path, jnl, sizeof(jnl)) ||
 	    !swap_base_for(path, base, sizeof(base)))
 		return SWAP_NONE;
-	if (vf_read_file(jnl, &s, &n) != 0)
+	if (vf_read_file(jnl, &s, &n) != 0) {
+		Vstat bst;
+
+		/* No journal, so no edits to recover. But a base (.swpf) left
+		 * beside the file by an interrupted session would otherwise be
+		 * ignored here and silently overwritten on the next edit. The
+		 * base alone is just the file as it was loaded, holding no
+		 * unsaved changes (those live in the journal), so there is
+		 * nothing to recover from it; report the leftover and offer to
+		 * clear it. */
+		if (g_vfs->stat(base, &bst) == 0 && bst.is_reg) {
+			key = dlg_prompt_key(e,
+			    "Leftover swap base, no journal "
+			    "(no changes to recover). (d)elete (k)eep? ");
+			if (key == 'd') {
+				g_vfs->remove(base);
+				set_status(e, "removed the leftover swap base");
+			}
+		}
 		return SWAP_NONE;
+	}
 	off = swap_parse_header(s, n, &base_size, &file_mtime, owner,
 	    sizeof(owner));
 	free(s);

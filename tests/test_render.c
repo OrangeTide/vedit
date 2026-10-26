@@ -1494,6 +1494,65 @@ t_swap_recover_delete(Test *t)
 	rmdir(dir);
 }
 
+/* A leftover base (.swpf) with no journal is an orphan: it holds no edits, so
+ * there is nothing to recover, but it must be reported rather than silently
+ * overwritten. Answering 'd' clears it, 'k' keeps it, and either way the file
+ * opens with its on-disk content. */
+static void
+t_swap_orphan_base(Test *t)
+{
+	char dir[] = "/tmp/vedit_swoXXXXXX";
+	char path[PATH_MAX], sp[PATH_MAX], base[PATH_MAX];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	FILE *f;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/doc.txt", dir);
+	f = fopen(path, "w");
+	TAP_ASSERT(t, f != NULL);
+	fputs("orig\n", f);
+	fclose(f);
+	plant_swap(path, "stale");
+	TAP_ASSERT(t, swap_path_for(path, sp, sizeof(sp)));
+	TAP_ASSERT(t, swap_base_for(path, base, sizeof(base)));
+	unlink(sp);				/* drop the journal: base is orphaned */
+	TAP_ASSERT(t, access(sp, F_OK) != 0);
+	TAP_ASSERT(t, access(base, F_OK) == 0);
+
+	/* 'd' clears the orphan; the file still opens with its disk content */
+	memio_init(&m, "d", 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	vedit_run(v);
+	TAP_CHECK(t, vline_is(v, 0, "orig"));
+	TAP_CHECK(t, access(base, F_OK) != 0);		/* orphan removed */
+	vedit_free(v);
+	memio_free(&m);
+
+	/* a fresh orphan base; 'k' leaves it in place */
+	plant_swap(path, "stale");
+	unlink(sp);
+	TAP_ASSERT(t, access(base, F_OK) == 0);
+	memio_init(&m, "k", 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	vedit_run(v);
+	TAP_CHECK(t, vline_is(v, 0, "orig"));
+	TAP_CHECK(t, access(base, F_OK) == 0);		/* orphan kept */
+	vedit_free(v);
+	memio_free(&m);
+
+	unlink(base);
+	unlink(path);
+	rmdir(dir);
+}
+
 /* A live lock from another session (the Emacs-style .#name symlink naming a
  * running process on this host) asks before opening. Answering 'r' opens the
  * file read-only: :w is refused, :w! still writes, and the foreign lock is
@@ -5249,6 +5308,7 @@ const Case tap_cases[] = {
 	{ "swap_file_created", t_swap_file_created },
 	{ "swap_recover_key", t_swap_recover_key },
 	{ "swap_recover_delete", t_swap_recover_delete },
+	{ "swap_orphan_base", t_swap_orphan_base },
 	{ "swap_recover_readonly", t_swap_lock_readonly },
 	{ "search_icase", t_search_icase },
 	{ "search_word", t_search_word },

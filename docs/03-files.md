@@ -139,6 +139,17 @@ changed since the journal was started.
 - `q`, or any other key, quits vedit at startup, or keeps the current
   buffer in File > Open and `:e`.
 
+If a base is left beside the file with no journal, there are no recorded
+edits to recover, so vedit reports the leftover instead and offers to
+clear it:
+
+```
+Leftover swap base, no journal (no changes to recover). (d)elete (k)eep?
+```
+
+`d` removes it; `k` leaves it in place. Either way the file opens with its
+content on disk.
+
 Replay stops at the first damaged record. A crash during a write loses at
 most one edit. The journal is flushed to disk whenever input
 goes quiet, and when the editor is killed by `SIGTERM` or `SIGHUP`. Only a
