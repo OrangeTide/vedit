@@ -136,7 +136,9 @@ again.
 
 The `:` command line works in the table view with the vi keys. With the
 EDIT keys a typed `:` starts editing the cell, so the Edit menu is the way
-to the row and column commands.
+to the row and column commands. With the mouse on, a click moves the cell
+cursor, a click on the header row picks a column, one on the row numbers
+picks a row, and the wheel scrolls.
 
 Editing a cell happens on the prompt line: the value is loaded into it,
 Left, Right, Home, End, Backspace, and Delete edit it, Alt+Enter inserts a
@@ -211,8 +213,8 @@ insert or overwrite mode, and the file name.
 
 Overwriting cannot change a newline byte or write one; insert mode can
 insert a newline, which splits the line. Each edit is one undo step, and
-Edit > Undo reaches it. The hex view ignores the mouse except for the menu
-bar.
+Edit > Undo reaches it. With the mouse on, a click moves to the byte under
+it, from the hex columns or the ascii panel, and the wheel scrolls.
 
 ## Mail
 

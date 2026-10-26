@@ -343,6 +343,49 @@ t_term_loop_cmd(Test *t)
 	memio_free(&m);
 }
 
+/* An SGR mouse report from the outer terminal is translated to the child's
+ * grid and re-sent when the child enabled mouse reporting. A full-screen
+ * terminal's grid (0,0) is at screen (CHROME_TOP, CHROME_LEFT), so a click at
+ * 1-based screen (col 2, row 3) becomes the child's (1,1). When the child did
+ * not enable mouse, the report is dropped rather than forwarded raw. */
+static void
+t_term_mouse_forward(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int child, n;
+	char buf[32];
+	const char *in = "\033[<0;2;3M";		/* grid (0,0), left press */
+
+	/* the child turned SGR mouse reporting on */
+	v = term_editor_in(&m, &io, in, strlen(in), 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+	v->e.vterm->vt->modes |= VT_MODE_MOUSE | VT_MODE_MOUSE_SGR;
+	v->e.vterm->vt->mouse_mode = 1000;
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_CONT);
+	n = read_all(child, buf, sizeof(buf));
+	TAP_CHECKF(t, n == 9 && memcmp(buf, "\033[<0;1;1M", 9) == 0,
+	    "child got %d bytes", n);
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+
+	/* a child that never enabled mouse: the report is dropped */
+	v = term_editor_in(&m, &io, in, strlen(in), 1);
+	TAP_ASSERT(t, v != NULL);
+	g_winch = 0;
+	TAP_ASSERT(t, term_pair(v, &child, 10, 40) == 0);
+	TAP_CHECK(t, term_loop_step(&v->e) == TERM_CONT);
+	n = read_all(child, buf, sizeof(buf));
+	TAP_CHECKF(t, n == 0, "mouse-off child got %d bytes", n);
+	close(child);
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* Ctrl-W q on the only buffer asks the editor to quit. */
 static void
 t_term_loop_quit(Test *t)
@@ -1923,6 +1966,7 @@ const Case tap_cases[] = {
 	{ "term_title_cursor", t_term_title_cursor },
 	{ "term_fork_smoke", t_term_fork_smoke },
 	{ "term_loop_input", t_term_loop_input },
+	{ "term_mouse_forward", t_term_mouse_forward },
 	{ "term_loop_literal", t_term_loop_literal },
 	{ "term_loop_cmd", t_term_loop_cmd },
 	{ "term_loop_quit", t_term_loop_quit },

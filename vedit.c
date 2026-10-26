@@ -8371,6 +8371,8 @@ typedef struct editor {
 	int		prev_row0, prev_rows;	/* the text region at the last paint */
 	int		term_dirty;	/* active terminal output pending a render */
 	int		term_prefix;	/* 1 = Ctrl-W seen, awaiting a command key */
+	char		term_mseq[40];	/* a mouse CSI being collected from the outer */
+	int		term_mseq_n;	/* bytes buffered in term_mseq, 0 = not in one */
 	int		pane_focus;	/* keys go to the pane's terminal, not the text */
 
 	/* two text panes. split is SPLIT_NONE, SPLIT_H (one above the other)
@@ -33696,6 +33698,112 @@ art_drag_extend(Editor *e, int x, int y)
 }
 #endif /* VEDIT_ART */
 
+#ifndef VEDIT_NO_HEX
+/* A click or wheel in the hex view. A plain press places the cursor on the byte
+ * under the pointer, picking the hex or the ascii column from where it landed;
+ * the wheel moves the cursor three rows. */
+static Menuact
+hex_mouse(Editor *e, const struct tkbd_seq *m)
+{
+	int content_h = e->rows - 2 - (e->hex_inspect ? 1 : 0);
+	int cols = e->hex_cols ? e->hex_cols : 16;
+	size_t total = hex_total(e->t), curoff, off;
+	int i, j, as, hc;
+
+	if (total == 0)
+		return MA_NONE;
+	if (m->key == TKBD_MOUSE_WHEEL_UP || m->key == TKBD_MOUSE_WHEEL_DOWN) {
+		curoff = hex_offset_of(e->t, e->cy, e->cx);
+		if (m->key == TKBD_MOUSE_WHEEL_UP)
+			off = curoff >= (size_t)(3 * cols) ?
+			    curoff - (size_t)(3 * cols) : 0;
+		else if ((off = curoff + (size_t)(3 * cols)) >= total)
+			off = total - 1;
+		hex_pos_at(e->t, off, &e->cy, &e->cx);
+		return MA_NONE;
+	}
+	if (m->key != TKBD_MOUSE_LEFT || (m->mod & TKBD_MOD_MOTION))
+		return MA_NONE;			/* only a plain press places */
+	if (content_h < 1)
+		content_h = 1;
+	i = m->y - 1;				/* dump rows begin at screen row 1 */
+	if (i < 0 || i >= content_h)
+		return MA_NONE;
+	as = hex_ascii_start(cols);
+	if (m->x >= as) {			/* the ascii gutter */
+		j = m->x - as;
+		if (j >= cols)
+			return MA_NONE;
+		e->hex_ascii = 1;
+	} else {				/* a hex pair, else a gap */
+		for (j = 0; j < cols; j++) {
+			hc = hex_hexcol(j);
+			if (m->x == hc || m->x == hc + 1)
+				break;
+		}
+		if (j >= cols)
+			return MA_NONE;
+		e->hex_ascii = 0;
+	}
+	off = (e->hex_top + (size_t)i) * (size_t)cols + (size_t)j;
+	if (off >= total)
+		off = total - 1;
+	hex_pos_at(e->t, off, &e->cy, &e->cx);
+	return MA_NONE;
+}
+#endif /* !VEDIT_NO_HEX */
+
+#ifndef VEDIT_NO_TABLE
+/* A click or wheel in the table view. A press on a cell moves the cell cursor;
+ * a press on the header row changes only the column, on the row-number gutter
+ * only the row. The wheel moves the row cursor three rows. */
+static Menuact
+tbl_mouse(Editor *e, const struct tkbd_seq *m)
+{
+	Tbl *tb = e->tbl;
+	int text_w = text_width(e), gw, first, rx, ry, x, c;
+	size_t nl = text_lines(e->t), row;
+
+	if (m->key == TKBD_MOUSE_WHEEL_UP || m->key == TKBD_MOUSE_WHEEL_DOWN) {
+		if (m->key == TKBD_MOUSE_WHEEL_UP)
+			e->cy = e->cy >= 3 ? e->cy - 3 : 0;
+		else if (nl > 0)
+			e->cy = e->cy + 3 < nl ? e->cy + 3 : nl - 1;
+		return MA_NONE;
+	}
+	if (m->key != TKBD_MOUSE_LEFT || (m->mod & TKBD_MOD_MOTION))
+		return MA_NONE;
+	gw = tbl_gutter(e);
+	first = (int)tbl_first_row(e);
+	rx = m->x - CHROME_LEFT;
+	ry = m->y - CHROME_TOP;
+	if (ry < 0 || rx < 0 || rx >= text_w)
+		return MA_NONE;
+	if (ry >= 1) {				/* a data row; the label row (0) is kept */
+		if (first && ry == 1)
+			row = 0;		/* the frozen header */
+		else
+			row = e->top + (size_t)(ry - 1 - (first ? 1 : 0));
+		if (row >= nl)
+			return MA_NONE;
+		e->cy = row;
+	}
+	if (rx >= gw) {				/* a cell; the row gutter is kept */
+		x = gw;
+		for (c = tb->left; c < tb->ncols; c++) {
+			int w = tbl_width(tb, c);
+
+			if (rx >= x && rx < x + w) {
+				tb->cx = c;
+				break;
+			}
+			x += w + 1;
+		}
+	}
+	return MA_NONE;
+}
+#endif /* !VEDIT_NO_TABLE */
+
 /* Act on a mouse report. A click on the menu bar opens that menu and returns
  * the action chosen there; in the text area a left click places the cursor,
  * a drag extends a selection, and the wheel scrolls three lines. In art mode
@@ -33735,8 +33843,14 @@ ed_mouse_event(Editor *e, const struct tkbd_seq *m)
 	if ((press || m->key == TKBD_MOUSE_WHEEL_UP ||
 	    m->key == TKBD_MOUSE_WHEEL_DOWN) && mouse_sbar(e, m))
 		return MA_NONE;
-	if (e->hex_view || e->tbl)
-		return MA_NONE;
+#ifndef VEDIT_NO_HEX
+	if (e->hex_view)
+		return hex_mouse(e, m);
+#endif
+#ifndef VEDIT_NO_TABLE
+	if (e->tbl)
+		return tbl_mouse(e, m);
+#endif
 #ifdef VEDIT_TERM
 	if (e->kind == BUF_TERM || e->pane_focus)
 		return MA_NONE;
@@ -36691,6 +36805,7 @@ enum vt_target {
 #define VT_MODE_DECCKM		(1u << 6)
 #define VT_MODE_DECKPAM		(1u << 7)
 #define VT_MODE_MOUSE		(1u << 8)
+#define VT_MODE_MOUSE_SGR	(1u << 9)	/* ?1006: SGR extended reports */
 
 /* max depth of the kitty keyboard protocol flag stack */
 #define VT_KITTY_KBD_STACK_MAX	16
@@ -38515,6 +38630,9 @@ op_csi(void *ctx, const int *params, int nparam, int intermed, int final)
 				st->mouse_mode = n;
 				st->modes |= VT_MODE_MOUSE;
 				break;
+			case 1006:	/* SGR extended coordinates */
+				st->modes |= VT_MODE_MOUSE_SGR;
+				break;
 			case 2004:
 				st->modes |= VT_MODE_BRACKETPASTE;
 				break;
@@ -38546,6 +38664,9 @@ op_csi(void *ctx, const int *params, int nparam, int intermed, int final)
 			case 1003:
 				st->mouse_mode = 0;
 				st->modes &= ~VT_MODE_MOUSE;
+				break;
+			case 1006:
+				st->modes &= ~VT_MODE_MOUSE_SGR;
 				break;
 			case 2004:
 				st->modes &= ~VT_MODE_BRACKETPASTE;
@@ -40770,6 +40891,65 @@ term_write(Term *t, const char *buf, int n)
 	}
 }
 
+/* The screen origin (0-based) of the focused terminal's grid cell (0,0): the
+ * chrome corner for a full-screen terminal, below the text for a bottom pane. */
+static void
+term_grid_origin(Editor *e, int in_pane, int *row0, int *col0)
+{
+	if (in_pane) {
+		*row0 = view_row0(e) + text_height(e) + 1;
+		*col0 = view_col0(e);
+	} else {
+		*row0 = CHROME_TOP;
+		*col0 = CHROME_LEFT;
+	}
+}
+
+/* Forward one SGR mouse report from the outer terminal to the child when the
+ * child asked for mouse events. The report's absolute screen coordinates are
+ * translated to the child's grid; a position outside the grid is dropped; and
+ * the event is re-encoded in the child's own format, SGR when it enabled ?1006
+ * else the legacy X10 byte form. seq is "ESC [ < b ; x ; y (M|m)". */
+static void
+term_forward_mouse(Editor *e, Term *t, int in_pane, const char *seq, int seqn)
+{
+	int b, x, y, release, row0, col0, gr, gc, enc_n;
+	char enc[32];
+
+	if (!(t->vt->modes & VT_MODE_MOUSE))
+		return;				/* the child does not want mouse */
+	if (seqn < 9 || (seq[seqn - 1] != 'M' && seq[seqn - 1] != 'm'))
+		return;
+	release = seq[seqn - 1] == 'm';
+	if (sscanf(seq + 3, "%d;%d;%d", &b, &x, &y) != 3)
+		return;
+	term_grid_origin(e, in_pane, &row0, &col0);
+	gc = x - 1 - col0;			/* 0-based grid column */
+	gr = y - 1 - row0;			/* 0-based grid row */
+	if (gc < 0 || gr < 0 || gc >= t->cols || gr >= t->rows)
+		return;				/* outside the child's grid */
+	if (t->vt->modes & VT_MODE_MOUSE_SGR) {
+		enc_n = snprintf(enc, sizeof(enc), "\033[<%d;%d;%d%c",
+		    b, gc + 1, gr + 1, release ? 'm' : 'M');
+	} else {
+		/* legacy X10: ESC [ M then (32+code)(32+col)(32+row), 1-based;
+		 * a release reports the all-buttons code (low two bits set). */
+		int code = release ? (b | 3) : b;
+
+		if (gc + 1 > 223 || gr + 1 > 223 || code + 32 > 255)
+			return;			/* unencodable in one byte */
+		enc[0] = '\033';
+		enc[1] = '[';
+		enc[2] = 'M';
+		enc[3] = (char)(32 + code);
+		enc[4] = (char)(32 + gc + 1);
+		enc[5] = (char)(32 + gr + 1);
+		enc_n = 6;
+	}
+	if (enc_n > 0 && enc_n <= (int)sizeof(enc))
+		term_write(t, enc, enc_n);
+}
+
 /* Free a terminal handle that was never installed on a buffer. Hangs up a real
  * child but not an injected fd (child_pid < 0). */
 static void
@@ -40836,6 +41016,7 @@ term_install(Editor *e, Term *t)
 	e->kind = BUF_TERM;
 	e->vterm = t;
 	e->term_prefix = 0;
+	e->term_mseq_n = 0;
 	e->art = NULL;
 #ifdef VEDIT_MAIL
 	e->mref = NULL;
@@ -40992,6 +41173,40 @@ term_loop_step(Editor *e)
 		unsigned char b = raw[i];
 
 		if (!e->term_prefix) {
+			/* Collecting a confirmed partial mouse CSI (ESC [ < ...)
+			 * from a previous byte: take digits and ';' until the
+			 * final M/m, then forward it to the child's grid. A byte
+			 * that cannot belong to the report flushes it raw. */
+			if (e->term_mseq_n > 0) {
+				e->term_mseq[e->term_mseq_n++] = (char)b;
+				if (b == 'M' || b == 'm') {
+					term_forward_mouse(e, t, in_pane,
+					    e->term_mseq, e->term_mseq_n);
+					e->term_mseq_n = 0;
+				} else if (!((b >= '0' && b <= '9') ||
+				    b == ';') ||
+				    e->term_mseq_n >= (int)sizeof(e->term_mseq)) {
+					term_write(t, e->term_mseq, e->term_mseq_n);
+					e->term_mseq_n = 0;
+				}
+				continue;
+			}
+			/* An outer SGR mouse report begins ESC [ < ; start
+			 * collecting it (only once confirmed, so a lone ESC key
+			 * is never held back). */
+			if (b == 0x1b && i + 2 < n && raw[i + 1] == '[' &&
+			    raw[i + 2] == '<') {
+				if (outn) {
+					term_write(t, out, outn);
+					outn = 0;
+				}
+				e->term_mseq[0] = '\033';
+				e->term_mseq[1] = '[';
+				e->term_mseq[2] = '<';
+				e->term_mseq_n = 3;
+				i += 2;			/* consumed [ and < */
+				continue;
+			}
 			if (b == 0x17) {	/* Ctrl-W: begin prefix */
 				if (outn) {
 					term_write(t, out, outn);

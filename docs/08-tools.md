@@ -138,6 +138,11 @@ talking to the editor instead:
 | Ctrl-W +, Ctrl-W - | a row taller or shorter, for a terminal in the pane |
 | Ctrl-W Ctrl-W | send a literal Ctrl-W to the program |
 
+With the mouse on, a program that asks for mouse events (an editor, a
+pager, a file manager) gets them: vedit translates each click to the
+program's own grid and passes it on. A program that does not ask for the
+mouse is left alone, so the wheel still scrolls its own output as usual.
+
 When the program exits the status line shows `[process exited N]` and the
 buffer waits for Ctrl-W q.
 

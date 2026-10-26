@@ -5270,6 +5270,124 @@ t_date_mouse(Test *t)
 	memio_free(&m);
 }
 
+#if !defined(VEDIT_NO_MOUSE) && !defined(VEDIT_NO_HEX)
+/* A click in the hex view places the cursor on the byte under the pointer,
+ * from either the hex pairs or the ascii gutter; the wheel moves three rows. */
+static void
+t_hex_mouse(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	struct tkbd_seq ev;
+	size_t off, total;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	text_insert(v->e.t, 0, 0,
+	    "0123456789abcdef0123456789abcdef01234567", 40);
+	v->e.hex_view = 1;
+	v->e.mouse = 1;
+	ed_render(&v->e, v->e.d);		/* lay out rows and hex_top */
+	total = hex_total(v->e.t);
+
+	memset(&ev, 0, sizeof(ev));
+	ev.type = TKBD_MOUSE;
+	ev.key = TKBD_MOUSE_LEFT;
+	ev.x = hex_hexcol(5);			/* byte 5's hex pair, dump row 0 */
+	ev.y = 1;
+	ed_mouse_event(&v->e, &ev);
+	off = hex_offset_of(v->e.t, v->e.cy, v->e.cx);
+	TAP_CHECKF(t, off == 5 && v->e.hex_ascii == 0,
+	    "hex click off=%zu ascii=%d", off, v->e.hex_ascii);
+
+	ev.x = hex_asciicol(9, 16);		/* byte 9 in the ascii gutter */
+	ed_mouse_event(&v->e, &ev);
+	off = hex_offset_of(v->e.t, v->e.cy, v->e.cx);
+	TAP_CHECKF(t, off == 9 && v->e.hex_ascii == 1,
+	    "ascii click off=%zu ascii=%d", off, v->e.hex_ascii);
+
+	ev.key = TKBD_MOUSE_WHEEL_DOWN;		/* three rows down, clamped to the end */
+	ed_mouse_event(&v->e, &ev);
+	off = hex_offset_of(v->e.t, v->e.cy, v->e.cx);
+	TAP_CHECKF(t, off == total - 1, "wheel off=%zu of %zu", off, total);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+#endif
+
+#if !defined(VEDIT_NO_MOUSE) && !defined(VEDIT_NO_TABLE)
+/* A click in the table view moves the cell cursor; a click on the header row
+ * sets only the column, and the wheel moves the row cursor. */
+static void
+t_tbl_mouse(Test *t)
+{
+	char dir[] = "/tmp/vedit-tblm-XXXXXX";
+	char path[PATH_MAX];
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	struct tkbd_seq ev;
+	FILE *f;
+	int gw, first, x, c;
+	size_t row;
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(path, sizeof(path), "%s/a.csv", dir);
+	f = fopen(path, "wb");
+	TAP_ASSERT(t, f != NULL);
+	fputs("id,name,note\n1,Ann,aa\n2,Bob,bb\n3,Cy,cc\n", f);
+	fclose(f);
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, vedit_open(v, path) == 0);
+	TAP_ASSERT(t, v->e.tbl != NULL && v->e.tbl->ncols == 3);
+	v->e.mouse = 1;
+	ed_render(&v->e, v->e.d);		/* lay out columns and e->top */
+	gw = tbl_gutter(&v->e);
+	first = (int)tbl_first_row(&v->e);
+
+	/* a data cell: the second visible data row, column 1 (name). The screen
+	 * row mirrors the render's row formula so the inverse is what we test. */
+	row = v->e.top + 1;
+	memset(&ev, 0, sizeof(ev));
+	ev.type = TKBD_MOUSE;
+	ev.key = TKBD_MOUSE_LEFT;
+	ev.y = CHROME_TOP + 1 + first + (int)(row - v->e.top);	/* past label+header */
+	x = gw + tbl_width(v->e.tbl, 0) + 1;	/* start of column 1, rx-space */
+	ev.x = CHROME_LEFT + x + 1;
+	ed_mouse_event(&v->e, &ev);
+	TAP_CHECKF(t, v->e.cy == row && v->e.tbl->cx == 1,
+	    "cell click cy=%zu cx=%d", v->e.cy, v->e.tbl->cx);
+
+	/* the header label row (ry 0) changes only the column, not the row */
+	ev.y = CHROME_TOP;
+	x = gw;
+	for (c = 0; c < 2; c++)			/* walk to column 2's start */
+		x += tbl_width(v->e.tbl, c) + 1;
+	ev.x = CHROME_LEFT + x + 1;
+	ed_mouse_event(&v->e, &ev);
+	TAP_CHECKF(t, v->e.cy == row && v->e.tbl->cx == 2,
+	    "header click cy=%zu cx=%d", v->e.cy, v->e.tbl->cx);
+
+	/* the wheel moves the row cursor */
+	ev.key = TKBD_MOUSE_WHEEL_UP;
+	ed_mouse_event(&v->e, &ev);
+	TAP_CHECK(t, v->e.cy == 0);		/* row was < 3, so clamps to 0 */
+
+	vedit_free(v);
+	memio_free(&m);
+	unlink(path);
+	rmdir(dir);
+}
+#endif
+
 const Case tap_cases[] = {
 	{ "resize_grid", t_resize_grid },
 	{ "resize_signal", t_resize_signal },
@@ -5309,6 +5427,12 @@ const Case tap_cases[] = {
 	{ "swap_recover_key", t_swap_recover_key },
 	{ "swap_recover_delete", t_swap_recover_delete },
 	{ "swap_orphan_base", t_swap_orphan_base },
+#if !defined(VEDIT_NO_MOUSE) && !defined(VEDIT_NO_HEX)
+	{ "hex_mouse", t_hex_mouse },
+#endif
+#if !defined(VEDIT_NO_MOUSE) && !defined(VEDIT_NO_TABLE)
+	{ "tbl_mouse", t_tbl_mouse },
+#endif
 	{ "swap_recover_readonly", t_swap_lock_readonly },
 	{ "search_icase", t_search_icase },
 	{ "search_word", t_search_word },
