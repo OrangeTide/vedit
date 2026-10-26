@@ -18,8 +18,10 @@ sorted by name.
 | Tab | move to the `File:` line at the top |
 | Esc | cancel |
 
-The `File:` line takes a typed name or path. A directory there changes
-into it. Any other name opens that file, which may be a new one.
+The `File:` line takes a typed name or path. A leading `~` expands to the
+home directory, an absolute path is taken as given, and any other name is
+relative to the listed directory. A directory there changes into it; any
+other name opens that file, which may be a new one.
 
 **File > Save As**, and the first save of an unnamed buffer, use the same
 browser with the `File:` line focused. For a named file it is filled with

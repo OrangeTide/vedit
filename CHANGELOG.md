@@ -29,6 +29,7 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
   full feature set. New `VEDIT_NO_*` gates compile out the hex view, draw
   mode, swap files, reflow, themes, tags, the table view, and syntax
   highlighting; the text editor, the vi keys, and search stay in.
+- The file browser's `File:` line expands a leading `~` to the home directory.
 
 ### Changed
 - View and mode key dispatch is centralized, and the grid-view render path is

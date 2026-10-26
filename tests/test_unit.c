@@ -2098,6 +2098,64 @@ t_filepick_start_dir(Test *t)
 	rmdir(dir);
 }
 
+/* The file browser's entry line: an absolute path and a name relative to the
+ * current directory each pick a file, a "~" expands against $HOME, and a typed
+ * directory descends into it rather than picking. */
+static void
+t_filepick_submit(Test *t)
+{
+	char tmpl[] = "/tmp/vedit_fsXXXXXX";
+	char *dir = mkdtemp(tmpl);
+	char sub[PATH_MAX], hfile[PATH_MAX], real[PATH_MAX], want[PATH_MAX];
+	char keep_home[PATH_MAX];
+	char *saved_home = getenv("HOME");
+	Filepick fp;
+
+	TAP_ASSERT(t, dir != NULL);
+	TAP_ASSERT(t, realpath(dir, real) != NULL);
+	keep_home[0] = '\0';
+	if (saved_home)
+		snprintf(keep_home, sizeof(keep_home), "%s", saved_home);
+	setenv("HOME", real, 1);			/* HOME is this temp dir */
+
+	snprintf(sub, sizeof(sub), "%s/sub", real);
+	TAP_ASSERT(t, mkdir(sub, 0700) == 0);
+	snprintf(hfile, sizeof(hfile), "%s/hfile", real);
+	TAP_ASSERT(t, fclose(fopen(hfile, "w")) == 0);
+
+	memset(&fp, 0, sizeof(fp));
+	snprintf(fp.dir, sizeof(fp.dir), "%s", real);
+
+	/* an absolute path is taken as given */
+	TAP_CHECK(t, filepick_submit(&fp, hfile) == PICK_DONE);
+	TAP_CHECKF(t, strcmp(fp.chosen, hfile) == 0, "absolute -> %s", fp.chosen);
+
+	/* a bare name is relative to the current directory */
+	TAP_CHECK(t, filepick_submit(&fp, "hfile") == PICK_DONE);
+	snprintf(want, sizeof(want), "%s/hfile", real);
+	TAP_CHECKF(t, strcmp(fp.chosen, want) == 0, "relative -> %s", fp.chosen);
+
+	/* "~/name" expands against $HOME */
+	fp.chosen[0] = '\0';
+	TAP_CHECK(t, filepick_submit(&fp, "~/hfile") == PICK_DONE);
+	TAP_CHECKF(t, strcmp(fp.chosen, want) == 0, "~ expand -> %s", fp.chosen);
+
+	/* a typed directory descends instead of picking */
+	TAP_CHECK(t, filepick_submit(&fp, "sub") == PICK_STAY);
+	TAP_ASSERT(t, realpath(sub, want) != NULL);
+	TAP_CHECKF(t, strcmp(fp.dir, want) == 0, "descend -> %s", fp.dir);
+	filepick_clear(&fp);
+	free(fp.ent);
+
+	if (keep_home[0])
+		setenv("HOME", keep_home, 1);
+	else
+		unsetenv("HOME");
+	rmdir(sub);
+	unlink(hfile);
+	rmdir(real);
+}
+
 /* Write text to a temp file and parse it; caller frees *out and unlinks path. */
 static Cfg *
 load_cfg_text(const char *text, char *path, size_t pathsz)
@@ -5922,6 +5980,7 @@ const Case tap_cases[] = {
 	{ "pick_jump", t_pick_jump },
 	{ "filepick_load", t_filepick_load },
 	{ "filepick_start_dir", t_filepick_start_dir },
+	{ "filepick_submit", t_filepick_submit },
 	{ "cfg_parse", t_cfg_parse },
 	{ "cfg_include_resolve", t_cfg_include_resolve },
 	{ "cfg_resolve", t_cfg_resolve },

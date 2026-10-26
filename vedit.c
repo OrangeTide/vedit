@@ -3349,12 +3349,12 @@ static char g_cfg_dir[PATH_MAX];
 static char g_cfg_root_dir[PATH_MAX];
 static int g_cfg_inc_depth;
 
-/* Expand a leading "~" or "~/" in a config path against $HOME, writing the
- * result into out and returning out. A path that does not start with "~", one
- * already absolute among them, is copied unchanged. With $HOME unset the "~"
- * is left as written. */
+/* Expand a leading "~" or "~/" in a path against $HOME, writing the result
+ * into out and returning out. A path that does not start with "~", one already
+ * absolute among them, is copied unchanged. With $HOME unset the "~" is left as
+ * written. */
 static const char *
-cfg_expand_home(const char *path, char *out, size_t sz)
+path_expand_home(const char *path, char *out, size_t sz)
 {
 	const char *home;
 
@@ -3381,7 +3381,7 @@ cfg_include(Cfg *c, const char *relpath)
 
 	if (g_cfg_inc_depth >= 8 || !relpath[0])
 		return;
-	path = cfg_expand_home(relpath, expanded, sizeof(expanded));
+	path = path_expand_home(relpath, expanded, sizeof(expanded));
 	if (path[0] == '/') {
 		snprintf(full, sizeof(full), "%s", path);
 	} else {
@@ -19158,7 +19158,7 @@ resolve_dir_opt(const char *key, char *out, size_t sz)
 
 	if (!v || !v[0] || strcmp(v, ".") == 0)
 		return 0;
-	cfg_expand_home(v, out, sz);
+	path_expand_home(v, out, sz);
 	if (g_vfs->access(out, VF_W | VF_X) != 0)
 		return 0;
 	return 1;
@@ -22312,7 +22312,7 @@ tags_locate(Editor *e, char *out, size_t outsz)
 	char dir[PATH_MAX];
 
 	if (cfg && cfg[0]) {
-		cfg_expand_home(cfg, out, outsz);
+		path_expand_home(cfg, out, outsz);
 		return g_vfs->access(out, VF_R) == 0 ? 0 : -1;
 	}
 	if (!e->has_name)
@@ -22748,7 +22748,7 @@ cc_resolve(Editor *e, CcIncludes *out)
 	out->dir[0] = '\0';
 	if (!cfg || !cfg[0] || !e->has_name)
 		return -1;
-	cfg = cfg_expand_home(cfg, cfgbuf, sizeof(cfgbuf));
+	cfg = path_expand_home(cfg, cfgbuf, sizeof(cfgbuf));
 	if (g_vfs->stat(cfg, &st) != 0)
 		return -1;
 
@@ -25969,21 +25969,25 @@ filepick_choose(void *ctx, int i)
 }
 
 /* The entry line: a typed directory descends, anything else opens (or creates)
- * a file by that name. */
+ * a file by that name. A leading "~" expands against $HOME, and the result, or
+ * any absolute path, is taken as given; anything else is relative to the
+ * current directory. */
 static int
 filepick_submit(void *ctx, const char *text)
 {
 	Filepick *fp = ctx;
-	char cand[PATH_MAX];
+	char expanded[PATH_MAX], cand[PATH_MAX];
+	const char *path;
 	Vstat st;
 
 	if (!text[0])
 		return PICK_STAY;
-	if (text[0] == '/') {
-		if (snprintf(cand, sizeof(cand), "%s", text)
+	path = path_expand_home(text, expanded, sizeof(expanded));
+	if (path[0] == '/') {
+		if (snprintf(cand, sizeof(cand), "%s", path)
 		    >= (int)sizeof(cand))
 			return PICK_STAY;
-	} else if (snprintf(cand, sizeof(cand), "%s/%s", fp->dir, text)
+	} else if (snprintf(cand, sizeof(cand), "%s/%s", fp->dir, path)
 	    >= (int)sizeof(cand)) {
 		return PICK_STAY;
 	}
