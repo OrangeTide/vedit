@@ -3340,32 +3340,67 @@ cfg_make_key(char *out, size_t outsz, const char *section,
 
 int vedit_cfg_load(Cfg *c, const char *path);	/* file loader, defined below */
 
-/* The directory of the config file currently loading, so an [include] path
- * resolves relative to it, and a depth guard against include cycles. Both are
- * saved and restored around each nested load. */
+/* The directory of the config file currently loading, so an explicitly
+ * relative [include] path ("./x", "../x") resolves against it; the default
+ * config directory (the directory of the outermost file), against which an
+ * unqualified [include] path resolves; and a depth guard against include
+ * cycles. The first and third are saved and restored around each nested load. */
 static char g_cfg_dir[PATH_MAX];
+static char g_cfg_root_dir[PATH_MAX];
 static int g_cfg_inc_depth;
 
-/* Load the file named by an [include] path line, resolving a relative path
- * against the including file's directory. A no-op past a small depth so a
- * cycle cannot recurse forever. */
+/* Expand a leading "~" or "~/" in a config path against $HOME, writing the
+ * result into out and returning out. A path that does not start with "~", one
+ * already absolute among them, is copied unchanged. With $HOME unset the "~"
+ * is left as written. */
+static const char *
+cfg_expand_home(const char *path, char *out, size_t sz)
+{
+	const char *home;
+
+	if (path[0] == '~' && (path[1] == '/' || path[1] == '\0') &&
+	    (home = getenv("HOME")) != NULL && home[0]) {
+		snprintf(out, sz, "%s%s", home, path + 1);
+	} else {
+		snprintf(out, sz, "%s", path);
+	}
+	return out;
+}
+
+/* Load the file named by an [include] path line. A leading "~" expands against
+ * $HOME and counts as absolute; an absolute path is used as given. An
+ * explicitly relative path ("./x" or "../x") resolves against the including
+ * file's directory; any other unqualified path resolves against the default
+ * config directory. A no-op past a small depth so a cycle cannot recurse
+ * forever. */
 static void
 cfg_include(Cfg *c, const char *relpath)
 {
-	char full[PATH_MAX];
+	char expanded[PATH_MAX], full[PATH_MAX];
+	const char *path, *base_dir;
 
 	if (g_cfg_inc_depth >= 8 || !relpath[0])
 		return;
-	if (relpath[0] == '/' || g_cfg_dir[0] == '\0') {
-		snprintf(full, sizeof(full), "%s", relpath);
+	path = cfg_expand_home(relpath, expanded, sizeof(expanded));
+	if (path[0] == '/') {
+		snprintf(full, sizeof(full), "%s", path);
 	} else {
-		size_t dl = strlen(g_cfg_dir), rl = strlen(relpath);
+		int here = path[0] == '.' && (path[1] == '/' ||
+		    (path[1] == '.' && path[2] == '/'));
+		size_t dl, rl;
 
-		if (dl + 1 + rl >= sizeof(full))
-			return;			/* the joined path will not fit */
-		memcpy(full, g_cfg_dir, dl);
-		full[dl] = '/';
-		memcpy(full + dl + 1, relpath, rl + 1);
+		base_dir = here ? g_cfg_dir : g_cfg_root_dir;
+		if (base_dir[0] == '\0') {
+			snprintf(full, sizeof(full), "%s", path);
+		} else {
+			dl = strlen(base_dir);
+			rl = strlen(path);
+			if (dl + 1 + rl >= sizeof(full))
+				return;		/* the joined path will not fit */
+			memcpy(full, base_dir, dl);
+			full[dl] = '/';
+			memcpy(full + dl + 1, path, rl + 1);
+		}
 	}
 	g_cfg_inc_depth++;
 	(void)vedit_cfg_load(c, full);	/* sets and restores g_cfg_dir itself */
@@ -3503,8 +3538,8 @@ vedit_cfg_load(Cfg *c, const char *path)
 		return -1;
 	if (vf_read_file(path, &buf, &len) != 0)
 		return -1;
-	/* Remember this file's directory so an [include] inside it resolves a
-	 * relative path against it; restore the caller's on the way out. */
+	/* Remember this file's directory so an explicitly relative [include]
+	 * inside it resolves against it; restore the caller's on the way out. */
 	memcpy(saved_dir, g_cfg_dir, sizeof(saved_dir));
 	slash = strrchr(path, '/');
 	if (slash && (size_t)(slash - path) < sizeof(g_cfg_dir))
@@ -3512,6 +3547,10 @@ vedit_cfg_load(Cfg *c, const char *path)
 		    (int)(slash - path), path);
 	else
 		g_cfg_dir[0] = '\0';
+	/* The outermost file's directory is the default config directory, which
+	 * an unqualified [include] path resolves against at any nesting depth. */
+	if (g_cfg_inc_depth == 0)
+		memcpy(g_cfg_root_dir, g_cfg_dir, sizeof(g_cfg_root_dir));
 	rc = cfg_load_mem(c, buf);
 	memcpy(g_cfg_dir, saved_dir, sizeof(g_cfg_dir));
 	free(buf);
@@ -19109,7 +19148,7 @@ path_mangle(const char *full, char *out, size_t sz)
 }
 
 /* Resolve the directory named by config key (edit.swapdir / edit.backupdir)
- * into out. A leading "~/" expands against $HOME. Returns 1 when a usable,
+ * into out. A leading "~" expands against $HOME. Returns 1 when a usable,
  * writable directory is set, 0 for "beside the file" (unset, empty, ".", or a
  * directory that does not exist or cannot be written). */
 static int
@@ -19119,16 +19158,7 @@ resolve_dir_opt(const char *key, char *out, size_t sz)
 
 	if (!v || !v[0] || strcmp(v, ".") == 0)
 		return 0;
-	if (v[0] == '~' && v[1] == '/') {
-		const char *home = getenv("HOME");
-
-		if (!home || !home[0])
-			return 0;
-		if ((size_t)snprintf(out, sz, "%s%s", home, v + 1) >= sz)
-			return 0;
-	} else if ((size_t)snprintf(out, sz, "%s", v) >= sz) {
-		return 0;
-	}
+	cfg_expand_home(v, out, sz);
 	if (g_vfs->access(out, VF_W | VF_X) != 0)
 		return 0;
 	return 1;
@@ -22282,7 +22312,7 @@ tags_locate(Editor *e, char *out, size_t outsz)
 	char dir[PATH_MAX];
 
 	if (cfg && cfg[0]) {
-		snprintf(out, outsz, "%s", cfg);
+		cfg_expand_home(cfg, out, outsz);
 		return g_vfs->access(out, VF_R) == 0 ? 0 : -1;
 	}
 	if (!e->has_name)
@@ -22708,6 +22738,7 @@ cc_resolve(Editor *e, CcIncludes *out)
 	static int cache_valid;
 
 	const char *cfg = cfg_proj_get("cc.file");
+	char cfgbuf[PATH_MAX];
 	Vstat st;
 	char *json = NULL, *p;
 	size_t len = 0;
@@ -22717,6 +22748,7 @@ cc_resolve(Editor *e, CcIncludes *out)
 	out->dir[0] = '\0';
 	if (!cfg || !cfg[0] || !e->has_name)
 		return -1;
+	cfg = cfg_expand_home(cfg, cfgbuf, sizeof(cfgbuf));
 	if (g_vfs->stat(cfg, &st) != 0)
 		return -1;
 
@@ -34973,7 +35005,8 @@ static const char g_config_template[] =
 	"#	width = 10           # default column width\n"
 	"\n"
 	"#[include]\n"
-	"#	path = /path/to/other.conf   # merge another config file in here\n"
+	"#	path = other.conf    # merge a config file in here; a bare name is\n"
+	"#	                     # found next to this config file, ~ expands $HOME\n"
 	"\n"
 	"[keys]\n"
 	"#	modes = msedit vi    # single-word keymaps F2 cycles through\n"

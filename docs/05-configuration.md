@@ -44,6 +44,8 @@ and `#` or `;` comments.
   quotes, or the reader takes the rest as a comment.
 - A section with a name, such as `[command "c"]`, sets keys of the form
   `command.c.compile`.
+- A path value, such as `edit.swapdir`, `tags.file`, `cc.file`, `mail.dir`, or
+  an `[include]` path, expands a leading `~` against `$HOME`.
 
 ## The keys most people set
 
@@ -224,8 +226,12 @@ the command language, which has its own chapter (chapter 6).
 |---|---|---|
 | `path` | | read another config file in at this point |
 
-A relative `path` resolves against the including file's directory. The line
-takes effect where it appears, so later settings in the including file win.
+A leading `~` in `path` expands against `$HOME`. An absolute `path` is used as
+given. An explicitly relative `path` (one that starts with `./` or `../`)
+resolves against the including file's directory. Any other `path`, such as a
+bare name, resolves against the config directory (where the main `config` file
+lives). The line takes effect where it appears, so later settings in the
+including file win.
 
 ### `[edit]`: editing
 

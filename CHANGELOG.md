@@ -34,6 +34,12 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
 - View and mode key dispatch is centralized, and the grid-view render path is
   a single dispatch.
 - Reflow indents its output to the configured left margin.
+- An unqualified `[include]` path (a bare or slashed name) now resolves against
+  the config directory rather than the including file's directory. An
+  explicitly relative `./` or `../` path still resolves against the including
+  file, and an absolute path is still used as given.
+- A leading `~` in a config path value (`edit.swapdir`, `edit.backupdir`,
+  `tags.file`, `cc.file`, an `[include]` path) expands against `$HOME`.
 
 ## [1.6.0] - 2026-10-16
 - WebAssembly builds: a headless `wasm32-wasi` binary (`make wasm`) and a

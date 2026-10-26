@@ -2167,6 +2167,95 @@ t_cfg_parse(Test *t)
 	unlink(path);
 }
 
+/* Write text to an exact path, creating it (caller unlinks). */
+static int
+write_file_at(const char *path, const char *text)
+{
+	FILE *f = fopen(path, "w");
+
+	if (!f)
+		return -1;
+	fputs(text, f);
+	return fclose(f) == 0 ? 0 : -1;
+}
+
+/* An [include] path resolves by shape: a bare or slashed name against the
+ * default config directory (the outermost file, even from a nested include), a
+ * "./" or "../" name against the including file's directory, and a leading "~"
+ * against $HOME. */
+static void
+t_cfg_include_resolve(Test *t)
+{
+	char dir[] = "/tmp/vedit_incXXXXXX";
+	char sub[PATH_MAX], home[PATH_MAX], p[PATH_MAX];
+	char *saved_home = getenv("HOME");
+	char keep_home[PATH_MAX];
+	Cfg *c;
+	const char *v;
+
+	keep_home[0] = '\0';
+	if (saved_home)
+		snprintf(keep_home, sizeof(keep_home), "%s", saved_home);
+
+	TAP_ASSERT(t, mkdtemp(dir) != NULL);
+	snprintf(sub, sizeof(sub), "%s/sub", dir);
+	snprintf(home, sizeof(home), "%s/home", dir);
+	TAP_ASSERT(t, mkdir(sub, 0700) == 0 && mkdir(home, 0700) == 0);
+	setenv("HOME", home, 1);
+
+	/* main -> sub/mid.conf (slashed: against the config dir -> dir/sub).  */
+	snprintf(p, sizeof(p), "%s/main.conf", dir);
+	TAP_ASSERT(t, write_file_at(p,
+	    "[include]\n\tpath = sub/mid.conf\n") == 0);
+	/* mid, inside sub/, pulls a bare "leaf.conf" (against the config dir,
+	 * dir/leaf.conf, not dir/sub/leaf.conf), a "./sib.conf" (against its
+	 * own dir, dir/sub/sib.conf), and a "~/h.conf" (against HOME). */
+	snprintf(p, sizeof(p), "%s/mid.conf", sub);
+	TAP_ASSERT(t, write_file_at(p,
+	    "[include]\n\tpath = leaf.conf\n"
+	    "\tpath = ./sib.conf\n"
+	    "\tpath = ~/h.conf\n") == 0);
+	snprintf(p, sizeof(p), "%s/leaf.conf", dir);
+	TAP_ASSERT(t, write_file_at(p, "mark.leaf = root\n") == 0);
+	snprintf(p, sizeof(p), "%s/leaf.conf", sub);	/* must NOT be chosen */
+	TAP_ASSERT(t, write_file_at(p, "mark.leaf = sub\n") == 0);
+	snprintf(p, sizeof(p), "%s/sib.conf", sub);
+	TAP_ASSERT(t, write_file_at(p, "mark.sib = here\n") == 0);
+	snprintf(p, sizeof(p), "%s/h.conf", home);
+	TAP_ASSERT(t, write_file_at(p, "mark.home = yes\n") == 0);
+
+	c = vedit_cfg_new();
+	TAP_ASSERT(t, c != NULL);
+	snprintf(p, sizeof(p), "%s/main.conf", dir);
+	TAP_ASSERT(t, vedit_cfg_load(c, p) == 0);
+
+	v = cfg_get(c, "mark.leaf");
+	TAP_CHECKF(t, v && strcmp(v, "root") == 0, "bare name -> config dir: %s",
+	    v ? v : "(nil)");
+	v = cfg_get(c, "mark.sib");
+	TAP_CHECKF(t, v && strcmp(v, "here") == 0, "./ -> including dir: %s",
+	    v ? v : "(nil)");
+	v = cfg_get(c, "mark.home");
+	TAP_CHECKF(t, v && strcmp(v, "yes") == 0, "~ -> HOME: %s",
+	    v ? v : "(nil)");
+
+	vedit_cfg_free(c);
+	if (keep_home[0])
+		setenv("HOME", keep_home, 1);
+	else
+		unsetenv("HOME");
+	/* clean up the tree */
+	snprintf(p, sizeof(p), "%s/main.conf", dir);	unlink(p);
+	snprintf(p, sizeof(p), "%s/leaf.conf", dir);	unlink(p);
+	snprintf(p, sizeof(p), "%s/mid.conf", sub);	unlink(p);
+	snprintf(p, sizeof(p), "%s/leaf.conf", sub);	unlink(p);
+	snprintf(p, sizeof(p), "%s/sib.conf", sub);	unlink(p);
+	snprintf(p, sizeof(p), "%s/h.conf", home);	unlink(p);
+	rmdir(sub);
+	rmdir(home);
+	rmdir(dir);
+}
+
 static void
 t_cfg_resolve(Test *t)
 {
@@ -5834,6 +5923,7 @@ const Case tap_cases[] = {
 	{ "filepick_load", t_filepick_load },
 	{ "filepick_start_dir", t_filepick_start_dir },
 	{ "cfg_parse", t_cfg_parse },
+	{ "cfg_include_resolve", t_cfg_include_resolve },
 	{ "cfg_resolve", t_cfg_resolve },
 	{ "keymap_cycle", t_keymap_cycle },
 	{ "keymap_bind", t_keymap_bind },
