@@ -72,10 +72,12 @@ a mark and `go [pos 5 1]` jumps to a line.
   is unset.
 - `span inner OBJECT` and `span around OBJECT` are vi text objects. The objects
   are `word` and `big-word`; the bracket pairs `paren`, `brace`, `bracket` and
-  `angle`; and the quotes `double-quote`, `single-quote` and `back-quote`.
-  `inner` is the content, `around` takes the delimiters or the trailing space
-  too, so `span inner word` is the word under the cursor and `span around paren`
-  is a `(...)` with its parentheses.
+  `angle`; the quotes `double-quote`, `single-quote` and `back-quote`; and
+  `paragraph`. `inner` is the content, `around` takes the delimiters or the
+  trailing space too, so `span inner word` is the word under the cursor and
+  `span around paren` is a `(...)` with its parentheses. `paragraph` is a line
+  region of the whole rows the cursor's paragraph covers, as vi's `ip` and `ap`
+  are; `around` adds the blank lines after it.
 - `$clip` is the clipboard, and `reg NAME` a named register. A register persists
   between keypresses; a single letter `a` to `z` is vi's register of that
   letter, so a program and vi share it, and any other name is a register of its

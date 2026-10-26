@@ -28337,6 +28337,24 @@ bi_span(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		cle_err(ev, "span needs inner or around");
 		return -1;
 	}
+	/* Paragraph is a line object, not one of the vi char objects: its span is
+	 * whole rows, exactly as vi's ip/ap select linewise. inner is the run of
+	 * (non-blank) lines holding the cursor; around adds the blank lines after
+	 * it. para_lines reads the same bounds the vi engine uses. */
+	if (strcmp(argv[1].s, "paragraph") == 0) {
+		size_t lo, hi;
+
+		para_lines(e, e->cy, kind == 'a', &lo, &hi);
+		p1.row = lo;
+		p1.col = 0;
+		p2.row = hi;
+		p2.col = 0;
+		cl_region_build(e, CLK_LINE, p1, p2, &r);
+		r.buffer = CLB_CUR;
+		r.file = e->cur;
+		*result = clv_region(r);
+		return 0;
+	}
 	obj = cl_span_object(argv[1].s);
 	if (!obj) {
 		cle_err(ev, "unknown span object: %.20s", argv[1].s);

@@ -5421,6 +5421,69 @@ t_cl_select(Test *t)
 	g_cfg = old;
 }
 
+/* span inner|around paragraph is a line object: it spans whole rows the way vi
+ * ip/ap do, inner the run of text lines under the cursor, around the trailing
+ * blank lines too. */
+static void
+t_cl_span_para(Test *t)
+{
+	const Cfg *old = g_cfg;
+	ClProg *p;
+	char err[64];
+	int i;
+	Editor e;
+
+	g_cfg = NULL;
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	/* rows: 0 "line a", 1 "line b", 2 "", 3 "line c" */
+	text_insert(e.t, 0, 0, "line a", 6);
+	text_split(e.t, 0, 6); text_insert(e.t, 1, 0, "line b", 6);
+	text_split(e.t, 1, 6);			/* row 2 is the empty tail */
+	text_split(e.t, 2, 0); text_insert(e.t, 3, 0, "line c", 6);
+
+	/* inner: the two text lines holding the cursor, as a line region */
+	e.cy = 0; e.cx = 0;
+	p = cl_parse("copy [span inner paragraph] [reg a]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[0].len == 14 &&
+	    memcmp(e.vi_regs[0].bytes, "line a\nline b\n", 14) == 0,
+	    "span ip [%.*s]", (int)e.vi_regs[0].len, e.vi_regs[0].bytes);
+
+	/* around: the blank line after the paragraph is taken too */
+	e.cy = 0; e.cx = 0;
+	p = cl_parse("copy [span around paragraph] [reg b]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	TAP_CHECKF(t, e.vi_regs[1].len == 15 &&
+	    memcmp(e.vi_regs[1].bytes, "line a\nline b\n\n", 15) == 0,
+	    "span ap [%.*s]", (int)e.vi_regs[1].len, e.vi_regs[1].bytes);
+
+	/* deleting through the inner paragraph removes those whole rows */
+	e.cy = 0; e.cx = 0;
+	p = cl_parse("delete [span inner paragraph]", err, sizeof(err));
+	TAP_ASSERT(t, p != NULL);
+	cl_run(&e, p);
+	cl_prog_free(p);
+	{
+		const char *s;
+		size_t len;
+
+		s = text_line(e.t, 0, &len);
+		TAP_CHECKF(t, len == 0, "after para delete row0 len=%zu", len);
+	}
+
+	for (i = 0; i < 26; i++)
+		free(e.vi_regs[i].bytes);
+	free(e.clip);
+	text_free(e.t);
+	g_cfg = old;
+}
+
 /* An anchored region names its endpoints by mark, so it tracks edits: a region
  * set up before an edit still spans the right text after lines move. */
 static void
@@ -5645,6 +5708,7 @@ const Case tap_cases[] = {
 	{ "cl_selection", t_cl_selection },
 	{ "cl_block", t_cl_block },
 	{ "cl_select", t_cl_select },
+	{ "cl_span_para", t_cl_span_para },
 	{ "cl_anchored", t_cl_anchored },
 	{ "cl_anchored_xfile", t_cl_anchored_xfile },
 	{ "mark_track", t_mark_track },
