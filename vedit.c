@@ -6144,7 +6144,7 @@ static uint32_t syn_line(const Syntax *sy, uint32_t state_in, const char *bytes,
  * authoritative number; a shipped build always overrides this define, so this
  * may lag it between releases. */
 #ifndef VEDIT_VERSION
-#define VEDIT_VERSION "vedit 1.6.1"
+#define VEDIT_VERSION "vedit 1.27.2"
 #endif
 
 /****************************************************************
