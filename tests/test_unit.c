@@ -4998,6 +4998,68 @@ t_cl_bool(Test *t)
 	TAP_CHECK(t, bi_cmp(&ev, 3, argv, &result) == -1);	/* bad operator */
 }
 
+/* for counts a variable over a range; while and until loop on a condition the
+ * body changes (no arithmetic here, so a flag the body sets drives them). */
+static void
+t_cl_loop(Test *t)
+{
+	Editor e;
+	ClEval ev;
+	ClVal argv[4], result;
+	char out[64];
+
+	/* for runs the body once per step; two deletes leave the last line */
+	cl_if_run("for i 1 2 { delete [region line 1 1] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "c") == 0, "for 1 2 -> %s", out);
+
+	/* the loop variable takes each value: delete only when i is 2 */
+	cl_if_run("for i 1 3 { if $i = 2 { delete [region line 1 1] } }",
+	    out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "for var -> %s", out);
+
+	/* counting down starts at the high end (i is 3 on the first pass) */
+	cl_if_run("for i 3 1 { if $i = 3 { delete [region line 1 1] } }",
+	    out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "for down -> %s", out);
+
+	/* a single-step range runs exactly once */
+	cl_if_run("for i 5 5 { delete [region line 1 1] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "for 5 5 -> %s", out);
+
+	/* while re-evaluates its condition: the body clears the flag, so it
+	 * runs once */
+	cl_if_run("set go 1 ; while { $go } { delete [region line 1 1] ; "
+	    "set go 0 }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "while once -> %s", out);
+
+	/* a false condition never enters the body */
+	cl_if_run("set go 0 ; while { $go } { delete [region line 1 1] }",
+	    out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "a/b/c") == 0, "while never -> %s", out);
+
+	/* until loops while the condition is false; the body makes it true */
+	cl_if_run("set go 0 ; until { $go } { delete [region line 1 1] ; "
+	    "set go 1 }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "until once -> %s", out);
+
+	/* a comparison condition, re-evaluated, also drives while */
+	cl_if_run("set s go ; while { $s = go } { delete [region line 1 1] ; "
+	    "set s stop }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "while cmp -> %s", out);
+
+	/* arity errors, without running a loop */
+	editor_init(&e);
+	memset(&ev, 0, sizeof(ev));
+	ev.e = &e;
+	memset(argv, 0, sizeof(argv));
+	memset(&result, 0, sizeof(result));
+	TAP_CHECK(t, cl_builtin_find("for") && cl_builtin_find("while") &&
+	    cl_builtin_find("until"));
+	TAP_CHECK(t, bi_while(&ev, 1, argv, &result) == -1);
+	TAP_CHECK(t, bi_until(&ev, 1, argv, &result) == -1);
+	TAP_CHECK(t, bi_for(&ev, 3, argv, &result) == -1);
+}
+
 /* A key bound to a {program} runs its commands in order. ^D here runs
  * line-end then newline, which opens a blank line below "hello" and lands on
  * it. */
@@ -6186,6 +6248,7 @@ const Case tap_cases[] = {
 	{ "cl_dialog_builtins", t_cl_dialog_builtins },
 	{ "cl_if", t_cl_if },
 	{ "cl_bool", t_cl_bool },
+	{ "cl_loop", t_cl_loop },
 	{ "cl_region", t_cl_region },
 	{ "cl_rect", t_cl_rect },
 	{ "block_column", t_block_column },

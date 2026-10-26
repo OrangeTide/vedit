@@ -45,6 +45,9 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
 - The command language gains the boolean combinators `not`, `and`, and `or`
   over truthiness, and `cmp A OP B` to use a comparison as a value, so compound
   conditions such as `if [and [cmp $n < 10] [confirm {ok?}]] { ... }` work.
+- The command language gains loops: `for VAR START END { BODY }` counts a
+  variable over a range, and `while { COND } { BODY }` and `until { COND }
+  { BODY }` repeat on a re-evaluated condition.
 - The command language gains a `menu TITLE LABEL BODY ...` verb: it lists the
   labels and runs the chosen entry's program, so a keymap can build its own menu
   with no change to the editor.

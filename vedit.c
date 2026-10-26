@@ -27760,6 +27760,7 @@ typedef struct cl_eval {
 } ClEval;
 
 #define CL_RUN_MAX 64		/* deepest run nesting before it is an error */
+#define CL_LOOP_MAX 1000000	/* most iterations a loop may run before it stops */
 
 static void
 cle_err(ClEval *ev, const char *fmt, ...)
@@ -29532,6 +29533,160 @@ bi_cmp(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 	return cl_result_str(ev, result, b ? "1" : "0");
 }
 
+/* Evaluate a loop's condition text to 0 or 1. The text is one test, re-parsed
+ * and re-evaluated on each call so a counter it reads is current: a single
+ * value is read for truth (cl_truthy), and three words A OP B are a comparison,
+ * the same grammar if's condition uses. Returns 0, or -1 (ev->err set). */
+static int
+cl_eval_cond(ClEval *ev, const char *src, int *out)
+{
+	ClProg *p;
+	ClCmd *c;
+	char perr[128];
+	int rc = 0;
+
+	p = cl_parse(src, perr, sizeof(perr));
+	if (!p) {
+		cle_err(ev, "%.100s", perr);
+		return -1;
+	}
+	if (p->ncmds != 1) {
+		cle_err(ev, "a loop condition must be one test");
+		cl_prog_free(p);
+		return -1;
+	}
+	c = &p->cmds[0];
+	if (c->nwords == 1) {
+		ClVal v = { 0 };
+
+		rc = cl_eval_word(ev, &c->words[0], &v);
+		if (rc == 0)
+			*out = cl_truthy(&v);
+		clv_clear(&v);
+	} else if (c->nwords == 3) {
+		ClVal a = { 0 }, op = { 0 }, b = { 0 };
+
+		if (cl_eval_word(ev, &c->words[0], &a) < 0 ||
+		    cl_eval_word(ev, &c->words[1], &op) < 0 ||
+		    cl_eval_word(ev, &c->words[2], &b) < 0)
+			rc = -1;
+		else if (op.type != CLV_STR || !cl_is_cmp_op(op.s)) {
+			cle_err(ev, "a loop condition is a value or A OP B");
+			rc = -1;
+		} else
+			rc = cl_cmp(ev, &a, op.s, &b, out);
+		clv_clear(&a);
+		clv_clear(&op);
+		clv_clear(&b);
+	} else {
+		cle_err(ev, "a loop condition is a value or A OP B");
+		rc = -1;
+	}
+	cl_prog_free(p);
+	return rc;
+}
+
+/* The body of while and until: run BODY while COND (re-evaluated each pass) is
+ * true, or while it is false when invert is set. A quit raised in the body ends
+ * the loop and propagates; a runaway loop stops after CL_LOOP_MAX passes. */
+static int
+cl_loop_cond(ClEval *ev, const char *cond, const char *body, int invert,
+    ClVal *result)
+{
+	long iters = 0;
+
+	for (;;) {
+		int ok;
+
+		if (cl_eval_cond(ev, cond, &ok) < 0)
+			return -1;
+		if (invert)
+			ok = !ok;
+		if (!ok)
+			break;
+		if (cl_eval_string(ev, body, result) < 0)
+			return -1;
+		if (cl_req_is_quit(ev->pending_req))
+			break;		/* the body quit: leave it to propagate */
+		if (++iters >= CL_LOOP_MAX) {
+			cle_err(ev, "loop ran too long");
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* while { COND } { BODY }: run BODY while COND is true. The condition is program
+ * text (so brace it), re-evaluated each pass, so `set i 0 ; while { $i < 3 }
+ * { ... ; set i [...] }` counts. */
+static int
+bi_while(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	if (argc != 2 || argv[0].type != CLV_STR || argv[1].type != CLV_STR) {
+		cle_err(ev, "while needs a condition and a body");
+		return -1;
+	}
+	return cl_loop_cond(ev, argv[0].s, argv[1].s, 0, result);
+}
+
+/* until { COND } { BODY }: run BODY until COND becomes true (while it is
+ * false). */
+static int
+bi_until(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	if (argc != 2 || argv[0].type != CLV_STR || argv[1].type != CLV_STR) {
+		cle_err(ev, "until needs a condition and a body");
+		return -1;
+	}
+	return cl_loop_cond(ev, argv[0].s, argv[1].s, 1, result);
+}
+
+/* for VAR START END { BODY }: run BODY with VAR set to each integer from START
+ * to END inclusive, counting up when START <= END and down otherwise. A quit in
+ * the body ends the loop; the run is capped at CL_LOOP_MAX passes. */
+static int
+bi_for(ClEval *ev, int argc, ClVal *argv, ClVal *result)
+{
+	long from, to, i, step, iters = 0;
+
+	if (argc != 4 || argv[0].type != CLV_STR || argv[3].type != CLV_STR) {
+		cle_err(ev, "for needs a variable, a start, an end, and a body");
+		return -1;
+	}
+	from = clv_arg_int(&argv[1]);
+	to = clv_arg_int(&argv[2]);
+	step = (from <= to) ? 1 : -1;
+	for (i = from;; i += step) {
+		ClVal v = { 0 };
+		char b[32];
+
+		snprintf(b, sizeof(b), "%ld", i);
+		v.type = CLV_STR;
+		v.s = clv_strdup(b);
+		if (!v.s) {
+			cle_err(ev, "out of memory");
+			return -1;
+		}
+		if (cle_set(ev, argv[0].s, &v) < 0) {
+			clv_clear(&v);
+			cle_err(ev, "out of memory");
+			return -1;
+		}
+		clv_clear(&v);
+		if (cl_eval_string(ev, argv[3].s, result) < 0)
+			return -1;
+		if (cl_req_is_quit(ev->pending_req))
+			break;
+		if (i == to)
+			break;
+		if (++iters >= CL_LOOP_MAX) {
+			cle_err(ev, "loop ran too long");
+			return -1;
+		}
+	}
+	return 0;
+}
+
 /* The list picker backing menu: the title and the (label, body) pairs
  * (argv + 1, label at an even offset, body at the next), and the entry the user
  * activated, or -1. */
@@ -29631,6 +29786,9 @@ static const ClBuiltin cl_builtins[] = {
 	{ "and", bi_and },
 	{ "or", bi_or },
 	{ "cmp", bi_cmp },
+	{ "while", bi_while },
+	{ "until", bi_until },
+	{ "for", bi_for },
 	{ "menu", bi_menu },
 	{ "ask", bi_ask },
 	{ "confirm", bi_confirm },

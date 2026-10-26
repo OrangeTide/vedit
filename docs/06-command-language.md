@@ -207,6 +207,25 @@ as a value (`1` or `0`), so a comparison can feed `and`, `or`, and `not`:
     bind = "^J { if [and [cmp $n < 10] [confirm {Insert?}]] { put ok at [cursor] } }"
 ```
 
+**Loops.** Three verbs repeat a body:
+
+- `for VAR START END { BODY }` runs `BODY` with `VAR` set to each integer from
+  `START` to `END` inclusive, counting up when `START <= END` and down
+  otherwise.
+- `while { COND } { BODY }` runs `BODY` while `COND` is true, and
+  `until { COND } { BODY }` runs it until `COND` becomes true.
+
+A loop condition is a single test, the same grammar `if` uses (a value, or
+`A OP B`), but it is written as program text, so brace it: the loop re-evaluates
+it each pass, so a counter or flag it reads is current. A quit inside a body
+ends the loop, and a loop that never stops is cut off after a safety limit.
+
+```ini
+[keys "demo"]
+    bind = "^G { for i 1 5 { put $i at [cursor] } }"
+    bind = "^K { while { [confirm {Insert another?}] } { put x at [cursor] } }"
+```
+
 **Dialogs.** Four verbs open a dialog and return what the user chose, so a
 program can ask for a value and act on it:
 
