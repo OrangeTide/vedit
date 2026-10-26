@@ -14150,9 +14150,9 @@ tbl_cell_value(const Editor *e, size_t row, int col, char *buf, size_t n)
  * the gutter shows), so A1 is column A of line 1. The file stays plain CSV: the
  * formula is stored as its '=' text and the grid shows the computed value. The
  * recalc is recompute-on-read: a referenced cell is evaluated when a formula
- * reads it, with a visiting stack to catch cycles. Phase B first cut: numbers
- * only, single-cell references, no A1:B3 ranges yet (see
- * docs/design/expr-and-spreadsheet.md).
+ * reads it, with a visiting stack to catch cycles. Numbers and A1:B3 ranges
+ * with the SUM/AVG/COUNT/MIN/MAX functions; references are relabeled when rows
+ * or columns are inserted or deleted (see docs/design/expr-and-spreadsheet.md).
  ****************************************************************/
 
 #define TBL_FORMULA_DEPTH 64	/* deepest reference chain before it is a cycle */
@@ -14205,7 +14205,8 @@ tbl_formula_num(TblEval *tv, size_t row, int col, const char *expr, double *out)
 	if (expr_eval(expr, &env, &ov, err, sizeof(err)) < 0) {
 		tv->nvis--;
 		if (tv->err[0] == '\0') {	/* not already a #REF!/#CYCLE! */
-			snprintf(tv->err, sizeof(tv->err), "%s",
+			snprintf(tv->err, sizeof(tv->err), "%.7s",
+			    err[0] == '#' ? err :	/* a #REF! from reloc */
 			    strstr(err, "division by zero") ? "#DIV/0!" :
 			    "#ERR!");
 		}
@@ -14370,6 +14371,210 @@ tbl_cell_display(const Editor *e, size_t row, int col, char *buf, size_t n)
 		snprintf(buf, n, "%s", tv.err[0] ? tv.err : "#ERR!");
 	else
 		expr_format(v, buf, n);
+}
+
+/* Map the index interval [*lo, *hi] (lo <= hi, rows or columns) through a
+ * structural edit at `at`, `n` wide. An insert (del == 0) shifts indices at or
+ * past `at` up by n. A delete removes [at, at + n): lower indices stay, those
+ * inside the band collapse, higher ones shift down. Returns 0 with the new
+ * interval, or -1 if a delete removed the whole interval. */
+static int
+tbl_reloc_span(long *lo, long *hi, long at, int n, int del)
+{
+	long nlo, nhi;
+
+	if (!del) {
+		if (*lo >= at)
+			*lo += n;
+		if (*hi >= at)
+			*hi += n;
+		return 0;
+	}
+	nlo = *lo < at ? *lo : (*lo < at + n ? at : *lo - n);
+	nhi = *hi < at ? *hi : (*hi < at + n ? at - 1 : *hi - n);
+	if (nlo > nhi)
+		return -1;		/* the span was entirely deleted */
+	*lo = nlo;
+	*hi = nhi;
+	return 0;
+}
+
+/* Append one reference, as a label and 1-based row, to out at *o. */
+static int
+tbl_reloc_emit(char *out, size_t outsz, size_t *o, int col, long row)
+{
+	char label[TBL_LABEL_MAX];
+	int w;
+
+	w = snprintf(out + *o, outsz - *o, "%s%ld",
+	    tbl_label(col, label, sizeof(label)), row + 1);
+	if (w < 0 || (size_t)w >= outsz - *o)
+		return -1;
+	*o += (size_t)w;
+	return 0;
+}
+
+/* Rewrite the A1 references in formula text src for a structural edit on rows
+ * (is_col == 0) or columns, at `at`, `n` wide, inserting or deleting (del). A
+ * single reference and an A1:B3 range are adjusted; a reference to a deleted
+ * cell, or a range deleted whole, becomes #REF!, and a range straddling the
+ * band shrinks. Text that is not a reference, including function names and
+ * numbers, is copied unchanged. Writes to out and returns 1 if it differs from
+ * src, 0 if not, or -1 on overflow. */
+static int
+tbl_reloc_formula(const char *src, int is_col, long at, int n, int del,
+    char *out, size_t outsz)
+{
+	size_t i = 0, o = 0;
+	int changed = 0;
+
+	while (src[i]) {
+		char id1[TBL_LABEL_MAX + 12];
+		size_t start = i, k;
+		int c1, c2, isrange = 0;
+		long r1, r2, elo, ehi, nlo, nhi, clo, chi, rlo, rhi;
+		char *end;
+
+		if (isdigit((unsigned char)src[i]) ||
+		    (src[i] == '.' && isdigit((unsigned char)src[i + 1]))) {
+			strtod(src + i, &end);	/* copy a whole number intact */
+			while (src + i < end) {
+				if (o + 1 >= outsz)
+					return -1;
+				out[o++] = src[i++];
+			}
+			continue;
+		}
+		if (!isalpha((unsigned char)src[i]) && src[i] != '_') {
+			if (o + 1 >= outsz)
+				return -1;
+			out[o++] = src[i++];
+			continue;
+		}
+		for (k = 0; (isalnum((unsigned char)src[i]) || src[i] == '_') &&
+		    k + 1 < sizeof(id1); k++)
+			id1[k] = src[i++];
+		id1[k] = '\0';
+		if (tbl_ref_parse(id1, &c1, &r1) < 0) {	/* a name, not a ref */
+			if (o + k >= outsz)
+				return -1;
+			memcpy(out + o, id1, k);
+			o += k;
+			continue;
+		}
+		c2 = c1;
+		r2 = r1;
+		if (src[i] == ':') {		/* a range: a second reference */
+			size_t j = i + 1, m = 0;
+			char id2[TBL_LABEL_MAX + 12];
+
+			while ((isalnum((unsigned char)src[j]) ||
+			    src[j] == '_') && m + 1 < sizeof(id2))
+				id2[m++] = src[j++];
+			id2[m] = '\0';
+			if (tbl_ref_parse(id2, &c2, &r2) == 0) {
+				isrange = 1;
+				i = j;
+			}
+		}
+		/* the edited axis, as an interval, adjusted */
+		elo = is_col ? (c1 < c2 ? c1 : c2) : (r1 < r2 ? r1 : r2);
+		ehi = is_col ? (c1 > c2 ? c1 : c2) : (r1 > r2 ? r1 : r2);
+		nlo = elo;
+		nhi = ehi;
+		if (tbl_reloc_span(&nlo, &nhi, at, n, del) < 0) {
+			if (o + 5 >= outsz)	/* the cell(s) are gone */
+				return -1;
+			memcpy(out + o, "#REF!", 5);
+			o += 5;
+			changed = 1;
+			continue;
+		}
+		if (nlo == elo && nhi == ehi) {	/* unchanged: copy verbatim */
+			if (o + (i - start) >= outsz)
+				return -1;
+			memcpy(out + o, src + start, i - start);
+			o += i - start;
+			continue;
+		}
+		if (is_col) {
+			clo = nlo;
+			chi = nhi;
+			rlo = r1 < r2 ? r1 : r2;
+			rhi = r1 > r2 ? r1 : r2;
+		} else {
+			rlo = nlo;
+			rhi = nhi;
+			clo = c1 < c2 ? c1 : c2;
+			chi = c1 > c2 ? c1 : c2;
+		}
+		changed = 1;
+		if (tbl_reloc_emit(out, outsz, &o, (int)clo, rlo) < 0)
+			return -1;
+		if (isrange) {
+			if (o + 1 >= outsz)
+				return -1;
+			out[o++] = ':';
+			if (tbl_reloc_emit(out, outsz, &o, (int)chi, rhi) < 0)
+				return -1;
+		}
+	}
+	if (o >= outsz)
+		return -1;
+	out[o] = '\0';
+	return changed;
+}
+
+/* Replace cell (row, col) with val, encoded as a field. Unlike tbl_set_cell it
+ * runs inside the caller's undo group and leaves the cursor and status line
+ * alone, for the relocation sweep. Returns 0, or -1. */
+static int
+tbl_cell_replace_raw(Editor *e, size_t row, int col, const char *val, size_t n)
+{
+	Tbl *tb = e->tbl;
+	size_t off, len, outn;
+	int nf = tbl_cell_off(e, row, col, &off, &len), changed;
+	char *enc;
+
+	if (col >= nf)
+		return 0;		/* the row is too short to hold it */
+	enc = tbl_quote(tb->delim, val, n, &outn, &changed);
+	if (!enc)
+		return -1;
+	if (len)
+		text_delete(e->t, row, off, len);
+	if (outn)
+		text_insert(e->t, row, off, enc, outn);
+	free(enc);
+	return 0;
+}
+
+/* Relabel every formula's A1 references for a structural edit: rows (is_col ==
+ * 0) or columns were inserted or deleted (del) at `at`, `n` wide. Runs inside
+ * the caller's undo group so one undo reverts the edit and the relabeling
+ * together. A no-op when formulas are off. */
+static void
+tbl_reloc(Editor *e, int is_col, long at, int n, int del)
+{
+	size_t nl = text_lines(e->t), y;
+
+	if (!e->tbl_formulas || n < 1)
+		return;
+	for (y = 0; y < nl; y++) {
+		size_t off, len;
+		int nf = tbl_cell_off(e, y, 0, &off, &len), col;
+
+		for (col = 0; col < nf; col++) {
+			char cell[TBL_CELL_MAX], out[TBL_CELL_MAX];
+
+			tbl_cell_value(e, y, col, cell, sizeof(cell));
+			if (cell[0] != '=')
+				continue;
+			if (tbl_reloc_formula(cell, is_col, at, n, del,
+			    out, sizeof(out)) == 1)
+				tbl_cell_replace_raw(e, y, col, out, strlen(out));
+		}
+	}
 }
 
 /* Row-number gutter width: the digits of the line count, at least two, plus
@@ -14980,6 +15185,7 @@ tbl_row_add(Editor *e, int n, int below)
 		else
 			text_split(e->t, y, 0);
 	}
+	tbl_reloc(e, 0, below ? (long)y + 1 : (long)y, n, 0);
 	text_undo_group_end(e->t);
 	hl_touch(e, y);
 	e->cy = below ? y + 1 : y;
@@ -15042,6 +15248,7 @@ tbl_row_del(Editor *e, int n)
 	tbl_row_copy(e, n);
 	text_undo_group_begin(e->t);
 	vi_delete_lines(e, y, y + (size_t)n - 1);
+	tbl_reloc(e, 0, (long)y, n, 1);
 	text_undo_group_end(e->t);
 	e->cx = 0;
 	set_status(e, "%d row%s deleted (Ctrl+V or p pastes them back)", n,
@@ -15117,6 +15324,7 @@ tbl_col_add(Editor *e, int n, int after)
 		for (k = 0; k < n; k++)
 			text_insert(e->t, y, at, &tb->delim, 1);
 	}
+	tbl_reloc(e, 1, after ? (long)c + 1 : (long)c, n, 0);
 	text_undo_group_end(e->t);
 	hl_touch(e, 0);
 	tbl_width_shift(tb, after ? c + 1 : c, n);
@@ -15157,6 +15365,7 @@ tbl_col_del(Editor *e, int n)
 				text_delete(e->t, y, off - 1, len + 1);
 		}
 	}
+	tbl_reloc(e, 1, (long)c, n, 1);
 	text_undo_group_end(e->t);
 	hl_touch(e, 0);
 	tbl_width_shift(tb, c, -n);
@@ -30068,6 +30277,19 @@ expr_lex(ExprP *x)
 		x->name[i] = '\0';
 		x->p = p;
 		x->tok = ETK_IDENT;
+		return;
+	}
+	if (*p == '#') {		/* an error literal, e.g. #REF! from reloc */
+		char lit[16];
+		size_t i = 0;
+
+		lit[i++] = *p++;
+		while (i + 1 < sizeof(lit) &&
+		    (isalnum((unsigned char)*p) || *p == '/' || *p == '!'))
+			lit[i++] = *p++;
+		lit[i] = '\0';
+		x->p = p;
+		expr_fail(x, "%s", lit);
 		return;
 	}
 	switch (*p) {

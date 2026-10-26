@@ -167,8 +167,11 @@ value cannot be computed the cell shows a code: `#DIV/0!` for division by zero,
 `#REF!` for a reference outside the table, `#CYCLE!` when formulas depend on
 each other in a loop, and `#ERR!` for anything else, such as a range used where
 a single value is wanted. The status line shows a formula cell as its source and
-its value, `C7: =B2*C2 = 12`, and editing a cell edits the `=` text. Set
-`table.formulas = off` for a file that uses a leading `=` as literal text.
+its value, `C7: =B2*C2 = 12`, and editing a cell edits the `=` text. Inserting or
+deleting a row or column relabels the references in every formula, so they keep
+pointing at the same cells. A reference to a deleted cell becomes `#REF!`, and a
+range that straddles a deletion shrinks. Set `table.formulas = off` for a file
+that uses a leading `=` as literal text.
 
 `:rowadd [N]` inserts N blank rows above the cursor row and `:rowadd! [N]`
 below it. `:rowdel [N]` deletes N rows from the cursor. `:coladd [N]` inserts N empty columns

@@ -60,6 +60,9 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
 - Table formulas take ranges: `A1:B3` names a block of cells, and the functions
   `SUM`, `AVG`, `COUNT`, `MIN`, and `MAX` fold a range (or plain numbers) into a
   value, so `=SUM(A1:A10)` totals a column. Function names are case-insensitive.
+- Table formula references are relabeled when a row or column is inserted or
+  deleted, so a formula keeps pointing at the same cells. A reference to a
+  deleted cell becomes `#REF!`, and a range straddling a deletion shrinks.
 - The command language gains a `menu TITLE LABEL BODY ...` verb: it lists the
   labels and runs the chosen entry's program, so a keymap can build its own menu
   with no change to the editor.

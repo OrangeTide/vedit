@@ -4,9 +4,9 @@ Status: Phase A and a second cut of Phase B implemented. The standalone `expr_*`
 evaluator, the command-language `expr` verb, and the table view's formulas are
 built (`vedit.c`, the Expression evaluator and Table formulas sections). The
 formula cut is numbers and ranges (`A1:B3` with `SUM`, `AVG`, `COUNT`, `MIN`,
-`MAX`), recompute-on-read with a visiting stack for cycles; string value
-variants in `ExprVal`, incremental recalc, reference adjustment on row and
-column edits, and `EVAL` are not built yet. This note records the design for two features that
+`MAX`), recompute-on-read with a visiting stack for cycles, and reference
+relabeling on row and column insert or delete; string value variants in
+`ExprVal`, incremental recalc, and `EVAL` are not built yet. This note records the design for two features that
 share one piece: an arithmetic `expr` for the command language, and formulas for
 the CSV/TSV table view. The shared piece is an expression
 evaluator. The point of writing this before building `expr` is to give the
@@ -161,11 +161,14 @@ specific and is most of the work:
   topological order and cycle detection. Start with recompute-all on any edit,
   which is simple and fine for modest sheets, and add incremental dependency
   tracking later. Cycle detection is needed either way.
-- Reference adjustment on structural edits. The table view already inserts and
-  deletes rows and columns (`tbl_row_add`, `tbl_col_del`, and the rest). A
-  formula with `A1` references must have those references relabeled when rows or
-  columns shift, the way a real spreadsheet does, or the formulas silently point
-  at the wrong cells. This is engine work with no parser involvement.
+- Reference adjustment on structural edits (built). The table view inserts and
+  deletes rows and columns (`tbl_row_add`, `tbl_col_del`, and the rest), and
+  each of those now calls `tbl_reloc` inside its undo step to relabel every
+  formula's references: a reference past the edit shifts, one into a deleted
+  band becomes `#REF!`, and a range straddling a deletion shrinks. It rewrites
+  the formula text (`tbl_reloc_formula`) rather than any cell model, so it is a
+  text pass with no parser involvement. Row sort and clipboard paste do not
+  relabel yet.
 
 Sharing the evaluator saves perhaps a fifth of the spreadsheet effort. The
 engine, the cache, the dependency order, and reference adjustment are the rest.
@@ -196,9 +199,10 @@ language (whose values are `long` today through `clv_arg_int`) and the sheet
   recompute-on-read with a visiting stack for cycles (`tbl_formula_num`), error
   values, and the source-and-value status line. The `:` range operator with
   `tbl_deref` and `tbl_fold` backing the `SUM`, `AVG`, `COUNT`, `MIN`, and `MAX`
-  functions. Still to come: a value cache, incremental recalc, reference
-  adjustment on row and column edits, string formulas, and `EVAL` with the
-  restricted formula context.
+  functions. Reference relabeling on row and column insert or delete
+  (`tbl_reloc`), rewriting the formula text in place within the edit's undo
+  step. Still to come: a value cache, incremental recalc, string formulas, and
+  `EVAL` with the restricted formula context.
 - Gating. `expr_*` stays ungated and small, so the `expr` verb works in builds
   without the table, and the table works without arithmetic. The spreadsheet
   engine stays behind `VEDIT_TABLE`.

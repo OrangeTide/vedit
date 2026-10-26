@@ -4603,6 +4603,112 @@ t_tbl_formula_range(Test *t)
 	text_free(e.t);
 }
 
+/* Rewrite a formula's references for a structural edit and compare the text. */
+static int
+reloc_is(const char *src, int is_col, long at, int n, int del, const char *want)
+{
+	char out[128];
+
+	if (tbl_reloc_formula(src, is_col, at, n, del, out, sizeof(out)) < 0)
+		return 0;
+	return strcmp(out, want) == 0;
+}
+
+/* Reference relocation relabels A1 references when rows or columns are inserted
+ * or deleted: references past the edit shift, a range straddling it grows or
+ * shrinks, a reference to a deleted cell becomes #REF!, and function names and
+ * numbers are left alone. Indices are zero-based; A3 is row index 2. */
+static void
+t_tbl_reloc(Test *t)
+{
+	/* row insert: references at or past the point shift down by one */
+	TAP_CHECK(t, reloc_is("=A1+A5", 0, 2, 1, 0, "=A1+A6"));
+	TAP_CHECK(t, reloc_is("=A1", 0, 0, 1, 0, "=A2"));
+	TAP_CHECK(t, reloc_is("=SUM(A1:A5)", 0, 2, 1, 0, "=SUM(A1:A6)"));
+	/* an unrelated formula is returned byte-for-byte (rc 0) */
+	TAP_CHECK(t, reloc_is("=A1", 0, 5, 1, 0, "=A1"));
+
+	/* row delete: a reference into the band is #REF!, past it shifts up, a
+	 * range straddling it shrinks */
+	TAP_CHECK(t, reloc_is("=A3", 0, 2, 1, 1, "=#REF!"));
+	TAP_CHECK(t, reloc_is("=A5", 0, 2, 1, 1, "=A4"));
+	TAP_CHECK(t, reloc_is("=SUM(A1:A5)", 0, 2, 1, 1, "=SUM(A1:A4)"));
+
+	/* column insert and delete, with labels A, B, C ... */
+	TAP_CHECK(t, reloc_is("=A1+B1", 1, 1, 1, 0, "=A1+C1"));
+	TAP_CHECK(t, reloc_is("=B1", 1, 1, 1, 1, "=#REF!"));
+	TAP_CHECK(t, reloc_is("=C1", 1, 1, 1, 1, "=B1"));
+	TAP_CHECK(t, reloc_is("=SUM(A1:C1)", 1, 1, 1, 1, "=SUM(A1:B1)"));
+
+	/* function names and numbers (even in e-notation) are untouched */
+	TAP_CHECK(t, reloc_is("=MAX(A6,1e5)", 0, 0, 1, 0, "=MAX(A7,1e5)"));
+}
+
+/* True when raw buffer line `row` equals want. */
+static int
+rawline_is(Editor *e, size_t row, const char *want)
+{
+	size_t len = 0;
+	const char *s = text_line(e->t, row, &len);
+
+	return s && len == strlen(want) && memcmp(s, want, len) == 0;
+}
+
+/* The structural table operations relabel formula references through the same
+ * relocation, within one undo step. Insert a row and a range grows; delete a
+ * referenced column and the reference becomes #REF!. */
+static void
+t_tbl_reloc_live(Test *t)
+{
+	static const char *const R[] = { "1,=SUM(A1:A3)", "2,", "3," };
+	static const char *const C[] = { "=B1,10,20" };
+	Editor e;
+
+	/* a row inserted below row 1 grows the range B1 to A1:A4 */
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, R, 3);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+	e.cy = 0;
+	e.tbl->cx = 0;
+	tbl_row_add(&e, 1, 1);
+	TAP_CHECK(t, rawline_is(&e, 0, "1,=SUM(A1:A4)"));
+	/* deleting that blank row shrinks it back, and one undo reverts both */
+	e.cy = 1;
+	tbl_row_del(&e, 1);
+	TAP_CHECK(t, rawline_is(&e, 0, "1,=SUM(A1:A3)"));
+	tbl_detach(&e);
+	text_free(e.t);
+
+	/* a column inserted left of B shifts a B reference to C */
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, C, 1);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+	e.tbl->cx = 1;
+	tbl_col_add(&e, 1, 0);
+	TAP_CHECK(t, rawline_is(&e, 0, "=C1,,10,20"));
+	tbl_detach(&e);
+	text_free(e.t);
+
+	/* deleting the referenced column makes the reference #REF! */
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, C, 1);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+	e.tbl->cx = 1;
+	tbl_col_del(&e, 1);
+	TAP_CHECK(t, rawline_is(&e, 0, "=#REF!,20"));
+	tbl_detach(&e);
+	text_free(e.t);
+}
+
 /* The non-vi motion layer maps a position to where a modeless motion lands,
  * without touching the editor cursor. Left and right step by rune and wrap
  * across line ends; up and down clamp the column to the target line; the
@@ -6495,6 +6601,8 @@ const Case tap_cases[] = {
 	{ "tbl_formula", t_tbl_formula },
 	{ "tbl_formula_cycle", t_tbl_formula_cycle },
 	{ "tbl_formula_range", t_tbl_formula_range },
+	{ "tbl_reloc", t_tbl_reloc },
+	{ "tbl_reloc_live", t_tbl_reloc_live },
 	{ "swap_paths", t_swap_paths },
 	{ "atomic_save", t_atomic_save },
 	{ "save_rodir_fallback", t_save_rodir_fallback },
