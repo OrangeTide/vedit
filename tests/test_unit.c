@@ -4709,6 +4709,66 @@ t_tbl_reloc_live(Test *t)
 	text_free(e.t);
 }
 
+/* Rewrite a formula through a sort's row permutation and compare the text. */
+static int
+sort_fmla_is(const char *src, size_t lo, size_t hi, const size_t *rowmap,
+    const char *want)
+{
+	char out[128];
+
+	if (tbl_sort_formula(src, lo, hi, rowmap, out, sizeof(out)) < 0)
+		return 0;
+	return strcmp(out, want) == 0;
+}
+
+/* A sort permutes rows, and single-cell references follow their moved cells
+ * through the row map, while ranges and references outside the sorted block are
+ * left alone (an aggregate is order-independent). Columns never move. */
+static void
+t_tbl_sort_reloc(Test *t)
+{
+	size_t rev[3] = { 2, 1, 0 };	/* rows 0,1,2 reversed */
+
+	TAP_CHECK(t, sort_fmla_is("=A1", 0, 2, rev, "=A3"));
+	TAP_CHECK(t, sort_fmla_is("=A3", 0, 2, rev, "=A1"));
+	TAP_CHECK(t, sort_fmla_is("=A2", 0, 2, rev, "=A2"));
+	TAP_CHECK(t, sort_fmla_is("=B1", 0, 2, rev, "=B3"));
+	TAP_CHECK(t, sort_fmla_is("=A1+A3*2", 0, 2, rev, "=A3+A1*2"));
+	/* a range is unchanged; a reference past the sorted block too */
+	TAP_CHECK(t, sort_fmla_is("=SUM(A1:A3)", 0, 2, rev, "=SUM(A1:A3)"));
+	TAP_CHECK(t, sort_fmla_is("=A5", 0, 2, rev, "=A5"));
+}
+
+/* End to end: sorting the table relabels a single-cell reference so it points
+ * at the same datum after the rows move. */
+static void
+t_tbl_sort_live(Test *t)
+{
+	static const char *const L[] = { "3,=A3", "1,", "2," };
+	Sortopt o;
+	Editor e;
+
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, L, 3);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+
+	/* sort the three rows ascending by column A: 1, 2, 3. The formula
+	 * =A3 (value 2) rode along from row 1 to row 3; its reference now
+	 * reads A2, where that datum landed, so the cell still shows 2. */
+	memset(&o, 0, sizeof(o));
+	o.numeric = 1;
+	o.tblcol = 0;
+	TAP_ASSERT(t, sort_lines(&e, 0, 2, &o) >= 0);
+	TAP_CHECK(t, rawline_is(&e, 0, "1,"));
+	TAP_CHECK(t, rawline_is(&e, 2, "3,=A2"));
+
+	tbl_detach(&e);
+	text_free(e.t);
+}
+
 /* The non-vi motion layer maps a position to where a modeless motion lands,
  * without touching the editor cursor. Left and right step by rune and wrap
  * across line ends; up and down clamp the column to the target line; the
@@ -6603,6 +6663,8 @@ const Case tap_cases[] = {
 	{ "tbl_formula_range", t_tbl_formula_range },
 	{ "tbl_reloc", t_tbl_reloc },
 	{ "tbl_reloc_live", t_tbl_reloc_live },
+	{ "tbl_sort_reloc", t_tbl_sort_reloc },
+	{ "tbl_sort_live", t_tbl_sort_live },
 	{ "swap_paths", t_swap_paths },
 	{ "atomic_save", t_atomic_save },
 	{ "save_rodir_fallback", t_save_rodir_fallback },

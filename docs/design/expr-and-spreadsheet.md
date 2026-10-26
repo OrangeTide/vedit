@@ -5,7 +5,7 @@ evaluator, the command-language `expr` verb, and the table view's formulas are
 built (`vedit.c`, the Expression evaluator and Table formulas sections). The
 formula cut is numbers and ranges (`A1:B3` with `SUM`, `AVG`, `COUNT`, `MIN`,
 `MAX`), recompute-on-read with a visiting stack for cycles, and reference
-relabeling on row and column insert or delete; string value variants in
+relabeling on row and column insert, delete, and sort; string value variants in
 `ExprVal`, incremental recalc, and `EVAL` are not built yet. This note records the design for two features that
 share one piece: an arithmetic `expr` for the command language, and formulas for
 the CSV/TSV table view. The shared piece is an expression
@@ -167,7 +167,13 @@ specific and is most of the work:
   formula's references: a reference past the edit shifts, one into a deleted
   band becomes `#REF!`, and a range straddling a deletion shrinks. It rewrites
   the formula text (`tbl_reloc_formula`) rather than any cell model, so it is a
-  text pass with no parser involvement. Row sort and clipboard paste do not
+  text pass with no parser involvement.
+- Reference adjustment on sort (built). `sort_lines` builds a row map from the
+  sort permutation and calls `tbl_sort_reloc`, which relabels every single-cell
+  reference to a sorted row so it follows the cell to its new place
+  (`tbl_sort_formula`). A range is left unchanged: the rows it spans are
+  permuted among themselves, so the order-independent aggregates are unaffected,
+  and there is no contiguous range for a scattered set. Clipboard paste does not
   relabel yet.
 
 Sharing the evaluator saves perhaps a fifth of the spreadsheet effort. The

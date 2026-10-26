@@ -63,6 +63,9 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
 - Table formula references are relabeled when a row or column is inserted or
   deleted, so a formula keeps pointing at the same cells. A reference to a
   deleted cell becomes `#REF!`, and a range straddling a deletion shrinks.
+- Sorting the table relabels single-cell formula references so they follow
+  their cells to the sorted rows. Ranges are left alone, since the aggregate
+  functions do not depend on order.
 - The command language gains a `menu TITLE LABEL BODY ...` verb: it lists the
   labels and runs the chosen entry's program, so a keymap can build its own menu
   with no change to the editor.

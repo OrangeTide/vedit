@@ -14152,7 +14152,8 @@ tbl_cell_value(const Editor *e, size_t row, int col, char *buf, size_t n)
  * recalc is recompute-on-read: a referenced cell is evaluated when a formula
  * reads it, with a visiting stack to catch cycles. Numbers and A1:B3 ranges
  * with the SUM/AVG/COUNT/MIN/MAX functions; references are relabeled when rows
- * or columns are inserted or deleted (see docs/design/expr-and-spreadsheet.md).
+ * or columns are inserted, deleted, or sorted (see
+ * docs/design/expr-and-spreadsheet.md).
  ****************************************************************/
 
 #define TBL_FORMULA_DEPTH 64	/* deepest reference chain before it is a cycle */
@@ -14571,6 +14572,103 @@ tbl_reloc(Editor *e, int is_col, long at, int n, int del)
 			if (cell[0] != '=')
 				continue;
 			if (tbl_reloc_formula(cell, is_col, at, n, del,
+			    out, sizeof(out)) == 1)
+				tbl_cell_replace_raw(e, y, col, out, strlen(out));
+		}
+	}
+}
+
+/* Rewrite a formula's references through a sort's row permutation: a single
+ * reference to a row in [lo, hi] moves to rowmap[row - lo], so it follows the
+ * cell to where the sort put it. A range is left unchanged: the rows it spans
+ * are permuted among themselves, and the order-independent aggregates give the
+ * same result. Columns do not move. Writes out and returns 1 if it differs from
+ * src, 0 if not, or -1 on overflow. */
+static int
+tbl_sort_formula(const char *src, size_t lo, size_t hi, const size_t *rowmap,
+    char *out, size_t outsz)
+{
+	size_t i = 0, o = 0;
+	int changed = 0;
+
+	while (src[i]) {
+		char id1[TBL_LABEL_MAX + 12];
+		size_t start = i, k;
+		int c1, c2;
+		long r1, r2, nr;
+		char *end;
+
+		if (isdigit((unsigned char)src[i]) ||
+		    (src[i] == '.' && isdigit((unsigned char)src[i + 1]))) {
+			strtod(src + i, &end);	/* copy a whole number intact */
+			while (src + i < end) {
+				if (o + 1 >= outsz)
+					return -1;
+				out[o++] = src[i++];
+			}
+			continue;
+		}
+		if (!isalpha((unsigned char)src[i]) && src[i] != '_') {
+			if (o + 1 >= outsz)
+				return -1;
+			out[o++] = src[i++];
+			continue;
+		}
+		for (k = 0; (isalnum((unsigned char)src[i]) || src[i] == '_') &&
+		    k + 1 < sizeof(id1); k++)
+			id1[k] = src[i++];
+		id1[k] = '\0';
+		if (tbl_ref_parse(id1, &c1, &r1) == 0 && src[i] == ':') {
+			size_t j = i + 1, m = 0;
+			char id2[TBL_LABEL_MAX + 12];
+
+			while ((isalnum((unsigned char)src[j]) ||
+			    src[j] == '_') && m + 1 < sizeof(id2))
+				id2[m++] = src[j++];
+			id2[m] = '\0';
+			if (tbl_ref_parse(id2, &c2, &r2) == 0)
+				i = j;		/* a range: copy it verbatim below */
+		}
+		if (i == start + k && tbl_ref_parse(id1, &c1, &r1) == 0 &&
+		    r1 >= (long)lo && r1 <= (long)hi &&
+		    (nr = (long)rowmap[r1 - lo]) != r1) {
+			if (tbl_reloc_emit(out, outsz, &o, c1, nr) < 0)
+				return -1;
+			changed = 1;
+			continue;
+		}
+		if (o + (i - start) >= outsz)	/* verbatim: name, or a range */
+			return -1;
+		memcpy(out + o, src + start, i - start);
+		o += i - start;
+	}
+	if (o >= outsz)
+		return -1;
+	out[o] = '\0';
+	return changed;
+}
+
+/* Relabel every formula's single-cell references for a sort that permuted the
+ * rows [lo, hi], rowmap carrying each row's new place. Runs inside the sort's
+ * undo group. A no-op when formulas are off. */
+static void
+tbl_sort_reloc(Editor *e, size_t lo, size_t hi, const size_t *rowmap)
+{
+	size_t nl = text_lines(e->t), y;
+
+	if (!e->tbl_formulas)
+		return;
+	for (y = 0; y < nl; y++) {
+		size_t off, len;
+		int nf = tbl_cell_off(e, y, 0, &off, &len), col;
+
+		for (col = 0; col < nf; col++) {
+			char cell[TBL_CELL_MAX], out[TBL_CELL_MAX];
+
+			tbl_cell_value(e, y, col, cell, sizeof(cell));
+			if (cell[0] != '=')
+				continue;
+			if (tbl_sort_formula(cell, lo, hi, rowmap,
 			    out, sizeof(out)) == 1)
 				tbl_cell_replace_raw(e, y, col, out, strlen(out));
 		}
@@ -16657,6 +16755,18 @@ sort_lines(Editor *e, size_t lo, size_t hi, const Sortopt *o)
 			text_insert(e->t, lo + i, 0, bytes[keys[i].idx],
 			    lens[keys[i].idx]);
 		}
+#ifdef VEDIT_TABLE
+		if (e->tbl && e->tbl_formulas) {	/* follow moved cells */
+			size_t *rowmap = malloc(n * sizeof(*rowmap));
+
+			if (rowmap) {
+				for (i = 0; i < n; i++)
+					rowmap[keys[i].idx] = lo + i;
+				tbl_sort_reloc(e, lo, hi, rowmap);
+				free(rowmap);
+			}
+		}
+#endif
 		text_undo_group_end(e->t);
 		hl_touch(e, lo);
 	}
