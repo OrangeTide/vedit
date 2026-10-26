@@ -2742,6 +2742,51 @@ t_jsf_highlight(Test *t)
 	unlink(path);
 }
 
+/* A [color "c"] section with no states of its own recolors the built-in C
+ * grammar rather than shadowing it: the state machine is inherited (so
+ * highlighting still works) while the named colors take the user's values. */
+static void
+t_jsf_color_only(Test *t)
+{
+	static const char *text =
+	    "[color \"c\"]\n"
+	    "  keyword = 208\n"
+	    "  type    = 55 bold\n";
+	char path[256];
+	Cfg *c;
+	const Cfg *old = g_cfg;
+	int lang, kw, ty;
+
+	syntax_load_defaults();			/* g_def must hold the C grammar */
+	c = load_cfg_text(text, path, sizeof(path));
+	TAP_ASSERT(t, c != NULL);
+	g_cfg = c;
+	syntax_load_user(c);			/* the wrapper that folds colors in */
+
+	lang = jsf_find(&g_user, "c");
+	TAP_ASSERT(t, lang >= 0);
+	/* the cloned state machine came across, so highlighting is not broken */
+	TAP_CHECKF(t, g_user.lang[lang].nstates > 0,
+	    "c inherited states: %d", g_user.lang[lang].nstates);
+
+	kw = jsf_class_of(lang, "keyword");
+	ty = jsf_class_of(lang, "type");
+	TAP_ASSERT(t, kw > 0 && ty > 0);
+	TAP_CHECKF(t, g_user.lang[lang].fg[kw].type == COLOR_INDEXED &&
+	    g_user.lang[lang].fg[kw].index == 208, "keyword recolored");
+	TAP_CHECKF(t, g_user.lang[lang].fg[ty].type == COLOR_INDEXED &&
+	    g_user.lang[lang].fg[ty].index == 55 &&
+	    (g_user.lang[lang].attr[ty] & ATTR_BOLD), "type recolored bold");
+
+	/* the resolver still finds a usable grammar */
+	TAP_CHECK(t, syn_for_ext("c") != NULL);
+
+	g_cfg = old;
+	syntax_load_cfg(&g_user, NULL);		/* clear for other tests */
+	vedit_cfg_free(c);
+	unlink(path);
+}
+
 /* A user grammar can embed one by name with a mid-line end string, matched
  * without regard to case; the outer grammar resumes on the end string with
  * its own rules, and the region carries across lines until it is seen. */
@@ -5779,6 +5824,7 @@ const Case tap_cases[] = {
 	{ "cfg_theme", t_cfg_theme },
 	{ "jsf_charset", t_jsf_charset },
 	{ "jsf_highlight", t_jsf_highlight },
+	{ "jsf_color_only", t_jsf_color_only },
 	{ "jsf_embed", t_jsf_embed },
 	{ "jsf_linecomment", t_jsf_linecomment },
 	{ "jsf_recolormark", t_jsf_recolormark },

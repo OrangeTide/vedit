@@ -99,7 +99,21 @@ embedded language's own `embed` states are ignored.
 A language named after a file extension is used for that extension
 without a mapping. The built-in languages are written in this format, and
 defining a language with the same name as a built-in replaces it outright,
-so to change one, copy its whole grammar and edit that.
+so to rewrite a grammar, copy its whole definition and edit that.
+
+To restyle a built-in language without rewriting it, give just its
+`[color "name"]` section and no states. A color section with no grammar of
+its own recolors the built-in grammar, so a theme can repaint the shipped
+languages in a few lines:
+
+```ini
+[color "c"]
+    keyword = 208 bold    # the states come from the built-in C grammar
+    string  = 71
+    comment = 244
+```
+
+A class name not listed keeps its built-in color.
 
 ## Color schemes
 
@@ -139,6 +153,16 @@ with a `bright-` prefix for 8 to 15). A `#rrggbb` value must be quoted,
 since an unquoted `#` starts a comment. Unset fields keep the base
 preset's value, and `base = black` turns `borderless` on unless the theme
 sets it off. Up to eight themes can be defined.
+
+`examples/halloween.conf` is a full worked theme: a dark Solarized-style
+base recolored in Halloween pumpkin, blood red, and purple, covering both
+the chrome above and the syntax colors through `[color "name"]` overrides.
+Include it to use it:
+
+```ini
+[include]
+    path = /path/to/examples/halloween.conf
+```
 
 ## Another version control system
 

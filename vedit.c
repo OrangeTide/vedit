@@ -4647,6 +4647,47 @@ jsf_reset(Jsfreg *r)
 	r->count = 0;
 }
 
+/* Deep-copy a grammar into dst, duplicating the three heap arrays so dst and
+ * src can be freed independently. Word byte-pointers still point into the
+ * source config's text, which outlives both registries. Returns -1 on OOM,
+ * leaving dst untouched. */
+static int
+jsf_clone(Jsf *dst, const Jsf *src)
+{
+	Jsfrule *rules = NULL;
+	Jsfkw *kws = NULL;
+	Jsfword *words = NULL;
+	size_t rb = (size_t)src->nrules * sizeof(*rules);
+	size_t kb = (size_t)src->nkws * sizeof(*kws);
+	size_t wb = (size_t)src->nwords * sizeof(*words);
+
+	if (src->nrules > 0 && !(rules = malloc(rb)))
+		return -1;
+	if (src->nkws > 0 && !(kws = malloc(kb))) {
+		free(rules);
+		return -1;
+	}
+	if (src->nwords > 0 && !(words = malloc(wb))) {
+		free(rules);
+		free(kws);
+		return -1;
+	}
+	if (rules)
+		memcpy(rules, src->rules, rb);
+	if (kws)
+		memcpy(kws, src->kws, kb);
+	if (words)
+		memcpy(words, src->words, wb);
+	*dst = *src;			/* states, colors, names, scalars */
+	dst->rules = rules;
+	dst->rulecap = src->nrules;
+	dst->kws = kws;
+	dst->kwcap = src->nkws;
+	dst->words = words;
+	dst->wordcap = src->nwords;
+	return 0;
+}
+
 /* Intern a language slot by name in registry r. */
 static Jsf *
 jsf_lang(Jsfreg *r, const char *name)
@@ -4935,6 +4976,54 @@ syntax_load_cfg(Jsfreg *r, const Cfg *c)
 		r->syn[i].start = r->lang[i].start;
 		r->syn[i].fsm = &r->lang[i];
 	}
+}
+
+/* A user "[color \"x\"]" section with no states of its own is a recolor of the
+ * built-in grammar x, not a replacement. For each such user grammar, clone the
+ * default's state machine and keep the user's colors, so a theme can restyle
+ * syntax without copying whole grammars. Call after g_user is loaded and g_def
+ * is current. */
+static void
+syntax_merge_color_only(void)
+{
+	int i, k;
+
+	for (i = 0; i < g_user.count; i++) {
+		Jsf *u = &g_user.lang[i];
+		char names[JSF_CLASS_MAX][24];
+		Color fg[JSF_CLASS_MAX];
+		uint16_t attr[JSF_CLASS_MAX];
+		int nc, di;
+
+		if (u->nstates > 0)		/* a full grammar: a real override */
+			continue;
+		di = jsf_find(&g_def, u->name);
+		if (di < 0)			/* no built-in to inherit states from */
+			continue;
+		nc = u->nclasses;		/* snapshot the user's colors by name */
+		for (k = 0; k < nc && k < JSF_CLASS_MAX; k++) {
+			memcpy(names[k], u->classname[k], sizeof(names[k]));
+			fg[k] = u->fg[k];
+			attr[k] = u->attr[k];
+		}
+		if (jsf_clone(u, &g_def.lang[di]) != 0)
+			continue;		/* OOM: fall back to default colors */
+		for (k = 1; k < nc && k < JSF_CLASS_MAX; k++) {
+			int ci = jsf_class(u, names[k]);
+
+			u->fg[ci] = fg[k];
+			u->attr[ci] = attr[k];
+		}
+		g_user.syn[i].start = u->start;	/* name/fsm still point at this slot */
+	}
+}
+
+/* Load the user grammars, then fold color-only sections onto the built-ins. */
+static void
+syntax_load_user(const Cfg *c)
+{
+	syntax_load_cfg(&g_user, c);
+	syntax_merge_color_only();
 }
 
 /* The built-in default grammars (C family and shell), authored in the same
@@ -34717,7 +34806,7 @@ ed_reload_config(Editor *e)
 	themes_load_cfg(nc);		/* before ed_apply_config resolves scheme */
 #ifdef VEDIT_SYNTAX
 	syntax_reload_defaults();	/* built-in grammars (some read the config) */
-	syntax_load_cfg(&g_user, nc);	/* user grammars override them */
+	syntax_load_user(nc);		/* user grammars; color-only recolor */
 #endif
 	ed_refresh_syntax(e);		/* re-point syn before ed_apply_config reads it */
 	if (e->term) {
@@ -34874,7 +34963,7 @@ vedit_set_config(struct vedit *v, const struct cfg *c)
 	themes_load_cfg(c);		/* before ed_apply_config resolves scheme */
 #ifdef VEDIT_SYNTAX
 	syntax_reload_defaults();	/* built-in grammars (some read the config) */
-	syntax_load_cfg(&g_user, c);	/* user grammars override them */
+	syntax_load_user(c);		/* user grammars; color-only recolor */
 #endif
 	if (v->e.term) {
 		v->e.term->box_mode = box_default();
