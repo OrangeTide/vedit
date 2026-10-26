@@ -132,6 +132,14 @@ placing at the top of file 1:
     bind = "^T { copy [region line 1 1 file 2] [reg a] ; put [reg a] at [pos 1 1] }"
 ```
 
+A WordStar keymap sets a block with begin and end markers, and `block` reaches
+it, so one key can send the marked block into the top of a second open file:
+
+```ini
+[keys "wordstar"]
+    bind = "^K M { copy [block] ; put $clip at [pos 1 1] file 2 }"
+```
+
 Marks persist too, so one key can bracket a span and a later key act on it as an
 anchored region, even after the text in between has changed:
 
