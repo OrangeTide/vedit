@@ -56,8 +56,10 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
 - The table view evaluates formulas. A cell starting with `=` is an arithmetic
   expression over A1-style cell references, shown computed in the grid while the
   file keeps the `=` text as plain CSV. Errors show as `#DIV/0!`, `#REF!`,
-  `#CYCLE!`, or `#ERR!`. The `table.formulas` config turns it off. Ranges
-  (`A1:B3`) are not supported yet.
+  `#CYCLE!`, or `#ERR!`. The `table.formulas` config turns it off.
+- Table formulas take ranges: `A1:B3` names a block of cells, and the functions
+  `SUM`, `AVG`, `COUNT`, `MIN`, and `MAX` fold a range (or plain numbers) into a
+  value, so `=SUM(A1:A10)` totals a column. Function names are case-insensitive.
 - The command language gains a `menu TITLE LABEL BODY ...` verb: it lists the
   labels and runs the chosen entry's program, so a keymap can build its own menu
   with no change to the editor.

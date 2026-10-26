@@ -4563,6 +4563,46 @@ t_tbl_formula_cycle(Test *t)
 	text_free(e.t);
 }
 
+/* An A1:B3 range feeds SUM, AVG, COUNT, MIN, and MAX. The range spans a
+ * bounding box; empty and text cells are skipped by the counting functions but
+ * SUM treats them as nothing. A lone range used as a value is an error. */
+static void
+t_tbl_formula_range(Test *t)
+{
+	static const char *const L[] = {
+		"1,2,=SUM(A1:B2)",		/* C1 = 1+2+3+4 = 10 */
+		"3,4,=AVG(A1:B2)",		/* C2 = 10/4 = 2.5 */
+		"=MAX(A1:B2),=MIN(A1:B2),=COUNT(A1:B4)",
+		"5,x,=A1:B2" };			/* A4=5, B4 text; C4 misuses a range */
+	Editor e;
+	char buf[64];
+
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, L, 4);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+
+	tbl_disp(&e, 0, 2, buf, sizeof(buf));
+	TAP_CHECKF(t, strcmp(buf, "10") == 0, "SUM(A1:B2) -> %s", buf);
+	tbl_disp(&e, 1, 2, buf, sizeof(buf));
+	TAP_CHECKF(t, strcmp(buf, "2.5") == 0, "AVG(A1:B2) -> %s", buf);
+	tbl_disp(&e, 2, 0, buf, sizeof(buf));
+	TAP_CHECKF(t, strcmp(buf, "4") == 0, "MAX(A1:B2) -> %s", buf);
+	tbl_disp(&e, 2, 1, buf, sizeof(buf));
+	TAP_CHECKF(t, strcmp(buf, "1") == 0, "MIN(A1:B2) -> %s", buf);
+	/* COUNT(A1:B4) sees seven numbers; the text cell B4 ("x") is skipped */
+	tbl_disp(&e, 2, 2, buf, sizeof(buf));
+	TAP_CHECKF(t, strcmp(buf, "7") == 0, "COUNT(A1:B4) -> %s", buf);
+	/* a bare range is not a single value */
+	tbl_disp(&e, 3, 2, buf, sizeof(buf));
+	TAP_CHECKF(t, strcmp(buf, "#ERR!") == 0, "=A1:B2 -> %s", buf);
+
+	tbl_detach(&e);
+	text_free(e.t);
+}
+
 /* The non-vi motion layer maps a position to where a modeless motion lands,
  * without touching the editor cursor. Left and right step by rune and wrap
  * across line ends; up and down clamp the column to the target line; the
@@ -6454,6 +6494,7 @@ const Case tap_cases[] = {
 	{ "tbl_join", t_tbl_join },
 	{ "tbl_formula", t_tbl_formula },
 	{ "tbl_formula_cycle", t_tbl_formula_cycle },
+	{ "tbl_formula_range", t_tbl_formula_range },
 	{ "swap_paths", t_swap_paths },
 	{ "atomic_save", t_atomic_save },
 	{ "save_rodir_fallback", t_save_rodir_fallback },

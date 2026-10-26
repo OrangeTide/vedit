@@ -158,13 +158,17 @@ plain CSV that other tools read. A formula is an arithmetic expression (the same
 one the command language's `expr` verb evaluates, chapter 6) over cell
 references: `A1` is column A, row 1, the labels the grid shows. So `=B2*C2`
 multiplies two cells and `=(A1+A2)/2` averages two. A formula may read a cell
-that is itself a formula. When a value cannot be computed the cell shows a code:
-`#DIV/0!` for division by zero, `#REF!` for a reference outside the table,
-`#CYCLE!` when formulas depend on each other in a loop, and `#ERR!` for anything
-else. The status line shows a formula cell as its source and its value,
-`C7: =B2*C2 = 12`, and editing a cell edits the `=` text. Ranges such as
-`A1:B3` are not supported yet. Set `table.formulas = off` for a file that uses a
-leading `=` as literal text.
+that is itself a formula. A range is two references joined with a colon,
+`A1:B3`, naming the block of cells they bound. The functions `SUM`, `AVG`,
+`COUNT`, `MIN`, and `MAX` take ranges (and plain numbers), so `=SUM(A1:A10)`
+totals a column and `=AVG(B1:B5)` averages five cells. The counting functions
+skip empty and non-numeric cells. Function names are case-insensitive. When a
+value cannot be computed the cell shows a code: `#DIV/0!` for division by zero,
+`#REF!` for a reference outside the table, `#CYCLE!` when formulas depend on
+each other in a loop, and `#ERR!` for anything else, such as a range used where
+a single value is wanted. The status line shows a formula cell as its source and
+its value, `C7: =B2*C2 = 12`, and editing a cell edits the `=` text. Set
+`table.formulas = off` for a file that uses a leading `=` as literal text.
 
 `:rowadd [N]` inserts N blank rows above the cursor row and `:rowadd! [N]`
 below it. `:rowdel [N]` deletes N rows from the cursor. `:coladd [N]` inserts N empty columns

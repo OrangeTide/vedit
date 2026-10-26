@@ -13517,15 +13517,26 @@ hex_render(Editor *e, Screen *d)
 
 /* The expression evaluator's value and environment, defined here so the table
  * formulas and the command language's expr verb both see them; the evaluator
- * itself is defined further down. An ExprEnv gives names and functions their
- * meaning through its callbacks. */
+ * itself is defined further down. A value is a number or a cell range; the
+ * range corners are opaque to the evaluator, which only compares and passes
+ * them. An ExprEnv gives names, references, and functions their meaning:
+ * lookup resolves a name (a variable, or a 1x1 cell range); deref reads the
+ * scalar of a 1x1 range; fold accumulates a range's numeric cells for the
+ * aggregate functions; call resolves any other function. */
+enum { EXPR_NUM, EXPR_RANGE };
+
 typedef struct expr_val {
-	double	num;
+	int	kind;			/* EXPR_NUM or EXPR_RANGE */
+	double	num;			/* EXPR_NUM */
+	long	r0, c0, r1, c1;		/* EXPR_RANGE corners, inclusive */
 } ExprVal;
 
 typedef struct expr_env {
 	void	*ctx;
 	int	(*lookup)(void *ctx, const char *name, ExprVal *out);
+	int	(*deref)(void *ctx, const ExprVal *v, double *out);
+	int	(*fold)(void *ctx, const ExprVal *range, double *sum,
+		    long *count, double *minv, double *maxv);
 	int	(*call)(void *ctx, const char *fn, int argc, const ExprVal *argv,
 		    ExprVal *out);
 } ExprEnv;
@@ -13533,6 +13544,8 @@ typedef struct expr_env {
 static int expr_eval(const char *src, const ExprEnv *env, ExprVal *out,
     char *err, size_t errlen);
 static void expr_format(double v, char *buf, size_t n);
+static void expr_agg_add(double d, double *sum, long *count, double *minv,
+    double *maxv);
 
 /****************************************************************
  * Table view: CSV and TSV as a grid of cells
@@ -14155,7 +14168,12 @@ typedef struct tbl_eval {
 } TblEval;
 
 static int tbl_cell_num(TblEval *tv, size_t row, int col, double *out);
+static int tbl_cell_numeric(TblEval *tv, size_t row, int col, double *out,
+    int *isnum);
 static int tbl_ref_lookup(void *ctx, const char *name, ExprVal *out);
+static int tbl_deref(void *ctx, const ExprVal *v, double *out);
+static int tbl_fold(void *ctx, const ExprVal *range, double *sum, long *count,
+    double *minv, double *maxv);
 
 /* Evaluate the formula text (the part after '=') of cell (row, col) to a
  * number. Pushes the cell on the visiting chain so a reference back to it is a
@@ -14179,9 +14197,11 @@ tbl_formula_num(TblEval *tv, size_t row, int col, const char *expr, double *out)
 		return -1;
 	}
 	tv->visiting[tv->nvis++] = id;
+	memset(&env, 0, sizeof(env));
 	env.ctx = tv;
 	env.lookup = tbl_ref_lookup;
-	env.call = NULL;
+	env.deref = tbl_deref;
+	env.fold = tbl_fold;
 	if (expr_eval(expr, &env, &ov, err, sizeof(err)) < 0) {
 		tv->nvis--;
 		if (tv->err[0] == '\0') {	/* not already a #REF!/#CYCLE! */
@@ -14196,18 +14216,15 @@ tbl_formula_num(TblEval *tv, size_t row, int col, const char *expr, double *out)
 	return 0;
 }
 
-/* The formula name resolver: a name like B12 is a cell reference. Its value is
- * the referenced cell's number, computed if that cell is itself a formula. A
- * malformed or out-of-range reference is #REF!. */
+/* Parse an A1-style reference like "B12" into a zero-based column and row.
+ * Returns 0, or -1 if the text is not a well-formed reference. */
 static int
-tbl_ref_lookup(void *ctx, const char *name, ExprVal *out)
+tbl_ref_parse(const char *name, int *col, long *row)
 {
-	TblEval *tv = ctx;
 	char colpart[TBL_LABEL_MAX];
 	char *endp;
-	long row;
-	int i = 0, col;
-	double v;
+	long r;
+	int i = 0;
 
 	while (name[i] && isalpha((unsigned char)name[i]) &&
 	    i + 1 < (int)sizeof(colpart)) {
@@ -14215,16 +14232,73 @@ tbl_ref_lookup(void *ctx, const char *name, ExprVal *out)
 		i++;
 	}
 	colpart[i] = '\0';
-	col = i ? tbl_label_col(colpart) : -1;
-	row = isdigit((unsigned char)name[i]) ? strtol(name + i, &endp, 10) : 0;
-	if (col < 0 || row < 1 || !isdigit((unsigned char)name[i]) ||
-	    *endp != '\0') {
+	if (!i || !isdigit((unsigned char)name[i]))
+		return -1;
+	r = strtol(name + i, &endp, 10);
+	if (*endp != '\0' || r < 1)
+		return -1;
+	*col = tbl_label_col(colpart);
+	if (*col < 0)
+		return -1;
+	*row = r - 1;
+	return 0;
+}
+
+/* The formula name resolver: a name like B12 is a single-cell reference,
+ * returned as a 1x1 range so the ':' operator and the range functions can act
+ * on it. A malformed or out-of-range reference is #REF!. */
+static int
+tbl_ref_lookup(void *ctx, const char *name, ExprVal *out)
+{
+	TblEval *tv = ctx;
+	long row;
+	int col;
+
+	if (tbl_ref_parse(name, &col, &row) < 0 ||
+	    col >= tv->e->tbl->ncols || (size_t)row >= text_lines(tv->e->t)) {
 		snprintf(tv->err, sizeof(tv->err), "#REF!");
 		return -1;
 	}
-	if (tbl_cell_num(tv, (size_t)(row - 1), col, &v) < 0)
-		return -1;		/* tv->err set by the nested call */
-	out->num = v;
+	out->kind = EXPR_RANGE;
+	out->r0 = out->r1 = row;
+	out->c0 = out->c1 = col;
+	out->num = 0;
+	return 0;
+}
+
+/* Coerce a range to a single number: only a 1x1 range has one. A multi-cell
+ * range used where a scalar is wanted is left for the caller to report. */
+static int
+tbl_deref(void *ctx, const ExprVal *v, double *out)
+{
+	TblEval *tv = ctx;
+
+	if (v->r0 != v->r1 || v->c0 != v->c1)
+		return -1;		/* a range is not a single value */
+	return tbl_cell_num(tv, (size_t)v->r0, (int)v->c0, out);
+}
+
+/* Fold a range for SUM/AVG/COUNT/MIN/MAX: visit each cell and feed the numeric
+ * ones to the accumulator, skipping empty and text cells. Returns 0, or -1
+ * with tv->err set. */
+static int
+tbl_fold(void *ctx, const ExprVal *range, double *sum, long *count,
+    double *minv, double *maxv)
+{
+	TblEval *tv = ctx;
+	long r;
+	int c;
+
+	for (r = range->r0; r <= range->r1; r++)
+		for (c = (int)range->c0; c <= (int)range->c1; c++) {
+			double d;
+			int isnum;
+
+			if (tbl_cell_numeric(tv, (size_t)r, c, &d, &isnum) < 0)
+				return -1;
+			if (isnum)
+				expr_agg_add(d, sum, count, minv, maxv);
+		}
 	return 0;
 }
 
@@ -14234,27 +14308,49 @@ tbl_ref_lookup(void *ctx, const char *name, ExprVal *out)
 static int
 tbl_cell_num(TblEval *tv, size_t row, int col, double *out)
 {
-	char cell[256], *endp;
-	const char *s;
-	double d;
+	int isnum;
 
 	if (col < 0 || col >= tv->e->tbl->ncols || row >= text_lines(tv->e->t)) {
 		snprintf(tv->err, sizeof(tv->err), "#REF!");
 		return -1;
 	}
+	return tbl_cell_numeric(tv, row, col, out, &isnum);
+}
+
+/* The value of cell (row, col), distinguishing a number from an empty or text
+ * cell: *isnum is 1 for a number (or a nested formula), 0 for empty or text,
+ * in which case *out is zero. A formula is computed. Returns 0, or -1 with
+ * tv->err set. An out-of-range cell reads as empty, since a range's corners
+ * are already bounds-checked. */
+static int
+tbl_cell_numeric(TblEval *tv, size_t row, int col, double *out, int *isnum)
+{
+	char cell[256], *endp;
+	const char *s;
+	double d;
+
+	*isnum = 0;
+	*out = 0;
+	if (col < 0 || col >= tv->e->tbl->ncols || row >= text_lines(tv->e->t))
+		return 0;
 	tbl_cell_value(tv->e, row, col, cell, sizeof(cell));
-	if (cell[0] == '=')
-		return tbl_formula_num(tv, row, col, cell + 1, out);
-	for (s = cell; *s == ' '; s++)
-		;
-	if (*s == '\0') {			/* empty reads as zero */
-		*out = 0;
+	if (cell[0] == '=') {
+		if (tbl_formula_num(tv, row, col, cell + 1, out) < 0)
+			return -1;
+		*isnum = 1;
 		return 0;
 	}
+	for (s = cell; *s == ' '; s++)
+		;
+	if (*s == '\0')				/* empty */
+		return 0;
 	d = strtod(s, &endp);
 	while (*endp == ' ')
 		endp++;
-	*out = (endp == s || *endp != '\0') ? 0 : d;	/* text reads as zero */
+	if (endp == s || *endp != '\0')		/* text */
+		return 0;
+	*out = d;
+	*isnum = 1;
 	return 0;
 }
 
@@ -29878,7 +29974,7 @@ bi_for(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 enum {
 	ETK_END, ETK_NUM, ETK_IDENT,
 	ETK_PLUS, ETK_MINUS, ETK_STAR, ETK_SLASH, ETK_PCT,
-	ETK_LP, ETK_RP, ETK_COMMA, ETK_NOT,
+	ETK_LP, ETK_RP, ETK_COMMA, ETK_NOT, ETK_COLON,
 	ETK_LT, ETK_LE, ETK_GT, ETK_GE, ETK_EQ, ETK_NE,
 	ETK_AND, ETK_OR
 };
@@ -29893,8 +29989,38 @@ typedef struct expr_p {
 	char		 err[160];
 } ExprP;
 
-static double expr_or(ExprP *x);
-static double expr_unary(ExprP *x);
+static ExprVal expr_or(ExprP *x);
+static ExprVal expr_unary(ExprP *x);
+static void expr_fail(ExprP *x, const char *fmt, ...);
+
+/* A number value. */
+static ExprVal
+expr_mknum(double d)
+{
+	ExprVal v;
+
+	v.kind = EXPR_NUM;
+	v.num = d;
+	v.r0 = v.c0 = v.r1 = v.c1 = 0;
+	return v;
+}
+
+/* The numeric value of v: a number as itself, a range through the env's deref
+ * (which fails for a multi-cell range). Sets an error and returns 0 on failure,
+ * so callers guard with x->error. */
+static double
+expr_num(ExprP *x, const ExprVal *v)
+{
+	double d;
+
+	if (v->kind == EXPR_NUM)
+		return v->num;
+	if (x->env && x->env->deref &&
+	    x->env->deref(x->env->ctx, v, &d) == 0)
+		return d;
+	expr_fail(x, "a range cannot be used as a single value");
+	return 0;
+}
 
 /* Record the first error and stop the parse by forcing the end token. */
 static void
@@ -29953,6 +30079,7 @@ expr_lex(ExprP *x)
 	case '(': x->tok = ETK_LP;    x->p = p + 1; return;
 	case ')': x->tok = ETK_RP;    x->p = p + 1; return;
 	case ',': x->tok = ETK_COMMA; x->p = p + 1; return;
+	case ':': x->tok = ETK_COLON; x->p = p + 1; return;
 	case '<':
 		x->tok = p[1] == '=' ? ETK_LE : ETK_LT;
 		x->p = p + (p[1] == '=' ? 2 : 1);
@@ -29990,29 +30117,100 @@ expr_lex(ExprP *x)
 	expr_fail(x, "bad character '%c'", *p);
 }
 
-/* Dispatch a function call: the built-in math first (libm-free), then the env's
- * own functions. Returns 0, or -1 (error set). */
+/* Add one scalar into the running aggregate, tracking the first value so min
+ * and max start right. */
+static void
+expr_agg_add(double d, double *sum, long *count, double *minv, double *maxv)
+{
+	if (*count == 0)
+		*minv = *maxv = d;
+	else {
+		if (d < *minv)
+			*minv = d;
+		if (d > *maxv)
+			*maxv = d;
+	}
+	*sum += d;
+	(*count)++;
+}
+
+/* The aggregate functions sum, avg, count, min, max over their arguments: a
+ * scalar contributes itself, a range its numeric cells through the env's fold.
+ * Returns 0, or -1 (error set). */
+static int
+expr_aggregate(ExprP *x, const char *name, int argc, const ExprVal *argv,
+    ExprVal *out)
+{
+	double sum = 0, minv = 0, maxv = 0;
+	long count = 0;
+	int i;
+
+	for (i = 0; i < argc; i++) {
+		if (argv[i].kind == EXPR_RANGE) {
+			if (!x->env || !x->env->fold ||
+			    x->env->fold(x->env->ctx, &argv[i], &sum, &count,
+			    &minv, &maxv) < 0) {
+				if (!x->error)
+					expr_fail(x, "%s cannot read that "
+					    "range", name);
+				return -1;
+			}
+		} else {
+			expr_agg_add(argv[i].num, &sum, &count, &minv, &maxv);
+		}
+	}
+	if (strcmp(name, "sum") == 0)
+		out->num = sum;
+	else if (strcmp(name, "count") == 0)
+		out->num = (double)count;
+	else if (count == 0) {
+		expr_fail(x, "%s of no values", name);
+		return -1;
+	} else if (strcmp(name, "avg") == 0)
+		out->num = sum / (double)count;
+	else if (strcmp(name, "min") == 0)
+		out->num = minv;
+	else
+		out->num = maxv;			/* max */
+	out->kind = EXPR_NUM;
+	return 0;
+}
+
+/* Dispatch a function call: the built-in math and aggregates (libm-free), then
+ * the env's own functions. Returns 0, or -1 (error set). */
 static int
 expr_apply(ExprP *x, const char *name, int argc, const ExprVal *argv,
     ExprVal *out)
 {
-	int i;
+	char lname[64];
+	size_t i;
 
+	/* The built-in names match without regard to case, so a sheet may write
+	 * SUM and a program sum. */
+	for (i = 0; name[i] && i < sizeof(lname) - 1; i++)
+		lname[i] = (char)tolower((unsigned char)name[i]);
+	lname[i] = '\0';
+	name = lname;
+
+	out->kind = EXPR_NUM;
 	if (strcmp(name, "abs") == 0) {
+		double a;
+
 		if (argc != 1) {
 			expr_fail(x, "abs takes one argument");
 			return -1;
 		}
-		out->num = argv[0].num < 0 ? -argv[0].num : argv[0].num;
-		return 0;
+		a = expr_num(x, &argv[0]);
+		out->num = a < 0 ? -a : a;
+		return x->error ? -1 : 0;
 	}
 	if (strcmp(name, "int") == 0) {
 		if (argc != 1) {
 			expr_fail(x, "int takes one argument");
 			return -1;
 		}
-		out->num = (double)(long)argv[0].num;	/* toward zero */
-		return 0;
+		out->num = (double)(long)expr_num(x, &argv[0]);	/* toward 0 */
+		return x->error ? -1 : 0;
 	}
 	if (strcmp(name, "mod") == 0) {
 		long b;
@@ -30021,29 +30219,24 @@ expr_apply(ExprP *x, const char *name, int argc, const ExprVal *argv,
 			expr_fail(x, "mod takes two arguments");
 			return -1;
 		}
-		b = (long)argv[1].num;
+		b = (long)expr_num(x, &argv[1]);
+		if (x->error)
+			return -1;
 		if (b == 0) {
 			expr_fail(x, "division by zero");
 			return -1;
 		}
-		out->num = (double)((long)argv[0].num % b);
-		return 0;
+		out->num = (double)((long)expr_num(x, &argv[0]) % b);
+		return x->error ? -1 : 0;
 	}
-	if (strcmp(name, "min") == 0 || strcmp(name, "max") == 0) {
-		int wantmax = name[1] == 'a';
-		double v;
-
+	if (strcmp(name, "sum") == 0 || strcmp(name, "avg") == 0 ||
+	    strcmp(name, "count") == 0 || strcmp(name, "min") == 0 ||
+	    strcmp(name, "max") == 0) {
 		if (argc < 1) {
 			expr_fail(x, "%s needs at least one argument", name);
 			return -1;
 		}
-		v = argv[0].num;
-		for (i = 1; i < argc; i++)
-			if ((wantmax && argv[i].num > v) ||
-			    (!wantmax && argv[i].num < v))
-				v = argv[i].num;
-		out->num = v;
-		return 0;
+		return expr_aggregate(x, name, argc, argv, out);
 	}
 	if (x->env && x->env->call &&
 	    x->env->call(x->env->ctx, name, argc, argv, out) == 0)
@@ -30052,16 +30245,18 @@ expr_apply(ExprP *x, const char *name, int argc, const ExprVal *argv,
 	return -1;
 }
 
-/* A number, a parenthesized expression, a variable, or a function call. */
-static double
+/* A number, a parenthesized expression, a variable or reference, or a function
+ * call. A name is resolved through the env, so for the table it is a cell
+ * reference (a 1x1 range). */
+static ExprVal
 expr_primary(ExprP *x)
 {
-	double v;
+	ExprVal v = expr_mknum(0);
 
 	if (x->error)
-		return 0;
+		return v;
 	if (x->tok == ETK_NUM) {
-		v = x->num;
+		v = expr_mknum(x->num);
 		expr_lex(x);
 		return v;
 	}
@@ -30070,14 +30265,13 @@ expr_primary(ExprP *x)
 		v = expr_or(x);
 		if (x->tok != ETK_RP) {
 			expr_fail(x, "expected )");
-			return 0;
+			return v;
 		}
 		expr_lex(x);
 		return v;
 	}
 	if (x->tok == ETK_IDENT) {
 		char name[64];
-		ExprVal out = { 0 };
 
 		snprintf(name, sizeof(name), "%s", x->name);
 		expr_lex(x);
@@ -30092,11 +30286,11 @@ expr_primary(ExprP *x)
 					    sizeof(argv[0]))) {
 						expr_fail(x, "too many "
 						    "arguments");
-						return 0;
+						return v;
 					}
-					argv[argc++].num = expr_or(x);
+					argv[argc++] = expr_or(x);
 					if (x->error)
-						return 0;
+						return v;
 					if (x->tok == ETK_COMMA) {
 						expr_lex(x);
 						continue;
@@ -30105,60 +30299,106 @@ expr_primary(ExprP *x)
 				}
 			if (x->tok != ETK_RP) {
 				expr_fail(x, "expected )");
-				return 0;
+				return v;
 			}
 			expr_lex(x);
-			if (expr_apply(x, name, argc, argv, &out) < 0)
-				return 0;
-			return out.num;
+			if (expr_apply(x, name, argc, argv, &v) < 0)
+				return expr_mknum(0);
+			return v;
 		}
 		if (!x->env || !x->env->lookup ||
-		    x->env->lookup(x->env->ctx, name, &out) < 0) {
+		    x->env->lookup(x->env->ctx, name, &v) < 0) {
 			expr_fail(x, "unknown name '%s'", name);
-			return 0;
+			return expr_mknum(0);
 		}
-		return out.num;
+		return v;
 	}
 	expr_fail(x, "unexpected token in expression");
-	return 0;
+	return v;
 }
 
-static double
+/* A cell range A1:B3, or a plain primary. The two sides must each be a
+ * reference (a 1x1 range); the result spans their bounding box. */
+static ExprVal
+expr_range(ExprP *x)
+{
+	ExprVal v = expr_primary(x);
+
+	if (!x->error && x->tok == ETK_COLON) {
+		ExprVal r, out;
+
+		expr_lex(x);
+		r = expr_primary(x);
+		if (x->error)
+			return v;
+		if (v.kind != EXPR_RANGE || r.kind != EXPR_RANGE) {
+			expr_fail(x, "a range needs two cell references");
+			return v;
+		}
+		out.kind = EXPR_RANGE;
+		out.num = 0;
+		out.r0 = v.r0 < r.r0 ? v.r0 : r.r0;
+		out.c0 = v.c0 < r.c0 ? v.c0 : r.c0;
+		out.r1 = v.r1 > r.r1 ? v.r1 : r.r1;
+		out.c1 = v.c1 > r.c1 ? v.c1 : r.c1;
+		return out;
+	}
+	return v;
+}
+
+static ExprVal
 expr_unary(ExprP *x)
 {
+	ExprVal r;
+
 	if (x->tok == ETK_MINUS) {
 		expr_lex(x);
-		return -expr_unary(x);
+		r = expr_unary(x);
+		return expr_mknum(-expr_num(x, &r));
 	}
 	if (x->tok == ETK_PLUS) {
 		expr_lex(x);
-		return expr_unary(x);
+		r = expr_unary(x);
+		return expr_mknum(expr_num(x, &r));
 	}
 	if (x->tok == ETK_NOT) {
 		expr_lex(x);
-		return expr_unary(x) == 0.0 ? 1.0 : 0.0;
+		r = expr_unary(x);
+		return expr_mknum(expr_num(x, &r) == 0.0 ? 1.0 : 0.0);
 	}
-	return expr_primary(x);
+	return expr_range(x);
 }
 
-static double
+/* Each binary level passes a lone operand through unchanged, so a range
+ * survives up to a function argument; an operator coerces both sides to
+ * numbers through expr_num. */
+static ExprVal
 expr_mul(ExprP *x)
 {
-	double v = expr_unary(x);
+	ExprVal lv = expr_unary(x);
+	double v;
 
+	if (x->error || (x->tok != ETK_STAR && x->tok != ETK_SLASH &&
+	    x->tok != ETK_PCT))
+		return lv;
+	v = expr_num(x, &lv);
 	while (!x->error && (x->tok == ETK_STAR || x->tok == ETK_SLASH ||
 	    x->tok == ETK_PCT)) {
 		int op = x->tok;
+		ExprVal rv;
 		double r;
 
 		expr_lex(x);
-		r = expr_unary(x);
+		rv = expr_unary(x);
+		r = expr_num(x, &rv);
+		if (x->error)
+			break;
 		if (op == ETK_STAR)
 			v *= r;
 		else if (op == ETK_SLASH) {
 			if (r == 0.0) {
 				expr_fail(x, "division by zero");
-				return 0;
+				break;
 			}
 			v /= r;
 		} else {
@@ -30166,102 +30406,132 @@ expr_mul(ExprP *x)
 
 			if (b == 0) {
 				expr_fail(x, "division by zero");
-				return 0;
+				break;
 			}
 			v = (double)((long)v % b);
 		}
 	}
-	return v;
+	return expr_mknum(v);
 }
 
-static double
+static ExprVal
 expr_add(ExprP *x)
 {
-	double v = expr_mul(x);
+	ExprVal lv = expr_mul(x);
+	double v;
 
+	if (x->error || (x->tok != ETK_PLUS && x->tok != ETK_MINUS))
+		return lv;
+	v = expr_num(x, &lv);
 	while (!x->error && (x->tok == ETK_PLUS || x->tok == ETK_MINUS)) {
 		int op = x->tok;
+		ExprVal rv;
 
 		expr_lex(x);
+		rv = expr_mul(x);
 		if (op == ETK_PLUS)
-			v += expr_mul(x);
+			v += expr_num(x, &rv);
 		else
-			v -= expr_mul(x);
+			v -= expr_num(x, &rv);
 	}
-	return v;
+	return expr_mknum(v);
 }
 
-static double
+static ExprVal
 expr_rel(ExprP *x)
 {
-	double v = expr_add(x);
+	ExprVal lv = expr_add(x);
+	double v;
 
+	if (x->error || (x->tok != ETK_LT && x->tok != ETK_LE &&
+	    x->tok != ETK_GT && x->tok != ETK_GE))
+		return lv;
+	v = expr_num(x, &lv);
 	while (!x->error && (x->tok == ETK_LT || x->tok == ETK_LE ||
 	    x->tok == ETK_GT || x->tok == ETK_GE)) {
 		int op = x->tok;
+		ExprVal rv;
 		double r;
 
 		expr_lex(x);
-		r = expr_add(x);
+		rv = expr_add(x);
+		r = expr_num(x, &rv);
 		v = (op == ETK_LT ? v < r : op == ETK_LE ? v <= r :
 		    op == ETK_GT ? v > r : v >= r) ? 1.0 : 0.0;
 	}
-	return v;
+	return expr_mknum(v);
 }
 
-static double
+static ExprVal
 expr_eq(ExprP *x)
 {
-	double v = expr_rel(x);
+	ExprVal lv = expr_rel(x);
+	double v;
 
+	if (x->error || (x->tok != ETK_EQ && x->tok != ETK_NE))
+		return lv;
+	v = expr_num(x, &lv);
 	while (!x->error && (x->tok == ETK_EQ || x->tok == ETK_NE)) {
 		int op = x->tok;
+		ExprVal rv;
 		double r;
 
 		expr_lex(x);
-		r = expr_rel(x);
+		rv = expr_rel(x);
+		r = expr_num(x, &rv);
 		v = ((op == ETK_EQ) ? (v == r) : (v != r)) ? 1.0 : 0.0;
 	}
-	return v;
+	return expr_mknum(v);
 }
 
-static double
+static ExprVal
 expr_and(ExprP *x)
 {
-	double v = expr_eq(x);
+	ExprVal lv = expr_eq(x);
+	double v;
 
+	if (x->error || x->tok != ETK_AND)
+		return lv;
+	v = expr_num(x, &lv);
 	while (!x->error && x->tok == ETK_AND) {
-		double r;
+		ExprVal rv;
 
 		expr_lex(x);
-		r = expr_eq(x);
-		v = (v != 0.0 && r != 0.0) ? 1.0 : 0.0;
+		rv = expr_eq(x);
+		v = (v != 0.0 && expr_num(x, &rv) != 0.0) ? 1.0 : 0.0;
 	}
-	return v;
+	return expr_mknum(v);
 }
 
-static double
+static ExprVal
 expr_or(ExprP *x)
 {
-	double v = expr_and(x);
+	ExprVal lv = expr_and(x);
+	double v;
 
+	if (x->error || x->tok != ETK_OR)
+		return lv;
+	v = expr_num(x, &lv);
 	while (!x->error && x->tok == ETK_OR) {
-		double r;
+		ExprVal rv;
 
 		expr_lex(x);
-		r = expr_and(x);
-		v = (v != 0.0 || r != 0.0) ? 1.0 : 0.0;
+		rv = expr_and(x);
+		v = (v != 0.0 || expr_num(x, &rv) != 0.0) ? 1.0 : 0.0;
 	}
-	return v;
+	return expr_mknum(v);
 }
 
-/* Evaluate src to a number in out. Returns 0, or -1 with err set. */
+/* Evaluate src to a number in out. A result that is still a range is read as a
+ * single value (so a bare A1 works, A1:B3 alone is an error). Returns 0, or -1
+ * with err set. */
 static int
 expr_eval(const char *src, const ExprEnv *env, ExprVal *out, char *err,
     size_t errlen)
 {
 	ExprP x;
-	double v;
+	ExprVal v;
+	double d;
 
 	memset(&x, 0, sizeof(x));
 	x.p = src;
@@ -30270,12 +30540,14 @@ expr_eval(const char *src, const ExprEnv *env, ExprVal *out, char *err,
 	v = expr_or(&x);
 	if (!x.error && x.tok != ETK_END)
 		expr_fail(&x, "unexpected trailing input");
+	d = x.error ? 0 : expr_num(&x, &v);
 	if (x.error) {
 		if (err && errlen)
 			snprintf(err, errlen, "%s", x.err);
 		return -1;
 	}
-	out->num = v;
+	out->kind = EXPR_NUM;
+	out->num = d;
 	return 0;
 }
 
@@ -30306,6 +30578,7 @@ cl_expr_lookup(void *ctx, const char *name, ExprVal *out)
 
 	if (!v)
 		return -1;
+	out->kind = EXPR_NUM;
 	if (v->type == CLV_INT) {
 		out->num = (double)v->i;
 		return 0;
@@ -30359,9 +30632,9 @@ bi_expr(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 		}
 		n += (size_t)w;
 	}
+	memset(&env, 0, sizeof(env));
 	env.ctx = ev;
 	env.lookup = cl_expr_lookup;
-	env.call = NULL;
 	if (expr_eval(buf, &env, &out, err, sizeof(err)) < 0) {
 		cle_err(ev, "expr: %.120s", err);
 		return -1;

@@ -1,12 +1,12 @@
 # Expression evaluator and the spreadsheet: design note
 
-Status: Phase A and a first cut of Phase B implemented. The standalone `expr_*`
+Status: Phase A and a second cut of Phase B implemented. The standalone `expr_*`
 evaluator, the command-language `expr` verb, and the table view's formulas are
 built (`vedit.c`, the Expression evaluator and Table formulas sections). The
-formula cut is numbers only, single-cell references, recompute-on-read with a
-visiting stack for cycles; `A1:B3` ranges, string and error value variants in
-`ExprVal`, incremental recalc, reference adjustment on row and column edits, and
-`EVAL` are not built yet. This note records the design for two features that
+formula cut is numbers and ranges (`A1:B3` with `SUM`, `AVG`, `COUNT`, `MIN`,
+`MAX`), recompute-on-read with a visiting stack for cycles; string value
+variants in `ExprVal`, incremental recalc, reference adjustment on row and
+column edits, and `EVAL` are not built yet. This note records the design for two features that
 share one piece: an arithmetic `expr` for the command language, and formulas for
 the CSV/TSV table view. The shared piece is an expression
 evaluator. The point of writing this before building `expr` is to give the
@@ -66,14 +66,21 @@ The `ExprEnv` supplies meaning through callbacks:
 typedef struct expr_env {
     void *ctx;
     int (*lookup)(void *ctx, const char *name, ExprVal *out);        /* a name */
+    int (*deref)(void *ctx, const ExprVal *v, double *out);          /* range->num */
+    int (*fold)(void *ctx, const ExprVal *range, double *sum,
+        long *count, double *minv, double *maxv);                    /* aggregate */
     int (*call)(void *ctx, const char *fn, int argc, const ExprVal *argv,
         ExprVal *out);                                               /* f(...) */
 } ExprEnv;
 ```
 
-`lookup` resolves a bare name (`$i` in a program, `A1` in a sheet). `call`
-resolves a function. The parser stays the same for both callers; only the env
-differs.
+`lookup` resolves a bare name (`$i` in a program, `A1` in a sheet). In a sheet a
+name is a single cell, returned as a 1x1 range so the `:` operator can join two
+of them. `deref` reads a 1x1 range as one number (so a bare `A1` yields a
+value); `fold` walks a range for the aggregate functions. `call` resolves a
+function the evaluator does not know itself. The parser stays the same for both
+callers; only the env differs. The command language leaves `deref`, `fold`, and
+`call` null, so it never forms a range.
 
 What is deliberately **not** shared: `cl_parse`. `expr` is a separate leaf
 language. The command language keeps `$name` and `[program]` substitution and
@@ -184,11 +191,12 @@ language (whose values are `long` today through `clv_arg_int`) and the sheet
   and unblocks `while` counters and computed arguments. `ExprVal` is numeric
   only for now; the string and error variants arrive with Phase B. The built-in
   functions are libm-free on purpose, since only the GUI build links libm.
-- Phase B (first cut done): the spreadsheet. The `=` convention, a cell resolver
-  (`tbl_ref_lookup`) over A1 references, recompute-on-read with a visiting stack
-  for cycles (`tbl_formula_num`), error values, and the source-and-value status
-  line. Numbers only, single-cell references. Still to come: a value cache, the
-  `A1:B3` range resolver and range functions, incremental recalc, reference
+- Phase B (second cut done): the spreadsheet. The `=` convention, a cell
+  resolver (`tbl_ref_lookup`) over A1 references returning a 1x1 range,
+  recompute-on-read with a visiting stack for cycles (`tbl_formula_num`), error
+  values, and the source-and-value status line. The `:` range operator with
+  `tbl_deref` and `tbl_fold` backing the `SUM`, `AVG`, `COUNT`, `MIN`, and `MAX`
+  functions. Still to come: a value cache, incremental recalc, reference
   adjustment on row and column edits, string formulas, and `EVAL` with the
   restricted formula context.
 - Gating. `expr_*` stays ungated and small, so the `expr` verb works in builds
