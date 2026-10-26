@@ -40,7 +40,8 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
 - The command language gains an `if COND { THEN } else { ELSE }` conditional.
   The condition is any value (a non-empty, non-`0` string, or a non-zero number,
   is true), so a dialog verb reads as a condition, and the untaken branch does
-  not run.
+  not run. A condition may also compare two operands, `if A OP B { ... }`, with
+  `=`, `==`, `!=` as text and `<`, `<=`, `>`, `>=` as numbers.
 - The command language gains a `menu TITLE LABEL BODY ...` verb: it lists the
   labels and runs the chosen entry's program, so a keymap can build its own menu
   with no change to the editor.

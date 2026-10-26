@@ -29349,39 +29349,123 @@ cl_truthy(const ClVal *v)
 	}
 }
 
-/* if COND { THEN } [else { ELSE }]: run THEN when COND is true, otherwise ELSE.
- * COND is any value (see cl_truthy), so `if [confirm {Delete?}] { ... }` works.
- * The branches are program text run only when taken, so their side effects and
- * prompts happen only on the chosen path, and an else body can hold another if.
- * The result is the taken branch's value, or none when no branch runs. */
+/* Whether s is one of if's comparison operators. "=" and "==" are equal, "!="
+ * unequal (both compare as text); "<", "<=", ">", ">=" compare as numbers. */
+static int
+cl_is_cmp_op(const char *s)
+{
+	return strcmp(s, "=") == 0 || strcmp(s, "==") == 0 ||
+	    strcmp(s, "!=") == 0 || strcmp(s, "<") == 0 ||
+	    strcmp(s, "<=") == 0 || strcmp(s, ">") == 0 ||
+	    strcmp(s, ">=") == 0;
+}
+
+/* The text form of a value for a string comparison: a string as itself, a
+ * number as its digits. A position or region has none, so it cannot be
+ * compared as text; buf holds a formatted number. Returns NULL when there is
+ * no text form. */
+static const char *
+cl_val_text(const ClVal *v, char *buf, size_t sz)
+{
+	switch (v->type) {
+	case CLV_STR:
+		return v->s;
+	case CLV_INT:
+		snprintf(buf, sz, "%ld", v->i);
+		return buf;
+	default:
+		return NULL;
+	}
+}
+
+/* Compare a OP b, writing 0 or 1 to out. "=", "==" and "!=" compare the text
+ * forms; the ordering operators read both operands as base-ten integers (a
+ * non-number reads as -1, matching the action-argument rule). Returns 0, or -1
+ * (ev->err set) when a text operand has no text form. */
+static int
+cl_cmp(ClEval *ev, const ClVal *a, const char *op, const ClVal *b, int *out)
+{
+	if (op[0] == '=' || op[0] == '!') {		/* =, ==, != */
+		char ba[32], bb[32];
+		const char *sa = cl_val_text(a, ba, sizeof(ba));
+		const char *sb = cl_val_text(b, bb, sizeof(bb));
+		int eq;
+
+		if (!sa || !sb) {
+			cle_err(ev, "if: cannot compare that value as text");
+			return -1;
+		}
+		eq = strcmp(sa, sb) == 0;
+		*out = (op[0] == '!') ? !eq : eq;
+	} else {					/* <, <=, >, >= */
+		long x = clv_arg_int(a), y = clv_arg_int(b);
+
+		if (strcmp(op, "<") == 0)
+			*out = x < y;
+		else if (strcmp(op, "<=") == 0)
+			*out = x <= y;
+		else if (strcmp(op, ">") == 0)
+			*out = x > y;
+		else
+			*out = x >= y;			/* ">=" */
+	}
+	return 0;
+}
+
+/* if COND { THEN } [else { ELSE }], or the comparison form
+ * if A OP B { THEN } [else { ELSE }] when a comparison operator (=, ==, !=, <,
+ * <=, >, >=) stands between two operands. Plain COND is any value (see
+ * cl_truthy), so `if [confirm {Delete?}] { ... }` works; a comparison tests the
+ * two operands, so `if [ask {Name: }] = root { ... }` and `if $n < 10 { ... }`
+ * work. The branches are program text run only when taken, so their side
+ * effects and prompts happen only on the chosen path, and an else body can hold
+ * another if. The result is the taken branch's value, or none when no branch
+ * runs. */
 static int
 bi_if(ClEval *ev, int argc, ClVal *argv, ClVal *result)
 {
-	const char *body = NULL;
+	int cmp = argc >= 4 && argv[1].type == CLV_STR &&
+	    cl_is_cmp_op(argv[1].s);
+	int cond, theni, elsei = -1;
+	const char *body;
 
-	if (argc != 2 && argc != 4) {
-		cle_err(ev, "if needs a condition, a body, and an optional "
-		    "else body");
+	if (cmp) {
+		if (argc != 4 && argc != 6) {
+			cle_err(ev, "if: a comparison takes two operands, a body, "
+			    "and an optional else body");
+			return -1;
+		}
+		if (cl_cmp(ev, &argv[0], argv[1].s, &argv[2], &cond) < 0)
+			return -1;
+		theni = 3;
+		if (argc == 6)
+			elsei = 5;
+	} else {
+		if (argc != 2 && argc != 4) {
+			cle_err(ev, "if needs a condition, a body, and an "
+			    "optional else body");
+			return -1;
+		}
+		cond = cl_truthy(&argv[0]);
+		theni = 1;
+		if (argc == 4)
+			elsei = 3;
+	}
+	if (elsei >= 0 &&
+	    (argv[elsei - 1].type != CLV_STR ||
+	    strcmp(argv[elsei - 1].s, "else") != 0)) {
+		cle_err(ev, "if: expected else before the second body");
 		return -1;
 	}
-	if (argv[1].type != CLV_STR) {
+	if (argv[theni].type != CLV_STR) {
 		cle_err(ev, "if: the body is not a program");
 		return -1;
 	}
-	if (argc == 4) {
-		if (argv[2].type != CLV_STR || strcmp(argv[2].s, "else") != 0) {
-			cle_err(ev, "if: expected else before the second body");
-			return -1;
-		}
-		if (argv[3].type != CLV_STR) {
-			cle_err(ev, "if: the else body is not a program");
-			return -1;
-		}
+	if (elsei >= 0 && argv[elsei].type != CLV_STR) {
+		cle_err(ev, "if: the else body is not a program");
+		return -1;
 	}
-	if (cl_truthy(&argv[0]))
-		body = argv[1].s;
-	else if (argc == 4)
-		body = argv[3].s;
+	body = cond ? argv[theni].s : (elsei >= 0 ? argv[elsei].s : NULL);
 	if (!body)
 		return 0;		/* no branch taken: the result stays none */
 	return cl_eval_string(ev, body, result);

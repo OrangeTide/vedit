@@ -167,16 +167,28 @@ show what the marks bracket before another key acts on it:
 ```
 
 **Conditionals.** `if COND { THEN } else { ELSE }` runs `THEN` when `COND` is
-true and `ELSE` otherwise; the `else { ELSE }` part is optional. The condition
-is any value: a non-empty string that is not `0`, or a non-zero number, is true,
-and an empty string, `0`, or no value is false. That is what the dialog verbs
-below yield, so `[confirm ...]` and `[ask ...]` read as conditions directly. The
-branches are program text, run only when taken, so their edits and prompts
-happen only on the chosen path and a branch may hold another `if`.
+true and `ELSE` otherwise; the `else { ELSE }` part is optional. A plain
+condition is any value: a non-empty string that is not `0`, or a non-zero
+number, is true, and an empty string, `0`, or no value is false. That is what
+the dialog verbs below yield, so `[confirm ...]` and `[ask ...]` read as
+conditions directly. The branches are program text, run only when taken, so
+their edits and prompts happen only on the chosen path and a branch may hold
+another `if`.
 
 ```ini
 [keys "demo"]
     bind = "^D { if [confirm {Delete the line?}] { delete [region line 1 1] } }"
+```
+
+A condition may also compare two operands, `if A OP B { ... }`. The operators
+`=`, `==`, and `!=` compare the operands as text; `<`, `<=`, `>`, and `>=`
+compare them as numbers (a non-number counts as `-1`). This pairs with the
+dialog verbs, so a program can branch on what the user typed or chose:
+
+```ini
+[keys "demo"]
+    bind = "^R { if [ask {Mode: }] = raw { put RAW at [cursor] } else { put COOKED at [cursor] } }"
+    bind = "^L { set n [ask {Count: }] ; if $n < 10 { put {single digit} at [cursor] } }"
 ```
 
 **Dialogs.** Four verbs open a dialog and return what the user chose, so a

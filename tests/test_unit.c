@@ -4907,6 +4907,37 @@ t_cl_if(Test *t)
 	cl_if_run("if 1 { if 0 { delete [region line 1 1] } else "
 	    "{ delete [region line 2 2] } }", out, sizeof(out));
 	TAP_CHECKF(t, strcmp(out, "a/c") == 0, "nested if -> %s", out);
+
+	/* string equality: = and == are true on a match, != on a mismatch */
+	cl_if_run("if foo = foo { delete [region line 1 1] }",
+	    out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "= match -> %s", out);
+	cl_if_run("if foo == bar { delete [region line 1 1] }",
+	    out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "a/b/c") == 0, "== mismatch -> %s", out);
+	cl_if_run("if foo != bar { delete [region line 1 1] }",
+	    out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "!= mismatch -> %s", out);
+	cl_if_run("set x hi ; if $x = hi { delete [region line 1 1] } else "
+	    "{ delete [region line 3 3] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "var = match -> %s", out);
+
+	/* numeric ordering: <, <=, >, >= read both operands as integers */
+	cl_if_run("if 2 < 10 { delete [region line 1 1] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "2<10 -> %s", out);
+	cl_if_run("if 10 < 2 { delete [region line 1 1] } else "
+	    "{ delete [region line 3 3] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "a/b") == 0, "10<2 else -> %s", out);
+	cl_if_run("if 5 >= 5 { delete [region line 1 1] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "b/c") == 0, "5>=5 -> %s", out);
+	cl_if_run("if 3 > 7 { delete [region line 1 1] }", out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "a/b/c") == 0, "3>7 -> %s", out);
+
+	/* a comparison result feeds another if as a plain condition would, and
+	 * a lone operator-looking body is still a body, not a comparison */
+	cl_if_run("if a = a { if 9 <= 9 { delete [region line 2 2] } }",
+	    out, sizeof(out));
+	TAP_CHECKF(t, strcmp(out, "a/c") == 0, "nested compare -> %s", out);
 }
 
 /* A key bound to a {program} runs its commands in order. ^D here runs
