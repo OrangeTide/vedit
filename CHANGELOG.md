@@ -71,8 +71,8 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
   down. A formula copied from the table and pasted elsewhere, whether a whole
   row or a single cell, has its own references shifted by the distance it moved
   across rows and columns (a relative paste); one pushed off the top or left
-  edge becomes `#REF!`. A formula pasted from outside the table keeps its text
-  as written.
+  edge becomes `#REF!`. A single formula pasted from outside the table keeps its
+  text as written (grid-shaped external text pastes as a range instead, below).
 - Cutting and pasting, whether rows or a single cell, is a move: a formula that
   referenced a cut cell follows it to where it lands instead of breaking, and a
   cut formula keeps its own references. The reference reads `#REF!` between the
@@ -91,7 +91,10 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
   cursor and growing the grid if it runs past the edge. A copied block's formulas
   shift their references by how far the block moved on both axes, so they point at
   cells in the same relative place; one pushed off the top or left edge becomes
-  `#REF!`.
+  `#REF!`. Grid-shaped text pasted from outside the table (tabs between columns,
+  newlines between rows) spreads across cells the same way; with no recorded
+  source, its top-left is taken as cell A1 and its formulas shift by the paste
+  coordinates. Plain single-line text still drops into the one cell.
 - The command language gains a `menu TITLE LABEL BODY ...` verb: it lists the
   labels and runs the chosen entry's program, so a keymap can build its own menu
   with no change to the editor.

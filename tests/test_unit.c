@@ -5094,6 +5094,67 @@ t_tbl_range_paste_shift(Test *t)
 	text_free(e.t);
 }
 
+static void
+t_tbl_ext_range_paste_shift(Test *t)
+{
+	static const char *const L[] = { "1,2,3", "4,5,6" };
+	Editor e;
+
+	/* A grid pasted from outside the table has no recorded source, so its
+	 * top-left is taken as cell A1 and its formulas shift by the paste
+	 * coordinates. The clip "=A1<TAB>=B1" is one row of two formulas; pasted at
+	 * B2 (dr = 1, dc = 1) it lands =A1 -> =B2 and =B1 -> =C2, overwriting B2 and
+	 * C2. tbl_paste sees the tab and routes it as a range. */
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, L, 2);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+	clip_set(&e, strdup("=A1\t=B1"), 7);	/* external: clip_tbl_src stays 0 */
+	e.cy = 1;
+	e.tbl->cx = 1;				/* paste top-left at B2 */
+	tbl_paste(&e);
+	TAP_CHECK(t, rawline_is(&e, 0, "1,2,3"));
+	TAP_CHECK(t, rawline_is(&e, 1, "4,=B2,=C2"));
+	tbl_detach(&e);
+	text_free(e.t);
+
+	/* A newline also makes a grid: "=B1<NL>=B2" is a single column of two rows.
+	 * Pasted at A1 the shift is zero, so the formulas keep their columns and
+	 * overwrite A1 and A2 down the first column. */
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, L, 2);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+	clip_set(&e, strdup("=B1\n=B2"), 7);
+	e.cy = 0;
+	e.tbl->cx = 0;				/* paste top-left at A1; dr = dc = 0 */
+	tbl_paste(&e);
+	TAP_CHECK(t, rawline_is(&e, 0, "=B1,2,3"));
+	TAP_CHECK(t, rawline_is(&e, 1, "=B2,5,6"));
+	tbl_detach(&e);
+	text_free(e.t);
+
+	/* Plain single-line external text is not a grid: tbl_paste drops it into
+	 * the one cell at the cursor, literally, with no shift. */
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, L, 2);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+	clip_set(&e, strdup("=A1"), 3);
+	e.cy = 1;
+	e.tbl->cx = 2;				/* cursor C2 */
+	tbl_paste(&e);
+	TAP_CHECK(t, rawline_is(&e, 1, "4,5,=A1"));	/* literal, one cell */
+	tbl_detach(&e);
+	text_free(e.t);
+}
+
 /* The non-vi motion layer maps a position to where a modeless motion lands,
  * without touching the editor cursor. Left and right step by rune and wrap
  * across line ends; up and down clamp the column to the target line; the
@@ -6997,6 +7058,7 @@ const Case tap_cases[] = {
 	{ "tbl_cell_move", t_tbl_cell_move },
 	{ "tbl_col_paste_shift", t_tbl_col_paste_shift },
 	{ "tbl_range_paste_shift", t_tbl_range_paste_shift },
+	{ "tbl_ext_range_paste_shift", t_tbl_ext_range_paste_shift },
 	{ "swap_paths", t_swap_paths },
 	{ "atomic_save", t_atomic_save },
 	{ "save_rodir_fallback", t_save_rodir_fallback },

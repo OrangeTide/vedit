@@ -183,8 +183,11 @@ row, a whole column, a single cell, or a selected rectangle of cells, has its
 own references shifted by the distance it moved, across rows and columns both,
 so it points at cells in the same relative place; one pushed off the top or left
 edge reads `#REF!`. A pasted rectangle overwrites the cells at the cursor rather
-than inserting, growing the grid if it runs past the edge. A formula pasted from
-outside the table keeps its text as written. Cutting and pasting a
+than inserting, growing the grid if it runs past the edge. A single formula
+pasted from outside the table keeps its text as written, but grid-shaped text
+(tabs between columns, newlines between rows) spreads across cells as a
+rectangle; with no recorded source its top-left is taken as cell A1 and its
+formulas shift by the paste coordinates. Cutting and pasting a
 whole row or a single cell is a move: a formula that referenced a cut cell
 follows it to where it lands rather than breaking, and a cut formula keeps its
 own references. Until the paste the reference reads `#REF!`, since the data is in

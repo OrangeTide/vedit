@@ -223,7 +223,14 @@ specific and is most of the work:
   a short row to hold it. `tbl_cut_range` copies and then blanks the cells, a
   plain clearing rather than a move, since clearing a sub-rectangle changes no
   grid structure. A 1x1 selection defers to the single-cell copy, cut, and paste,
-  so Ctrl-C, Ctrl-X, and Ctrl-V keep their one-cell meaning.
+  so Ctrl-C, Ctrl-X, and Ctrl-V keep their one-cell meaning. A paste dispatcher
+  (`tbl_paste`) routes a grid-shaped clipboard through `tbl_paste_range` and
+  anything else to the single cell: `tbl_clip_is_grid` reports a grid when the
+  clipboard holds a tab or an interior newline. That is how a range pasted from
+  outside the table spreads across cells. Such a clip has no recorded source, so
+  `tbl_paste_range` takes its top-left as cell A1 (row and column anchor zero) and
+  the shift becomes the paste coordinates; a single, unstructured external paste
+  has no tab or interior newline, so it still drops into the one cell, literally.
 - Cut and paste is a move (built). A row cut (`tbl_row_del`) copies, deletes, and
   sets `clip_tbl_cut`. A cut is half of a move, so a reference elsewhere to a cut
   cell must follow it to wherever the rows land, not break. Cut and paste are two

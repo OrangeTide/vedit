@@ -11571,6 +11571,8 @@ static void tbl_paste_cell(Editor *e);
 static void tbl_copy_range(Editor *e);
 static void tbl_cut_range(Editor *e);
 static void tbl_paste_range(Editor *e);
+static int tbl_clip_is_grid(const Editor *e);
+static void tbl_paste(Editor *e);
 static void tbl_find_again(Editor *e, int dir);
 static void tbl_row_add(Editor *e, int n, int below);
 static void tbl_row_copy(Editor *e, int n);
@@ -15362,10 +15364,7 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 				tbl_cut_cell(e);
 			return REQ_CONTINUE;
 		case TKBD_KEY_V:
-			if (e->clip_tbl_isrange)
-				tbl_paste_range(e);
-			else
-				tbl_paste_cell(e);
+			tbl_paste(e);
 			return REQ_CONTINUE;
 		case TKBD_KEY_Z:
 			tbl_undo(e, 0);
@@ -15569,12 +15568,16 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 	case 'p':
 		if (e->clip_tbl_iscol)
 			tbl_col_paste(e, 1);
+		else if (!e->clip_tbl_src && tbl_clip_is_grid(e))
+			tbl_paste_range(e);
 		else
 			tbl_row_paste(e, 1);
 		break;
 	case 'P':
 		if (e->clip_tbl_iscol)
 			tbl_col_paste(e, 0);
+		else if (!e->clip_tbl_src && tbl_clip_is_grid(e))
+			tbl_paste_range(e);
 		else
 			tbl_row_paste(e, 0);
 		break;
@@ -15869,13 +15872,16 @@ tbl_cut_range(Editor *e)
  * Each pasted formula's references shift by how far the block moved, on both
  * axes, so they point at cells in the same relative place; one pushed off the
  * top or left edge becomes #REF!. The grid grows to hold the block. One undo
- * step. */
+ * step. A grid pasted from outside the table has no recorded source, so its
+ * top-left is taken as cell A1 and the shift is the paste coordinates. */
 static void
 tbl_paste_range(Editor *e)
 {
 	size_t i = 0, dr0 = e->cy, r = dr0;
 	int dc0 = e->tbl->cx, wide = 0;
-	long dr = (long)dr0 - e->clip_tbl_row, dc = (long)dc0 - e->clip_tbl_col;
+	long arow = e->clip_tbl_src ? e->clip_tbl_row : 0;
+	long acol = e->clip_tbl_src ? e->clip_tbl_col : 0;
+	long dr = (long)dr0 - arow, dc = (long)dc0 - acol;
 
 	if (!e->clip || e->clip_len == 0) {
 		set_status(e, "nothing to paste");
@@ -15899,7 +15905,7 @@ tbl_paste_range(Editor *e)
 			memcpy(val, e->clip + i, n);
 			val[n] = '\0';
 			last = j >= e->clip_len || e->clip[j] == '\n';
-			if (e->clip_tbl_src && val[0] == '=' &&
+			if (val[0] == '=' &&
 			    tbl_cell_shift_formula(val, dr, dc, out,
 			        sizeof(out)) == 1)
 				tbl_set_cell(e, r, c, out, strlen(out));
@@ -15920,6 +15926,38 @@ tbl_paste_range(Editor *e)
 	e->tbl->cx = dc0;
 	e->tbl->ncols = tbl_count_cols(e->t, e->tbl->delim);
 	set_status(e, "pasted %zux%d cells", r - dr0, wide);
+}
+
+/* Does the external clip look like a grid to spread across cells? A tab means
+ * more than one column, and a newline before the final byte means more than one
+ * row. A trailing newline alone, or plain single-line text, is a single cell. */
+static int
+tbl_clip_is_grid(const Editor *e)
+{
+	size_t i;
+
+	if (!e->clip || e->clip_len == 0)
+		return 0;
+	for (i = 0; i < e->clip_len; i++) {
+		if (e->clip[i] == '\t')
+			return 1;
+		if (e->clip[i] == '\n' && i + 1 < e->clip_len)
+			return 1;
+	}
+	return 0;
+}
+
+/* Paste the clipboard at the cursor, choosing its shape. An internal range copy
+ * and grid-shaped text pasted from outside the table both spread across cells
+ * with a relative shift (tbl_paste_range); anything else drops into the single
+ * cell at the cursor. */
+static void
+tbl_paste(Editor *e)
+{
+	if (e->clip_tbl_isrange || (!e->clip_tbl_src && tbl_clip_is_grid(e)))
+		tbl_paste_range(e);
+	else
+		tbl_paste_cell(e);
 }
 
 /* Repeat the last search in direction dir and land on the cell. */
@@ -16483,6 +16521,7 @@ static int tbl_label_col(const char *s) { (void)s; return -1; }
 static size_t tbl_first_row(const Editor *e) { (void)e; return 0; }
 static void tbl_copy_cell(Editor *e) { (void)e; }
 static void tbl_paste_cell(Editor *e) { (void)e; }
+static void tbl_paste(Editor *e) { tbl_paste_cell(e); }
 static void tbl_undo(Editor *e, int redo) { (void)e; (void)redo; }
 static int tbl_count_arg(const char *arg) { (void)arg; return 1; }
 static void tbl_command(Editor *e, const char *arg)
@@ -34627,7 +34666,7 @@ run_menu_act(Editor *e, Menuact act)
 		break;
 	case MA_PASTE:
 		if (e->tbl)
-			tbl_paste_cell(e);
+			tbl_paste(e);
 		else
 			(void)ed_dispatch(e, CMD_PASTE, NULL);
 		break;
