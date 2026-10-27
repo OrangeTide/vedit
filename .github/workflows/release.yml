@@ -4,10 +4,14 @@ name: Release
 # them on the GitHub release for that tag, created here when it does not
 # exist yet. The tag must match VEDIT_VERSION in version.mk, so a stale
 # version string fails the run before anything is built.
+#
+# A manual run (workflow_dispatch) builds and checks the binaries from the
+# chosen ref but publishes nothing, for validating the build off a tag.
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -28,14 +32,18 @@ jobs:
       - name: Compare the tag with VEDIT_VERSION
         id: version
         run: |
-          tag="${GITHUB_REF_NAME#v}"
           src=$(sed -n 's/^VEDIT_VERSION := \(.*\)$/\1/p' version.mk)
-          echo "tag: $tag, source: $src"
-          if [ "$tag" != "$src" ]; then
-            echo "the tag does not match VEDIT_VERSION in version.mk"
-            exit 1
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            echo "tag: $tag, source: $src"
+            if [ "$tag" != "$src" ]; then
+              echo "the tag does not match VEDIT_VERSION in version.mk"
+              exit 1
+            fi
+          else
+            echo "manual run: version $src from version.mk, no publish"
           fi
-          echo "version=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$src" >> "$GITHUB_OUTPUT"
 
   # Static musl binaries for Linux, one per architecture, built natively on
   # the matching runner with the `make static` target. The man page rides
@@ -146,10 +154,12 @@ jobs:
 
   # Publish: create the release for the tag when it is missing (with
   # GitHub's generated notes), then attach the archives and their checksums.
-  # --clobber lets a rerun replace the assets of an existing release.
+  # --clobber lets a rerun replace the assets of an existing release. Only a
+  # tag push publishes; a manual run stops after the build jobs.
   publish:
     name: publish
     needs: [check, linux, windows]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
