@@ -15748,12 +15748,11 @@ tbl_cut_cell(Editor *e)
 	set_status(e, "cut the cell (Ctrl+V pastes it back)");
 }
 
-/* Paste the clipboard into the current cell, as one value. A cell cut from the
- * table lands here unchanged, and the references that pointed at it follow from
- * their off-sheet park to this cell, a move. A cell copied from the table has
- * its references shifted by how far it moved, so it points at cells in the same
- * relative place; a reference pushed off the top or left edge becomes #REF!. A
- * paste from outside the table is set verbatim. */
+/* Paste the clipboard into the current cell, as one value. A cut cell lands
+ * unchanged and the references that pointed at it follow from their off-sheet
+ * park to this cell, a move. A copied cell has its formula references shifted by
+ * the distance moved (tbl_cell_shift_formula). A paste from outside the table is
+ * set verbatim. */
 static void
 tbl_paste_cell(Editor *e)
 {
@@ -15868,12 +15867,11 @@ tbl_cut_range(Editor *e)
 	    c1 - c0 + 1);
 }
 
-/* Paste a copied rectangle, overwriting the block whose top-left is the cursor.
- * Each pasted formula's references shift by how far the block moved, on both
- * axes, so they point at cells in the same relative place; one pushed off the
- * top or left edge becomes #REF!. The grid grows to hold the block. One undo
- * step. A grid pasted from outside the table has no recorded source, so its
- * top-left is taken as cell A1 and the shift is the paste coordinates. */
+/* Paste a copied rectangle, overwriting the block whose top-left is the cursor
+ * and growing the grid to hold it. Each pasted formula's references shift by how
+ * far the block moved on both axes (tbl_cell_shift_formula). A grid pasted from
+ * outside the table has no recorded source, so its top-left is taken as cell A1
+ * and the shift is the paste coordinates. One undo step. */
 static void
 tbl_paste_range(Editor *e)
 {
@@ -16283,13 +16281,11 @@ tbl_col_cut(Editor *e)
 	set_status(e, "cut the column (p or :colpaste pastes it)");
 }
 
-/* Paste the clipboard column, inserting a new column to the right of the cursor
- * column (right) or to its left, and laying the stored value into each row. A
- * column copied from the table has the references in its formulas shifted by
- * how far it moved across columns, so they point at cells in the same relative
- * place; a reference pushed off the left edge becomes #REF!. A paste from
- * outside the table, or of a row or cell clip, lays the values down verbatim.
- * One undo step. */
+/* Paste the clipboard column, inserting a new column right of the cursor column
+ * (right) or left of it, and laying the stored value into each row. A column
+ * copied from the table has its formula references shifted by how far it moved
+ * across columns (tbl_cell_shift_formula). A paste from outside the table, or of
+ * a row or cell clip, lays the values down verbatim. One undo step. */
 static void
 tbl_col_paste(Editor *e, int right)
 {
