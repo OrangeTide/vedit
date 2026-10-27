@@ -14152,7 +14152,7 @@ tbl_cell_value(const Editor *e, size_t row, int col, char *buf, size_t n)
  * recalc is recompute-on-read: a referenced cell is evaluated when a formula
  * reads it, with a visiting stack to catch cycles. Numbers and A1:B3 ranges
  * with the SUM/AVG/COUNT/MIN/MAX functions; references are relabeled when rows
- * or columns are inserted, deleted, or sorted (see
+ * or columns are inserted, deleted, sorted, or pasted (see
  * docs/design/expr-and-spreadsheet.md).
  ****************************************************************/
 
@@ -14551,11 +14551,14 @@ tbl_cell_replace_raw(Editor *e, size_t row, int col, const char *val, size_t n)
 }
 
 /* Relabel every formula's A1 references for a structural edit: rows (is_col ==
- * 0) or columns were inserted or deleted (del) at `at`, `n` wide. Runs inside
- * the caller's undo group so one undo reverts the edit and the relabeling
- * together. A no-op when formulas are off. */
+ * 0) or columns were inserted or deleted (del) at `at`, `n` wide. Rows in the
+ * inclusive band [skip_lo, skip_hi] are left untouched, for a paste whose own
+ * rows carry literal formula text that must not shift; pass an empty band
+ * (0, -1) otherwise. Runs inside the caller's undo group so one undo reverts
+ * the edit and the relabeling together. A no-op when formulas are off. */
 static void
-tbl_reloc(Editor *e, int is_col, long at, int n, int del)
+tbl_reloc(Editor *e, int is_col, long at, int n, int del,
+    long skip_lo, long skip_hi)
 {
 	size_t nl = text_lines(e->t), y;
 
@@ -14563,8 +14566,11 @@ tbl_reloc(Editor *e, int is_col, long at, int n, int del)
 		return;
 	for (y = 0; y < nl; y++) {
 		size_t off, len;
-		int nf = tbl_cell_off(e, y, 0, &off, &len), col;
+		int nf, col;
 
+		if ((long)y >= skip_lo && (long)y <= skip_hi)
+			continue;	/* a pasted row: its formulas are literal */
+		nf = tbl_cell_off(e, y, 0, &off, &len);
 		for (col = 0; col < nf; col++) {
 			char cell[TBL_CELL_MAX], out[TBL_CELL_MAX];
 
@@ -15283,7 +15289,7 @@ tbl_row_add(Editor *e, int n, int below)
 		else
 			text_split(e->t, y, 0);
 	}
-	tbl_reloc(e, 0, below ? (long)y + 1 : (long)y, n, 0);
+	tbl_reloc(e, 0, below ? (long)y + 1 : (long)y, n, 0, 0, -1);
 	text_undo_group_end(e->t);
 	hl_touch(e, y);
 	e->cy = below ? y + 1 : y;
@@ -15346,7 +15352,7 @@ tbl_row_del(Editor *e, int n)
 	tbl_row_copy(e, n);
 	text_undo_group_begin(e->t);
 	vi_delete_lines(e, y, y + (size_t)n - 1);
-	tbl_reloc(e, 0, (long)y, n, 1);
+	tbl_reloc(e, 0, (long)y, n, 1, 0, -1);
 	text_undo_group_end(e->t);
 	e->cx = 0;
 	set_status(e, "%d row%s deleted (Ctrl+V or p pastes them back)", n,
@@ -15384,6 +15390,10 @@ tbl_row_paste(Editor *e, int below)
 		n++;
 		i = j + 1;
 	}
+	/* The paste inserts n rows at `first`, so references in the rest of the
+	 * sheet shift down as on a row insert; the pasted rows are skipped, their
+	 * formula text staying literal. */
+	tbl_reloc(e, 0, (long)first, n, 0, (long)first, (long)first + n - 1);
 	text_undo_group_end(e->t);
 	hl_touch(e, first);
 	e->cy = first;
@@ -15422,7 +15432,7 @@ tbl_col_add(Editor *e, int n, int after)
 		for (k = 0; k < n; k++)
 			text_insert(e->t, y, at, &tb->delim, 1);
 	}
-	tbl_reloc(e, 1, after ? (long)c + 1 : (long)c, n, 0);
+	tbl_reloc(e, 1, after ? (long)c + 1 : (long)c, n, 0, 0, -1);
 	text_undo_group_end(e->t);
 	hl_touch(e, 0);
 	tbl_width_shift(tb, after ? c + 1 : c, n);
@@ -15463,7 +15473,7 @@ tbl_col_del(Editor *e, int n)
 				text_delete(e->t, y, off - 1, len + 1);
 		}
 	}
-	tbl_reloc(e, 1, (long)c, n, 1);
+	tbl_reloc(e, 1, (long)c, n, 1, 0, -1);
 	text_undo_group_end(e->t);
 	hl_touch(e, 0);
 	tbl_width_shift(tb, c, -n);

@@ -5,8 +5,8 @@ evaluator, the command-language `expr` verb, and the table view's formulas are
 built (`vedit.c`, the Expression evaluator and Table formulas sections). The
 formula cut is numbers and ranges (`A1:B3` with `SUM`, `AVG`, `COUNT`, `MIN`,
 `MAX`), recompute-on-read with a visiting stack for cycles, and reference
-relabeling on row and column insert, delete, and sort; string value variants in
-`ExprVal`, incremental recalc, and `EVAL` are not built yet. This note records the design for two features that
+relabeling on row and column insert, delete, sort, and paste; string value
+variants in `ExprVal`, incremental recalc, and `EVAL` are not built yet. This note records the design for two features that
 share one piece: an arithmetic `expr` for the command language, and formulas for
 the CSV/TSV table view. The shared piece is an expression
 evaluator. The point of writing this before building `expr` is to give the
@@ -173,8 +173,14 @@ specific and is most of the work:
   reference to a sorted row so it follows the cell to its new place
   (`tbl_sort_formula`). A range is left unchanged: the rows it spans are
   permuted among themselves, so the order-independent aggregates are unaffected,
-  and there is no contiguous range for a scattered set. Clipboard paste does not
-  relabel yet.
+  and there is no contiguous range for a scattered set.
+- Reference adjustment on paste (built). Pasting clipboard rows (`tbl_row_paste`)
+  inserts those rows, so it reuses `tbl_reloc` to shift references in the rest of
+  the sheet down, just as a manual row insert does. The pasted rows carry a skip
+  band so their own formula text stays literal: the clipboard is plain bytes with
+  no record of where it came from, so a relative shift of a pasted formula has
+  nothing to shift against. Pasting into a single cell (`tbl_paste_cell`) sets
+  one value and makes no structural change, so it relabels nothing.
 
 Sharing the evaluator saves perhaps a fifth of the spreadsheet effort. The
 engine, the cache, the dependency order, and reference adjustment are the rest.
@@ -206,9 +212,10 @@ language (whose values are `long` today through `clv_arg_int`) and the sheet
   values, and the source-and-value status line. The `:` range operator with
   `tbl_deref` and `tbl_fold` backing the `SUM`, `AVG`, `COUNT`, `MIN`, and `MAX`
   functions. Reference relabeling on row and column insert or delete
-  (`tbl_reloc`), rewriting the formula text in place within the edit's undo
-  step. Still to come: a value cache, incremental recalc, string formulas, and
-  `EVAL` with the restricted formula context.
+  (`tbl_reloc`), on sort (`tbl_sort_reloc`), and on a row paste (`tbl_reloc`
+  again, skipping the pasted rows), rewriting the formula text in place within
+  the edit's undo step. Still to come: a value cache, incremental recalc, string
+  formulas, and `EVAL` with the restricted formula context.
 - Gating. `expr_*` stays ungated and small, so the `expr` verb works in builds
   without the table, and the table works without arithmetic. The spreadsheet
   engine stays behind `VEDIT_TABLE`.

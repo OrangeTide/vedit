@@ -4769,6 +4769,35 @@ t_tbl_sort_live(Test *t)
 	text_free(e.t);
 }
 
+/* Pasting rows inserts them, so a reference in the rest of the sheet shifts
+ * down as on a row insert, while a formula carried in on the clipboard keeps
+ * its literal text (the clipboard has no source position to shift against). */
+static void
+t_tbl_paste_reloc(Test *t)
+{
+	static const char *const L[] = { "=A2", "5" };
+	Editor e;
+
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, L, 2);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+
+	/* paste one formula row below row 0; the 5 it pointed at moves down */
+	clip_set(&e, strdup("=A9"), 3);
+	e.cy = 0;
+	e.tbl->cx = 0;
+	tbl_row_paste(&e, 1);
+	TAP_CHECK(t, rawline_is(&e, 0, "=A3"));	/* ref to the 5 followed it */
+	TAP_CHECK(t, rawline_is(&e, 1, "=A9"));	/* pasted text stays literal */
+	TAP_CHECK(t, rawline_is(&e, 2, "5"));
+
+	tbl_detach(&e);
+	text_free(e.t);
+}
+
 /* The non-vi motion layer maps a position to where a modeless motion lands,
  * without touching the editor cursor. Left and right step by rune and wrap
  * across line ends; up and down clamp the column to the target line; the
@@ -6665,6 +6694,7 @@ const Case tap_cases[] = {
 	{ "tbl_reloc_live", t_tbl_reloc_live },
 	{ "tbl_sort_reloc", t_tbl_sort_reloc },
 	{ "tbl_sort_live", t_tbl_sort_live },
+	{ "tbl_paste_reloc", t_tbl_paste_reloc },
 	{ "swap_paths", t_swap_paths },
 	{ "atomic_save", t_atomic_save },
 	{ "save_rodir_fallback", t_save_rodir_fallback },

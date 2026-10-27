@@ -66,6 +66,9 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
 - Sorting the table relabels single-cell formula references so they follow
   their cells to the sorted rows. Ranges are left alone, since the aggregate
   functions do not depend on order.
+- Pasting rows into the table relabels the formula references in the rest of
+  the sheet, so they keep pointing at their cells as the paste pushes rows
+  down. A formula carried in on the clipboard keeps its text as written.
 - The command language gains a `menu TITLE LABEL BODY ...` verb: it lists the
   labels and runs the chosen entry's program, so a keymap can build its own menu
   with no change to the editor.

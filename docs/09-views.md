@@ -172,7 +172,9 @@ deleting a row or column relabels the references in every formula, so they keep
 pointing at the same cells. A reference to a deleted cell becomes `#REF!`, and a
 range that straddles a deletion shrinks. Sorting the table relabels single-cell
 references too, so they follow their cells to the new rows. A range is left
-alone across a sort, since the aggregate functions do not depend on order. Set
+alone across a sort, since the aggregate functions do not depend on order.
+Pasting rows inserts them, so references elsewhere shift down to keep pointing at
+their cells; a formula carried in on the clipboard keeps its text as written. Set
 `table.formulas = off` for a file that uses a leading `=` as literal text.
 
 `:rowadd [N]` inserts N blank rows above the cursor row and `:rowadd! [N]`
