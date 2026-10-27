@@ -91,10 +91,13 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
   cursor and growing the grid if it runs past the edge. A copied block's formulas
   shift their references by how far the block moved on both axes, so they point at
   cells in the same relative place; one pushed off the top or left edge becomes
-  `#REF!`. Grid-shaped text pasted from outside the table (tabs between columns,
-  newlines between rows) spreads across cells the same way; with no recorded
-  source, its top-left is taken as cell A1 and its formulas shift by the paste
-  coordinates. Plain single-line text still drops into the one cell.
+  `#REF!`.
+- Grid-shaped text pasted into the table from an external source (tabs between
+  columns, newlines between rows) spreads across cells as a rectangle instead of
+  dropping into the one cell at the cursor. With no recorded source, its top-left
+  is taken as cell A1 and its formulas shift by the paste coordinates, the same
+  relative shift an internal range paste makes. Plain single-line text still goes
+  into the one cell, literally.
 - The command language gains a `menu TITLE LABEL BODY ...` verb: it lists the
   labels and runs the chosen entry's program, so a keymap can build its own menu
   with no change to the editor.
