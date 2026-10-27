@@ -10,7 +10,7 @@ number, so `vedit --version` on an untagged checkout reads like
 `1.6.1-dev-gfce3eef`. Each tagged release also carries full notes in its
 annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
 
-## [Unreleased]
+## [1.47.6] - 2026-10-27
 
 ### Added
 - Configurable keymaps. F2 cycles a list of keymap modes set with
@@ -112,6 +112,8 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
   file, and an absolute path is still used as given.
 - A leading `~` in a config path value (`edit.swapdir`, `edit.backupdir`,
   `tags.file`, `cc.file`, an `[include]` path) expands against `$HOME`.
+- The aarch64 Linux release tarball ships `gvedit` alongside `vedit`, as the
+  x86_64 tarball already does.
 
 ## [1.6.0] - 2026-10-16
 - WebAssembly builds: a headless `wasm32-wasi` binary (`make wasm`) and a
@@ -163,7 +165,7 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
 - First release: the single-file terminal text editor, with the EDIT keys, the
   vi personality, syntax highlighting, color-depth handling, and draw mode.
 
-[Unreleased]: https://github.com/OrangeTide/vedit/compare/v1.6.0...HEAD
+[1.47.6]: https://github.com/OrangeTide/vedit/compare/v1.6.0...v1.47.6
 [1.6.0]: https://github.com/OrangeTide/vedit/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/OrangeTide/vedit/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/OrangeTide/vedit/compare/v1.4.0...v1.4.1
