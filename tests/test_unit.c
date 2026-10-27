@@ -4798,6 +4798,52 @@ t_tbl_paste_reloc(Test *t)
 	text_free(e.t);
 }
 
+/* A row copied with tbl_row_copy carries its source position, so pasting it
+ * elsewhere shifts its references by the distance the rows moved: a relative
+ * paste. A reference driven off the top of the sheet becomes #REF!. */
+static void
+t_tbl_paste_shift(Test *t)
+{
+	static const char *const L[] = { "10", "=A1", "20" };
+	Editor e;
+
+	/* copy row 1 (=A1, pointing at the 10) and paste it below row 2: the
+	 * formula moves two rows down, so =A1 follows to =A3 (now the 20), while
+	 * the source copy is left as it was */
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, L, 3);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+	e.cy = 1;
+	e.tbl->cx = 0;
+	tbl_row_copy(&e, 1);
+	e.cy = 2;
+	tbl_row_paste(&e, 1);
+	TAP_CHECK(t, rawline_is(&e, 1, "=A1"));	/* source untouched */
+	TAP_CHECK(t, rawline_is(&e, 3, "=A3"));	/* pasted, shifted down two */
+	tbl_detach(&e);
+	text_free(e.t);
+
+	/* paste the same copy above row 0: the formula moves up past the top of
+	 * the sheet, so its reference falls off and becomes #REF! */
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, L, 3);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+	e.cy = 1;
+	e.tbl->cx = 0;
+	tbl_row_copy(&e, 1);
+	e.cy = 0;
+	tbl_row_paste(&e, 0);
+	TAP_CHECK(t, rawline_is(&e, 0, "=#REF!"));
+	tbl_detach(&e);
+	text_free(e.t);
+}
+
 /* The non-vi motion layer maps a position to where a modeless motion lands,
  * without touching the editor cursor. Left and right step by rune and wrap
  * across line ends; up and down clamp the column to the target line; the
@@ -6695,6 +6741,7 @@ const Case tap_cases[] = {
 	{ "tbl_sort_reloc", t_tbl_sort_reloc },
 	{ "tbl_sort_live", t_tbl_sort_live },
 	{ "tbl_paste_reloc", t_tbl_paste_reloc },
+	{ "tbl_paste_shift", t_tbl_paste_shift },
 	{ "swap_paths", t_swap_paths },
 	{ "atomic_save", t_atomic_save },
 	{ "save_rodir_fallback", t_save_rodir_fallback },

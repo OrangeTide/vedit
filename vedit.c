@@ -8232,6 +8232,8 @@ typedef struct editor {
 	size_t		clip_len;	/* length of clip in bytes */
 	int		clip_linewise;	/* clip holds whole lines (vi p/P) */
 	int		clip_block;	/* clip holds a rectangle (draw mode) */
+	int		clip_tbl_rows;	/* clip holds table rows from a known source */
+	long		clip_tbl_row;	/* that source's top row, for relative paste */
 	int		clip_osc52;	/* mirror every copy/yank through OSC 52 */
 	/* The kill stack fed by the capture suffix '.' on a removing verb, kept
 	 * separate from the clipboard above. Newest entry on top. */
@@ -14584,6 +14586,39 @@ tbl_reloc(Editor *e, int is_col, long at, int n, int del,
 	}
 }
 
+/* Shift every row reference in the formulas of rows [ylo, yhi] by delta, for a
+ * relative paste: a formula copied from one row and pasted `delta` rows away
+ * takes its references along. A reference shifted off the top of the sheet
+ * becomes #REF!. The shift is the row half of tbl_reloc_formula: inserting
+ * `delta` rows at the top moves every reference down by delta, and deleting
+ * `-delta` rows there moves them up and drops those that fall off. Runs inside
+ * the paste's undo group. A no-op when formulas are off or delta is zero. */
+static void
+tbl_paste_shift(Editor *e, size_t ylo, size_t yhi, long delta)
+{
+	long at = 0, n = delta < 0 ? -delta : delta;
+	int del = delta < 0;
+	size_t y;
+
+	if (!e->tbl_formulas || delta == 0)
+		return;
+	for (y = ylo; y <= yhi && y < text_lines(e->t); y++) {
+		size_t off, len;
+		int nf = tbl_cell_off(e, y, 0, &off, &len), col;
+
+		for (col = 0; col < nf; col++) {
+			char cell[TBL_CELL_MAX], out[TBL_CELL_MAX];
+
+			tbl_cell_value(e, y, col, cell, sizeof(cell));
+			if (cell[0] != '=')
+				continue;
+			if (tbl_reloc_formula(cell, 0, at, (int)n, del,
+			    out, sizeof(out)) == 1)
+				tbl_cell_replace_raw(e, y, col, out, strlen(out));
+		}
+	}
+}
+
 /* Rewrite a formula's references through a sort's row permutation: a single
  * reference to a row in [lo, hi] moves to rowmap[row - lo], so it follows the
  * cell to where the sort put it. A range is left unchanged: the rows it spans
@@ -15336,6 +15371,8 @@ tbl_row_copy(Editor *e, int n)
 	if (!buf)
 		return;
 	clip_set(e, buf, len);
+	e->clip_tbl_rows = 1;		/* a known source, for a relative paste */
+	e->clip_tbl_row = (long)e->cy;
 	set_status(e, "copied %d row%s", n, n == 1 ? "" : "s");
 }
 
@@ -15391,9 +15428,14 @@ tbl_row_paste(Editor *e, int below)
 		i = j + 1;
 	}
 	/* The paste inserts n rows at `first`, so references in the rest of the
-	 * sheet shift down as on a row insert; the pasted rows are skipped, their
-	 * formula text staying literal. */
+	 * sheet shift down as on a row insert; the pasted rows are skipped here. */
 	tbl_reloc(e, 0, (long)first, n, 0, (long)first, (long)first + n - 1);
+	/* When the clipboard rows came from a known source, shift the references
+	 * in the pasted formulas by how far the rows moved, a relative paste.
+	 * Otherwise (an external or cell paste, with no source) they stay literal. */
+	if (e->clip_tbl_rows)
+		tbl_paste_shift(e, first, first + n - 1,
+		    (long)first - e->clip_tbl_row);
 	text_undo_group_end(e->t);
 	hl_touch(e, first);
 	e->cy = first;
@@ -18891,6 +18933,7 @@ clip_set(Editor *e, char *bytes, size_t len)
 	e->clip = bytes;
 	e->clip_len = len;
 	e->clip_block = 0;	/* a plain copy; block copies set this themselves */
+	e->clip_tbl_rows = 0;	/* a table row copy re-sets this after calling us */
 	/* Mirror to the terminal's clipboard via OSC 52 only when the config
 	 * opted in; by default a copy stays in the internal clipboard so the
 	 * common case never depends on OSC 52 working. */
