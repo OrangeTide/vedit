@@ -4535,6 +4535,7 @@ t_tbl_formula(Test *t)
 	tbl_disp(&e, 0, 2, buf, sizeof(buf));
 	TAP_CHECK(t, strcmp(buf, "=A1+B1") == 0);
 
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 }
@@ -4559,6 +4560,7 @@ t_tbl_formula_cycle(Test *t)
 	tbl_disp(&e, 0, 2, buf, sizeof(buf));	/* C1 = C1 is a self-cycle */
 	TAP_CHECKF(t, strcmp(buf, "#CYCLE!") == 0, "C1 -> %s", buf);
 
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 }
@@ -4599,6 +4601,7 @@ t_tbl_formula_range(Test *t)
 	tbl_disp(&e, 3, 2, buf, sizeof(buf));
 	TAP_CHECKF(t, strcmp(buf, "#ERR!") == 0, "=A1:B2 -> %s", buf);
 
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 }
@@ -4679,6 +4682,7 @@ t_tbl_reloc_live(Test *t)
 	e.cy = 1;
 	tbl_row_del(&e, 1);
 	TAP_CHECK(t, rawline_is(&e, 0, "1,=SUM(A1:A3)"));
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 
@@ -4692,6 +4696,7 @@ t_tbl_reloc_live(Test *t)
 	e.tbl->cx = 1;
 	tbl_col_add(&e, 1, 0);
 	TAP_CHECK(t, rawline_is(&e, 0, "=C1,,10,20"));
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 
@@ -4705,6 +4710,7 @@ t_tbl_reloc_live(Test *t)
 	e.tbl->cx = 1;
 	tbl_col_del(&e, 1);
 	TAP_CHECK(t, rawline_is(&e, 0, "=#REF!,20"));
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 }
@@ -4765,6 +4771,7 @@ t_tbl_sort_live(Test *t)
 	TAP_CHECK(t, rawline_is(&e, 0, "1,"));
 	TAP_CHECK(t, rawline_is(&e, 2, "3,=A2"));
 
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 }
@@ -4794,6 +4801,7 @@ t_tbl_paste_reloc(Test *t)
 	TAP_CHECK(t, rawline_is(&e, 1, "=A9"));	/* pasted text stays literal */
 	TAP_CHECK(t, rawline_is(&e, 2, "5"));
 
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 }
@@ -4823,6 +4831,7 @@ t_tbl_paste_shift(Test *t)
 	tbl_row_paste(&e, 1);
 	TAP_CHECK(t, rawline_is(&e, 1, "=A1"));	/* source untouched */
 	TAP_CHECK(t, rawline_is(&e, 3, "=A3"));	/* pasted, shifted down two */
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 
@@ -4840,6 +4849,7 @@ t_tbl_paste_shift(Test *t)
 	e.cy = 0;
 	tbl_row_paste(&e, 0);
 	TAP_CHECK(t, rawline_is(&e, 0, "=#REF!"));
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 }
@@ -4873,6 +4883,7 @@ t_tbl_paste_cell_shift(Test *t)
 	e.tbl->cx = 1;
 	tbl_paste_cell(&e);
 	TAP_CHECK(t, rawline_is(&e, 1, "10,=C3,30"));
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 
@@ -4889,6 +4900,7 @@ t_tbl_paste_cell_shift(Test *t)
 	e.tbl->cx = 0;
 	tbl_paste_cell(&e);		/* one column left: A falls off the edge */
 	TAP_CHECK(t, rawline_is(&e, 0, "=#REF!,=A1"));
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 }
@@ -4921,6 +4933,7 @@ t_tbl_row_move(Test *t)
 	TAP_CHECK(t, rawline_is(&e, 0, "10"));
 	TAP_CHECK(t, rawline_is(&e, 1, "=A3"));	/* followed the 20 */
 	TAP_CHECK(t, rawline_is(&e, 2, "20"));
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 
@@ -4938,6 +4951,7 @@ t_tbl_row_move(Test *t)
 	e.cy = text_lines(e.t) - 1;
 	tbl_row_paste(&e, 1);			/* paste below the last row */
 	TAP_CHECK(t, rawline_is(&e, 2, "=A1"));	/* reference preserved */
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 }
@@ -4968,6 +4982,7 @@ t_tbl_cell_move(Test *t)
 	tbl_paste_cell(&e);			/* paste into A2 */
 	TAP_CHECK(t, rawline_is(&e, 0, ",=A2"));	/* B1 followed the 10 */
 	TAP_CHECK(t, rawline_is(&e, 1, "10,"));
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 
@@ -4986,6 +5001,7 @@ t_tbl_cell_move(Test *t)
 	e.tbl->cx = 1;
 	tbl_paste_cell(&e);			/* paste into B2 */
 	TAP_CHECK(t, rawline_is(&e, 1, ",=A1"));	/* reference preserved */
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 }
@@ -5018,6 +5034,7 @@ t_tbl_col_paste_shift(Test *t)
 	tbl_col_paste(&e, 1);			/* new column C; dc = 2 */
 	TAP_CHECK(t, rawline_is(&e, 0, "=B1,10,=D1"));
 	TAP_CHECK(t, rawline_is(&e, 1, "=B2,20,=D2"));
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 
@@ -5036,6 +5053,7 @@ t_tbl_col_paste_shift(Test *t)
 	e.tbl->cx = 0;
 	tbl_col_paste(&e, 0);			/* new column A; dc = -1 */
 	TAP_CHECK(t, rawline_is(&e, 0, "=#REF!,x,=B1"));
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 }
@@ -5071,6 +5089,7 @@ t_tbl_range_paste_shift(Test *t)
 	tbl_paste_range(&e);
 	TAP_CHECK(t, rawline_is(&e, 0, "1,2,=A1,2,=C1"));
 	TAP_CHECK(t, rawline_is(&e, 1, "3,4,=A2,4,=C2"));
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 
@@ -5090,6 +5109,7 @@ t_tbl_range_paste_shift(Test *t)
 	tbl_cut_range(&e);
 	TAP_CHECK(t, rawline_is(&e, 0, ",,7"));
 	TAP_CHECK(t, rawline_is(&e, 1, ",,4"));
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 }
@@ -5117,6 +5137,7 @@ t_tbl_ext_range_paste_shift(Test *t)
 	tbl_paste(&e);
 	TAP_CHECK(t, rawline_is(&e, 0, "1,2,3"));
 	TAP_CHECK(t, rawline_is(&e, 1, "4,=B2,=C2"));
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 
@@ -5135,6 +5156,7 @@ t_tbl_ext_range_paste_shift(Test *t)
 	tbl_paste(&e);
 	TAP_CHECK(t, rawline_is(&e, 0, "=B1,2,3"));
 	TAP_CHECK(t, rawline_is(&e, 1, "=B2,5,6"));
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 
@@ -5151,6 +5173,7 @@ t_tbl_ext_range_paste_shift(Test *t)
 	e.tbl->cx = 2;				/* cursor C2 */
 	tbl_paste(&e);
 	TAP_CHECK(t, rawline_is(&e, 1, "4,5,=A1"));	/* literal, one cell */
+	free(e.clip);
 	tbl_detach(&e);
 	text_free(e.t);
 }
