@@ -209,6 +209,21 @@ specific and is most of the work:
   own formulas shift relative. In a vi keymap `yc` copies a column and `dc` cuts
   one; `p` and `P` paste it right and left, dispatching on `clip_tbl_iscol` so the
   same keys still paste rows when the clipboard holds rows.
+- Range paste is the rectangle analog (built). The grid keeps a block selection
+  in `Tbl` (`sel`, `say`, `sax`): `v` toggles a visual block, Shift with the arrow
+  keys starts and extends one, and `tbl_premove` keeps the selection in step with
+  each motion, so a visual selection rides a plain motion while a shift-started
+  one ends on an unshifted move. `tbl_copy_range` writes the selected cells to the
+  clipboard as the TSV a spreadsheet uses, cells joined by a tab and rows by a
+  newline, with `clip_tbl_isrange` set and the top-left as the relative source
+  (`clip_tbl_row`, `clip_tbl_col`). `tbl_paste_range` parses that back and
+  overwrites the block whose top-left is the cursor, shifting each formula by the
+  row and column distance with `tbl_cell_shift_formula`; a rectangle cannot be
+  inserted the way a row or column can, so it overwrites and `tbl_set_cell` grows
+  a short row to hold it. `tbl_cut_range` copies and then blanks the cells, a
+  plain clearing rather than a move, since clearing a sub-rectangle changes no
+  grid structure. A 1x1 selection defers to the single-cell copy, cut, and paste,
+  so Ctrl-C, Ctrl-X, and Ctrl-V keep their one-cell meaning.
 - Cut and paste is a move (built). A row cut (`tbl_row_del`) copies, deletes, and
   sets `clip_tbl_cut`. A cut is half of a move, so a reference elsewhere to a cut
   cell must follow it to wherever the rows land, not break. Cut and paste are two
@@ -271,7 +286,8 @@ language (whose values are `long` today through `clv_arg_int`) and the sheet
   rows), on a column paste (`tbl_col_paste`, `tbl_col_add` for the rest of the
   sheet and `tbl_cell_shift_formula` for the relative shift of the pasted
   column), on a cell paste (`tbl_cell_shift_formula`, a relative shift on both
-  axes), and as a move on a cut and paste of rows (`tbl_move_formula`) or a cell
+  axes), on a range paste (`tbl_paste_range`, the same relative shift over a
+  selected rectangle), and as a move on a cut and paste of rows (`tbl_move_formula`) or a cell
   (`tbl_remap_cell_formula`), references to the cut cells parking off-sheet until
   the paste lands them, rewriting the formula text in place within the edit's
   undo step. Still to come: a value cache,

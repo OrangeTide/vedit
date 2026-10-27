@@ -123,6 +123,8 @@ again.
 | clear the cell | Delete | `x` |
 | copy, paste a cell | Ctrl-C, Ctrl-V | Ctrl-C, Ctrl-V |
 | cut the cell | Ctrl-X | Ctrl-X |
+| select a block of cells | Shift+arrows | `v`, then motions; Shift+arrows |
+| copy, cut, paste the block | Ctrl-C, Ctrl-X, Ctrl-V | the same |
 | search, next, previous | Ctrl-F, F3, Shift-F3 | `/`, `n`, `N` |
 | go to a cell | | `:cell C7` |
 | insert a row above, below | Edit menu inserts above; `:rowadd`, `:rowadd!` | `O`, `o` |
@@ -177,17 +179,22 @@ alone across a sort, since the aggregate functions do not depend on order.
 Pasting rows or a column inserts them, so references elsewhere shift to keep
 pointing at their cells, down for inserted rows and right for an inserted
 column. A formula copied from the table and pasted elsewhere, whether a whole
-row, a whole column, or a single cell, has its own references shifted by the
-distance it moved, across rows and columns both, so it points at cells in the
-same relative place; one pushed off the top or left edge reads `#REF!`. A formula
-pasted from outside the table keeps its text as written. Cutting and pasting a
+row, a whole column, a single cell, or a selected rectangle of cells, has its
+own references shifted by the distance it moved, across rows and columns both,
+so it points at cells in the same relative place; one pushed off the top or left
+edge reads `#REF!`. A pasted rectangle overwrites the cells at the cursor rather
+than inserting, growing the grid if it runs past the edge. A formula pasted from
+outside the table keeps its text as written. Cutting and pasting a
 whole row or a single cell is a move: a formula that referenced a cut cell
 follows it to where it lands rather than breaking, and a cut formula keeps its
 own references. Until the paste the reference reads `#REF!`, since the data is in
 flight, so complete a cut with a paste. Cutting and pasting a column is a
 relative paste, not a move: a reference to a cut column's cell becomes `#REF!`,
-and the pasted column's own formulas shift by the distance it moved. Set
-`table.formulas = off` for a file that uses a leading `=` as literal text.
+and the pasted column's own formulas shift by the distance it moved. A selected
+rectangle of cells copies and pastes the same relative way; cutting one blanks
+those cells rather than removing them, so a reference to a blanked cell reads it
+as empty. Set `table.formulas = off` for a file that uses a leading `=` as
+literal text.
 
 `:rowadd [N]` inserts N blank rows above the cursor row and `:rowadd! [N]`
 below it. `:rowdel [N]` deletes N rows from the cursor. `:coladd [N]` inserts N empty columns

@@ -84,6 +84,14 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
   shifts the references in the rest of the sheet right, and a copied column's own
   formulas shift by how far it moved across columns, so they point at cells in the
   same relative place; a reference pushed off the left edge becomes `#REF!`.
+- The table view selects a rectangle of cells and copies, cuts, or pastes it. A
+  vi `v` toggles a visual block that the cursor motions extend, and Shift with the
+  arrow keys selects a block in either keymap. Ctrl-C copies the block, Ctrl-X
+  cuts it (blanking the cells), and Ctrl-V pastes it, overwriting the cells at the
+  cursor and growing the grid if it runs past the edge. A copied block's formulas
+  shift their references by how far the block moved on both axes, so they point at
+  cells in the same relative place; one pushed off the top or left edge becomes
+  `#REF!`.
 - The command language gains a `menu TITLE LABEL BODY ...` verb: it lists the
   labels and runs the chosen entry's program, so a keymap can build its own menu
   with no change to the editor.

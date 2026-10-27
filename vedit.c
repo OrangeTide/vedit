@@ -7984,6 +7984,9 @@ typedef struct tbl {
 	int	left;			/* first visible column */
 	int	pending;		/* vi: a 'g' waiting for its second key */
 	int	searching;		/* a search is moving the text cursor */
+	int	sel;			/* block select: 0 none, 1 visual, 2 shift */
+	size_t	say;			/* block select: anchor row */
+	int	sax;			/* block select: anchor column */
 } Tbl;
 
 /* One open file. The editor keeps a list of these; the active buffer's fields
@@ -8235,6 +8238,7 @@ typedef struct editor {
 	int		clip_tbl_src;	/* clip holds table content from a known cell */
 	int		clip_tbl_cut;	/* that content was cut: a paste is a move */
 	int		clip_tbl_iscol;	/* clip holds a column, one value per line */
+	int		clip_tbl_isrange;/* clip holds a cell rectangle (tab/newline) */
 	long		clip_tbl_row;	/* that source's top row, for relative paste */
 	long		clip_tbl_col;	/* that source's column, for relative paste */
 	int		clip_osc52;	/* mirror every copy/yank through OSC 52 */
@@ -11564,6 +11568,9 @@ static void tbl_edit_cell(Editor *e, uint32_t how);
 static void tbl_copy_cell(Editor *e);
 static void tbl_cut_cell(Editor *e);
 static void tbl_paste_cell(Editor *e);
+static void tbl_copy_range(Editor *e);
+static void tbl_cut_range(Editor *e);
+static void tbl_paste_range(Editor *e);
 static void tbl_find_again(Editor *e, int dir);
 static void tbl_row_add(Editor *e, int n, int below);
 static void tbl_row_copy(Editor *e, int n);
@@ -14168,9 +14175,10 @@ tbl_cell_value(const Editor *e, size_t row, int col, char *buf, size_t n)
  * recalc is recompute-on-read: a referenced cell is evaluated when a formula
  * reads it, with a visiting stack to catch cycles. Numbers and A1:B3 ranges
  * with the SUM/AVG/COUNT/MIN/MAX functions; references are relabeled when rows
- * or columns are inserted, deleted, sorted, pasted (a copied row, column, or
- * cell carries its own references by the distance it moved), or cut and pasted
- * as a move (rows or a single cell; see docs/design/expr-and-spreadsheet.md).
+ * or columns are inserted, deleted, sorted, pasted (a copied row, column, cell,
+ * or cell rectangle carries its own references by the distance it moved), or cut
+ * and pasted as a move (rows or a single cell; see
+ * docs/design/expr-and-spreadsheet.md).
  ****************************************************************/
 
 #define TBL_FORMULA_DEPTH 64	/* deepest reference chain before it is a cycle */
@@ -15127,6 +15135,34 @@ tbl_paint_cell(Screen *d, int row, int col, int w, const char *val,
 		scr_cell(d, row, col + w - 1, more, fg, bg, at | ATTR_DIM);
 }
 
+/* The current block selection as a normalized inclusive rectangle: rows
+ * [*r0, *r1], columns [*c0, *c1], with the anchor and the cell cursor as two
+ * opposite corners. Returns 0 when nothing is selected. */
+static int
+tbl_sel_rect(const Editor *e, size_t *r0, size_t *r1, int *c0, int *c1)
+{
+	const Tbl *tb = e->tbl;
+
+	if (!tb->sel)
+		return 0;
+	*r0 = tb->say < e->cy ? tb->say : e->cy;
+	*r1 = tb->say < e->cy ? e->cy : tb->say;
+	*c0 = tb->sax < tb->cx ? tb->sax : tb->cx;
+	*c1 = tb->sax < tb->cx ? tb->cx : tb->sax;
+	return 1;
+}
+
+/* Whether cell (row, col) is inside the current block selection. */
+static int
+tbl_in_sel(const Editor *e, size_t row, int col)
+{
+	size_t r0, r1;
+	int c0, c1;
+
+	return tbl_sel_rect(e, &r0, &r1, &c0, &c1) &&
+	    row >= r0 && row <= r1 && col >= c0 && col <= c1;
+}
+
 static void
 tbl_render(Editor *e, Screen *d)
 {
@@ -15184,7 +15220,7 @@ tbl_render(Editor *e, Screen *d)
 				w = text_w - x;
 			if (row == 0 && first)
 				at |= ATTR_BOLD;
-			if (row == e->cy && c == tb->cx)
+			if ((row == e->cy && c == tb->cx) || tbl_in_sel(e, row, c))
 				at |= ATTR_REVERSE;
 			tbl_cell_value(e, row, c, buf, sizeof(buf));
 			tbl_cell_display(e, row, c, buf, sizeof(buf));
@@ -15232,6 +15268,26 @@ tbl_move(Editor *e, long dy, int dx)
 	tb->pending = 0;
 }
 
+/* Called before a cursor motion to keep the block selection in step. With
+ * Shift held, a motion starts a selection if none is active (anchored at the
+ * cell being left) and then extends it. Without Shift, a shift-started
+ * selection ends, while a visual selection (from v) rides the motion. */
+static void
+tbl_premove(Editor *e, int shift)
+{
+	Tbl *tb = e->tbl;
+
+	if (shift) {
+		if (!tb->sel) {
+			tb->sel = 2;
+			tb->say = e->cy;
+			tb->sax = tb->cx;
+		}
+	} else if (tb->sel == 2) {
+		tb->sel = 0;
+	}
+}
+
 /* A search starts at the current cell and, while it runs, moves the text
  * cursor; the grid follows it and tbl_sync lands the cell cursor after. */
 static void
@@ -15263,6 +15319,30 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 	if (page < 1)
 		page = 1;
 
+	/* A block selection survives only cursor motions (which extend it), the
+	 * v toggle, Esc, and the clipboard keys; any other key clears it. */
+	if (tb->sel) {
+		int keeps = 0;
+
+		if (ctrl)
+			keeps = k == TKBD_KEY_C || k == TKBD_KEY_X ||
+			    k == TKBD_KEY_V || k == TKBD_KEY_HOME ||
+			    k == TKBD_KEY_END ||
+			    ((k == TKBD_KEY_B || k == TKBD_KEY_F) && vi);
+		else if (k == TKBD_KEY_LEFT || k == TKBD_KEY_RIGHT ||
+		    k == TKBD_KEY_UP || k == TKBD_KEY_DOWN ||
+		    k == TKBD_KEY_HOME || k == TKBD_KEY_END ||
+		    k == TKBD_KEY_PGUP || k == TKBD_KEY_PGDN ||
+		    k == TKBD_KEY_TAB || k == TKBD_KEY_ESC)
+			keeps = 1;
+		else if (vi && (ch == 'h' || ch == 'l' || ch == 'k' ||
+		    ch == 'j' || ch == '0' || ch == '$' || ch == 'g' ||
+		    ch == 'G' || ch == 'n' || ch == 'N' || ch == 'v'))
+			keeps = 1;
+		if (!keeps)
+			tb->sel = 0;
+	}
+
 	if (ctrl) {
 		switch (k) {
 		case TKBD_KEY_S:
@@ -15270,13 +15350,22 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 		case TKBD_KEY_Q:
 			return REQ_QUIT;
 		case TKBD_KEY_C:
-			tbl_copy_cell(e);
+			if (tb->sel)
+				tbl_copy_range(e);
+			else
+				tbl_copy_cell(e);
 			return REQ_CONTINUE;
 		case TKBD_KEY_X:
-			tbl_cut_cell(e);
+			if (tb->sel)
+				tbl_cut_range(e);
+			else
+				tbl_cut_cell(e);
 			return REQ_CONTINUE;
 		case TKBD_KEY_V:
-			tbl_paste_cell(e);
+			if (e->clip_tbl_isrange)
+				tbl_paste_range(e);
+			else
+				tbl_paste_cell(e);
 			return REQ_CONTINUE;
 		case TKBD_KEY_Z:
 			tbl_undo(e, 0);
@@ -15296,9 +15385,11 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 			tbl_search_from_cell(e);
 			return REQ_FIND;
 		case TKBD_KEY_HOME:
+			tbl_premove(e, shift);
 			tbl_move(e, -(long)e->cy, -tb->cx);
 			return REQ_CONTINUE;
 		case TKBD_KEY_END:
+			tbl_premove(e, shift);
 			tbl_move(e, (long)text_lines(e->t), -tb->cx);
 			return REQ_CONTINUE;
 		case TKBD_KEY_B:
@@ -15312,30 +15403,38 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 
 	switch (k) {
 	case TKBD_KEY_LEFT:
+		tbl_premove(e, shift);
 		tbl_move(e, 0, -1);
 		return REQ_CONTINUE;
 	case TKBD_KEY_RIGHT:
+		tbl_premove(e, shift);
 		tbl_move(e, 0, 1);
 		return REQ_CONTINUE;
 	case TKBD_KEY_UP:
+		tbl_premove(e, shift);
 		tbl_move(e, -1, 0);
 		return REQ_CONTINUE;
 	case TKBD_KEY_DOWN:
+		tbl_premove(e, shift);
 		tbl_move(e, 1, 0);
 		return REQ_CONTINUE;
 	case TKBD_KEY_TAB:
 		tbl_move(e, 0, shift ? -1 : 1);
 		return REQ_CONTINUE;
 	case TKBD_KEY_HOME:
+		tbl_premove(e, shift);
 		tbl_move(e, 0, -tb->cx);
 		return REQ_CONTINUE;
 	case TKBD_KEY_END:
+		tbl_premove(e, shift);
 		tbl_move(e, 0, tb->ncols);
 		return REQ_CONTINUE;
 	case TKBD_KEY_PGUP:
+		tbl_premove(e, shift);
 		tbl_move(e, -page, 0);
 		return REQ_CONTINUE;
 	case TKBD_KEY_PGDN:
+		tbl_premove(e, shift);
 		tbl_move(e, page, 0);
 		return REQ_CONTINUE;
 	case TKBD_KEY_F1:
@@ -15357,6 +15456,7 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 		return REQ_CONTINUE;
 	case TKBD_KEY_ESC:
 		tb->pending = 0;
+		tb->sel = 0;
 		return REQ_CONTINUE;
 	default:
 		break;
@@ -15370,8 +15470,10 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 	}
 	if (tb->pending == 'g') {		/* gg: the first row */
 		tb->pending = 0;
-		if (ch == 'g')
+		if (ch == 'g') {
+			tbl_premove(e, 0);
 			tbl_move(e, -(long)e->cy, 0);
+		}
 		return REQ_CONTINUE;
 	}
 	if (tb->pending == 'd' || tb->pending == 'y') {	/* dd, yy */
@@ -15393,28 +15495,44 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 	}
 	switch (ch) {
 	case 'h':
+		tbl_premove(e, 0);
 		tbl_move(e, 0, -1);
 		break;
 	case 'l':
+		tbl_premove(e, 0);
 		tbl_move(e, 0, 1);
 		break;
 	case 'k':
+		tbl_premove(e, 0);
 		tbl_move(e, -1, 0);
 		break;
 	case 'j':
+		tbl_premove(e, 0);
 		tbl_move(e, 1, 0);
 		break;
 	case '0':
+		tbl_premove(e, 0);
 		tbl_move(e, 0, -tb->cx);
 		break;
 	case '$':
+		tbl_premove(e, 0);
 		tbl_move(e, 0, tb->ncols);
 		break;
 	case 'g':
 		tb->pending = 'g';
 		break;
 	case 'G':
+		tbl_premove(e, 0);
 		tbl_move(e, (long)text_lines(e->t), 0);
+		break;
+	case 'v':			/* toggle a visual block selection */
+		if (tb->sel) {
+			tb->sel = 0;
+		} else {
+			tb->sel = 1;
+			tb->say = e->cy;
+			tb->sax = tb->cx;
+		}
 		break;
 	case ':':
 		return REQ_VI_COLON;
@@ -15662,6 +15780,146 @@ tbl_paste_cell(Editor *e)
 		return;
 	}
 	tbl_set_cell(e, (size_t)dr, dc, e->clip, e->clip_len);
+}
+
+/* Copy the selected rectangle to the clipboard, cells joined by a tab within a
+ * row and rows by a newline (the TSV a spreadsheet pastes), marked as a range
+ * with its top-left as the relative-paste source. A 1x1 selection is just the
+ * current cell, so it defers to the single-cell copy. */
+static void
+tbl_copy_range(Editor *e)
+{
+	size_t r0, r1, r, total = 0, o = 0;
+	int c0, c1, c;
+	char *buf, *val = malloc(TBL_CELL_MAX);
+
+	if (!val)
+		return;
+	if (!tbl_sel_rect(e, &r0, &r1, &c0, &c1)) {
+		free(val);
+		return;
+	}
+	if (r0 == r1 && c0 == c1) {		/* a single cell: the cell clipboard */
+		free(val);
+		tbl_copy_cell(e);
+		e->tbl->sel = 0;
+		return;
+	}
+	for (r = r0; r <= r1; r++)
+		for (c = c0; c <= c1; c++) {
+			tbl_cell_value(e, r, c, val, TBL_CELL_MAX);
+			total += strlen(val) + 1;	/* a tab or newline after */
+		}
+	buf = malloc(total + 1);
+	if (!buf) {
+		free(val);
+		return;
+	}
+	for (r = r0; r <= r1; r++)
+		for (c = c0; c <= c1; c++) {
+			size_t len;
+
+			tbl_cell_value(e, r, c, val, TBL_CELL_MAX);
+			len = strlen(val);
+			memcpy(buf + o, val, len);
+			o += len;
+			buf[o++] = c < c1 ? '\t' : '\n';
+		}
+	buf[o] = '\0';
+	free(val);
+	clip_set(e, buf, o);
+	e->clip_tbl_src = 1;		/* a known source, for a relative paste */
+	e->clip_tbl_isrange = 1;	/* the clip holds a cell rectangle */
+	e->clip_tbl_row = (long)r0;
+	e->clip_tbl_col = c0;
+	e->tbl->sel = 0;
+	set_status(e, "copied %zux%d cells", r1 - r0 + 1, c1 - c0 + 1);
+}
+
+/* Cut the selected rectangle: copy it, then blank each cell. Unlike a
+ * single-cell cut this is a plain blanking, not a move, so a reference to a
+ * cleared cell reads it as empty rather than following it. A 1x1 selection is
+ * the single-cell cut (a move). One undo step. */
+static void
+tbl_cut_range(Editor *e)
+{
+	size_t r0, r1, r;
+	int c0, c1, c;
+
+	if (!tbl_sel_rect(e, &r0, &r1, &c0, &c1))
+		return;
+	if (r0 == r1 && c0 == c1) {		/* a single cell: the cell cut */
+		tbl_cut_cell(e);
+		e->tbl->sel = 0;
+		return;
+	}
+	tbl_copy_range(e);			/* records the source, clears sel */
+	text_undo_group_begin(e->t);
+	for (r = r0; r <= r1; r++)
+		for (c = c0; c <= c1; c++)
+			tbl_cell_replace_raw(e, r, c, "", 0);
+	text_undo_group_end(e->t);
+	e->cy = r0;
+	e->tbl->cx = c0;
+	set_status(e, "cut %zux%d cells (Ctrl+V pastes them)", r1 - r0 + 1,
+	    c1 - c0 + 1);
+}
+
+/* Paste a copied rectangle, overwriting the block whose top-left is the cursor.
+ * Each pasted formula's references shift by how far the block moved, on both
+ * axes, so they point at cells in the same relative place; one pushed off the
+ * top or left edge becomes #REF!. The grid grows to hold the block. One undo
+ * step. */
+static void
+tbl_paste_range(Editor *e)
+{
+	size_t i = 0, dr0 = e->cy, r = dr0;
+	int dc0 = e->tbl->cx, wide = 0;
+	long dr = (long)dr0 - e->clip_tbl_row, dc = (long)dc0 - e->clip_tbl_col;
+
+	if (!e->clip || e->clip_len == 0) {
+		set_status(e, "nothing to paste");
+		return;
+	}
+	text_undo_group_begin(e->t);
+	while (i < e->clip_len) {
+		int c = dc0;
+
+		for (;;) {
+			char val[TBL_CELL_MAX], out[TBL_CELL_MAX];
+			size_t j = i, n;
+			int last;
+
+			while (j < e->clip_len && e->clip[j] != '\t' &&
+			    e->clip[j] != '\n')
+				j++;
+			n = j - i;
+			if (n >= sizeof(val))
+				n = sizeof(val) - 1;
+			memcpy(val, e->clip + i, n);
+			val[n] = '\0';
+			last = j >= e->clip_len || e->clip[j] == '\n';
+			if (e->clip_tbl_src && val[0] == '=' &&
+			    tbl_cell_shift_formula(val, dr, dc, out,
+			        sizeof(out)) == 1)
+				tbl_set_cell(e, r, c, out, strlen(out));
+			else
+				tbl_set_cell(e, r, c, val, n);
+			i = j < e->clip_len ? j + 1 : j;
+			c++;
+			if (last)
+				break;
+		}
+		if (c - dc0 > wide)
+			wide = c - dc0;
+		r++;
+	}
+	text_undo_group_end(e->t);
+	hl_touch(e, dr0);
+	e->cy = dr0;
+	e->tbl->cx = dc0;
+	e->tbl->ncols = tbl_count_cols(e->t, e->tbl->delim);
+	set_status(e, "pasted %zux%d cells", r - dr0, wide);
 }
 
 /* Repeat the last search in direction dir and land on the cell. */
@@ -19457,6 +19715,7 @@ clip_set(Editor *e, char *bytes, size_t len)
 	e->clip_tbl_src = 0;	/* a table copy re-sets this after calling us */
 	e->clip_tbl_cut = 0;	/* a row cut re-sets this after calling us */
 	e->clip_tbl_iscol = 0;	/* a column copy re-sets this after calling us */
+	e->clip_tbl_isrange = 0;/* a range copy re-sets this after calling us */
 	/* Mirror to the terminal's clipboard via OSC 52 only when the config
 	 * opted in; by default a copy stays in the internal clipboard so the
 	 * common case never depends on OSC 52 working. */

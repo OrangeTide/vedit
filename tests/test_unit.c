@@ -5040,6 +5040,60 @@ t_tbl_col_paste_shift(Test *t)
 	text_free(e.t);
 }
 
+/* Copying a rectangle of cells and pasting it overwrites the block at the
+ * cursor, shifting the references in its formulas by how far the block moved on
+ * both axes. Cutting a rectangle blanks the source cells. */
+static void
+t_tbl_range_paste_shift(Test *t)
+{
+	static const char *const L[] = { "1,2,=A1", "3,4,=A2" };
+	static const char *const M[] = { "9,8,7", "6,5,4" };
+	Editor e;
+
+	/* Select the 2x2 block B1:C2 (the 2/4 column and the =A1/=A2 column) and
+	 * copy it, then paste at D1: the block moves two columns right and no rows,
+	 * so =A1 -> =C1 and =A2 -> =C2, while the plain numbers come along as-is.
+	 * The original column C is overwrite-free, so it still reads =A1 / =A2. */
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, L, 2);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+	e.tbl->sel = 1;
+	e.tbl->say = 0;
+	e.tbl->sax = 1;			/* anchor B1 */
+	e.cy = 1;
+	e.tbl->cx = 2;			/* cell cursor C2: the rect is B1:C2 */
+	tbl_copy_range(&e);
+	e.cy = 0;
+	e.tbl->cx = 3;			/* paste top-left at D1; dr = 0, dc = 2 */
+	tbl_paste_range(&e);
+	TAP_CHECK(t, rawline_is(&e, 0, "1,2,=A1,2,=C1"));
+	TAP_CHECK(t, rawline_is(&e, 1, "3,4,=A2,4,=C2"));
+	tbl_detach(&e);
+	text_free(e.t);
+
+	/* Cut the 2x2 block A1:B2: it is copied and the source cells are blanked,
+	 * a plain clearing rather than a structural delete. */
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, M, 2);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+	e.tbl->sel = 1;
+	e.tbl->say = 0;
+	e.tbl->sax = 0;			/* anchor A1 */
+	e.cy = 1;
+	e.tbl->cx = 1;			/* cell cursor B2: the rect is A1:B2 */
+	tbl_cut_range(&e);
+	TAP_CHECK(t, rawline_is(&e, 0, ",,7"));
+	TAP_CHECK(t, rawline_is(&e, 1, ",,4"));
+	tbl_detach(&e);
+	text_free(e.t);
+}
+
 /* The non-vi motion layer maps a position to where a modeless motion lands,
  * without touching the editor cursor. Left and right step by rune and wrap
  * across line ends; up and down clamp the column to the target line; the
@@ -6942,6 +6996,7 @@ const Case tap_cases[] = {
 	{ "tbl_row_move", t_tbl_row_move },
 	{ "tbl_cell_move", t_tbl_cell_move },
 	{ "tbl_col_paste_shift", t_tbl_col_paste_shift },
+	{ "tbl_range_paste_shift", t_tbl_range_paste_shift },
 	{ "swap_paths", t_swap_paths },
 	{ "atomic_save", t_atomic_save },
 	{ "save_rodir_fallback", t_save_rodir_fallback },
