@@ -8233,6 +8233,7 @@ typedef struct editor {
 	int		clip_linewise;	/* clip holds whole lines (vi p/P) */
 	int		clip_block;	/* clip holds a rectangle (draw mode) */
 	int		clip_tbl_src;	/* clip holds table content from a known cell */
+	int		clip_tbl_cut;	/* that content was cut: a paste is a move */
 	long		clip_tbl_row;	/* that source's top row, for relative paste */
 	long		clip_tbl_col;	/* that source's column, for relative paste */
 	int		clip_osc52;	/* mirror every copy/yank through OSC 52 */
@@ -14155,8 +14156,8 @@ tbl_cell_value(const Editor *e, size_t row, int col, char *buf, size_t n)
  * recalc is recompute-on-read: a referenced cell is evaluated when a formula
  * reads it, with a visiting stack to catch cycles. Numbers and A1:B3 ranges
  * with the SUM/AVG/COUNT/MIN/MAX functions; references are relabeled when rows
- * or columns are inserted, deleted, sorted, or pasted (see
- * docs/design/expr-and-spreadsheet.md).
+ * or columns are inserted, deleted, sorted, pasted, or cut and pasted as a move
+ * (see docs/design/expr-and-spreadsheet.md).
  ****************************************************************/
 
 #define TBL_FORMULA_DEPTH 64	/* deepest reference chain before it is a cycle */
@@ -14529,6 +14530,147 @@ tbl_reloc_formula(const char *src, int is_col, long at, int n, int del,
 	return changed;
 }
 
+/* An off-sheet row base that holds a cut's single-cell references between the
+ * cut and the paste that lands them. A reference to a cut row parks here rather
+ * than becoming #REF!, so the paste can carry it to the destination: a row cut
+ * and pasted elsewhere is a move, and references to the cut cells follow. The
+ * base is far past any real row, so a parked reference reads #REF! until the
+ * paste, and no real reference is taken for a parked one. */
+#define TBL_MOVE_PARK 1000000000L
+
+/* Row r after the n-row band at `a` moves to `b` (b in the coordinates left
+ * once the band is removed): a row inside the band rides to the band's new
+ * place, and the rest shift for the removal at `a` and the insertion at `b`. */
+static long
+tbl_move_row(long r, long a, long n, long b)
+{
+	if (r >= a && r < a + n)
+		return b + (r - a);
+	if (r >= a + n)
+		r -= n;
+	if (r >= b)
+		r += n;
+	return r;
+}
+
+/* Map an inclusive row interval through the same move, structurally: the band
+ * at `a` is removed (the interval shrinks, or is lost if it lay wholly inside)
+ * and then re-inserted at `b`. A range does not ride a move the way a single
+ * reference does; it adjusts like a delete and then an insert, as it does
+ * across a sort. Returns -1 if the interval was removed whole. */
+static int
+tbl_move_span(long *lo, long *hi, long a, long n, long b)
+{
+	if (tbl_reloc_span(lo, hi, a, n, 1) < 0)
+		return -1;
+	tbl_reloc_span(lo, hi, b, n, 0);
+	return 0;
+}
+
+/* Rewrite the A1 references in formula text src for moving the n-row band at
+ * `a` to `b`: the reference transform of a row cut (a = source, b = the park)
+ * and of the paste that lands it (a = the park, b = destination). A single
+ * reference rides the move; a range adjusts structurally and is #REF! if all
+ * its rows were in the band. Columns never move. Text that is not a reference
+ * is copied unchanged. Writes out and returns 1 if it differs from src, 0 if
+ * not, or -1 on overflow. */
+static int
+tbl_move_formula(const char *src, long a, long n, long b, char *out, size_t outsz)
+{
+	size_t i = 0, o = 0;
+	int changed = 0;
+
+	while (src[i]) {
+		char id1[TBL_LABEL_MAX + 12];
+		size_t start = i, k;
+		int c1, c2, clo, chi, isrange = 0;
+		long r1, r2, elo, ehi, rlo, rhi;
+		char *end;
+
+		if (isdigit((unsigned char)src[i]) ||
+		    (src[i] == '.' && isdigit((unsigned char)src[i + 1]))) {
+			strtod(src + i, &end);	/* copy a whole number intact */
+			while (src + i < end) {
+				if (o + 1 >= outsz)
+					return -1;
+				out[o++] = src[i++];
+			}
+			continue;
+		}
+		if (!isalpha((unsigned char)src[i]) && src[i] != '_') {
+			if (o + 1 >= outsz)
+				return -1;
+			out[o++] = src[i++];
+			continue;
+		}
+		for (k = 0; (isalnum((unsigned char)src[i]) || src[i] == '_') &&
+		    k + 1 < sizeof(id1); k++)
+			id1[k] = src[i++];
+		id1[k] = '\0';
+		if (tbl_ref_parse(id1, &c1, &r1) < 0) {	/* a name, not a ref */
+			if (o + k >= outsz)
+				return -1;
+			memcpy(out + o, id1, k);
+			o += k;
+			continue;
+		}
+		c2 = c1;
+		r2 = r1;
+		if (src[i] == ':') {		/* a range: a second reference */
+			size_t j = i + 1, m = 0;
+			char id2[TBL_LABEL_MAX + 12];
+
+			while ((isalnum((unsigned char)src[j]) ||
+			    src[j] == '_') && m + 1 < sizeof(id2))
+				id2[m++] = src[j++];
+			id2[m] = '\0';
+			if (tbl_ref_parse(id2, &c2, &r2) == 0) {
+				isrange = 1;
+				i = j;
+			}
+		}
+		clo = c1 < c2 ? c1 : c2;
+		chi = c1 > c2 ? c1 : c2;
+		elo = r1 < r2 ? r1 : r2;
+		ehi = r1 > r2 ? r1 : r2;
+		if (!isrange) {			/* a single reference rides the move */
+			rlo = rhi = tbl_move_row(r1, a, n, b);
+		} else {			/* a range adjusts structurally */
+			rlo = elo;
+			rhi = ehi;
+			if (tbl_move_span(&rlo, &rhi, a, n, b) < 0) {
+				if (o + 5 >= outsz)
+					return -1;
+				memcpy(out + o, "#REF!", 5);
+				o += 5;
+				changed = 1;
+				continue;
+			}
+		}
+		if (rlo == elo && rhi == ehi) {	/* unchanged: copy verbatim */
+			if (o + (i - start) >= outsz)
+				return -1;
+			memcpy(out + o, src + start, i - start);
+			o += i - start;
+			continue;
+		}
+		changed = 1;
+		if (tbl_reloc_emit(out, outsz, &o, clo, rlo) < 0)
+			return -1;
+		if (isrange) {
+			if (o + 1 >= outsz)
+				return -1;
+			out[o++] = ':';
+			if (tbl_reloc_emit(out, outsz, &o, chi, rhi) < 0)
+				return -1;
+		}
+	}
+	if (o >= outsz)
+		return -1;
+	out[o] = '\0';
+	return changed;
+}
+
 /* Replace cell (row, col) with val, encoded as a field. Unlike tbl_set_cell it
  * runs inside the caller's undo group and leaves the cursor and status line
  * alone, for the relocation sweep. Returns 0, or -1. */
@@ -14616,6 +14758,39 @@ tbl_paste_shift(Editor *e, size_t ylo, size_t yhi, long delta)
 			if (tbl_reloc_formula(cell, 0, at, (int)n, del,
 			    out, sizeof(out)) == 1)
 				tbl_cell_replace_raw(e, y, col, out, strlen(out));
+		}
+	}
+}
+
+/* Rewrite the formulas of rows [ylo, yhi] for moving the n-row band at `a` to
+ * `b` (tbl_move_formula per cell). A row cut sweeps the whole sheet to park its
+ * references; the paste that lands them sweeps the sheet to un-park and the
+ * pasted rows to carry them in. Runs inside the caller's undo group. A no-op
+ * when formulas are off. */
+static void
+tbl_move_rows(Editor *e, long ylo, long yhi, long a, long n, long b)
+{
+	long y, nl = (long)text_lines(e->t);
+
+	if (!e->tbl_formulas || n < 1)
+		return;
+	if (ylo < 0)
+		ylo = 0;
+	if (yhi >= nl)
+		yhi = nl - 1;
+	for (y = ylo; y <= yhi; y++) {
+		size_t off, len;
+		int nf = tbl_cell_off(e, (size_t)y, 0, &off, &len), col;
+
+		for (col = 0; col < nf; col++) {
+			char cell[TBL_CELL_MAX], out[TBL_CELL_MAX];
+
+			tbl_cell_value(e, (size_t)y, col, cell, sizeof(cell));
+			if (cell[0] != '=')
+				continue;
+			if (tbl_move_formula(cell, a, n, b, out, sizeof(out)) == 1)
+				tbl_cell_replace_raw(e, (size_t)y, col, out,
+				    strlen(out));
 		}
 	}
 }
@@ -15433,9 +15608,14 @@ tbl_row_del(Editor *e, int n)
 	if (y + (size_t)n > nl)
 		n = (int)(nl - y);
 	tbl_row_copy(e, n);
+	e->clip_tbl_cut = 1;		/* a cut: a later paste is a move */
 	text_undo_group_begin(e->t);
 	vi_delete_lines(e, y, y + (size_t)n - 1);
-	tbl_reloc(e, 0, (long)y, n, 1, 0, -1);
+	/* A cut is the first half of a move: references to the deleted rows park
+	 * off-sheet (reading #REF! meanwhile) so the paste that lands the rows can
+	 * carry those references to their destination. References below the band
+	 * still shift up for the removal. */
+	tbl_move_rows(e, 0, (long)text_lines(e->t) - 1, (long)y, n, TBL_MOVE_PARK);
 	text_undo_group_end(e->t);
 	e->cx = 0;
 	set_status(e, "%d row%s deleted (Ctrl+V or p pastes them back)", n,
@@ -15473,15 +15653,31 @@ tbl_row_paste(Editor *e, int below)
 		n++;
 		i = j + 1;
 	}
-	/* The paste inserts n rows at `first`, so references in the rest of the
-	 * sheet shift down as on a row insert; the pasted rows are skipped here. */
-	tbl_reloc(e, 0, (long)first, n, 0, (long)first, (long)first + n - 1);
-	/* When the clipboard rows came from a known source, shift the references
-	 * in the pasted formulas by how far the rows moved, a relative paste.
-	 * Otherwise (an external or cell paste, with no source) they stay literal. */
-	if (e->clip_tbl_src)
-		tbl_paste_shift(e, first, first + n - 1,
-		    (long)first - e->clip_tbl_row);
+	if (e->clip_tbl_cut) {
+		/* The second half of a move: un-park the references the cut sent
+		 * off-sheet onto the landed rows, and shift the rest of the sheet
+		 * for the insertion. The pasted rows carry their own references the
+		 * whole way, from the original source to here. */
+		long nn = n, dst = (long)first, src = e->clip_tbl_row;
+
+		tbl_move_rows(e, 0, dst - 1, TBL_MOVE_PARK, nn, dst);
+		tbl_move_rows(e, dst + nn, (long)text_lines(e->t) - 1,
+		    TBL_MOVE_PARK, nn, dst);
+		tbl_move_rows(e, dst, dst + nn - 1, src, nn, dst);
+	} else {
+		/* The paste inserts n rows at `first`, so references in the rest of
+		 * the sheet shift down as on a row insert; the pasted rows are
+		 * skipped here. */
+		tbl_reloc(e, 0, (long)first, n, 0, (long)first,
+		    (long)first + n - 1);
+		/* When the clipboard rows came from a known source, shift the
+		 * references in the pasted formulas by how far the rows moved, a
+		 * relative paste. Otherwise (an external paste, with no source) they
+		 * stay literal. */
+		if (e->clip_tbl_src)
+			tbl_paste_shift(e, first, first + n - 1,
+			    (long)first - e->clip_tbl_row);
+	}
 	text_undo_group_end(e->t);
 	hl_touch(e, first);
 	e->cy = first;
@@ -18980,6 +19176,7 @@ clip_set(Editor *e, char *bytes, size_t len)
 	e->clip_len = len;
 	e->clip_block = 0;	/* a plain copy; block copies set this themselves */
 	e->clip_tbl_src = 0;	/* a table copy re-sets this after calling us */
+	e->clip_tbl_cut = 0;	/* a row cut re-sets this after calling us */
 	/* Mirror to the terminal's clipboard via OSC 52 only when the config
 	 * opted in; by default a copy stays in the internal clipboard so the
 	 * common case never depends on OSC 52 working. */

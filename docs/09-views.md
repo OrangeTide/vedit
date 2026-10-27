@@ -178,7 +178,10 @@ their cells. A formula copied from the table and pasted elsewhere, whether a
 whole row or a single cell, has its own references shifted by the distance it
 moved, across rows and columns both, so it points at cells in the same relative
 place; one pushed off the top or left edge reads `#REF!`. A formula pasted from
-outside the table keeps its text as written. Set `table.formulas = off` for a
+outside the table keeps its text as written. Cutting rows and pasting them is a
+move: a formula that referenced a cut cell follows it to where the rows land
+rather than breaking. Until the paste the reference reads `#REF!`, since the data
+is in flight, so complete a cut with a paste. Set `table.formulas = off` for a
 file that uses a leading `=` as literal text.
 
 `:rowadd [N]` inserts N blank rows above the cursor row and `:rowadd! [N]`

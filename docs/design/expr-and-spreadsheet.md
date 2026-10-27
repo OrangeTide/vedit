@@ -5,8 +5,9 @@ evaluator, the command-language `expr` verb, and the table view's formulas are
 built (`vedit.c`, the Expression evaluator and Table formulas sections). The
 formula cut is numbers and ranges (`A1:B3` with `SUM`, `AVG`, `COUNT`, `MIN`,
 `MAX`), recompute-on-read with a visiting stack for cycles, and reference
-relabeling on row and column insert, delete, sort, and paste; string value
-variants in `ExprVal`, incremental recalc, and `EVAL` are not built yet. This note records the design for two features that
+relabeling on row and column insert, delete, sort, paste, and a cut-and-paste
+move; string value variants in `ExprVal`, incremental recalc, and `EVAL` are not
+built yet. This note records the design for two features that
 share one piece: an arithmetic `expr` for the command language, and formulas for
 the CSV/TSV table view. The shared piece is an expression
 evaluator. The point of writing this before building `expr` is to give the
@@ -179,7 +180,7 @@ specific and is most of the work:
   the sheet down, just as a manual row insert does; a skip band keeps that pass
   off the pasted rows. The pasted rows themselves then get a relative shift when
   their source is known: `tbl_row_copy` records the top source row on the
-  clipboard (`clip_tbl_rows`, `clip_tbl_row`), and the paste shifts every
+  clipboard (`clip_tbl_src`, `clip_tbl_row`), and the paste shifts every
   reference in the pasted formulas by how far the rows moved, so a formula copied
   and pasted elsewhere takes its references along (`tbl_paste_shift`). That shift
   is the row half of `tbl_reloc_formula`, inserting or deleting the displacement
@@ -194,6 +195,24 @@ specific and is most of the work:
   (row, column) pair shared by the row and cell copies; `clip_set` clears the
   flag, so any other write to the clipboard drops the source and a later paste is
   literal.
+- Cut and paste is a move (built). A row cut (`tbl_row_del`) copies, deletes, and
+  sets `clip_tbl_cut`. A cut is half of a move, so a reference elsewhere to a cut
+  cell must follow it to wherever the rows land, not break. Cut and paste are two
+  separate operations with the clipboard between them, so the cut cannot know the
+  destination and cannot resolve the reference then. Instead it parks: the cut's
+  relocation sends references to the cut rows to an off-sheet base
+  (`TBL_MOVE_PARK`) rather than to `#REF!`, so they read `#REF!` meanwhile but
+  survive, and the paste (`tbl_move_rows`, when `clip_tbl_cut` is set) un-parks
+  them onto the landed rows. Both halves are the one transform `tbl_move_formula`
+  (`tbl_move_row` for a single reference, `tbl_move_span` for a range), which
+  moves an n-row band from `a` to `b`: the cut runs it with the park as `b`, the
+  paste with the park as `a` and the destination as `b`, and the pasted rows run
+  it straight from their original source to the destination. A single reference
+  rides the move; a range adjusts structurally, as across a sort, and is `#REF!`
+  if all its rows were cut. A plain delete with no paste simply leaves its parked
+  references reading `#REF!`. The park is far past any real row, so the window is
+  robust for the usual cut-then-paste; a structural edit between the two can
+  strand a parked reference.
 
 Sharing the evaluator saves perhaps a fifth of the spreadsheet effort. The
 engine, the cache, the dependency order, and reference adjustment are the rest.
@@ -227,10 +246,12 @@ language (whose values are `long` today through `clv_arg_int`) and the sheet
   functions. Reference relabeling on row and column insert or delete
   (`tbl_reloc`), on sort (`tbl_sort_reloc`), on a row paste (`tbl_reloc` for the
   rest of the sheet and `tbl_paste_shift` for the relative shift of the pasted
-  rows), and on a cell paste (`tbl_cell_shift_formula`, a relative shift on both
-  axes), rewriting the formula text in place within the edit's undo step. Still
-  to come: a value cache, incremental recalc, string formulas, and `EVAL` with
-  the restricted formula context.
+  rows), on a cell paste (`tbl_cell_shift_formula`, a relative shift on both
+  axes), and as a move on a row cut and paste (`tbl_move_formula`, references to
+  cut cells parking off-sheet until the paste lands them), rewriting the formula
+  text in place within the edit's undo step. Still to come: a value cache,
+  incremental recalc, string formulas, and `EVAL` with the restricted formula
+  context.
 - Gating. `expr_*` stays ungated and small, so the `expr` verb works in builds
   without the table, and the table works without arithmetic. The spreadsheet
   engine stays behind `VEDIT_TABLE`.

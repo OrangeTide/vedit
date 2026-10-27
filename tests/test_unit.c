@@ -4893,6 +4893,55 @@ t_tbl_paste_cell_shift(Test *t)
 	text_free(e.t);
 }
 
+/* Cutting rows and pasting them is a move. A reference from elsewhere to a cut
+ * cell follows it to the pasted location instead of breaking, and a moved
+ * formula keeps pointing at the same cells rather than shifting. */
+static void
+t_tbl_row_move(Test *t)
+{
+	static const char *const L[] = { "10", "20", "=A2" };
+	static const char *const M[] = { "10", "=A1", "20" };
+	Editor e;
+
+	/* =A2 points at the 20 on row 1. Cut that row and paste it at the end;
+	 * the reference follows the 20 down to =A3. */
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, L, 3);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+	e.cy = 1;
+	e.tbl->cx = 0;
+	tbl_row_del(&e, 1);			/* cut the 20 */
+	/* meanwhile the reference is parked off-sheet and reads #REF! */
+	TAP_CHECK(t, rawline_is(&e, 0, "10"));
+	e.cy = text_lines(e.t) - 1;
+	tbl_row_paste(&e, 1);			/* paste below the last row */
+	TAP_CHECK(t, rawline_is(&e, 0, "10"));
+	TAP_CHECK(t, rawline_is(&e, 1, "=A3"));	/* followed the 20 */
+	TAP_CHECK(t, rawline_is(&e, 2, "20"));
+	tbl_detach(&e);
+	text_free(e.t);
+
+	/* A moved formula keeps its own references: =A1 points at the 10 above
+	 * it, and after the move it still reads =A1 (not a relative shift). */
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, M, 3);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+	e.cy = 1;
+	e.tbl->cx = 0;
+	tbl_row_del(&e, 1);			/* cut =A1 */
+	e.cy = text_lines(e.t) - 1;
+	tbl_row_paste(&e, 1);			/* paste below the last row */
+	TAP_CHECK(t, rawline_is(&e, 2, "=A1"));	/* reference preserved */
+	tbl_detach(&e);
+	text_free(e.t);
+}
+
 /* The non-vi motion layer maps a position to where a modeless motion lands,
  * without touching the editor cursor. Left and right step by rune and wrap
  * across line ends; up and down clamp the column to the target line; the
@@ -6792,6 +6841,7 @@ const Case tap_cases[] = {
 	{ "tbl_paste_reloc", t_tbl_paste_reloc },
 	{ "tbl_paste_shift", t_tbl_paste_shift },
 	{ "tbl_paste_cell_shift", t_tbl_paste_cell_shift },
+	{ "tbl_row_move", t_tbl_row_move },
 	{ "swap_paths", t_swap_paths },
 	{ "atomic_save", t_atomic_save },
 	{ "save_rodir_fallback", t_save_rodir_fallback },
