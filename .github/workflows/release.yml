@@ -39,10 +39,10 @@ jobs:
 
   # Static musl binaries for Linux, one per architecture, built natively on
   # the matching runner with the `make static` target. The man page rides
-  # along in the tarball. The x86_64 tarball also carries gvedit, linked
-  # against a static SDL3 built from source (the sdl3-static action), so it
-  # needs no libSDL3 on the user's system; it is dynamic against glibc and
-  # loads X11 or Wayland at run time.
+  # along in the tarball. Each tarball also carries gvedit, linked against a
+  # static SDL3 built from source (the sdl3-static action), so it needs no
+  # libSDL3 on the user's system; it is dynamic against glibc and loads X11
+  # or Wayland at run time.
   linux:
     name: linux ${{ matrix.arch }}
     needs: check
@@ -57,6 +57,7 @@ jobs:
             gvedit: true
           - arch: aarch64
             runner: ubuntu-24.04-arm
+            gvedit: true
     steps:
       - uses: actions/checkout@v6
       - name: Install musl
