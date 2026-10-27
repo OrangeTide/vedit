@@ -8232,8 +8232,9 @@ typedef struct editor {
 	size_t		clip_len;	/* length of clip in bytes */
 	int		clip_linewise;	/* clip holds whole lines (vi p/P) */
 	int		clip_block;	/* clip holds a rectangle (draw mode) */
-	int		clip_tbl_rows;	/* clip holds table rows from a known source */
+	int		clip_tbl_src;	/* clip holds table content from a known cell */
 	long		clip_tbl_row;	/* that source's top row, for relative paste */
+	long		clip_tbl_col;	/* that source's column, for relative paste */
 	int		clip_osc52;	/* mirror every copy/yank through OSC 52 */
 	/* The kill stack fed by the capture suffix '.' on a removing verb, kept
 	 * separate from the clipboard above. Newest entry on top. */
@@ -14619,6 +14620,32 @@ tbl_paste_shift(Editor *e, size_t ylo, size_t yhi, long delta)
 	}
 }
 
+/* Shift a formula's references by dr rows and dc columns, for a relative cell
+ * paste: a formula copied from one cell and pasted into another takes its
+ * references along, so they point at cells in the same relative place. Each
+ * axis is the matching half of tbl_reloc_formula; a shift by d is inserting d
+ * lines at the edge (d > 0) or deleting -d (d < 0), so a reference pushed off
+ * the top or left edge becomes #REF!. The two passes run in sequence, the row
+ * shift first; a #REF! from the first pass is text the second copies intact.
+ * Returns 1 if out differs from src, 0 if not, or -1 on overflow. */
+static int
+tbl_cell_shift_formula(const char *src, long dr, long dc,
+    char *out, size_t outsz)
+{
+	char tmp[TBL_CELL_MAX];
+	int a, b;
+
+	a = tbl_reloc_formula(src, 0, 0, dr < 0 ? (int)-dr : (int)dr,
+	    dr < 0, tmp, sizeof(tmp));
+	if (a < 0)
+		return -1;
+	b = tbl_reloc_formula(tmp, 1, 0, dc < 0 ? (int)-dc : (int)dc,
+	    dc < 0, out, outsz);
+	if (b < 0)
+		return -1;
+	return a == 1 || b == 1;
+}
+
 /* Rewrite a formula's references through a sort's row permutation: a single
  * reference to a row in [lo, hi] moves to rowmap[row - lo], so it follows the
  * cell to where the sort put it. A range is left unchanged: the rows it spans
@@ -15275,15 +15302,33 @@ tbl_copy_cell(Editor *e)
 	tbl_cell_value(e, e->cy, e->tbl->cx, buf, TBL_CELL_MAX);
 	n = strlen(buf);
 	clip_set(e, buf, n);
+	e->clip_tbl_src = 1;		/* a known source, for a relative paste */
+	e->clip_tbl_row = (long)e->cy;
+	e->clip_tbl_col = e->tbl->cx;
 	set_status(e, "copied the cell");
 }
 
-/* Paste the clipboard into the current cell, as one value. */
+/* Paste the clipboard into the current cell, as one value. A formula copied
+ * from a known cell has its references shifted by how far it moved, so it
+ * points at cells in the same relative place; a reference pushed off the top or
+ * left edge becomes #REF!. A paste from outside the table is set verbatim. */
 static void
 tbl_paste_cell(Editor *e)
 {
+	char val[TBL_CELL_MAX], out[TBL_CELL_MAX];
+	size_t n;
+
 	if (!e->clip || e->clip_len == 0) {
 		set_status(e, "nothing to paste");
+		return;
+	}
+	n = e->clip_len < sizeof(val) ? e->clip_len : sizeof(val) - 1;
+	memcpy(val, e->clip, n);
+	val[n] = '\0';
+	if (e->clip_tbl_src && val[0] == '=' &&
+	    tbl_cell_shift_formula(val, (long)e->cy - e->clip_tbl_row,
+	        (long)e->tbl->cx - e->clip_tbl_col, out, sizeof(out)) == 1) {
+		tbl_set_cell(e, e->cy, e->tbl->cx, out, strlen(out));
 		return;
 	}
 	tbl_set_cell(e, e->cy, e->tbl->cx, e->clip, e->clip_len);
@@ -15371,8 +15416,9 @@ tbl_row_copy(Editor *e, int n)
 	if (!buf)
 		return;
 	clip_set(e, buf, len);
-	e->clip_tbl_rows = 1;		/* a known source, for a relative paste */
+	e->clip_tbl_src = 1;		/* a known source, for a relative paste */
 	e->clip_tbl_row = (long)e->cy;
+	e->clip_tbl_col = 0;		/* whole rows begin at the first column */
 	set_status(e, "copied %d row%s", n, n == 1 ? "" : "s");
 }
 
@@ -15433,7 +15479,7 @@ tbl_row_paste(Editor *e, int below)
 	/* When the clipboard rows came from a known source, shift the references
 	 * in the pasted formulas by how far the rows moved, a relative paste.
 	 * Otherwise (an external or cell paste, with no source) they stay literal. */
-	if (e->clip_tbl_rows)
+	if (e->clip_tbl_src)
 		tbl_paste_shift(e, first, first + n - 1,
 		    (long)first - e->clip_tbl_row);
 	text_undo_group_end(e->t);
@@ -18933,7 +18979,7 @@ clip_set(Editor *e, char *bytes, size_t len)
 	e->clip = bytes;
 	e->clip_len = len;
 	e->clip_block = 0;	/* a plain copy; block copies set this themselves */
-	e->clip_tbl_rows = 0;	/* a table row copy re-sets this after calling us */
+	e->clip_tbl_src = 0;	/* a table copy re-sets this after calling us */
 	/* Mirror to the terminal's clipboard via OSC 52 only when the config
 	 * opted in; by default a copy stays in the internal clipboard so the
 	 * common case never depends on OSC 52 working. */

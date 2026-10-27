@@ -174,11 +174,12 @@ range that straddles a deletion shrinks. Sorting the table relabels single-cell
 references too, so they follow their cells to the new rows. A range is left
 alone across a sort, since the aggregate functions do not depend on order.
 Pasting rows inserts them, so references elsewhere shift down to keep pointing at
-their cells. A formula copied from the table and pasted elsewhere has its own
-references shifted by the distance it moved, so it points at cells in the same
-relative place; one pushed off the top of the sheet reads `#REF!`. A formula
-pasted from outside the table keeps its text as written. Set
-`table.formulas = off` for a file that uses a leading `=` as literal text.
+their cells. A formula copied from the table and pasted elsewhere, whether a
+whole row or a single cell, has its own references shifted by the distance it
+moved, across rows and columns both, so it points at cells in the same relative
+place; one pushed off the top or left edge reads `#REF!`. A formula pasted from
+outside the table keeps its text as written. Set `table.formulas = off` for a
+file that uses a leading `=` as literal text.
 
 `:rowadd [N]` inserts N blank rows above the cursor row and `:rowadd! [N]`
 below it. `:rowdel [N]` deletes N rows from the cursor. `:coladd [N]` inserts N empty columns

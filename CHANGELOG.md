@@ -68,10 +68,11 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
   functions do not depend on order.
 - Pasting rows into the table relabels the formula references in the rest of
   the sheet, so they keep pointing at their cells as the paste pushes rows
-  down. A formula copied from the table and pasted elsewhere has its own
-  references shifted by the distance it moved (a relative paste); one pushed
-  off the top of the sheet becomes `#REF!`. A formula pasted from outside the
-  table keeps its text as written.
+  down. A formula copied from the table and pasted elsewhere, whether a whole
+  row or a single cell, has its own references shifted by the distance it moved
+  across rows and columns (a relative paste); one pushed off the top or left
+  edge becomes `#REF!`. A formula pasted from outside the table keeps its text
+  as written.
 - The command language gains a `menu TITLE LABEL BODY ...` verb: it lists the
   labels and runs the chosen entry's program, so a keymap can build its own menu
   with no change to the editor.

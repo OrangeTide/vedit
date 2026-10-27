@@ -184,9 +184,16 @@ specific and is most of the work:
   and pasted elsewhere takes its references along (`tbl_paste_shift`). That shift
   is the row half of `tbl_reloc_formula`, inserting or deleting the displacement
   worth of rows at the top, so a reference driven off the top becomes `#REF!`.
-  When the clipboard has no source (an external or cell paste), the pasted text
-  stays literal. Pasting into a single cell (`tbl_paste_cell`) sets one value and
-  makes no structural change, so it relabels nothing.
+  When the clipboard has no source (an external paste), the pasted text stays
+  literal. Pasting a single cell (`tbl_paste_cell`) makes no structural change,
+  but when the clipboard holds a formula copied from a known cell
+  (`tbl_copy_cell` records its row and column too) its references shift by the
+  distance moved on both axes, through `tbl_cell_shift_formula`. That runs the
+  row and column halves of `tbl_reloc_formula` in turn, so a reference pushed off
+  the top or left edge becomes `#REF!`. The clipboard source is one flag and a
+  (row, column) pair shared by the row and cell copies; `clip_set` clears the
+  flag, so any other write to the clipboard drops the source and a later paste is
+  literal.
 
 Sharing the evaluator saves perhaps a fifth of the spreadsheet effort. The
 engine, the cache, the dependency order, and reference adjustment are the rest.
@@ -218,11 +225,12 @@ language (whose values are `long` today through `clv_arg_int`) and the sheet
   values, and the source-and-value status line. The `:` range operator with
   `tbl_deref` and `tbl_fold` backing the `SUM`, `AVG`, `COUNT`, `MIN`, and `MAX`
   functions. Reference relabeling on row and column insert or delete
-  (`tbl_reloc`), on sort (`tbl_sort_reloc`), and on a row paste (`tbl_reloc` for
-  the rest of the sheet and `tbl_paste_shift` for the relative shift of the
-  pasted rows), rewriting the formula text in place within the edit's undo step.
-  Still to come: a value cache, incremental recalc, string formulas, and `EVAL`
-  with the restricted formula context.
+  (`tbl_reloc`), on sort (`tbl_sort_reloc`), on a row paste (`tbl_reloc` for the
+  rest of the sheet and `tbl_paste_shift` for the relative shift of the pasted
+  rows), and on a cell paste (`tbl_cell_shift_formula`, a relative shift on both
+  axes), rewriting the formula text in place within the edit's undo step. Still
+  to come: a value cache, incremental recalc, string formulas, and `EVAL` with
+  the restricted formula context.
 - Gating. `expr_*` stays ungated and small, so the `expr` verb works in builds
   without the table, and the table works without arithmetic. The spreadsheet
   engine stays behind `VEDIT_TABLE`.

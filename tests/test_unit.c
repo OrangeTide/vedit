@@ -4844,6 +4844,55 @@ t_tbl_paste_shift(Test *t)
 	text_free(e.t);
 }
 
+/* A cell copied with tbl_copy_cell carries its row and column, so pasting its
+ * formula into another cell shifts the references by the distance moved on both
+ * axes: a relative paste. A reference pushed off the top or left edge is #REF!. */
+static void
+t_tbl_paste_cell_shift(Test *t)
+{
+	static const char *const L[] = { "=B2,x,y", "10,20,30" };
+	static const char *const M[] = { "x,=A1" };
+	Editor e;
+
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, L, 2);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+
+	/* copy A1 (=B2) and paste into B1: one column right, so =B2 -> =C2 */
+	e.cy = 0;
+	e.tbl->cx = 0;
+	tbl_copy_cell(&e);
+	e.tbl->cx = 1;
+	tbl_paste_cell(&e);
+	TAP_CHECK(t, rawline_is(&e, 0, "=B2,=C2,y"));
+	/* paste the same copy into B2: one column right and one row down */
+	e.cy = 1;
+	e.tbl->cx = 1;
+	tbl_paste_cell(&e);
+	TAP_CHECK(t, rawline_is(&e, 1, "10,=C3,30"));
+	tbl_detach(&e);
+	text_free(e.t);
+
+	/* a reference pushed off the left edge becomes #REF! */
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, M, 1);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+	e.cy = 0;
+	e.tbl->cx = 1;
+	tbl_copy_cell(&e);		/* =A1 from column B */
+	e.tbl->cx = 0;
+	tbl_paste_cell(&e);		/* one column left: A falls off the edge */
+	TAP_CHECK(t, rawline_is(&e, 0, "=#REF!,=A1"));
+	tbl_detach(&e);
+	text_free(e.t);
+}
+
 /* The non-vi motion layer maps a position to where a modeless motion lands,
  * without touching the editor cursor. Left and right step by rune and wrap
  * across line ends; up and down clamp the column to the target line; the
@@ -6742,6 +6791,7 @@ const Case tap_cases[] = {
 	{ "tbl_sort_live", t_tbl_sort_live },
 	{ "tbl_paste_reloc", t_tbl_paste_reloc },
 	{ "tbl_paste_shift", t_tbl_paste_shift },
+	{ "tbl_paste_cell_shift", t_tbl_paste_cell_shift },
 	{ "swap_paths", t_swap_paths },
 	{ "atomic_save", t_atomic_save },
 	{ "save_rodir_fallback", t_save_rodir_fallback },
