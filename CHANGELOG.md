@@ -77,6 +77,13 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
   referenced a cut cell follows it to where it lands instead of breaking, and a
   cut formula keeps its own references. The reference reads `#REF!` between the
   cut and the paste, while the data is in flight.
+- The table view copies, cuts, and pastes a whole column. In a vi keymap `yc`
+  copies the current column and `dc` cuts it; `p` and `P` paste it right and left
+  of the cursor. The ex commands `:colcopy`, `:colcut`, `:colpaste`, and
+  `:colpaste!` and the Edit menu do the same. Pasting inserts the column and
+  shifts the references in the rest of the sheet right, and a copied column's own
+  formulas shift by how far it moved across columns, so they point at cells in the
+  same relative place; a reference pushed off the left edge becomes `#REF!`.
 - The command language gains a `menu TITLE LABEL BODY ...` verb: it lists the
   labels and runs the chosen entry's program, so a keymap can build its own menu
   with no change to the editor.

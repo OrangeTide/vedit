@@ -8234,6 +8234,7 @@ typedef struct editor {
 	int		clip_block;	/* clip holds a rectangle (draw mode) */
 	int		clip_tbl_src;	/* clip holds table content from a known cell */
 	int		clip_tbl_cut;	/* that content was cut: a paste is a move */
+	int		clip_tbl_iscol;	/* clip holds a column, one value per line */
 	long		clip_tbl_row;	/* that source's top row, for relative paste */
 	long		clip_tbl_col;	/* that source's column, for relative paste */
 	int		clip_osc52;	/* mirror every copy/yank through OSC 52 */
@@ -11507,6 +11508,7 @@ typedef enum menu_act {
 	MA_HEX,
 #endif
 	MA_TBL_ROWADD, MA_TBL_ROWDEL, MA_TBL_COLADD, MA_TBL_COLDEL, MA_TBL_FIT,
+	MA_TBL_COLCOPY, MA_TBL_COLCUT, MA_TBL_COLPASTE,
 	MA_SORT, MA_INS_DATE, MA_INS_FILE,
 	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS, MA_MOUSE, MA_STATUSLINE,
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS, MA_REFLOW, MA_TEXTWIDTH,
@@ -11569,6 +11571,9 @@ static void tbl_row_del(Editor *e, int n);
 static void tbl_row_paste(Editor *e, int below);
 static void tbl_col_add(Editor *e, int n, int after);
 static void tbl_col_del(Editor *e, int n);
+static void tbl_col_copy(Editor *e);
+static void tbl_col_cut(Editor *e);
+static void tbl_col_paste(Editor *e, int right);
 static void tbl_undo(Editor *e, int redo);
 static int tbl_count_arg(const char *arg);
 #endif
@@ -11624,6 +11629,9 @@ static const Menuitem mi_edit[] = {
 	{ "&Delete Row",	"",	":rowdel",	MA_TBL_ROWDEL },
 	{ "Insert Colu&mn",	"",	":coladd",	MA_TBL_COLADD },
 	{ "De&lete Column",	"",	":coldel",	MA_TBL_COLDEL },
+	{ "Cop&y Column",	"yc",	":colcopy",	MA_TBL_COLCOPY },
+	{ "C&ut Column",	"dc",	":colcut",	MA_TBL_COLCUT },
+	{ "Paste Col&umn",	"p",	":colpaste",	MA_TBL_COLPASTE },
 	{ "Fit Column Widt&hs",	"",	":colwidth fit all",	MA_TBL_FIT },
 #endif
 	{ "S&ort Lines...",	"",	":sort",	MA_SORT },
@@ -12094,6 +12102,9 @@ menu_item_enabled(const Editor *e, Menuact act)
 	case MA_TBL_ROWDEL:
 	case MA_TBL_COLADD:
 	case MA_TBL_COLDEL:
+	case MA_TBL_COLCOPY:
+	case MA_TBL_COLCUT:
+	case MA_TBL_COLPASTE:
 	case MA_TBL_FIT:
 		return e->tbl != NULL;
 	case MA_INS_DATE:
@@ -14157,8 +14168,9 @@ tbl_cell_value(const Editor *e, size_t row, int col, char *buf, size_t n)
  * recalc is recompute-on-read: a referenced cell is evaluated when a formula
  * reads it, with a visiting stack to catch cycles. Numbers and A1:B3 ranges
  * with the SUM/AVG/COUNT/MIN/MAX functions; references are relabeled when rows
- * or columns are inserted, deleted, sorted, pasted, or cut and pasted as a move
- * (rows or a single cell; see docs/design/expr-and-spreadsheet.md).
+ * or columns are inserted, deleted, sorted, pasted (a copied row, column, or
+ * cell carries its own references by the distance it moved), or cut and pasted
+ * as a move (rows or a single cell; see docs/design/expr-and-spreadsheet.md).
  ****************************************************************/
 
 #define TBL_FORMULA_DEPTH 64	/* deepest reference chain before it is a cycle */
@@ -15366,11 +15378,16 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 		int op = tb->pending;
 
 		tb->pending = 0;
-		if (ch == (uint32_t)op) {
+		if (ch == (uint32_t)op) {	/* dd deletes a row, yy copies one */
 			if (op == 'd')
 				tbl_row_del(e, 1);
 			else
 				tbl_row_copy(e, 1);
+		} else if (ch == 'c') {		/* dc cuts a column, yc copies one */
+			if (op == 'd')
+				tbl_col_cut(e);
+			else
+				tbl_col_copy(e);
 		}
 		return REQ_CONTINUE;
 	}
@@ -15432,10 +15449,16 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 		tbl_row_add(e, 1, 0);
 		break;
 	case 'p':
-		tbl_row_paste(e, 1);
+		if (e->clip_tbl_iscol)
+			tbl_col_paste(e, 1);
+		else
+			tbl_row_paste(e, 1);
 		break;
 	case 'P':
-		tbl_row_paste(e, 0);
+		if (e->clip_tbl_iscol)
+			tbl_col_paste(e, 0);
+		else
+			tbl_row_paste(e, 0);
 		break;
 	case 'u':
 		tbl_undo(e, 0);
@@ -15899,6 +15922,126 @@ tbl_col_del(Editor *e, int n)
 	set_status(e, "%d column%s deleted", n, n == 1 ? "" : "s");
 }
 
+/* Column c as text, one cell value per line of the sheet with a newline after
+ * each, so a paste can lay the column back down row by row. */
+static char *
+tbl_col_text(const Editor *e, int c, size_t *outn)
+{
+	size_t nl = text_lines(e->t), total = 0, i, o = 0;
+	char *buf, *val = malloc(TBL_CELL_MAX);
+
+	if (!val)
+		return NULL;
+	for (i = 0; i < nl; i++) {
+		tbl_cell_value(e, i, c, val, TBL_CELL_MAX);
+		total += strlen(val) + 1;
+	}
+	buf = malloc(total + 1);
+	if (!buf) {
+		free(val);
+		return NULL;
+	}
+	for (i = 0; i < nl; i++) {
+		size_t len;
+
+		tbl_cell_value(e, i, c, val, TBL_CELL_MAX);
+		len = strlen(val);
+		memcpy(buf + o, val, len);
+		o += len;
+		buf[o++] = '\n';
+	}
+	buf[o] = '\0';
+	free(val);
+	*outn = o;
+	return buf;
+}
+
+/* Copy the current column to the clipboard, one cell value per line, marked as
+ * a column so a paste lays it back down vertically. */
+static void
+tbl_col_copy(Editor *e)
+{
+	size_t len;
+	char *buf = tbl_col_text(e, e->tbl->cx, &len);
+
+	if (!buf)
+		return;
+	clip_set(e, buf, len);
+	e->clip_tbl_src = 1;		/* a known source, for a relative paste */
+	e->clip_tbl_iscol = 1;		/* the clip holds a column */
+	e->clip_tbl_row = 0;		/* a whole column begins at the first row */
+	e->clip_tbl_col = e->tbl->cx;
+	set_status(e, "copied the column");
+}
+
+/* Cut the current column: copy it, then delete it. References to the removed
+ * column become #REF! and ranges across it shrink, as on a plain column delete.
+ * A later paste inserts the column elsewhere with its own references shifted by
+ * how far it moved (a relative paste), so cutting a column is not a move. One
+ * undo step. */
+static void
+tbl_col_cut(Editor *e)
+{
+	tbl_col_copy(e);		/* records the source and sets clip_tbl_iscol */
+	tbl_col_del(e, 1);		/* leaves the clipboard flags alone */
+	set_status(e, "cut the column (p or :colpaste pastes it)");
+}
+
+/* Paste the clipboard column, inserting a new column to the right of the cursor
+ * column (right) or to its left, and laying the stored value into each row. A
+ * column copied from the table has the references in its formulas shifted by
+ * how far it moved across columns, so they point at cells in the same relative
+ * place; a reference pushed off the left edge becomes #REF!. A paste from
+ * outside the table, or of a row or cell clip, lays the values down verbatim.
+ * One undo step. */
+static void
+tbl_col_paste(Editor *e, int right)
+{
+	Tbl *tb = e->tbl;
+	size_t i = 0, y, nl;
+	int tc, src = e->clip_tbl_src && e->clip_tbl_iscol;
+	long dc;
+
+	if (!e->clip || e->clip_len == 0) {
+		set_status(e, "nothing to paste");
+		return;
+	}
+	text_undo_group_begin(e->t);
+	tc = right ? tb->cx + 1 : tb->cx;
+	/* Insert one blank column at tc. This shifts the references in the rest of
+	 * the sheet for the insertion; the new column is empty, so the pasted
+	 * formulas it is about to hold get only the relative shift below. */
+	tbl_col_add(e, 1, right);
+	dc = (long)tc - e->clip_tbl_col;
+	nl = text_lines(e->t);
+	for (y = 0; y < nl; y++) {
+		char val[TBL_CELL_MAX], out[TBL_CELL_MAX];
+		size_t j = i, n;
+
+		while (j < e->clip_len && e->clip[j] != '\n')
+			j++;
+		n = j - i;
+		if (n >= sizeof(val))
+			n = sizeof(val) - 1;
+		memcpy(val, e->clip + i, n);
+		val[n] = '\0';
+		if (src && val[0] == '=' &&
+		    tbl_cell_shift_formula(val, 0, dc, out, sizeof(out)) == 1)
+			tbl_cell_replace_raw(e, y, tc, out, strlen(out));
+		else
+			tbl_cell_replace_raw(e, y, tc, val, n);
+		if (j < e->clip_len)
+			i = j + 1;	/* step past this value's newline */
+		else
+			i = j;		/* clip exhausted: the rest paste empty */
+	}
+	text_undo_group_end(e->t);
+	hl_touch(e, 0);
+	tb->cx = tc;
+	tb->ncols = tbl_count_cols(e->t, tb->delim);
+	set_status(e, "pasted the column");
+}
+
 /* Undo or redo, then put the cell cursor where the text cursor landed. */
 static void
 tbl_undo(Editor *e, int redo)
@@ -16098,6 +16241,10 @@ static void tbl_col_add(Editor *e, int n, int after)
 { (void)n; (void)after; set_status(e, TBL_NOT_BUILT); }
 static void tbl_col_del(Editor *e, int n)
 { (void)n; set_status(e, TBL_NOT_BUILT); }
+static void tbl_col_copy(Editor *e) { set_status(e, TBL_NOT_BUILT); }
+static void tbl_col_cut(Editor *e) { set_status(e, TBL_NOT_BUILT); }
+static void tbl_col_paste(Editor *e, int right)
+{ (void)right; set_status(e, TBL_NOT_BUILT); }
 
 #undef TBL_NOT_BUILT
 
@@ -19309,6 +19456,7 @@ clip_set(Editor *e, char *bytes, size_t len)
 	e->clip_block = 0;	/* a plain copy; block copies set this themselves */
 	e->clip_tbl_src = 0;	/* a table copy re-sets this after calling us */
 	e->clip_tbl_cut = 0;	/* a row cut re-sets this after calling us */
+	e->clip_tbl_iscol = 0;	/* a column copy re-sets this after calling us */
 	/* Mirror to the terminal's clipboard via OSC 52 only when the config
 	 * opted in; by default a copy stays in the internal clipboard so the
 	 * common case never depends on OSC 52 working. */
@@ -21900,6 +22048,8 @@ static const struct {
 	{ ":cell C7",		"Table view: go to a cell by label and row" },
 	{ ":rowadd[!] [N]",	"Table view: insert N rows above (! below); :rowdel" },
 	{ ":coladd[!] [N]",	"Table view: insert N columns left (! right); :coldel" },
+	{ ":colcopy  :colcut",	"Table view: copy or cut this column (vi yc, dc)" },
+	{ ":colpaste[!]",	"Table view: paste a column right (! left) (vi p, P)" },
 #endif
 	{ ":config  :reload",	"Edit the config file / re-read it (Options menu too)" },
 	{ ":date [YYYY-MM-DD]",	"Insert today or a day; :set df=PATTERN its format" },
@@ -22180,6 +22330,9 @@ static const char *const tut_table[] = {
 	"    a row and p or P pastes rows below or above.",
 	"  - :coladd and :coladd! insert a column left or right of the",
 	"    cursor; :coldel deletes one. A count follows any of them.",
+	"  - vi yc copies a column and dc cuts one (:colcopy, :colcut);",
+	"    p or P (:colpaste, :colpaste!) pastes it right or left. A",
+	"    pasted column's formulas shift to the same relative cells.",
 	"  - :colwidth N sets the column's width, :colwidth fit fits it to",
 	"    its cells; add \"all\" for every column (also in the Edit menu).",
 	"  - Ctrl+Z and Ctrl+Y (vi u and Ctrl+R) undo and redo.",
@@ -34358,6 +34511,18 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_TBL_COLDEL:
 		if (e->tbl)
 			tbl_col_del(e, 1);
+		break;
+	case MA_TBL_COLCOPY:
+		if (e->tbl)
+			tbl_col_copy(e);
+		break;
+	case MA_TBL_COLCUT:
+		if (e->tbl)
+			tbl_col_cut(e);
+		break;
+	case MA_TBL_COLPASTE:
+		if (e->tbl)
+			tbl_col_paste(e, 1);
 		break;
 	case MA_TBL_FIT:
 		if (e->tbl)
@@ -51015,6 +51180,7 @@ enum excmd {
 	EX_DATE, EX_LOG, EX_DIFF, EX_BLAME, EX_COMMIT,
 	EX_MARKS, EX_DELMARKS, EX_JUMPS, EX_TERM, EX_SPLIT, EX_VSPLIT, EX_STERM, EX_CLOSE, EX_ONLY, EX_SBUFFER, EX_REPOST, EX_FORMAT, EX_TABLE, EX_COLWIDTH, EX_CELL, EX_SORT, EX_TABSTOPS,
 	EX_ROWADD, EX_ROWDEL, EX_COLADD, EX_COLDEL,
+	EX_COLCOPY, EX_COLCUT, EX_COLPASTE,
 };
 
 static const struct excmd_name {
@@ -51071,6 +51237,9 @@ static const struct excmd_name {
 	{ "rowdel",	4, EX_ROWDEL },
 	{ "coladd",	4, EX_COLADD },
 	{ "coldel",	4, EX_COLDEL },
+	{ "colcopy",	5, EX_COLCOPY },
+	{ "colcut",	5, EX_COLCUT },
+	{ "colpaste",	4, EX_COLPASTE },
 	{ "reload",	3, EX_RELOAD },
 	{ "config",	4, EX_CONFIG },
 #ifdef VEDIT_MAIL
@@ -51495,6 +51664,20 @@ vi_ex_exec(Editor *e, char *buf)
 			tbl_col_add(e, tbl_count_arg(rest), bang);
 		else
 			tbl_col_del(e, tbl_count_arg(rest));
+		return REQ_CONTINUE;
+	case EX_COLCOPY:
+	case EX_COLCUT:
+	case EX_COLPASTE:
+		if (!e->tbl) {
+			set_status(e, "not a table (:table turns the view on)");
+			return REQ_CONTINUE;
+		}
+		if (id == EX_COLCOPY)
+			tbl_col_copy(e);
+		else if (id == EX_COLCUT)
+			tbl_col_cut(e);
+		else
+			tbl_col_paste(e, !bang);	/* :colpaste right, ! left */
 		return REQ_CONTINUE;
 	case EX_RELOAD:
 		ed_reload_config(e);

@@ -130,6 +130,7 @@ again.
 | copy, paste rows | | `yy`, `p` (below), `P` (above); `dd` copies too |
 | insert a column left, right | Edit menu, `:coladd`, `:coladd!` | the same |
 | delete the column | Edit menu, `:coldel` | the same |
+| copy, paste a column | Edit menu, `:colcopy`, `:colpaste` (right), `:colpaste!` (left) | `yc`, `p` (right), `P` (left); `dc` cuts |
 | undo, redo | Ctrl-Z, Ctrl-Y | `u`, Ctrl-R |
 | sort the rows by this column | Edit > Sort Lines, `:sort` | `:sort`, `:sort! n` |
 | save, quit | Ctrl-S, Ctrl-Q | `:w`, `:q` |
@@ -173,23 +174,28 @@ pointing at the same cells. A reference to a deleted cell becomes `#REF!`, and a
 range that straddles a deletion shrinks. Sorting the table relabels single-cell
 references too, so they follow their cells to the new rows. A range is left
 alone across a sort, since the aggregate functions do not depend on order.
-Pasting rows inserts them, so references elsewhere shift down to keep pointing at
-their cells. A formula copied from the table and pasted elsewhere, whether a
-whole row or a single cell, has its own references shifted by the distance it
-moved, across rows and columns both, so it points at cells in the same relative
-place; one pushed off the top or left edge reads `#REF!`. A formula pasted from
-outside the table keeps its text as written. Cutting and pasting, whether rows or
-a single cell, is a move: a formula that referenced a cut cell follows it to
-where it lands rather than breaking, and a cut formula keeps its own references.
-Until the paste the reference reads `#REF!`, since the data is in flight, so
-complete a cut with a paste. Set `table.formulas = off` for a file that uses a
-leading `=` as literal text.
+Pasting rows or a column inserts them, so references elsewhere shift to keep
+pointing at their cells, down for inserted rows and right for an inserted
+column. A formula copied from the table and pasted elsewhere, whether a whole
+row, a whole column, or a single cell, has its own references shifted by the
+distance it moved, across rows and columns both, so it points at cells in the
+same relative place; one pushed off the top or left edge reads `#REF!`. A formula
+pasted from outside the table keeps its text as written. Cutting and pasting a
+whole row or a single cell is a move: a formula that referenced a cut cell
+follows it to where it lands rather than breaking, and a cut formula keeps its
+own references. Until the paste the reference reads `#REF!`, since the data is in
+flight, so complete a cut with a paste. Cutting and pasting a column is a
+relative paste, not a move: a reference to a cut column's cell becomes `#REF!`,
+and the pasted column's own formulas shift by the distance it moved. Set
+`table.formulas = off` for a file that uses a leading `=` as literal text.
 
 `:rowadd [N]` inserts N blank rows above the cursor row and `:rowadd! [N]`
 below it. `:rowdel [N]` deletes N rows from the cursor. `:coladd [N]` inserts N empty columns
 left of the cursor column, `:coladd! [N]` right of it, and `:coldel [N]`
-deletes N columns. A column operation edits every row in one undo step. A
-row's only cell is cleared rather than removed.
+deletes N columns. `:colcopy` copies the current column and `:colcut` cuts it
+(vi `yc`, `dc`); `:colpaste` inserts the copied column right of the cursor and
+`:colpaste!` left of it (vi `p`, `P`). A column operation edits every row in one
+undo step. A row's only cell is cleared rather than removed.
 
 Other commands:
 

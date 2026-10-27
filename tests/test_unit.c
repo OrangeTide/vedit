@@ -4990,6 +4990,56 @@ t_tbl_cell_move(Test *t)
 	text_free(e.t);
 }
 
+/* Pasting a copied column inserts it and shifts the references in its own
+ * formulas by how far the column moved, a relative paste, while the references
+ * in the rest of the sheet shift for the insertion. A reference pushed off the
+ * left edge becomes #REF!. */
+static void
+t_tbl_col_paste_shift(Test *t)
+{
+	static const char *const L[] = { "=B1,10", "=B2,20" };
+	static const char *const M[] = { "x,=A1" };
+	Editor e;
+
+	/* Copy column A (=B1 / =B2) and paste it to the right of column B, so the
+	 * new column C sits two columns over: each formula's reference shifts two
+	 * columns, B -> D. The sheet's own formulas (column A) point left of the
+	 * insertion, so they are left untouched. */
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, L, 2);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+	e.cy = 0;
+	e.tbl->cx = 0;
+	tbl_col_copy(&e);
+	e.tbl->cx = 1;
+	tbl_col_paste(&e, 1);			/* new column C; dc = 2 */
+	TAP_CHECK(t, rawline_is(&e, 0, "=B1,10,=D1"));
+	TAP_CHECK(t, rawline_is(&e, 1, "=B2,20,=D2"));
+	tbl_detach(&e);
+	text_free(e.t);
+
+	/* Copy column B (=A1) and paste it to the left of column A. The inserted
+	 * column shifts the sheet's own =A1 right to =B1, and the pasted formula,
+	 * moved one column left, pushes its A reference off the edge to #REF!. */
+	editor_init(&e);
+	e.t = text_new();
+	TAP_ASSERT(t, e.t != NULL);
+	tx_fill(e.t, M, 1);
+	e.tbl_formulas = 1;
+	TAP_ASSERT(t, tbl_attach(&e, ',', 0) == 0);
+	e.cy = 0;
+	e.tbl->cx = 1;
+	tbl_col_copy(&e);
+	e.tbl->cx = 0;
+	tbl_col_paste(&e, 0);			/* new column A; dc = -1 */
+	TAP_CHECK(t, rawline_is(&e, 0, "=#REF!,x,=B1"));
+	tbl_detach(&e);
+	text_free(e.t);
+}
+
 /* The non-vi motion layer maps a position to where a modeless motion lands,
  * without touching the editor cursor. Left and right step by rune and wrap
  * across line ends; up and down clamp the column to the target line; the
@@ -6891,6 +6941,7 @@ const Case tap_cases[] = {
 	{ "tbl_paste_cell_shift", t_tbl_paste_cell_shift },
 	{ "tbl_row_move", t_tbl_row_move },
 	{ "tbl_cell_move", t_tbl_cell_move },
+	{ "tbl_col_paste_shift", t_tbl_col_paste_shift },
 	{ "swap_paths", t_swap_paths },
 	{ "atomic_save", t_atomic_save },
 	{ "save_rodir_fallback", t_save_rodir_fallback },

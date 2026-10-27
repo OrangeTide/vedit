@@ -195,6 +195,20 @@ specific and is most of the work:
   (row, column) pair shared by the row and cell copies; `clip_set` clears the
   flag, so any other write to the clipboard drops the source and a later paste is
   literal.
+- Column paste is the column analog of the row paste (built). `tbl_col_copy`
+  records the column's cells, one value per line, with the source column on the
+  clipboard (`clip_tbl_iscol` marks it, alongside `clip_tbl_src` and
+  `clip_tbl_col`). `tbl_col_paste` inserts one blank column through `tbl_col_add`,
+  which shifts the references in the rest of the sheet right as a manual column
+  insert does; because that column is empty when the shift runs, no skip band is
+  needed. It then fills the new column, shifting each pasted formula by the column
+  distance with `tbl_cell_shift_formula` (row delta zero), so a reference driven
+  off the left edge becomes `#REF!`. A column cut (`tbl_col_cut`) copies and then
+  deletes with `tbl_col_del`: that is a plain structural delete, not a move, so a
+  reference to a cut column's cell becomes `#REF!` and only the pasted column's
+  own formulas shift relative. In a vi keymap `yc` copies a column and `dc` cuts
+  one; `p` and `P` paste it right and left, dispatching on `clip_tbl_iscol` so the
+  same keys still paste rows when the clipboard holds rows.
 - Cut and paste is a move (built). A row cut (`tbl_row_del`) copies, deletes, and
   sets `clip_tbl_cut`. A cut is half of a move, so a reference elsewhere to a cut
   cell must follow it to wherever the rows land, not break. Cut and paste are two
@@ -254,7 +268,9 @@ language (whose values are `long` today through `clv_arg_int`) and the sheet
   functions. Reference relabeling on row and column insert or delete
   (`tbl_reloc`), on sort (`tbl_sort_reloc`), on a row paste (`tbl_reloc` for the
   rest of the sheet and `tbl_paste_shift` for the relative shift of the pasted
-  rows), on a cell paste (`tbl_cell_shift_formula`, a relative shift on both
+  rows), on a column paste (`tbl_col_paste`, `tbl_col_add` for the rest of the
+  sheet and `tbl_cell_shift_formula` for the relative shift of the pasted
+  column), on a cell paste (`tbl_cell_shift_formula`, a relative shift on both
   axes), and as a move on a cut and paste of rows (`tbl_move_formula`) or a cell
   (`tbl_remap_cell_formula`), references to the cut cells parking off-sheet until
   the paste lands them, rewriting the formula text in place within the edit's
