@@ -11560,6 +11560,7 @@ static int tbl_set_cell(Editor *e, size_t row, int col, const char *val,
     size_t n);
 static void tbl_edit_cell(Editor *e, uint32_t how);
 static void tbl_copy_cell(Editor *e);
+static void tbl_cut_cell(Editor *e);
 static void tbl_paste_cell(Editor *e);
 static void tbl_find_again(Editor *e, int dir);
 static void tbl_row_add(Editor *e, int n, int below);
@@ -14157,7 +14158,7 @@ tbl_cell_value(const Editor *e, size_t row, int col, char *buf, size_t n)
  * reads it, with a visiting stack to catch cycles. Numbers and A1:B3 ranges
  * with the SUM/AVG/COUNT/MIN/MAX functions; references are relabeled when rows
  * or columns are inserted, deleted, sorted, pasted, or cut and pasted as a move
- * (see docs/design/expr-and-spreadsheet.md).
+ * (rows or a single cell; see docs/design/expr-and-spreadsheet.md).
  ****************************************************************/
 
 #define TBL_FORMULA_DEPTH 64	/* deepest reference chain before it is a cycle */
@@ -14795,6 +14796,109 @@ tbl_move_rows(Editor *e, long ylo, long yhi, long a, long n, long b)
 	}
 }
 
+/* Rewrite the A1 references in formula text src that point exactly at the cell
+ * (fr, fc), remapping them to (tr, tc): the reference transform of a single-cell
+ * cut (the cut cell to an off-sheet park) and of the paste that lands it (the
+ * park to the destination). Only a single reference follows the cell; a range
+ * keeps its rectangle, as it does across a sort, so both its corners are copied
+ * unchanged. Other text is copied as it is. Writes out and returns 1 if it
+ * differs from src, 0 if not, or -1 on overflow. */
+static int
+tbl_remap_cell_formula(const char *src, long fr, int fc, long tr, int tc,
+    char *out, size_t outsz)
+{
+	size_t i = 0, o = 0;
+	int changed = 0;
+
+	while (src[i]) {
+		char id1[TBL_LABEL_MAX + 12];
+		size_t start = i, k;
+		int c1, c2;
+		long r1, r2;
+		char *end;
+
+		if (isdigit((unsigned char)src[i]) ||
+		    (src[i] == '.' && isdigit((unsigned char)src[i + 1]))) {
+			strtod(src + i, &end);	/* copy a whole number intact */
+			while (src + i < end) {
+				if (o + 1 >= outsz)
+					return -1;
+				out[o++] = src[i++];
+			}
+			continue;
+		}
+		if (!isalpha((unsigned char)src[i]) && src[i] != '_') {
+			if (o + 1 >= outsz)
+				return -1;
+			out[o++] = src[i++];
+			continue;
+		}
+		for (k = 0; (isalnum((unsigned char)src[i]) || src[i] == '_') &&
+		    k + 1 < sizeof(id1); k++)
+			id1[k] = src[i++];
+		id1[k] = '\0';
+		if (tbl_ref_parse(id1, &c1, &r1) == 0 && src[i] == ':') {
+			size_t j = i + 1, m = 0;	/* a range: copy it whole */
+			char id2[TBL_LABEL_MAX + 12];
+
+			while ((isalnum((unsigned char)src[j]) ||
+			    src[j] == '_') && m + 1 < sizeof(id2))
+				id2[m++] = src[j++];
+			id2[m] = '\0';
+			if (tbl_ref_parse(id2, &c2, &r2) == 0) {
+				if (o + (j - start) >= outsz)
+					return -1;
+				memcpy(out + o, src + start, j - start);
+				o += j - start;
+				i = j;
+				continue;
+			}
+		}
+		if (tbl_ref_parse(id1, &c1, &r1) == 0 && c1 == fc && r1 == fr) {
+			changed = 1;
+			if (tbl_reloc_emit(out, outsz, &o, tc, tr) < 0)
+				return -1;
+			continue;
+		}
+		if (o + k >= outsz)
+			return -1;
+		memcpy(out + o, id1, k);	/* a name or a non-matching reference */
+		o += k;
+	}
+	if (o >= outsz)
+		return -1;
+	out[o] = '\0';
+	return changed;
+}
+
+/* Remap every formula's references to the cell (fr, fc) onto (tr, tc). A cell
+ * cut parks its references off-sheet with this; the paste that lands the cell
+ * un-parks them onto the destination. Runs inside the caller's undo group. A
+ * no-op when formulas are off. */
+static void
+tbl_remap_cell(Editor *e, long fr, int fc, long tr, int tc)
+{
+	size_t nl = text_lines(e->t), y;
+
+	if (!e->tbl_formulas)
+		return;
+	for (y = 0; y < nl; y++) {
+		size_t off, len;
+		int nf = tbl_cell_off(e, y, 0, &off, &len), col;
+
+		for (col = 0; col < nf; col++) {
+			char cell[TBL_CELL_MAX], out[TBL_CELL_MAX];
+
+			tbl_cell_value(e, y, col, cell, sizeof(cell));
+			if (cell[0] != '=')
+				continue;
+			if (tbl_remap_cell_formula(cell, fr, fc, tr, tc,
+			    out, sizeof(out)) == 1)
+				tbl_cell_replace_raw(e, y, col, out, strlen(out));
+		}
+	}
+}
+
 /* Shift a formula's references by dr rows and dc columns, for a relative cell
  * paste: a formula copied from one cell and pasted into another takes its
  * references along, so they point at cells in the same relative place. Each
@@ -15157,8 +15261,7 @@ tbl_key(Editor *e, const struct tkbd_seq *seq)
 			tbl_copy_cell(e);
 			return REQ_CONTINUE;
 		case TKBD_KEY_X:
-			tbl_copy_cell(e);
-			tbl_set_cell(e, e->cy, tb->cx, "", 0);
+			tbl_cut_cell(e);
 			return REQ_CONTINUE;
 		case TKBD_KEY_V:
 			tbl_paste_cell(e);
@@ -15483,30 +15586,59 @@ tbl_copy_cell(Editor *e)
 	set_status(e, "copied the cell");
 }
 
-/* Paste the clipboard into the current cell, as one value. A formula copied
- * from a known cell has its references shifted by how far it moved, so it
- * points at cells in the same relative place; a reference pushed off the top or
- * left edge becomes #REF!. A paste from outside the table is set verbatim. */
+/* Cut the current cell: copy it, then clear it and park every reference to it
+ * off-sheet (reading #REF! meanwhile) so a later paste lands the cell and
+ * carries those references to it, a move. One undo step. */
+static void
+tbl_cut_cell(Editor *e)
+{
+	long r = (long)e->cy;
+	int c = e->tbl->cx;
+
+	tbl_copy_cell(e);		/* records the source and sets clip_tbl_src */
+	e->clip_tbl_cut = 1;		/* a cut: a later paste is a move */
+	text_undo_group_begin(e->t);
+	tbl_set_cell(e, (size_t)r, c, "", 0);
+	tbl_remap_cell(e, r, c, TBL_MOVE_PARK, 0);
+	text_undo_group_end(e->t);
+	set_status(e, "cut the cell (Ctrl+V pastes it back)");
+}
+
+/* Paste the clipboard into the current cell, as one value. A cell cut from the
+ * table lands here unchanged, and the references that pointed at it follow from
+ * their off-sheet park to this cell, a move. A cell copied from the table has
+ * its references shifted by how far it moved, so it points at cells in the same
+ * relative place; a reference pushed off the top or left edge becomes #REF!. A
+ * paste from outside the table is set verbatim. */
 static void
 tbl_paste_cell(Editor *e)
 {
 	char val[TBL_CELL_MAX], out[TBL_CELL_MAX];
+	long dr = (long)e->cy;
+	int dc = e->tbl->cx;
 	size_t n;
 
 	if (!e->clip || e->clip_len == 0) {
 		set_status(e, "nothing to paste");
 		return;
 	}
+	if (e->clip_tbl_cut) {		/* a move: land the cell, un-park its refs */
+		text_undo_group_begin(e->t);
+		tbl_set_cell(e, (size_t)dr, dc, e->clip, e->clip_len);
+		tbl_remap_cell(e, TBL_MOVE_PARK, 0, dr, dc);
+		text_undo_group_end(e->t);
+		return;
+	}
 	n = e->clip_len < sizeof(val) ? e->clip_len : sizeof(val) - 1;
 	memcpy(val, e->clip, n);
 	val[n] = '\0';
 	if (e->clip_tbl_src && val[0] == '=' &&
-	    tbl_cell_shift_formula(val, (long)e->cy - e->clip_tbl_row,
-	        (long)e->tbl->cx - e->clip_tbl_col, out, sizeof(out)) == 1) {
-		tbl_set_cell(e, e->cy, e->tbl->cx, out, strlen(out));
+	    tbl_cell_shift_formula(val, dr - e->clip_tbl_row,
+	        (long)dc - e->clip_tbl_col, out, sizeof(out)) == 1) {
+		tbl_set_cell(e, (size_t)dr, dc, out, strlen(out));
 		return;
 	}
-	tbl_set_cell(e, e->cy, e->tbl->cx, e->clip, e->clip_len);
+	tbl_set_cell(e, (size_t)dr, dc, e->clip, e->clip_len);
 }
 
 /* Repeat the last search in direction dir and land on the cell. */

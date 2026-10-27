@@ -73,9 +73,10 @@ annotated tag (`git tag -n99 v1.6.0`), which is what the release page shows.
   across rows and columns (a relative paste); one pushed off the top or left
   edge becomes `#REF!`. A formula pasted from outside the table keeps its text
   as written.
-- Cutting rows and pasting them is a move: a formula that referenced a cut cell
-  follows it to where the rows land instead of breaking. The reference reads
-  `#REF!` between the cut and the paste, while the rows are in flight.
+- Cutting and pasting, whether rows or a single cell, is a move: a formula that
+  referenced a cut cell follows it to where it lands instead of breaking, and a
+  cut formula keeps its own references. The reference reads `#REF!` between the
+  cut and the paste, while the data is in flight.
 - The command language gains a `menu TITLE LABEL BODY ...` verb: it lists the
   labels and runs the chosen entry's program, so a keymap can build its own menu
   with no change to the editor.

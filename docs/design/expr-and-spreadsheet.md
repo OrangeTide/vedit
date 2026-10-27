@@ -213,6 +213,14 @@ specific and is most of the work:
   references reading `#REF!`. The park is far past any real row, so the window is
   robust for the usual cut-then-paste; a structural edit between the two can
   strand a parked reference.
+- A single-cell cut and paste is a move the same way (`tbl_cut_cell`,
+  `tbl_paste_cell` when `clip_tbl_cut` is set). Clearing a cell changes no grid
+  structure, so the move is just a remap of one cell address: references pointing
+  exactly at the cut cell park off-sheet and the paste brings them to the cell's
+  new address (`tbl_remap_cell`, `tbl_remap_cell_formula`). Only a single
+  reference follows; a range keeps its rectangle. The landed cell keeps its own
+  references as written, so a cut formula does not shift the way a copied one
+  does.
 
 Sharing the evaluator saves perhaps a fifth of the spreadsheet effort. The
 engine, the cache, the dependency order, and reference adjustment are the rest.
@@ -247,9 +255,10 @@ language (whose values are `long` today through `clv_arg_int`) and the sheet
   (`tbl_reloc`), on sort (`tbl_sort_reloc`), on a row paste (`tbl_reloc` for the
   rest of the sheet and `tbl_paste_shift` for the relative shift of the pasted
   rows), on a cell paste (`tbl_cell_shift_formula`, a relative shift on both
-  axes), and as a move on a row cut and paste (`tbl_move_formula`, references to
-  cut cells parking off-sheet until the paste lands them), rewriting the formula
-  text in place within the edit's undo step. Still to come: a value cache,
+  axes), and as a move on a cut and paste of rows (`tbl_move_formula`) or a cell
+  (`tbl_remap_cell_formula`), references to the cut cells parking off-sheet until
+  the paste lands them, rewriting the formula text in place within the edit's
+  undo step. Still to come: a value cache,
   incremental recalc, string formulas, and `EVAL` with the restricted formula
   context.
 - Gating. `expr_*` stays ungated and small, so the `expr` verb works in builds
