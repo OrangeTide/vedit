@@ -100,12 +100,13 @@ once a build has produced output.
 
 ## Help
 
-- **F1** shows the key bindings of the active personality. Up and Down
-  scroll it, PgUp, PgDn, and Space page, Home and End jump, and Esc,
-  Enter, or `q` returns.
-- **Help > Tutorial**, or `t` on the F1 screen, opens the built-in
-  walkthroughs: draw mode, terminal buffers, the art view, the table view,
-  and crash recovery.
+- **F1** opens the key bindings of the active personality as a read-only
+  `*Help*` buffer. The ordinary editing commands move through it: the arrows
+  and PgUp/PgDn scroll, Home/End and Ctrl+Home/End jump, and a split shows it
+  beside your file. F8 switches to the next buffer and back; in the vi
+  personality `:bd` closes it.
+- **Help > Tutorial** opens the built-in walkthroughs: draw mode, terminal
+  buffers, the art view, the table view, and crash recovery.
 - **Help > About** shows the version.
 
 ## Two sets of keys

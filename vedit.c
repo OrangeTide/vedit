@@ -11177,8 +11177,9 @@ static const char *
 buf_name_at(const Editor *e, int i)
 {
 	if (i == e->cur && !e->view_swap)
-		return e->has_name ? e->path : "Untitled";
-	return e->bufs[i].has_name ? e->bufs[i].path : "Untitled";
+		return e->has_name ? e->path : (e->label[0] ? e->label : "Untitled");
+	return e->bufs[i].has_name ? e->bufs[i].path :
+	    (e->bufs[i].label[0] ? e->bufs[i].label : "Untitled");
 }
 
 #ifdef VEDIT_TERM
@@ -22861,62 +22862,8 @@ dlg_tutorial(Editor *e)
 		dlg_tutorial_show(e, &g_tutorials[chosen]);
 }
 
-static int
-help_frame_key(Editor *e, UiFrame *f, const Event *ev)
-{
-	PagerCtx *pg = (PagerCtx *)&f->ctx;
-	int body = (e->rows > 0 ? e->rows : 24) - 2;
-
-	if (ev->type != EVENT_KEY || ev->key.type != TKBD_KEY)
-		return 0;
-	if (pager_scroll_key(e, pg, ev->key.key))
-		return 0;
-	if (ev->key.key == TKBD_KEY_ESC || ev->key.key == TKBD_KEY_ENTER)
-		return 1;
-	if (ev->key.ch == 't' || ev->key.ch == 'T') {
-		dlg_tutorial(e);	/* a tutorial frame stacks over the help */
-		return 0;
-	}
-	if (ev->key.ch == ' ') {
-		pg->top += body;	/* Space pages down */
-		return 0;
-	}
-	if (ev->key.ch == 'q' || ev->key.ch == 'Q' ||
-	    ev->key.ch == '\r' || ev->key.ch == '\n')
-		return 1;
-	return 0;
-}
-
-/* Show the scrollable key-bindings screen. Up/Down and PgUp/PgDn (or Space)
- * scroll, Home/End jump, 't' opens the tutorial, and Esc, q, or Enter returns. */
-static void
-dlg_help(Editor *e)
-{
-	int vi = e->mode != MODE_MODELESS;
-	int base = e->ui_depth;
-	UiFrame *f;
-	PagerCtx *pg;
-
-	f = ui_push(e, UI_PAGER, pager_frame_draw, help_frame_key, NULL);
-	if (!f)
-		return;
-	pg = (PagerCtx *)&f->ctx;
-	pg->footer = " Up/Down PgUp/PgDn scroll   t tutorial   Esc returns";
-	pg->top = 0;
-	if (e->kb_map) {		/* a custom keymap shows its own help */
-		snprintf(pg->hdr, sizeof(pg->hdr), " vedit -- %s key bindings",
-		    e->kb_modes[e->kb_cur]);
-		pg->line = kb_help_line;
-		pg->n = kb_help_count(e);
-	} else {
-		snprintf(pg->hdr, sizeof(pg->hdr), "%s",
-		    vi ? " vedit -- vi key bindings" : " vedit -- key bindings");
-		pg->line = help_line;
-		pg->n = vi ? HELP_VI_COUNT : HELP_COUNT;
-	}
-	pg->line_ctx = NULL;
-	ui_pump_modal(e, base);
-}
+/* dlg_help opens the key bindings as a read-only "*Help*" buffer. It is defined
+ * near vcs_open_text, the shared helper for synthetic read-only buffers. */
 
 /****************************************************************
  * Menu bar actions and the pull-down modal loop
@@ -34156,6 +34103,68 @@ vcs_open_text(Editor *e, const char *text, size_t len, const char *label,
 	e->cy = e->cx = e->top = e->left = 0;
 	buf_save(e, &e->bufs[e->cur]);
 	return i;
+}
+
+/* Build the active personality's key-binding help, one "keys  description" row
+ * per line, into b. Reuses the help_line / kb_help_line formatters so the help
+ * buffer and any other help path render identically. */
+static void
+help_text_build(Editor *e, struct fmtbuf *b)
+{
+	const char *(*line)(Editor *, void *, int) =
+	    e->kb_map ? kb_help_line : help_line;
+	int n = e->kb_map ? kb_help_count(e) :
+	    (e->mode != MODE_MODELESS ? HELP_VI_COUNT : HELP_COUNT);
+	int i;
+
+	for (i = 0; i < n; i++) {
+		const char *s = line(e, NULL, i);
+		char row[160];
+		int m = snprintf(row, sizeof(row), "%s\n", s ? s : "");
+
+		if (m > 0)
+			fmt_emit(b, row, (size_t)m);
+	}
+}
+
+/* Help > Key Bindings and F1: show the key bindings as a read-only "*Help*"
+ * buffer, so the ordinary editing commands scroll, split, and close it. A help
+ * buffer already open is refreshed in place rather than stacked, which also
+ * picks up a mode or keymap change since it was last shown. */
+static void
+dlg_help(Editor *e)
+{
+	struct fmtbuf b = { NULL, 0, 0, 0 };
+	int i;
+
+	help_text_build(e, &b);
+	if (b.oom) {
+		free(b.buf);
+		set_status(e, "out of memory building help");
+		return;
+	}
+	for (i = 0; i < e->nbuf; i++) {	/* a help buffer is open: refresh it */
+		const char *l = i == e->cur ? e->label : e->bufs[i].label;
+
+		if (strcmp(l, "*Help*") == 0)
+			break;
+	}
+	if (i < e->nbuf) {
+		buf_switch(e, i);
+		e->t->readonly = 0;
+		text_load_mem(e->t, b.buf ? b.buf : "", b.len);
+		e->t->dirty = 0;
+		e->t->readonly = 1;
+		e->syn = NULL;
+		e->hl_valid = 0;
+		e->cy = e->cx = e->top = e->left = 0;
+		buf_save(e, &e->bufs[e->cur]);
+	} else {
+		vcs_open_text(e, b.buf ? b.buf : "", b.len, "*Help*", "");
+	}
+	set_status(e, "key bindings (read-only; F8 switches away%s)",
+	    e->mode != MODE_MODELESS ? ", :bd closes" : "");
+	free(b.buf);
 }
 
 /* Open rev's diff of path (vcs.<name>.show) as a read-only buffer named

@@ -4326,7 +4326,7 @@ t_mail_more(Test *t)
 static void
 t_help_scroll(Test *t)
 {
-	const char keys[] = "\033OQ\033OP      ";	/* F2, F1, six page-downs */
+	const char keys[] = "\033OQ\033OPG";	/* F2, F1, then G to the end */
 	Memio m;
 	struct vedit_io io;
 	struct vedit *v;
@@ -4336,8 +4336,9 @@ t_help_scroll(Test *t)
 	v = vedit_new(&io);
 	TAP_ASSERT(t, v != NULL);
 	vedit_run(v);
-	/* ":reload" is one of the last vi-help rows, off the first screen at 12
-	 * rows, so seeing it proves both the vi table and the scrolling. */
+	/* Help is now a read-only buffer, so ordinary motions scroll it. ":reload"
+	 * is one of the last vi-help rows, off the first screen at 12 rows, so G
+	 * reaching it proves both the vi table and the buffer scrolling. */
 	TAP_CHECK(t, strstr(m.out, "Edit the config file") != NULL);
 	vedit_free(v);
 	memio_free(&m);
