@@ -152,7 +152,7 @@ that a terminal reports Ctrl-J, Ctrl-M, and Ctrl-I as Enter, Enter, and Tab, so
 bind those three by their key names, not as `^J`, `^M`, or `^I`.
 
 A few editor-wide keys stay fixed in every mode, so a keymap does not bind them:
-F2 (cycle modes), F6 (other pane), F8 and Shift-F8 (next and previous buffer),
+F2 (cycle modes), F6 (other pane), F8 (last-used buffer), Alt-1..9 (buffer N),
 Ctrl-W (the pane prefix), Ctrl-] (jump to the tag under the cursor), the build
 keys (chapter 8), F10 and Alt+letter (the menu bar), and the mouse. Everything
 else is the mode's to claim. The built-in `msedit` and `vi` keys are still

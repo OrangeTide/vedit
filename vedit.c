@@ -8241,6 +8241,8 @@ typedef struct editor {
 	int		nbuf;		/* number of open buffers */
 	int		bufs_cap;	/* allocated slots in bufs */
 	int		cur;		/* index of the active buffer */
+	int		alt_buf;	/* last-used other buffer, or -1; the
+					 * F8 / Ctrl-Tab toggle target */
 	Text	*t;
 	char		path[PATH_MAX];
 	int		has_name;
@@ -8608,6 +8610,7 @@ int buf_open(Editor *e, const char *path);	/* open/switch; index or -1 */
 static int buf_same_file(const char *a, const char *b);
 void buf_switch(Editor *e, int i);
 int buf_cycle(Editor *e, int dir);		/* next/prev; new index */
+void buf_alt_toggle(Editor *e);			/* F8 / Ctrl-Tab: last-used buffer */
 int buf_close(Editor *e, int i);			/* 0 ok, -1 refused */
 void buf_list(Editor *e);			/* summarize into status */
 static int dlg_save_file(Editor *e, char *out, size_t outsz);
@@ -11529,7 +11532,7 @@ thumb_index(size_t off, size_t max_off, int span)
 typedef enum menu_act {
 	MA_NONE, MA_SEP,
 	MA_NEW, MA_OPEN, MA_SAVE, MA_SAVE_AS,
-	MA_BUF_NEXT, MA_BUF_PREV, MA_BUF_LIST, MA_EXIT,
+	MA_BUF_ALT, MA_BUF_NEXT, MA_BUF_PREV, MA_BUF_LIST, MA_EXIT,
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE, MA_OSC_COPY, MA_OSC_COPY_FILE,
 	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_TAG_POP, MA_OPEN_HEADER,
 	MA_GOTO,
@@ -11648,8 +11651,9 @@ static const Menuitem mi_file[] = {
 	{ "&Save",	"Ctrl+S",	":w",	MA_SAVE },
 	{ "Save &As...","",		"",	MA_SAVE_AS },
 	{ "",		"",		"",	MA_SEP },
-	{ "Next &Buffer","F8",		":bn",	MA_BUF_NEXT },
-	{ "&Prev Buffer","Shift+F8",	":bp",	MA_BUF_PREV },
+	{ "&Switch Buffer","F8",	"",	MA_BUF_ALT },
+	{ "Next &Buffer","",		":bn",	MA_BUF_NEXT },
+	{ "&Prev Buffer","",		":bp",	MA_BUF_PREV },
 	{ "Buffer &List","",		"",	MA_BUF_LIST },
 	{ "",		"",		"",	MA_SEP },
 	{ "E&xit",	"Ctrl+Q",	":q",	MA_EXIT },
@@ -22266,7 +22270,7 @@ static const struct {
 	{ "F10 / Alt+letter",	"Open the menu bar (View/Edit options live there)" },
 	{ "F1",			"Show this help" },
 	{ "F2",			"Toggle vi keys (modal editing)" },
-	{ "F8 / Shift+F8",	"Next / previous open buffer" },
+	{ "F8  Alt-1..9",	"Switch to the last-used buffer / go to buffer N" },
 	{ "Ctrl-W s / v  F6",	"Split the text in two panes, stacked / side by side; F6 other pane" },
 	{ "Ctrl-W w h j k l",	"Other pane / the pane left, below, above, right of this one" },
 	{ "Ctrl-W c / o",	"Close this pane / close the other pane" },
@@ -22327,7 +22331,8 @@ static const struct {
 #ifndef VEDIT_NO_TAGS
 	{ "gf",			"Open the header or file named under the cursor" },
 #endif
-	{ ":bn :bp :bd :ls",	"Next / prev / delete / list buffers (also F8)" },
+	{ ":bn :bp :bd :ls",	"Next / prev / delete / list buffers" },
+	{ "F8  Alt-1..9",	"Switch to the last-used buffer / go to buffer N" },
 	{ ":set nu wrap list",	"Toggle line numbers, word wrap, show-tabs" },
 	{ ":set sl=plain|powerline",	"Status bar style (View > Status Line cycles)" },
 	{ ":set mouse",		"Click to place the cursor, wheel to scroll (View menu)" },
@@ -22529,8 +22534,8 @@ static const char *const tut_term[] = {
 	"",
 	"  - Terminal > New Terminal, or the vi command :terminal, opens",
 	"    a buffer running your login shell. :terminal CMD runs CMD.",
-	"  - The new terminal becomes the current buffer. F8 and Shift+F8",
-	"    cycle between it and your files like any other buffer.",
+	"  - The new terminal becomes the current buffer. F8 switches back",
+	"    to the last-used buffer, and Alt-1..9 reach a buffer by number.",
 	"  - When the program exits, the buffer stays so you can read its",
 	"    last output. Close it with Ctrl-W q.",
 	"  - Make, Compile, and Run (F9, Alt+F9, Ctrl+F9) open a terminal",
@@ -23105,6 +23110,7 @@ buf_switch(Editor *e, int i)
 		return;
 	swap_maybe_write(e);		/* flush the outgoing buffer's swap */
 	buf_save(e, &e->bufs[e->cur]);
+	e->alt_buf = e->cur;		/* the one we leave is the toggle target */
 	e->cur = i;
 	buf_load(e, &e->bufs[i]);
 	vcs_refresh(e);
@@ -23120,6 +23126,21 @@ buf_cycle(Editor *e, int dir)
 	i = ((e->cur + dir) % e->nbuf + e->nbuf) % e->nbuf;
 	buf_switch(e, i);
 	return e->cur;
+}
+
+/* F8 / Ctrl-Tab: toggle to the last-used other buffer. With the alternate
+ * cleared or gone, fall back to the next buffer so the key still moves. */
+void
+buf_alt_toggle(Editor *e)
+{
+	if (e->nbuf <= 1) {
+		set_status(e, "no other buffer");
+		return;
+	}
+	if (e->alt_buf >= 0 && e->alt_buf < e->nbuf && e->alt_buf != e->cur)
+		buf_switch(e, e->alt_buf);
+	else
+		buf_cycle(e, 1);
 }
 
 /* Whether a and b name the same file for buffer de-duplication. When both exist
@@ -23183,6 +23204,7 @@ static void
 buf_install_slot(Editor *e, Text *nt, int i)
 {
 	buf_save(e, &e->bufs[e->cur]);		/* park the current buffer */
+	e->alt_buf = e->cur;			/* opening one makes it the toggle target */
 	e->cur = i;
 	e->t = nt;
 	e->t->owner = e;
@@ -23345,6 +23367,10 @@ buf_close(Editor *e, int i)
 			e->cur--;
 		split_buf_closed(e, i);
 	}
+	if (e->alt_buf == i)		/* the toggle target was closed */
+		e->alt_buf = -1;
+	else if (e->alt_buf > i)	/* its index shifted down */
+		e->alt_buf--;
 	return 0;
 }
 
@@ -34487,6 +34513,9 @@ run_menu_act(Editor *e, Menuact act)
 	case MA_SAVE_AS:
 		ed_save_as(e);
 		break;
+	case MA_BUF_ALT:
+		buf_alt_toggle(e);
+		break;
 	case MA_BUF_NEXT:
 		buf_cycle(e, 1);
 		break;
@@ -35165,7 +35194,8 @@ usage(void)
 	    "  Ctrl-Z / Ctrl-Y  undo / redo\n"
 	    "  Ctrl-S        save (prompts for a name if the buffer has none)\n"
 	    "  Ctrl-Q        quit (prompts if the buffer was modified)\n"
-	    "  F8 / Shift+F8 next / previous open buffer\n"
+	    "  F8            switch to the last-used buffer\n"
+	    "  Alt-1..9      go to buffer N by its position\n"
 	    "  F10 or Alt+letter  open the menu bar\n"
 	    "  Ctrl-W m      open the menu bar from inside a terminal buffer\n"
 	    "  Ctrl-W s/v/w/c  split the text in two panes / other pane / close one\n"
@@ -35986,6 +36016,7 @@ static void
 editor_init(Editor *e)
 {
 	memset(e, 0, sizeof(*e));
+	e->alt_buf = -1;	/* no last-used buffer yet (F8 / Ctrl-Tab target) */
 	e->hl_on = 1;		/* highlight when a file type is recognized */
 	e->show_tabs = 1;	/* show hard tabs by default */
 	e->mouse = mouse_default();
@@ -37393,11 +37424,29 @@ editor_loop(Editor *e)
 			continue;
 		}
 
-		/* F8 cycles to the next open buffer, Shift+F8 to the previous
-		 * one; a no-op while only one file is open. */
-		if (seq.type == TKBD_KEY && seq.key == TKBD_KEY_F8 &&
-		    !(seq.mod & TKBD_MOD_CTRL)) {
-			buf_cycle(e, (seq.mod & TKBD_MOD_SHIFT) ? -1 : 1);
+		/* F8 (and Ctrl-Tab where the terminal sends it) toggles to the
+		 * last-used buffer; Shift does not change it, since the toggle
+		 * has no direction. Ctrl-Tab needs an enhanced-protocol terminal,
+		 * so F8 is the one that always arrives. */
+		if (seq.type == TKBD_KEY &&
+		    (seq.key == TKBD_KEY_F8 ||
+		     (seq.key == TKBD_KEY_TAB && (seq.mod & TKBD_MOD_CTRL)))) {
+			buf_alt_toggle(e);
+			ed_render(e, e->d);
+			continue;
+		}
+
+		/* Alt-1..9 jump to that buffer by its position in the list.
+		 * Not in draw or art mode, where Alt+digit picks a glyph. */
+		if (seq.type == TKBD_KEY && (seq.mod & TKBD_MOD_ALT) &&
+		    seq.ch >= '1' && seq.ch <= '9' &&
+		    !e->draw_mode && !e->art) {
+			int n = seq.ch - '1';
+
+			if (n < e->nbuf)
+				buf_switch(e, n);
+			else
+				set_status(e, "no buffer %d", n + 1);
 			ed_render(e, e->d);
 			continue;
 		}

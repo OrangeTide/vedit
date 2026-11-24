@@ -216,7 +216,8 @@ tab stops and the indent settings.
 | F1 | key bindings |
 | F2 | the vi keys (chapter 7) |
 | F4, Shift-F4, F9, Alt-F9, Ctrl-F9, Alt-F5 | build commands (chapter 8) |
-| F8, Shift-F8 | next and previous buffer |
+| F8 | switch to the last-used buffer |
+| Alt-1..9 | go to buffer N by its position |
 | F10, Alt+letter | the menu bar |
 
 Every other control key and function key does nothing.

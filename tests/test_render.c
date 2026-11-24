@@ -4400,6 +4400,72 @@ t_tutorial_buffer(Test *t)
 	memio_free(&m);
 }
 
+/* The F8 / Ctrl-Tab toggle tracks the last-used buffer: opening one makes the
+ * previous one the target, the toggle ping-pongs between the two most recent,
+ * any switch retargets it, and closing the target clears it. */
+static void
+t_buf_alt_toggle(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	buf_slot(&v->e);			/* register buffer 0 (vedit_run does */
+	buf_save(&v->e, &v->e.bufs[0]);		/* this lazily; we skip the run) */
+	v->registered = 1;
+
+	buf_open(&v->e, NULL);			/* buffer B (1) */
+	buf_open(&v->e, NULL);			/* buffer C (2), now current */
+	TAP_CHECKF(t, v->e.nbuf == 3 && v->e.cur == 2, "nbuf %d cur %d",
+	    v->e.nbuf, v->e.cur);
+	TAP_CHECKF(t, v->e.alt_buf == 1, "alt %d", v->e.alt_buf);
+
+	buf_alt_toggle(&v->e);			/* -> B, target becomes C */
+	TAP_CHECKF(t, v->e.cur == 1 && v->e.alt_buf == 2, "cur %d alt %d",
+	    v->e.cur, v->e.alt_buf);
+	buf_alt_toggle(&v->e);			/* -> C again */
+	TAP_CHECK(t, v->e.cur == 2 && v->e.alt_buf == 1);
+
+	buf_switch(&v->e, 0);			/* a jump retargets to the old cur */
+	TAP_CHECK(t, v->e.cur == 0 && v->e.alt_buf == 2);
+	buf_close(&v->e, 2);			/* closing the target clears it */
+	TAP_CHECKF(t, v->e.alt_buf == -1, "alt after close %d", v->e.alt_buf);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
+/* Alt-3 jumps to the third buffer by position, through the real key path. */
+static void
+t_buf_alt_digit(Test *t)
+{
+	const char keys[] = "\0333";	/* Alt-3 (ESC then '3') */
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, keys, sizeof(keys) - 1, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	buf_slot(&v->e);			/* register buffer 0 before adding */
+	buf_save(&v->e, &v->e.bufs[0]);
+	v->registered = 1;
+	buf_open(&v->e, NULL);
+	buf_open(&v->e, NULL);			/* 3 buffers */
+	buf_switch(&v->e, 0);			/* start on buffer 1 */
+	TAP_CHECK(t, v->e.cur == 0);
+	vedit_run(v);				/* Alt-3 -> buffer index 2 */
+	TAP_CHECKF(t, v->e.cur == 2, "cur after Alt-3 %d", v->e.cur);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* A pending termination signal unwinds the run like end-of-input: scr_wait
  * reports EOF while g_sig_quit is set, so vedit_run returns promptly. (The
  * command-line handler, self-pipe, and re-raise are CLI-only and not exercised
@@ -5541,6 +5607,8 @@ const Case tap_cases[] = {
 	{ "win_too_small", t_win_too_small },
 	{ "help_scroll", t_help_scroll },
 	{ "tutorial_buffer", t_tutorial_buffer },
+	{ "buf_alt_toggle", t_buf_alt_toggle },
+	{ "buf_alt_digit", t_buf_alt_digit },
 	{ "sig_quit_unwinds", t_sig_quit_unwinds },
 #ifndef VEDIT_NO_TOOLS
 	{ "vcs_status", t_vcs_status },

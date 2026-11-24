@@ -103,7 +103,7 @@ once a build has produced output.
 - **F1** opens the key bindings of the active personality as a read-only
   `*Help*` buffer. The ordinary editing commands move through it: the arrows
   and PgUp/PgDn scroll, Home/End and Ctrl+Home/End jump, and a split shows it
-  beside your file. F8 switches to the next buffer and back; in the vi
+  beside your file. F8 switches to the last-used buffer and back; in the vi
   personality `:bd` closes it.
 - **Help > Tutorial** opens the built-in walkthroughs: draw mode, terminal
   buffers, the art view, the table view, and crash recovery. Each one opens as

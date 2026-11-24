@@ -47,7 +47,10 @@ prompt if it has unsaved changes. To keep the current file open as well,
 use `:e name` or `:enew` in the vi keys (chapter 7). Each open file is
 then a buffer, and one buffer is shown at a time.
 
-- **F8** switches to the next buffer and **Shift-F8** to the previous one.
+- **F8** (and **Ctrl-Tab** where the terminal sends it) switches to the
+  last-used buffer, and pressing it again returns, so it flips between the
+  two you are working in. **Alt-1** through **Alt-9** go to a buffer by its
+  position. `:bn` and `:bp` step to the next and previous in order.
 - **File > Buffer List** lists them: the buffer number, a `*` on the
   current one, the name, `[+]` when it has unsaved changes, and the line
   count. Move with the arrows, or type a digit to jump to that buffer
