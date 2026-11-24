@@ -4466,6 +4466,36 @@ t_buf_alt_digit(Test *t)
 	memio_free(&m);
 }
 
+/* File > Close Buffer (MA_BUF_CLOSE) closes the current buffer, works in the
+ * modeless keys where there is no :bd, and refuses the last buffer. */
+static void
+t_buf_close_menu(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	buf_slot(&v->e);
+	buf_save(&v->e, &v->e.bufs[0]);
+	v->registered = 1;
+	buf_open(&v->e, NULL);			/* a second buffer, now current */
+	TAP_CHECK(t, v->e.nbuf == 2 && v->e.mode == MODE_MODELESS);
+
+	run_menu_act(&v->e, MA_BUF_CLOSE);	/* clean buffer closes with no prompt */
+	TAP_CHECKF(t, v->e.nbuf == 1, "nbuf after close %d", v->e.nbuf);
+
+	run_menu_act(&v->e, MA_BUF_CLOSE);	/* the last buffer cannot be closed */
+	TAP_CHECKF(t, v->e.nbuf == 1, "nbuf after last close %d", v->e.nbuf);
+	TAP_CHECK(t, strstr(v->e.status, "last buffer") != NULL);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* With several buffers open the top border carries the numbered tab strip in
  * place of the centered title; a click on a tab switches to it, and turning the
  * strip off restores the [n/m] title. */
@@ -5669,6 +5699,7 @@ const Case tap_cases[] = {
 	{ "tutorial_buffer", t_tutorial_buffer },
 	{ "buf_alt_toggle", t_buf_alt_toggle },
 	{ "buf_alt_digit", t_buf_alt_digit },
+	{ "buf_close_menu", t_buf_close_menu },
 	{ "bufbar", t_bufbar },
 	{ "sig_quit_unwinds", t_sig_quit_unwinds },
 #ifndef VEDIT_NO_TOOLS

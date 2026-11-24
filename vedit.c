@@ -11533,7 +11533,7 @@ thumb_index(size_t off, size_t max_off, int span)
 typedef enum menu_act {
 	MA_NONE, MA_SEP,
 	MA_NEW, MA_OPEN, MA_SAVE, MA_SAVE_AS,
-	MA_BUF_ALT, MA_BUF_NEXT, MA_BUF_PREV, MA_BUF_LIST, MA_EXIT,
+	MA_BUF_ALT, MA_BUF_NEXT, MA_BUF_PREV, MA_BUF_LIST, MA_BUF_CLOSE, MA_EXIT,
 	MA_UNDO, MA_REDO, MA_CUT, MA_COPY, MA_PASTE, MA_OSC_COPY, MA_OSC_COPY_FILE,
 	MA_FIND, MA_FIND_NEXT, MA_REPLACE, MA_SYMBOL, MA_TAG_POP, MA_OPEN_HEADER,
 	MA_GOTO,
@@ -11657,6 +11657,7 @@ static const Menuitem mi_file[] = {
 	{ "Next &Buffer","",		":bn",	MA_BUF_NEXT },
 	{ "&Prev Buffer","",		":bp",	MA_BUF_PREV },
 	{ "Buffer &List","",		"",	MA_BUF_LIST },
+	{ "&Close Buffer","",		":bd",	MA_BUF_CLOSE },
 	{ "",		"",		"",	MA_SEP },
 	{ "E&xit",	"Ctrl+Q",	":q",	MA_EXIT },
 };
@@ -23493,6 +23494,31 @@ buf_close(Editor *e, int i)
 	return 0;
 }
 
+/* Close the current buffer from a menu or key, prompting to save a modified
+ * text buffer first (the same Yes/No/Cancel question File > Exit uses). The
+ * last buffer cannot be closed. */
+static void
+ed_buf_close(Editor *e)
+{
+	const char *name, *slash;
+	char msg[96];
+
+	if (e->nbuf <= 1) {
+		set_status(e, "cannot close the last buffer");
+		return;
+	}
+	if (buf_kind_at(e, e->cur) == BUF_TEXT && text_dirty(e->t)) {
+		name = buf_name_at(e, e->cur);
+		slash = strrchr(name, '/');
+		snprintf(msg, sizeof(msg), "Save changes to %.40s before closing?",
+		    slash ? slash + 1 : name);
+		if (!dlg_confirm_save(e, msg))
+			return;			/* cancelled, or the save failed */
+	}
+	if (buf_close(e, e->cur) < 0)
+		set_status(e, "cannot close the last buffer");
+}
+
 void
 buf_list(Editor *e)
 {
@@ -34072,12 +34098,12 @@ synth_text_buffer(Editor *e, const char *text, size_t len, const char *label,
 	}
 }
 
-/* The closing hint for a synthetic buffer, mode-aware: modeless has no ex line
- * so no :bd. */
+/* The closing hint for a synthetic buffer, mode-aware: the vi keys close it
+ * with :bd, the modeless keys from the File menu. */
 static const char *
 synth_close_hint(const Editor *e)
 {
-	return e->mode != MODE_MODELESS ? ", :bd closes" : "";
+	return e->mode != MODE_MODELESS ? ", :bd closes" : ", File > Close";
 }
 
 /* Help > Key Bindings and F1: show the key bindings as a read-only "*Help*"
@@ -34643,6 +34669,9 @@ run_menu_act(Editor *e, Menuact act)
 		break;
 	case MA_BUF_LIST:
 		dlg_buffer_pick(e);
+		break;
+	case MA_BUF_CLOSE:
+		ed_buf_close(e);
 		break;
 	case MA_EXIT:
 		if (quit_confirm_all(e))

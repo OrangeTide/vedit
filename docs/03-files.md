@@ -60,8 +60,9 @@ buftabs` in the vi keys, turns the strip off.
   current one, the name, `[+]` when it has unsaved changes, and the line
   count. Move with the arrows, or type a digit to jump to that buffer
   number, then Enter switches to it.
-- `:bd` in the vi keys closes the current buffer. Quitting closes them
-  all.
+- **File > Close Buffer**, or `:bd` in the vi keys, closes the current
+  buffer. A modified file is offered the same save prompt as Exit first.
+  The last buffer cannot be closed; quitting closes them all.
 
 `:e` of a file that is already open, even under another spelling (a
 symlink, a `./` or `../` detour, or a hard link), switches to the existing
