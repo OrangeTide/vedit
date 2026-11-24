@@ -4466,6 +4466,66 @@ t_buf_alt_digit(Test *t)
 	memio_free(&m);
 }
 
+/* With several buffers open the top border carries the numbered tab strip in
+ * place of the centered title; a click on a tab switches to it, and turning the
+ * strip off restores the [n/m] title. */
+static void
+t_bufbar(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	struct tkbd_seq ev;
+	Scrbuf *sb;
+	int c, top, found1 = 0, found2 = 0, foundbr = 0;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	buf_slot(&v->e);			/* register buffer 0 (see above) */
+	buf_save(&v->e, &v->e.bufs[0]);
+	v->registered = 1;
+	buf_open(&v->e, NULL);			/* a second buffer, now current */
+	TAP_CHECK(t, v->e.nbuf == 2 && v->e.buf_tabs == 1 && v->e.cur == 1);
+
+	top = CHROME_TOP - 1;
+	ed_render(&v->e, v->e.d);
+	sb = v->e.d->t;
+	for (c = 0; c < v->e.cols; c++) {
+		uint32_t ch = sb->cur[(size_t)top * sb->cols + c].codepoint;
+
+		if (ch == '1')
+			found1 = 1;
+		if (ch == '2')
+			found2 = 1;
+	}
+	TAP_CHECKF(t, found1 && found2, "tab numbers on border 1=%d 2=%d",
+	    found1, found2);
+
+	/* a left click within tab 1's cell (col 2 lands on its number) switches */
+	v->e.mouse = 1;
+	memset(&ev, 0, sizeof(ev));
+	ev.type = TKBD_MOUSE;
+	ev.key = TKBD_MOUSE_LEFT;
+	ev.x = 2;
+	ev.y = top;
+	ed_mouse_event(&v->e, &ev);
+	TAP_CHECKF(t, v->e.cur == 0, "click switched to buffer %d", v->e.cur);
+
+	/* turning the strip off brings back the centered [n/m] title */
+	v->e.buf_tabs = 0;
+	ed_render(&v->e, v->e.d);
+	sb = v->e.d->t;
+	for (c = 0; c < v->e.cols; c++)
+		if (sb->cur[(size_t)top * sb->cols + c].codepoint == '[')
+			foundbr = 1;
+	TAP_CHECK(t, foundbr);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* A pending termination signal unwinds the run like end-of-input: scr_wait
  * reports EOF while g_sig_quit is set, so vedit_run returns promptly. (The
  * command-line handler, self-pipe, and re-raise are CLI-only and not exercised
@@ -5609,6 +5669,7 @@ const Case tap_cases[] = {
 	{ "tutorial_buffer", t_tutorial_buffer },
 	{ "buf_alt_toggle", t_buf_alt_toggle },
 	{ "buf_alt_digit", t_buf_alt_digit },
+	{ "bufbar", t_bufbar },
 	{ "sig_quit_unwinds", t_sig_quit_unwinds },
 #ifndef VEDIT_NO_TOOLS
 	{ "vcs_status", t_vcs_status },

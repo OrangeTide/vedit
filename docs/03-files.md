@@ -47,6 +47,11 @@ prompt if it has unsaved changes. To keep the current file open as well,
 use `:e name` or `:enew` in the vi keys (chapter 7). Each open file is
 then a buffer, and one buffer is shown at a time.
 
+With more than one buffer open, the top border shows a numbered tab strip,
+one cell per buffer with the current one highlighted. The numbers match
+Alt+N, and a click on a tab switches to it. View > Buffer Tabs, or `:set
+buftabs` in the vi keys, turns the strip off.
+
 - **F8** (and **Ctrl-Tab** where the terminal sends it) switches to the
   last-used buffer, and pressing it again returns, so it flips between the
   two you are working in. **Alt-1** through **Alt-9** go to a buffer by its

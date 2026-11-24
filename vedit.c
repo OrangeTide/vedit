@@ -8308,6 +8308,7 @@ typedef struct editor {
 	int		show_lineno;	/* draw the line-number gutter */
 	int		wrap;		/* soft-wrap long lines to the window width */
 	int		show_tabs;	/* draw a guide glyph at each hard tab */
+	int		buf_tabs;	/* show the buffer-tab strip when >1 buffer */
 	int		mouse;		/* act on mouse reports (and ask for them) */
 	int		mouse_drag;	/* MDRAG_*: what the held button drags */
 	int		msb_r0;		/* dragged scrollbar: first track cell (row/col) */
@@ -11546,7 +11547,8 @@ typedef enum menu_act {
 	MA_TBL_ROWADD, MA_TBL_ROWDEL, MA_TBL_COLADD, MA_TBL_COLDEL, MA_TBL_FIT,
 	MA_TBL_COLCOPY, MA_TBL_COLCUT, MA_TBL_COLPASTE,
 	MA_SORT, MA_INS_DATE, MA_INS_FILE,
-	MA_SHOW_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS, MA_MOUSE, MA_STATUSLINE,
+	MA_SHOW_TABS, MA_BUF_TABS, MA_AUTO_INDENT, MA_EXPAND_TABS, MA_MOUSE,
+	MA_STATUSLINE,
 	MA_TABS_TO_SPACES, MA_SPACES_TO_TABS, MA_REFLOW, MA_TEXTWIDTH,
 	MA_VI_MODE, MA_EDIT_CONFIG, MA_RELOAD_CONFIG,
 #ifdef VEDIT_GLYPHS
@@ -11714,6 +11716,7 @@ static const Menuitem mi_view[] = {
 	{ "&Word Wrap",		"",	":set wrap",	MA_WRAP },
 	{ "Line &Endings",	"",	":set ff=",	MA_EOL },
 	{ "Show &Tabs",		"",	":set list",	MA_SHOW_TABS },
+	{ "&Buffer Tabs",	"",	":set buftabs",	MA_BUF_TABS },
 #ifndef VEDIT_NO_MOUSE
 	{ "&Mouse",		"",	":set mouse",	MA_MOUSE },
 #endif
@@ -12064,6 +12067,8 @@ menu_checked(const Editor *e, Menuact act)
 		return e->wrap ? 1 : 0;
 	case MA_SHOW_TABS:
 		return e->show_tabs ? 1 : 0;
+	case MA_BUF_TABS:
+		return e->buf_tabs ? 1 : 0;
 	case MA_AUTO_INDENT:
 		return e->auto_indent ? 1 : 0;
 	case MA_EXPAND_TABS:
@@ -12367,6 +12372,108 @@ dlg_palette(const Editor *e, Color *fg, Color *bg,
 	*base = p->reverse_bars ? ATTR_REVERSE : 0;
 }
 
+#define TAB_NAME_MAX	24	/* longest basename shown on a buffer tab */
+
+/* Whether the buffer-tab strip replaces the centered title: enabled, more than
+ * one buffer, and no split (split_chrome titles each pane on its own). */
+static int
+bufbar_shown(const Editor *e)
+{
+	return e->buf_tabs && e->nbuf > 1 && !split_shown(e);
+}
+
+/* Build buffer i's tab label, " N name " with a '*' before the name when the
+ * buffer is modified, and return its printed width. The name is the basename,
+ * truncated to TAB_NAME_MAX. */
+static int
+tab_label(const Editor *e, int i, char *out, size_t sz)
+{
+	const char *name = buf_name_at(e, i), *slash = strrchr(name, '/');
+	const Text *t = buf_text_at(e, i);
+
+	if (slash && slash[1])
+		name = slash + 1;
+	return snprintf(out, sz, " %d %s%.*s ", i + 1,
+	    t && text_dirty(t) ? "*" : "", TAB_NAME_MAX, name);
+}
+
+/* The printed width of buffer i's tab cell. */
+static int
+tab_cell_width(const Editor *e, int i)
+{
+	char lab[TAB_NAME_MAX + 32];
+
+	return tab_label(e, i, lab, sizeof(lab));
+}
+
+/* Draw the buffer-tab strip on the top border row: one " N name " cell per
+ * buffer, numbered to match Alt-N, the current one reversed. The strip scrolls
+ * horizontally to keep the current tab in view, with '<' / '>' markers when
+ * buffers fall off an end. ed_mouse maps a click on this row back to a buffer
+ * with the same layout. */
+static void
+ui_tabbar(const Editor *e, Screen *d, const Pal *p, int top, Color bg)
+{
+	Color fg = p->frame_fg;
+	char lab[TAB_NAME_MAX + 32];
+	int left = 1, right = e->cols - 1;	/* inside the two corners */
+	int avail = right - left, start, x, i, w;
+
+	if (avail < 4)
+		return;
+
+	/* choose the first visible tab so the current one fits: walk left from
+	 * the current tab while its neighbours still fit the strip */
+	start = e->cur;
+	w = tab_cell_width(e, e->cur);
+	while (start > 0 && w + 1 + tab_cell_width(e, start - 1) <= avail) {
+		start--;
+		w += 1 + tab_cell_width(e, start);
+	}
+
+	if (start > 0)
+		scr_cell(d, top, left, '<', fg, bg, ATTR_BOLD);
+	x = start > 0 ? left + 1 : left;
+	for (i = start; i < e->nbuf; i++) {
+		w = tab_label(e, i, lab, sizeof(lab));
+		if (x + w > right) {		/* ran out of room */
+			scr_cell(d, top, right - 1, '>', fg, bg, ATTR_BOLD);
+			break;
+		}
+		ui_field(d, top, x, w, lab, p->title_fg, bg,
+		    i == e->cur ? (ATTR_BOLD | ATTR_REVERSE) : ATTR_BOLD);
+		x += w + 1;			/* a gap keeps a border cell */
+	}
+}
+
+/* The buffer whose tab cell covers column x on the top border row, or -1.
+ * Mirrors ui_tabbar's layout so a click lands on the tab the eye sees. */
+static int
+tabbar_hit(const Editor *e, int x)
+{
+	int left = 1, right = e->cols - 1;
+	int avail = right - left, start, cx, i, w;
+
+	if (!bufbar_shown(e) || avail < 4)
+		return -1;
+	start = e->cur;
+	w = tab_cell_width(e, e->cur);
+	while (start > 0 && w + 1 + tab_cell_width(e, start - 1) <= avail) {
+		start--;
+		w += 1 + tab_cell_width(e, start);
+	}
+	cx = start > 0 ? left + 1 : left;
+	for (i = start; i < e->nbuf; i++) {
+		w = tab_cell_width(e, i);
+		if (cx + w > right)
+			break;
+		if (x >= cx && x < cx + w)
+			return i;
+		cx += w + 1;
+	}
+	return -1;
+}
+
 static void
 ui_frame(Editor *e, const Pal *p)
 {
@@ -12425,21 +12532,33 @@ ui_frame(Editor *e, const Pal *p)
 	scr_cell(d, bot, 0, GL_BL, fg, bg, 0);
 	scr_cell(d, bot, sb, GL_BR, fg, bg, 0);
 
-	/* centered filename on the top border, bracketed by spaces; a buffer
-	 * index is prefixed when more than one file is open */
-	if (e->nbuf > 1)
+	/* the top border carries the buffer-tab strip when several files are
+	 * open, otherwise the centered filename bracketed by spaces */
+	if (bufbar_shown(e)) {
+		ui_tabbar(e, d, p, top, bg);
+	} else if (e->nbuf > 1) {
 		tlen = snprintf(title, sizeof(title), " [%d/%d] %s ",
 		    e->cur + 1, e->nbuf, name);
-	else
+		if (tlen > e->cols - 4)
+			tlen = e->cols - 4;
+		if (tlen > 0 && !split) {
+			tstart = (e->cols - tlen) / 2;
+			if (tstart < 1)
+				tstart = 1;
+			ui_field(d, top, tstart, tlen, title, p->title_fg, bg,
+			    ATTR_BOLD);
+		}
+	} else {
 		tlen = snprintf(title, sizeof(title), " %s ", name);
-	if (tlen > e->cols - 4)
-		tlen = e->cols - 4;
-	if (tlen > 0 && !split) {	/* split_chrome titles each pane */
-		tstart = (e->cols - tlen) / 2;
-		if (tstart < 1)
-			tstart = 1;
-		ui_field(d, top, tstart, tlen, title, p->title_fg, bg,
-		    ATTR_BOLD);
+		if (tlen > e->cols - 4)
+			tlen = e->cols - 4;
+		if (tlen > 0 && !split) {	/* split_chrome titles each pane */
+			tstart = (e->cols - tlen) / 2;
+			if (tstart < 1)
+				tstart = 1;
+			ui_field(d, top, tstart, tlen, title, p->title_fg, bg,
+			    ATTR_BOLD);
+		}
 	}
 
 	/* left border column and the vertical scrollbar column (with a split
@@ -34627,6 +34746,11 @@ run_menu_act(Editor *e, Menuact act)
 		set_status(e, "show tabs %s",
 		    e->show_tabs ? "on" : "off");
 		break;
+	case MA_BUF_TABS:
+		e->buf_tabs = !e->buf_tabs;
+		set_status(e, "buffer tabs %s",
+		    e->buf_tabs ? "on" : "off");
+		break;
 	case MA_AUTO_INDENT:
 		e->auto_indent = !e->auto_indent;
 		set_status(e, "auto-indent %s",
@@ -36019,6 +36143,7 @@ editor_init(Editor *e)
 	e->alt_buf = -1;	/* no last-used buffer yet (F8 / Ctrl-Tab target) */
 	e->hl_on = 1;		/* highlight when a file type is recognized */
 	e->show_tabs = 1;	/* show hard tabs by default */
+	e->buf_tabs = 1;	/* show the buffer-tab strip when several are open */
 	e->mouse = mouse_default();
 	e->auto_indent = 1;	/* copy the previous line's indent by default */
 	e->swap_enabled = 1;	/* write crash-recovery swap files by default */
@@ -36753,6 +36878,13 @@ ed_mouse_event(Editor *e, const struct tkbd_seq *m)
 		int mi = menu_hit(e, m->x);
 
 		return mi >= 0 ? menu_bar_run(e, mi, 1) : MA_NONE;
+	}
+	if (press && m->y == CHROME_TOP - 1 && bufbar_shown(e)) {
+		int bi = tabbar_hit(e, m->x);	/* a buffer tab on the border */
+
+		if (bi >= 0 && bi != e->cur)
+			buf_switch(e, bi);
+		return MA_NONE;
 	}
 	if ((press || m->key == TKBD_MOUSE_WHEEL_UP ||
 	    m->key == TKBD_MOUSE_WHEEL_DOWN) && mouse_sbar(e, m))
@@ -37756,6 +37888,7 @@ ed_apply_config(Editor *e)
 	e->wrap = cfg_bool(g_cfg, "ui.wrap", e->wrap);
 	e->show_lineno = cfg_bool(g_cfg, "ui.number", e->show_lineno);
 	e->show_tabs = cfg_bool(g_cfg, "ui.tabs", e->show_tabs);
+	e->buf_tabs = cfg_bool(g_cfg, "ui.buffer-tabs", e->buf_tabs);
 	s = cfg_get(g_cfg, "ui.statusline");
 	if (s)
 		e->statusline = strcmp(s, "powerline") == 0 ?
@@ -51156,6 +51289,17 @@ ex_set(Editor *e, const char *arg)
 			e->show_tabs = 1;
 		set_status(e, "show tabs %s",
 		    e->show_tabs ? "on" : "off");
+		return REQ_CONTINUE;
+	} else if (strcmp(arg, "buftabs") == 0 || strcmp(arg, "nobuftabs") == 0 ||
+	    strcmp(arg, "buftabs!") == 0 || strcmp(arg, "invbuftabs") == 0) {
+		if (arg[0] == 'n')
+			e->buf_tabs = 0;
+		else if (strchr(arg, '!') || arg[0] == 'i')
+			e->buf_tabs = !e->buf_tabs;
+		else
+			e->buf_tabs = 1;
+		set_status(e, "buffer tabs %s",
+		    e->buf_tabs ? "on" : "off");
 		return REQ_CONTINUE;
 #ifndef VEDIT_NO_MOUSE
 	} else if (strcmp(arg, "mouse") == 0 || strcmp(arg, "nomouse") == 0 ||

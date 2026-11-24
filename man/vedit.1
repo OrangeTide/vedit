@@ -40,6 +40,15 @@ read-only
 buffer that the ordinary editing commands scroll, split, and switch away from.
 Open the Help menu for the built-in tutorials.
 .PP
+With more than one buffer open, the top border shows a numbered tab strip, one
+cell per buffer with the current one highlighted. The numbers match Alt+N, a
+click on a tab switches to it, and
+.B F8
+flips to the last-used buffer.
+View > Buffer Tabs, or
+.B :set buftabs
+in the vi keys, turns the strip off.
+.PP
 With
 .B mail.dir
 set in the configuration, the Mail menu (and the

@@ -26,10 +26,14 @@ From top to bottom:
   Insert leaves while a view has no text cursor. On a narrow screen the
   titles that would collide with Help are not drawn, but Alt+letter
   still opens them.
-- **The frame.** The file name sits in the top border, as `[2/3] name`
-  when more than one file is open, or `Untitled` for a new buffer. The
-  right border is a scrollbar, and the bottom border scrolls sideways.
-  With two panes (chapter 3) each pane has its own title.
+- **The frame.** The file name sits in the top border, or `Untitled` for
+  a new buffer. When more than one file is open the top border instead
+  shows a numbered tab strip, one ` N name ` cell per buffer with the
+  current one highlighted, and a click on a tab switches to it. The number
+  matches Alt+N. View > Buffer Tabs turns the strip off, which falls back
+  to a centered `[2/3] name` title. The right border is a scrollbar, and
+  the bottom border scrolls sideways. With two panes (chapter 3) each pane
+  has its own title and the strip steps aside.
 - **The text.**
 - **The status line.** On the left, `F1=Help` and, in a version control
   working copy, the system and branch, as `git:main`, with `*` added

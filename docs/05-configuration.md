@@ -108,6 +108,7 @@ environment variables say; it starts with `ui.clipboard = on`.
 | `scroll` | `off` | use the terminal scroll region when scrolling (chapter 10) |
 | `clipboard` | `off` | also send every copy and cut to the terminal clipboard (chapter 2) |
 | `tabs` | `on` | mark hard tabs with a guide glyph |
+| `buffer-tabs` | `on` | show the numbered buffer-tab strip on the top border when more than one file is open (chapter 1) |
 | `paneheight` | `0` | rows for the pane under the text, 0 to 500; 0 is a third (chapter 8; builds with terminals) |
 | `mouse` | `on` | mouse reporting (chapter 2) |
 
