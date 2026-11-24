@@ -111,6 +111,7 @@ environment variables say; it starts with `ui.clipboard = on`.
 | `buffer-tabs` | `on` | show the numbered buffer-tab strip on the top border when more than one file is open (chapter 1) |
 | `paneheight` | `0` | rows for the pane under the text, 0 to 500; 0 is a third (chapter 8; builds with terminals) |
 | `mouse` | `on` | mouse reporting (chapter 2) |
+| `enhanced-keys` | `on` | ask the terminal for xterm modifyOtherKeys reports, so Ctrl-Tab and other modified keys arrive; turn off for a terminal that mishandles the request |
 
 ### `[keys]`: keybinding modes
 

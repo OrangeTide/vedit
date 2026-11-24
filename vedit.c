@@ -4172,6 +4172,26 @@ scroll_default(void)
 	return 0;	/* conservative: dumb full-row repaint */
 }
 
+/* Whether to ask the terminal for xterm modifyOtherKeys reports, so keys with
+ * no unambiguous encoding (Ctrl-Tab above all) still reach the editor. On by
+ * default; a terminal that mishandles the request can set ui.enhanced-keys off
+ * or VEDIT_ENHANCED_KEYS=0. */
+static int
+enhanced_kbd_default(void)
+{
+	const char *s = getenv("VEDIT_ENHANCED_KEYS");
+
+	if (s) {
+		if (strcmp(s, "1") == 0 || strcmp(s, "on") == 0 ||
+		    strcmp(s, "yes") == 0)
+			return 1;
+		if (strcmp(s, "0") == 0 || strcmp(s, "off") == 0 ||
+		    strcmp(s, "no") == 0)
+			return 0;
+	}
+	return cfg_bool(g_cfg, "ui.enhanced-keys", 1);
+}
+
 #ifndef VEDIT_NO_MOUSE
 /* Shell-style wildcard match of s against pat: '*' any run, '?' one char. */
 static int
@@ -6379,6 +6399,7 @@ typedef struct draw_term {
 
 	int		begun;
 	int		mouse;		/* report the mouse (?1002 + ?1006) while begun */
+	int		kbd_enhanced;	/* ask for modifyOtherKeys reports while begun */
 	int		want_resize;	/* a resize is pending for scr_wait */
 	int		box_mode;	/* enum vedit_box_mode for the glyphs */
 	int		colors;		/* 256 or 16 (downgrade palette) */
@@ -6532,6 +6553,7 @@ scr_new_io(const struct vedit_io *io)
 	t->box_mode = box_default();
 	t->colors = color_default();
 	t->scroll = scroll_default();
+	t->kbd_enhanced = enhanced_kbd_default();
 	if (t->io.getsize && t->io.getsize(t->io.ctx, &rows, &cols) == 0) {
 		if (rows < 1)
 			rows = 24;
@@ -7146,6 +7168,8 @@ scr_begin(Screen *d)
 	t->begun = 1;
 	scr_str(t, "\033[?1049h");	/* alt screen, if supported */
 	scr_str(t, "\033[?2004h");	/* bracketed paste */
+	if (t->kbd_enhanced)
+		scr_str(t, "\033[>4;1m");	/* modifyOtherKeys level 1 */
 	if (t->mouse)
 		scr_str(t, "\033[?1002h\033[?1006h");	/* mouse+drag, SGR reports */
 	scr_str(t, "\033[2J");		/* clear */
@@ -7169,6 +7193,8 @@ scr_end(Screen *d)
 	scr_str(t, "\033[0m");
 	scr_str(t, "\033[?2004l");
 	scr_str(t, "\033[?25h");
+	if (t->kbd_enhanced)
+		scr_str(t, "\033[>4;0m");	/* restore default key reporting */
 	if (t->mouse)
 		scr_str(t, "\033[?1006l\033[?1002l");
 	/* Drop the cursor to the bottom and scroll up one line, so on a client
@@ -7500,6 +7526,40 @@ tkbd_decode(struct tkbd_seq *seq, const unsigned char *buf, int len)
 		case 'Z': seq_simple(seq, TKBD_KEY_TAB, TKBD_MOD_SHIFT);
 			return i + 1;
 		case '~':
+			/* xterm modifyOtherKeys: CSI 27 ; mod ; code ~ carries a
+			 * key that has no unambiguous encoding of its own, such as
+			 * Ctrl-Tab (code 9). The modifier is params[1], the key
+			 * code params[2]. */
+			if (np >= 3 && params[0] == 27) {
+				int code = params[2];
+				uint8_t m = csi_mods(params[1]);
+
+				switch (code) {
+				case 9:
+					seq_simple(seq, TKBD_KEY_TAB, m);
+					return i + 1;
+				case 13:
+					seq_simple(seq, TKBD_KEY_ENTER, m);
+					return i + 1;
+				case 27:
+					seq_simple(seq, TKBD_KEY_ESC, m);
+					return i + 1;
+				case 8:
+				case 127:
+					seq_simple(seq, TKBD_KEY_BACKSPACE, m);
+					return i + 1;
+				default:
+					if (code >= 32 && code < 127) {
+						seq->type = TKBD_KEY;
+						seq->ch = (uint32_t)code;
+						seq->mod = m;
+						seq->key = (code >= 'a' && code <= 'z')
+						    ? (uint16_t)(TKBD_KEY_A + (code - 'a'))
+						    : (uint16_t)code;
+					}
+					return i + 1;	/* decoded or skipped */
+				}
+			}
 			switch (params[0]) {
 			case 1: seq_simple(seq, TKBD_KEY_HOME, mod); break;
 			case 2: seq_simple(seq, TKBD_KEY_INS, mod); break;
@@ -38193,6 +38253,7 @@ vedit_set_config(struct vedit *v, const struct cfg *c)
 		v->e.term->box_mode = box_default();
 		v->e.term->colors = color_default();
 		v->e.term->scroll = scroll_default();
+		v->e.term->kbd_enhanced = enhanced_kbd_default();
 	}
 	ed_apply_config(&v->e);
 }
@@ -38390,7 +38451,7 @@ static void
 tty_on_fatal(int sig)
 {
 	static const char restore[] =
-	    "\033[0m\033[?1006l\033[?1002l\033[?1000l\033[?2004l\033[?25h\033[?1049l";
+	    "\033[0m\033[>4;0m\033[?1006l\033[?1002l\033[?1000l\033[?2004l\033[?25h\033[?1049l";
 	ssize_t wr;
 
 	signal(sig, SIG_DFL);
@@ -38633,7 +38694,7 @@ static void
 tty_restore(Ttyio *t)
 {
 	static const char restore[] =
-	    "\033[0m\033[?1006l\033[?1002l\033[?1000l\033[?2004l\033[?25h\033[?1049l";
+	    "\033[0m\033[>4;0m\033[?1006l\033[?1002l\033[?1000l\033[?2004l\033[?25h\033[?1049l";
 	DWORD w;
 
 	if (!t->raw)

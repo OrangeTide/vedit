@@ -734,6 +734,38 @@ t_cli_config_path(Test *t)
 		unsetenv("VEDIT_CONFIG");
 }
 
+/* xterm modifyOtherKeys reports: CSI 27 ; mod ; code ~ carries a key with no
+ * unambiguous encoding. Ctrl-Tab (code 9) is the one the editor needs. */
+static void
+t_tkbd_modother(Test *t)
+{
+	struct tkbd_seq seq;
+	int n;
+
+	n = tkbd_decode(&seq, (const unsigned char *)"\033[27;5;9~", 9);
+	TAP_CHECKF(t, n == 9 && seq.type == TKBD_KEY &&
+	    seq.key == TKBD_KEY_TAB && seq.mod == TKBD_MOD_CTRL,
+	    "Ctrl-Tab: n=%d key=%d mod=%d", n, seq.key, seq.mod);
+
+	n = tkbd_decode(&seq, (const unsigned char *)"\033[27;6;9~", 9);
+	TAP_CHECKF(t, n == 9 && seq.key == TKBD_KEY_TAB &&
+	    (seq.mod & TKBD_MOD_CTRL) && (seq.mod & TKBD_MOD_SHIFT),
+	    "Ctrl-Shift-Tab: key=%d mod=%d", seq.key, seq.mod);
+
+	n = tkbd_decode(&seq, (const unsigned char *)"\033[27;5;13~", 10);
+	TAP_CHECK(t, n == 10 && seq.key == TKBD_KEY_ENTER &&
+	    seq.mod == TKBD_MOD_CTRL);
+
+	/* a modified letter: code is the ascii of the key, carried in ch too */
+	n = tkbd_decode(&seq, (const unsigned char *)"\033[27;5;97~", 10);
+	TAP_CHECKF(t, n == 10 && seq.key == TKBD_KEY_A &&
+	    seq.mod == TKBD_MOD_CTRL && seq.ch == 'a',
+	    "Ctrl-a: key=%d mod=%d ch=%u", seq.key, seq.mod, seq.ch);
+
+	n = tkbd_decode(&seq, (const unsigned char *)"\033[27;5", 6);
+	TAP_CHECK(t, n == -1);			/* incomplete */
+}
+
 static Cfg *load_cfg_text(const char *text, char *path, size_t pathsz);
 #ifndef VEDIT_NO_MOUSE
 /* SGR mouse reports decode to mouse pseudo-keys with 0-based coordinates;
@@ -7052,6 +7084,7 @@ const Case tap_cases[] = {
 	{ "syntax_gitcommit", t_syntax_gitcommit },
 	{ "mkdir_p", t_mkdir_p },
 	{ "cli_config_path", t_cli_config_path },
+	{ "tkbd_modother", t_tkbd_modother },
 #ifndef VEDIT_NO_MOUSE
 	{ "tkbd_mouse", t_tkbd_mouse },
 	{ "mouse_default", t_mouse_default },
