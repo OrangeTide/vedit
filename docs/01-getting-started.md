@@ -106,7 +106,8 @@ once a build has produced output.
   beside your file. F8 switches to the next buffer and back; in the vi
   personality `:bd` closes it.
 - **Help > Tutorial** opens the built-in walkthroughs: draw mode, terminal
-  buffers, the art view, the table view, and crash recovery.
+  buffers, the art view, the table view, and crash recovery. Each one opens as
+  a read-only buffer you move through the same way as the help buffer.
 - **Help > About** shows the version.
 
 ## Two sets of keys

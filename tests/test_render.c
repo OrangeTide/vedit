@@ -2418,7 +2418,16 @@ t_shell_cmd(Test *t)
 	TAP_CHECKF(t, strcmp(g_fake_cmd, "echo hi") == 0, "ran '%s'",
 	    g_fake_cmd);
 	TAP_CHECK(t, g_fake_fg == 0);		/* captured, not foreground */
-	TAP_CHECK(t, m.out && strstr(m.out, "line one") != NULL);
+	/* the output opened as the current read-only *Build* buffer */
+	TAP_CHECKF(t, strcmp(v->e.label, "*Build*") == 0 && v->e.t->readonly,
+	    "label '%s' ro %d", v->e.label, v->e.t->readonly);
+	{
+		size_t l0 = 0;
+		const char *t0 = text_line(v->e.t, 0, &l0);
+
+		TAP_CHECKF(t, t0 && l0 == 8 && memcmp(t0, "line one", 8) == 0,
+		    "line0 '%.*s'", (int)l0, t0 ? t0 : "");
+	}
 	TAP_CHECKF(t, strstr(v->e.status, "exited 0") != NULL, "status '%s'",
 	    v->e.status);
 
@@ -2821,8 +2830,24 @@ t_tool_f9_make(Test *t)
 	TAP_CHECKF(t, strstr(v->e.status, "1 error") != NULL &&
 	    strstr(v->e.status, "1 warning") != NULL, "status '%s'", v->e.status);
 
-	/* the output pane rendered the captured text */
-	TAP_CHECK(t, m.out && strstr(m.out, "undeclared") != NULL);
+	/* the captured text opened as the current read-only *Build* buffer,
+	 * colored by the built-in "build" grammar */
+	TAP_CHECK(t, strcmp(v->e.label, "*Build*") == 0 && v->e.t->readonly);
+	TAP_CHECK(t, v->e.syn != NULL);
+	{
+		int found = 0;
+		size_t i, ln;
+
+		for (i = 0; i < text_lines(v->e.t); i++) {
+			const char *s = text_line(v->e.t, i, &ln);
+
+			if (s && memmem(s, ln, "undeclared", 10)) {
+				found = 1;
+				break;
+			}
+		}
+		TAP_CHECK(t, found);
+	}
 
 	vedit_free(v);
 	memio_free(&m);
@@ -4344,6 +4369,37 @@ t_help_scroll(Test *t)
 	memio_free(&m);
 }
 
+/* Help > Tutorial opens a walkthrough as a read-only buffer named after it;
+ * reopening the same one refreshes in place instead of stacking a second. */
+static void
+t_tutorial_buffer(Test *t)
+{
+	Memio m;
+	struct vedit_io io;
+	struct vedit *v;
+	int before;
+
+	memio_init(&m, "", 0, 24, 80);
+	memio_bind(&io, &m);
+	v = vedit_new(&io);
+	TAP_ASSERT(t, v != NULL);
+	TAP_ASSERT(t, TUTORIAL_COUNT > 0);
+
+	before = v->e.nbuf;
+	dlg_tutorial_show(&v->e, &g_tutorials[0]);
+	TAP_CHECKF(t, v->e.nbuf == before + 1, "opened %d buffers, want 1",
+	    v->e.nbuf - before);
+	TAP_CHECK(t, v->e.t->readonly);
+	TAP_CHECK(t, strstr(buf_name_at(&v->e, v->e.cur),
+	    g_tutorials[0].title) != NULL);
+
+	dlg_tutorial_show(&v->e, &g_tutorials[0]);	/* refresh, no new copy */
+	TAP_CHECK(t, v->e.nbuf == before + 1);
+
+	vedit_free(v);
+	memio_free(&m);
+}
+
 /* A pending termination signal unwinds the run like end-of-input: scr_wait
  * reports EOF while g_sig_quit is set, so vedit_run returns promptly. (The
  * command-line handler, self-pipe, and re-raise are CLI-only and not exercised
@@ -5484,6 +5540,7 @@ const Case tap_cases[] = {
 	{ "menu_narrow", t_menu_narrow },
 	{ "win_too_small", t_win_too_small },
 	{ "help_scroll", t_help_scroll },
+	{ "tutorial_buffer", t_tutorial_buffer },
 	{ "sig_quit_unwinds", t_sig_quit_unwinds },
 #ifndef VEDIT_NO_TOOLS
 	{ "vcs_status", t_vcs_status },

@@ -5091,6 +5091,8 @@ static const char g_default_grammar[] =
 	"	start = bol\n"
 	"[language \"blame\"]\n"
 	"	start = bol\n"
+	"[language \"build\"]\n"
+	"	start = text\n"
 	"\n"
 	"[syntax]\n"
 	"	h = c\n"
@@ -5841,6 +5843,34 @@ static const char g_default_grammar[] =
 	"	color = text\n"
 	"	rule = \"\\n\" bol\n"
 	"	rule = * code\n"
+	/* build: color a compiler diagnostic from its severity word to the end
+	 * of the line. Approximate on purpose (by keyword, not by what parsed as
+	 * a diagnostic), so a config can extend it with a tool's own words. */
+	"[color \"build\"]\n"
+	"	err = 9\n"
+	"	warn = 11\n"
+	"	note = 14\n"
+	"[state \"build.text\"]\n"
+	"	color = text\n"
+	"	rule = \"error\" err recolor\n"
+	"	rule = \"Error\" err recolor\n"
+	"	rule = \"warning\" warn recolor\n"
+	"	rule = \"Warning\" warn recolor\n"
+	"	rule = \"note\" note recolor\n"
+	"	rule = \"\\n\" text\n"
+	"	rule = * text\n"
+	"[state \"build.err\"]\n"
+	"	color = err\n"
+	"	rule = \"\\n\" text\n"
+	"	rule = * err\n"
+	"[state \"build.warn\"]\n"
+	"	color = warn\n"
+	"	rule = \"\\n\" text\n"
+	"	rule = * warn\n"
+	"[state \"build.note\"]\n"
+	"	color = note\n"
+	"	rule = \"\\n\" text\n"
+	"	rule = * note\n"
 	"[color \"gitcommit\"]\n"
 	"	subject = 15 bold\n"
 	"	over = 9 reverse\n"
@@ -8183,8 +8213,6 @@ typedef enum uikind {
 	UI_PROMPT,		/* line input on the status row */
 	UI_YESNOKEY,		/* one-key y/n/a/q prompt */
 	UI_MENU,		/* menu bar / dropdown */
-	UI_PAGER,		/* scrollable help/tutorial viewer */
-	UI_TOOLOUT,		/* tool/build output viewer */
 	UI_INCSEARCH,		/* incremental search */
 	UI_PASTE,		/* bracketed-paste sink */
 	UI_PANEKEY,		/* Ctrl-W window prefix */
@@ -10567,7 +10595,7 @@ typedef enum cmd {
 	CMD_COMPILE,		/* compile the current file (Alt+F9) */
 	CMD_MAKE,		/* build the project (F9) */
 	CMD_RUN,		/* run the program (Ctrl+F9) */
-	CMD_VIEW_OUTPUT,	/* reopen the last output pane (Alt+F5) */
+	CMD_VIEW_OUTPUT,	/* reopen the last output buffer (Alt+F5) */
 	CMD_ERR_NEXT,		/* jump to the next diagnostic (F4) */
 	CMD_ERR_PREV,		/* jump to the previous diagnostic (Shift+F4) */
 #endif
@@ -22361,32 +22389,6 @@ static const struct {
 #define HELP_VI_COUNT \
 	((int)(sizeof(help_entries_vi) / sizeof(help_entries_vi[0])))
 
-/* Paint a full-screen scrollable view: a bold header row, body lines drawn
- * from `top` (get_line returns the text for an absolute index, or NULL past
- * the end), and a bold footer row. Used by the help and build-output screens.
- */
-static void
-ui_scroll_view(Editor *e, const char *header, const char *footer,
-    int top, const char *(*get_line)(Editor *, void *, int), void *ctx)
-{
-	const Pal *p = ed_chrome(e);
-	uint16_t barat = (p->reverse_bars ? ATTR_REVERSE : 0) | ATTR_BOLD;
-	Screen *d = e->d;
-	int rows = e->rows > 0 ? e->rows : 24;
-	int row;
-
-	scr_clear(d);
-	ui_field(d, 0, 0, e->cols, header, p->bar_fg, p->bar_bg, barat);
-	for (row = 1; row < rows - 1; row++) {
-		const char *s = get_line(e, ctx, top + row - 1);
-
-		ui_field(d, row, 0, e->cols, s ? s : "", p->content_fg,
-		    p->content_bg, 0);
-	}
-	ui_field(d, rows - 1, 0, e->cols, footer, p->bar_fg, p->bar_bg, barat);
-	scr_present(d);
-}
-
 /* Line provider for the help view: one formatted "keys  description" row from
  * the active personality's table. */
 static const char *kb_help_line(Editor *e, void *ctx, int idx);
@@ -22688,6 +22690,9 @@ typedef struct tutorial {
 	int		 n;
 } Tutorial;
 
+/* Defined near dlg_help: opens the tutorial as a read-only buffer. */
+static void dlg_tutorial_show(Editor *e, const Tutorial *t);
+
 #define TUT(arr) (arr), (int)(sizeof(arr) / sizeof((arr)[0]))
 static const Tutorial g_tutorials[] = {
 #ifdef VEDIT_DRAW
@@ -22708,101 +22713,6 @@ static const Tutorial g_tutorials[] = {
 };
 #undef TUT
 #define TUTORIAL_COUNT ((int)(sizeof(g_tutorials) / sizeof(g_tutorials[0])))
-
-/* Line provider for dlg_text_view: one body line by absolute index. */
-static const char *
-tutorial_line(Editor *e, void *ctx, int idx)
-{
-	const Tutorial *t = ctx;
-
-	(void)e;
-	if (idx < 0 || idx >= t->n)
-		return NULL;
-	return t->lines[idx];
-}
-
-/* A scrollable full-screen pager (help, tutorial) while it is a frame: the
- * header, footer, line provider, total line count, and scroll offset. The
- * offset is clamped at draw time, so a resize needs no special handling. */
-typedef struct pager_ctx {
-	char		hdr[128];
-	const char	*footer;
-	const char	*(*line)(Editor *, void *, int);
-	void		*line_ctx;
-	int		n;		/* total body lines */
-	int		top;		/* scroll offset */
-} PagerCtx;
-
-_Static_assert(sizeof(PagerCtx) <= sizeof(UiCtx),
-    "PagerCtx must fit inline in a UiFrame");
-
-static void
-pager_frame_draw(Editor *e, UiFrame *f)
-{
-	PagerCtx *pg = (PagerCtx *)&f->ctx;
-	int body = (e->rows > 0 ? e->rows : 24) - 2;
-	int maxtop = (pg->n > body) ? pg->n - body : 0;
-
-	if (pg->top > maxtop)
-		pg->top = maxtop;
-	if (pg->top < 0)
-		pg->top = 0;
-	ui_scroll_view(e, pg->hdr, pg->footer, pg->top, pg->line, pg->line_ctx);
-}
-
-/* Apply a scroll/jump key to a pager; returns 1 if it consumed the key. */
-static int
-pager_scroll_key(Editor *e, PagerCtx *pg, uint32_t key)
-{
-	int body = (e->rows > 0 ? e->rows : 24) - 2;
-	int maxtop = (pg->n > body) ? pg->n - body : 0;
-
-	switch (key) {
-	case TKBD_KEY_UP:	pg->top -= 1; return 1;
-	case TKBD_KEY_DOWN:	pg->top += 1; return 1;
-	case TKBD_KEY_PGUP:	pg->top -= body; return 1;
-	case TKBD_KEY_PGDN:	pg->top += body; return 1;
-	case TKBD_KEY_HOME:	pg->top = 0; return 1;
-	case TKBD_KEY_END:	pg->top = maxtop; return 1;
-	default:		return 0;
-	}
-}
-
-static int
-tutorial_frame_key(Editor *e, UiFrame *f, const Event *ev)
-{
-	PagerCtx *pg = (PagerCtx *)&f->ctx;
-
-	if (ev->type != EVENT_KEY || ev->key.type != TKBD_KEY)
-		return 0;
-	if (pager_scroll_key(e, pg, ev->key.key))
-		return 0;
-	if (ev->key.key == TKBD_KEY_ESC || ev->key.ch == 'q' || ev->key.ch == 'Q')
-		return 1;
-	return 0;
-}
-
-/* Show one tutorial in a scrollable view: Up/Down and PgUp/PgDn scroll,
- * Home/End jump, Esc or q returns. */
-static void
-dlg_tutorial_show(Editor *e, const Tutorial *t)
-{
-	int base = e->ui_depth;
-	UiFrame *f;
-	PagerCtx *pg;
-
-	f = ui_push(e, UI_PAGER, pager_frame_draw, tutorial_frame_key, NULL);
-	if (!f)
-		return;
-	pg = (PagerCtx *)&f->ctx;
-	snprintf(pg->hdr, sizeof(pg->hdr), " vedit tutorial -- %s", t->title);
-	pg->footer = " Up/Down PgUp/PgDn Home/End scroll   Esc or q returns";
-	pg->line = tutorial_line;
-	pg->line_ctx = (void *)t;
-	pg->n = t->n;
-	pg->top = 0;
-	ui_pump_modal(e, base);
-}
 
 static const char *
 tutpick_title(void *ctx)
@@ -33161,150 +33071,11 @@ tool_err_at(Editor *e, int outline)
 	return -1;
 }
 
-/* An indexed terminal color as a value (CIDX is a struct initializer only). */
-static Color
-tool_color(uint8_t idx)
-{
-	Color c;
-
-	c.type = COLOR_INDEXED;
-	c.index = idx;
-	return c;
-}
-
-/* The tool-output viewer while it is a frame: the header and the cursor/scroll
- * lines. The output itself lives on the Editor (e->tool_*). */
-typedef struct toolout_ctx {
-	char	hdr[160];
-	int	cur, top;
-} ToolOutCtx;
-
-_Static_assert(sizeof(ToolOutCtx) <= sizeof(UiCtx),
-    "ToolOutCtx must fit inline in a UiFrame");
-
-static void
-toolout_frame_draw(Editor *e, UiFrame *f)
-{
-	ToolOutCtx *to = (ToolOutCtx *)&f->ctx;
-	const Pal *p = ed_chrome(e);
-	uint16_t barat = (p->reverse_bars ? ATTR_REVERSE : 0) | ATTR_BOLD;
-	Screen *d = e->d;
-	int rows = e->rows > 0 ? e->rows : 24;
-	int body = rows - 2;
-	int row;
-
-	if (to->cur < 0)
-		to->cur = 0;
-	if (to->cur >= e->tool_nlines)
-		to->cur = e->tool_nlines - 1;
-	if (to->cur < to->top)
-		to->top = to->cur;
-	if (body > 0 && to->cur >= to->top + body)
-		to->top = to->cur - body + 1;
-	if (to->top < 0)
-		to->top = 0;
-
-	scr_clear(d);
-	ui_field(d, 0, 0, e->cols, to->hdr, p->bar_fg, p->bar_bg, barat);
-	for (row = 1; row < rows - 1; row++) {
-		int idx = to->top + row - 1;
-		const char *s = (idx < e->tool_nlines) ?
-		    e->tool_lines[idx] : "";
-		Color fg = p->content_fg;
-		uint16_t at = 0;
-		int ei = (idx < e->tool_nlines) ?
-		    tool_err_at(e, idx) : -1;
-
-		if (ei >= 0) {
-			switch (e->tool_errs[ei].sev) {
-			case TSEV_ERROR: fg = tool_color(9); break;
-			case TSEV_WARN:  fg = tool_color(11); break;
-			default:	 fg = tool_color(14); break;
-			}
-		}
-		if (idx == to->cur)
-			at = ATTR_REVERSE;
-		ui_field(d, row, 0, e->cols, s, fg, p->content_bg, at);
-	}
-	ui_field(d, rows - 1, 0, e->cols,
-	    " Up/Down n/N move   Enter jump   Esc close",
-	    p->bar_fg, p->bar_bg, barat);
-	scr_present(d);
-}
-
-static int
-toolout_frame_key(Editor *e, UiFrame *f, const Event *ev)
-{
-	ToolOutCtx *to = (ToolOutCtx *)&f->ctx;
-	int body = (e->rows > 0 ? e->rows : 24) - 2;
-
-	if (ev->type != EVENT_KEY || ev->key.type != TKBD_KEY)
-		return 0;
-	switch (ev->key.key) {
-	case TKBD_KEY_UP:	to->cur -= 1; return 0;
-	case TKBD_KEY_DOWN:	to->cur += 1; return 0;
-	case TKBD_KEY_PGUP:	to->cur -= body; return 0;
-	case TKBD_KEY_PGDN:	to->cur += body; return 0;
-	case TKBD_KEY_HOME:	to->cur = 0; return 0;
-	case TKBD_KEY_END:	to->cur = e->tool_nlines - 1; return 0;
-	case TKBD_KEY_ENTER: {
-		int ei = tool_err_at(e, to->cur);
-
-		if (ei >= 0) {
-			tool_goto_err(e, ei);
-			return 1;
-		}
-		return 0;
-	}
-	case TKBD_KEY_ESC:
-		return 1;
-	default:
-		if (ev->key.ch == 'q' || ev->key.ch == 'Q')
-			return 1;
-		if ((ev->key.ch == 'n' || ev->key.ch == 'N') &&
-		    e->tool_nerr > 0) {
-			int step = (ev->key.ch == 'N') ? -1 : 1;
-			int ei = (e->tool_curerr < 0) ? 0 :
-			    e->tool_curerr + step;
-
-			if (ei < 0)
-				ei = 0;
-			if (ei >= e->tool_nerr)
-				ei = e->tool_nerr - 1;
-			e->tool_curerr = ei;
-			to->cur = e->tool_errs[ei].outline;
-		}
-		return 0;
-	}
-}
-
-/* The output pane: Up/Down (and PgUp/PgDn, Home/End) move the cursor line,
- * n / N step between diagnostics, Enter jumps to the one on the cursor line,
- * Esc or q closes. Diagnostic lines are drawn in red. */
-static void
-dlg_tool_output(Editor *e)
-{
-	int base = e->ui_depth;
-	UiFrame *f;
-	ToolOutCtx *to;
-	int ne, nw;
-
-	if (e->tool_nlines == 0) {
-		set_status(e, "no output to show");
-		return;
-	}
-	f = ui_push(e, UI_TOOLOUT, toolout_frame_draw, toolout_frame_key, NULL);
-	if (!f)
-		return;
-	to = (ToolOutCtx *)&f->ctx;
-	to->cur = (e->tool_nerr > 0) ? e->tool_errs[0].outline : 0;
-	to->top = 0;
-	tool_counts(e, &ne, &nw);
-	snprintf(to->hdr, sizeof(to->hdr),
-	    " Output: %s  (%d error%s, %d warning%s)", e->tool_title,
-	    ne, ne == 1 ? "" : "s", nw, nw == 1 ? "" : "s");
-	ui_pump_modal(e, base);
-}
+/* The last command's output opens as a read-only "*Build*" buffer; the function
+ * is defined near dlg_help with the other synthetic-buffer helpers. Enter on a
+ * diagnostic line jumps to it (hooked in editor_loop), and F4/Shift+F4 step the
+ * diagnostics the same as from any buffer. */
+static void tool_show_output(Editor *e);
 
 /* ---- running a command ---- */
 
@@ -33754,7 +33525,7 @@ tool_view_output(Editor *e)
 		return;
 	}
 #endif
-	dlg_tool_output(e);
+	tool_show_output(e);
 }
 
 /* Resolve and run the per-language command `which` (labelled `label`). It
@@ -33819,18 +33590,15 @@ ed_tool_run(Editor *e, const char *which, const char *label)
 		tool_term_start(e, cmd, dir, label);
 #endif
 	} else if (e->tools->run_capture) {
-		int fe, ne, nw;
+		int ne, nw;
 
 		tool_clear_output(e);
 		snprintf(e->tool_title, sizeof(e->tool_title), "%s", label);
 		rc = e->tools->run_capture(e->tools->ctx, cmd, dir, tool_emit,
 		    e);
 		tool_parse_output(e);
-		e->tool_curerr = -1;
-		fe = tool_first_error(e);
-		if (fe >= 0)			/* land on the first error */
-			tool_goto_err(e, fe);
-		dlg_tool_output(e);
+		e->tool_curerr = tool_first_error(e);	/* prime F4 on error 1 */
+		tool_show_output(e);		/* the *Build* buffer, on error 1 */
 		tool_counts(e, &ne, &nw);
 		if (rc < 0)
 			set_status(e,
@@ -33884,7 +33652,7 @@ ed_shell_cmd(Editor *e, const char *cmd)
 	rc = e->tools->run_capture(e->tools->ctx, cmd, dir, tool_emit, e);
 	tool_parse_output(e);
 	e->tool_curerr = -1;
-	dlg_tool_output(e);
+	tool_show_output(e);
 	if (rc < 0)
 		set_status(e, "could not run: %.80s", cmd);
 	else
@@ -34127,6 +33895,46 @@ help_text_build(Editor *e, struct fmtbuf *b)
 	}
 }
 
+/* Open text as a read-only buffer named label with the named grammar (lang, ""
+ * for none), or, when a buffer with that label is already open, refresh it in
+ * place rather than stacking a second copy. The shared path behind the built-in
+ * help, tutorial, and build-output buffers; they feel like any other read-only
+ * buffer. */
+static void
+synth_text_buffer(Editor *e, const char *text, size_t len, const char *label,
+    const char *lang)
+{
+	int i;
+
+	for (i = 0; i < e->nbuf; i++) {
+		const char *l = i == e->cur ? e->label : e->bufs[i].label;
+
+		if (strcmp(l, label) == 0)
+			break;
+	}
+	if (i < e->nbuf) {
+		buf_switch(e, i);
+		e->t->readonly = 0;
+		text_load_mem(e->t, text, len);
+		e->t->dirty = 0;
+		e->t->readonly = 1;
+		e->syn = syn_for_ext(lang);
+		e->hl_valid = 0;
+		e->cy = e->cx = e->top = e->left = 0;
+		buf_save(e, &e->bufs[e->cur]);
+	} else {
+		vcs_open_text(e, text, len, label, lang);
+	}
+}
+
+/* The closing hint for a synthetic buffer, mode-aware: modeless has no ex line
+ * so no :bd. */
+static const char *
+synth_close_hint(const Editor *e)
+{
+	return e->mode != MODE_MODELESS ? ", :bd closes" : "";
+}
+
 /* Help > Key Bindings and F1: show the key bindings as a read-only "*Help*"
  * buffer, so the ordinary editing commands scroll, split, and close it. A help
  * buffer already open is refreshed in place rather than stacked, which also
@@ -34135,7 +33943,6 @@ static void
 dlg_help(Editor *e)
 {
 	struct fmtbuf b = { NULL, 0, 0, 0 };
-	int i;
 
 	help_text_build(e, &b);
 	if (b.oom) {
@@ -34143,27 +33950,72 @@ dlg_help(Editor *e)
 		set_status(e, "out of memory building help");
 		return;
 	}
-	for (i = 0; i < e->nbuf; i++) {	/* a help buffer is open: refresh it */
-		const char *l = i == e->cur ? e->label : e->bufs[i].label;
-
-		if (strcmp(l, "*Help*") == 0)
-			break;
-	}
-	if (i < e->nbuf) {
-		buf_switch(e, i);
-		e->t->readonly = 0;
-		text_load_mem(e->t, b.buf ? b.buf : "", b.len);
-		e->t->dirty = 0;
-		e->t->readonly = 1;
-		e->syn = NULL;
-		e->hl_valid = 0;
-		e->cy = e->cx = e->top = e->left = 0;
-		buf_save(e, &e->bufs[e->cur]);
-	} else {
-		vcs_open_text(e, b.buf ? b.buf : "", b.len, "*Help*", "");
-	}
+	synth_text_buffer(e, b.buf ? b.buf : "", b.len, "*Help*", "");
 	set_status(e, "key bindings (read-only; F8 switches away%s)",
-	    e->mode != MODE_MODELESS ? ", :bd closes" : "");
+	    synth_close_hint(e));
+	free(b.buf);
+}
+
+/* Help > Tutorial: show one walkthrough as a read-only buffer named after it,
+ * navigated by the ordinary editing commands like the help buffer. Reopening
+ * the same tutorial refreshes it in place. */
+static void
+dlg_tutorial_show(Editor *e, const Tutorial *t)
+{
+	struct fmtbuf b = { NULL, 0, 0, 0 };
+	char label[64];
+	int i;
+
+	for (i = 0; i < t->n; i++) {
+		fmt_emit(&b, t->lines[i], strlen(t->lines[i]));
+		fmt_emit(&b, "\n", 1);
+	}
+	if (b.oom) {
+		free(b.buf);
+		set_status(e, "out of memory building the tutorial");
+		return;
+	}
+	snprintf(label, sizeof(label), "*Tutorial: %.40s*", t->title);
+	synth_text_buffer(e, b.buf ? b.buf : "", b.len, label, "");
+	set_status(e, "%s (read-only; F8 switches away%s)", t->title,
+	    synth_close_hint(e));
+	free(b.buf);
+}
+
+/* Alt+F5 / View > Output: show the last command's captured output as a
+ * read-only "*Build*" buffer, colored by the "build" grammar. Reopening after
+ * another run refreshes it in place. The cursor starts on the first diagnostic;
+ * Enter on a diagnostic line jumps to it (hooked in editor_loop), and F4 /
+ * Shift+F4 step the diagnostics from here as from any buffer. */
+static void
+tool_show_output(Editor *e)
+{
+	struct fmtbuf b = { NULL, 0, 0, 0 };
+	int i, ne, nw;
+
+	if (e->tool_nlines == 0) {
+		set_status(e, "no output to show");
+		return;
+	}
+	for (i = 0; i < e->tool_nlines; i++) {
+		fmt_emit(&b, e->tool_lines[i], strlen(e->tool_lines[i]));
+		fmt_emit(&b, "\n", 1);
+	}
+	if (b.oom) {
+		free(b.buf);
+		set_status(e, "out of memory building the output");
+		return;
+	}
+	synth_text_buffer(e, b.buf ? b.buf : "", b.len, "*Build*", "build");
+	if (e->tool_nerr > 0) {		/* land on the first diagnostic */
+		e->cy = (size_t)e->tool_errs[0].outline;
+		if (e->cy >= text_lines(e->t))
+			e->cy = text_lines(e->t) ? text_lines(e->t) - 1 : 0;
+	}
+	tool_counts(e, &ne, &nw);
+	set_status(e, "%s: %d error%s, %d warning%s (read-only; Enter jumps%s)",
+	    e->tool_title, ne, ne == 1 ? "" : "s", nw, nw == 1 ? "" : "s",
+	    synth_close_hint(e));
 	free(b.buf);
 }
 
@@ -37502,6 +37354,20 @@ editor_loop(Editor *e)
 			vcs_blame_follow(e);
 			ed_render(e, e->d);
 			continue;
+		}
+		/* Enter on a diagnostic line of the build-output buffer jumps to
+		 * it. The jump switches to the source, so a non-diagnostic line
+		 * falls through to normal handling. */
+		if (e->t->readonly && !e->has_name &&
+		    strcmp(e->label, "*Build*") == 0 &&
+		    seq.type == TKBD_KEY && seq.key == TKBD_KEY_ENTER) {
+			int ei = tool_err_at(e, (int)e->cy);
+
+			if (ei >= 0) {
+				tool_goto_err(e, ei);
+				ed_render(e, e->d);
+				continue;
+			}
 		}
 #endif
 

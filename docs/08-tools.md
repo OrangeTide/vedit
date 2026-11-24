@@ -51,9 +51,11 @@ the command exits, with the exit status on its status line, and the next
 build replaces it; a build still running must be stopped first (Ctrl-W c
 in its buffer). A window too short for the pane runs the command in a
 full-frame terminal buffer. `command.split = off` makes the terminal fill
-the frame instead, and `command.terminal = off` captures the output into
-a full-screen list with no terminal, where `n` and `N` step the
-diagnostics, Enter jumps to one, and Esc or `q` closes it.
+the frame instead, and `command.terminal = off` captures the output into a
+read-only `*Build*` buffer with no terminal. The ordinary editing commands
+move through it, Enter on a diagnostic line jumps to it, and F4 and
+Shift-F4 step the diagnostics. Switch away from it like any buffer (F8);
+in the vi keys `:bd` closes it.
 
 A command with a sibling key `run.interactive = on` (or `compile.`,
 `build.`) runs on the real terminal instead, for a program that needs the
@@ -64,13 +66,15 @@ whole screen. The editor hides until it exits.
 Output lines in the gcc and clang form (`file:line:col: message` or
 `file:line: message`, including a Windows path with a drive letter) become
 jump targets. F4 and Shift-F4 step through them from the editor, wrapping
-at the ends, and Enter on a line in the output pane goes to it. A
-diagnostic in another file opens or switches to that file.
+at the ends, and Enter on a diagnostic line in the `*Build*` buffer goes to
+it. A diagnostic in another file opens or switches to that file.
 
-The word after the location is read as the severity. Errors are red in
-the pane, warnings yellow, notes cyan, and the status line counts errors
-and warnings separately. When a build ends with errors the cursor lands on
-the first one; a clean build leaves the terminal in front. F4 steps
+The word after the location is read as the severity. In the `*Build*`
+buffer the "build" grammar colors a diagnostic from its severity word to
+the end of the line: errors red, warnings yellow, notes cyan. The status
+line counts errors and warnings separately. When a captured build ends the
+`*Build*` buffer opens on the first diagnostic; in a terminal the output
+stays live there. F4 steps
 through errors only, or through warnings when there are no errors, or
 through notes when there are only notes. A line
 in the location form with no recognized severity word, such as a linker
